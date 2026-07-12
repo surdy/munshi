@@ -1,5 +1,6 @@
 mod archive;
 mod archive_git;
+mod delivery;
 mod hooks;
 mod policy;
 mod project;
@@ -10,6 +11,13 @@ mod state;
 mod summary;
 
 pub use archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, SessionReference, archive_session};
+pub use delivery::{
+    DeliveryCredentialSource, DeliveryError, DeliveryItem, DeliveryOutcome, DeliveryRunItem,
+    DeliveryRunReport, DeliverySettings, DeliverySinkConfig, DeliveryStatusReport,
+    HttpNotesmithSink, NotesmithSink, backfill as delivery_backfill,
+    configure_sink as configure_delivery, load_settings as delivery_settings,
+    retry as delivery_retry, set_enabled as set_delivery_enabled, status as delivery_status,
+};
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook, read_last_failure,
     run_archive_worker, run_archive_worker_for_source, run_recovery, wait_for_hook_result,
@@ -30,8 +38,8 @@ pub use source::{
     resolve_session_reference, validate_transcript_envelope,
 };
 pub use state::{
-    BudgetOutcome, ClaimOutcome, CompletionReason, Diagnostic, SessionRecord, StateError,
-    StateStore, WaitState, try_acquire_session_lock,
+    BudgetOutcome, ClaimOutcome, CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic,
+    SessionRecord, StateError, StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
     StructuredSummary, SummaryError, build_revision_summary_input, build_summary_input,

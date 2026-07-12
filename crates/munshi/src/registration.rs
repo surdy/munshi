@@ -20,6 +20,8 @@ const CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_MAX_CALLS_PER_HOUR: u32 = 10;
 const DEFAULT_MAX_CALLS_PER_DAY: u32 = 50;
 const DEFAULT_MAX_CONCURRENCY: usize = 2;
+/// Bounded delivery attempts before a session's delivery is parked as a dead letter.
+pub(crate) const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 5;
 
 pub const DISCLOSURE: &str = "\
 IMPORTANT: MUNSHI TRANSCRIPT PROCESSING DISCLOSURE
@@ -95,6 +97,8 @@ pub(crate) struct StoredConfig {
     pub project_origin: String,
     pub limits: StoredLimits,
     pub remote_delivery: bool,
+    #[serde(default)]
+    pub delivery: StoredDelivery,
     #[serde(default = "StoredPolicy::defaults")]
     pub policy: StoredPolicy,
 }
@@ -104,6 +108,67 @@ pub(crate) struct StoredConfig {
 pub(crate) struct StoredCommand {
     pub executable: String,
     pub args: Vec<String>,
+}
+
+/// The Munshi-owned Notesmith sink configuration. Delivery is opt-in and disabled by default via
+/// `remote_delivery`; this section records only *where* to deliver and *how to find* a credential.
+/// It never stores the credential itself: `credential` names an environment variable or an
+/// operating-system credential-store entry that is read at delivery time (khata-handoff.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredDelivery {
+    /// Base URL of the Notesmith daemon, for example `http://127.0.0.1:27183`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Target Notesmith vault name.
+    #[serde(default)]
+    pub vault: Option<String>,
+    /// Optional vault-relative folder that Munshi-owned session notes are filed under.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Where the bearer credential is read from, or `None` for an unauthenticated local daemon.
+    #[serde(default)]
+    pub credential: Option<StoredCredential>,
+    /// Bounded number of delivery attempts before a session is parked as a dead letter.
+    #[serde(default = "default_max_delivery_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_max_delivery_attempts() -> u32 {
+    DEFAULT_MAX_DELIVERY_ATTEMPTS
+}
+
+impl Default for StoredDelivery {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            vault: None,
+            folder: None,
+            credential: None,
+            max_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        }
+    }
+}
+
+impl StoredDelivery {
+    /// A sink is fully addressable only when both the endpoint and vault are present.
+    pub(crate) fn is_addressable(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && self.vault.as_deref().is_some_and(|value| !value.is_empty())
+    }
+}
+
+/// The source of the Notesmith bearer credential. Munshi resolves the actual secret at delivery
+/// time and never persists it in configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum StoredCredential {
+    /// Read the bearer token from the named environment variable.
+    Env { var: String },
+    /// Read the bearer token from an operating-system credential store entry.
+    Keychain { service: String, account: String },
 }
 
 /// Global project-policy defaults: default-on processing, bounded summarization cost, and bounded
@@ -330,6 +395,7 @@ impl StoredConfig {
                 max_stderr_bytes: config.max_stderr_bytes,
             },
             remote_delivery: false,
+            delivery: StoredDelivery::default(),
             policy: StoredPolicy {
                 max_calls_per_hour: config.max_calls_per_hour,
                 max_calls_per_day: config.max_calls_per_day,
@@ -347,11 +413,11 @@ trait ManagedFile {
 impl ManagedFile for StoredConfig {
     fn is_recognized(&self) -> bool {
         self.version == 1
-            && !self.remote_delivery
             && self.local_archival_enabled
             && self.transcript_processing_accepted
             && self.project_origin == "agent_stop_cwd"
             && self.policy.max_concurrency >= 1
+            && (!self.remote_delivery || self.delivery.is_addressable())
             && Path::new(&self.output_directory).is_absolute()
             && Path::new(&self.state_directory).is_absolute()
             && Path::new(&self.summarizer.executable).is_absolute()
@@ -400,11 +466,11 @@ pub(crate) fn load_stored_config(
     let bytes = fs::read(path).map_err(RegistrationError::Io)?;
     let config: StoredConfig = serde_json::from_slice(&bytes).map_err(RegistrationError::Json)?;
     if config.version != 1
-        || config.remote_delivery
         || !config.local_archival_enabled
         || !config.transcript_processing_accepted
         || config.project_origin != "agent_stop_cwd"
         || config.policy.max_concurrency < 1
+        || (config.remote_delivery && !config.delivery.is_addressable())
         || Path::new(&config.state_directory) != state_directory
     {
         return Err(RegistrationError::MalformedOwnedFile);
@@ -421,6 +487,25 @@ pub struct ProjectStatus {
     pub disabled_reason: Option<&'static str>,
     pub max_calls_per_hour: u32,
     pub max_calls_per_day: u32,
+}
+
+/// Serializes a mutation of the Munshi-owned `config.json` against `register`/project commands by
+/// holding the registration lock, loading the recognized config, applying `update`, and writing it
+/// atomically. Returns the resulting config and the closure's value.
+pub(crate) fn update_stored_config<T>(
+    copilot_home: &Path,
+    state_directory: &Path,
+    update: impl FnOnce(&mut StoredConfig) -> Result<T, RegistrationError>,
+) -> Result<(StoredConfig, T), RegistrationError> {
+    let hooks_directory = copilot_home.join("hooks");
+    validate_existing_directory_if_present(&hooks_directory)?;
+    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let _lock = acquire_registration_lock(&lock_path)?;
+    let config_path = state_directory.join(CONFIG_FILE_NAME);
+    let mut config = load_stored_config(state_directory)?;
+    let value = update(&mut config)?;
+    atomic_json_replace(&config_path, &config)?;
+    Ok((config, value))
 }
 
 /// Adds or removes `project_directory`'s canonical identity from the explicitly disabled-projects

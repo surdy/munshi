@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceKind};
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 #[derive(Debug, Error)]
@@ -150,6 +150,39 @@ pub struct Diagnostic {
     pub cause_category: Option<String>,
     pub session_id: Option<String>,
     pub recorded_at_ms: i64,
+}
+
+/// The Munshi-owned remote delivery record for one logical session and one Notesmith sink.
+///
+/// This is rebuildable operational state (ADR 0002/0004): it holds the persisted remote note
+/// identifier, the last successfully delivered summary revision, and bounded retry/dead-letter
+/// bookkeeping. It never gates local archival, and a delivery failure never mutates a session's
+/// archival lifecycle.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    pub session_database_id: i64,
+    pub source: SourceKind,
+    pub session_id: String,
+    pub endpoint: String,
+    pub vault: String,
+    pub note_path: Option<String>,
+    pub delivered_revision: Option<u64>,
+    pub delivered_summary_hash: Option<String>,
+    pub remote_hash: Option<String>,
+    pub delivery_state: String,
+    pub attempts: u32,
+    pub next_attempt_at_ms: Option<i64>,
+    pub last_error_category: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// A successful delivery result to persist for one session's sink row.
+#[derive(Debug, Clone)]
+pub struct DeliverySuccess {
+    pub note_path: String,
+    pub delivered_revision: u64,
+    pub delivered_summary_hash: String,
+    pub remote_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +425,40 @@ impl StateStore {
                 params![2, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
+        }
+        if current < 3 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE deliveries (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL,
+                    vault TEXT NOT NULL,
+                    note_path TEXT,
+                    delivered_revision INTEGER,
+                    delivered_summary_hash TEXT,
+                    remote_hash TEXT,
+                    delivery_state TEXT NOT NULL CHECK (delivery_state IN (
+                        'pending','delivered','failed','dead-letter'
+                    )),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_ms INTEGER,
+                    last_error_category TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(session_id, endpoint, vault)
+                 );
+                 CREATE INDEX deliveries_state_idx
+                    ON deliveries(delivery_state, next_attempt_at_ms);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![3, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 3)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -654,6 +721,211 @@ impl StateStore {
             .map_err(Into::into)
     }
 
+    /// Resolves the internal session row id for this store's source scope.
+    fn session_database_id(&self, session_id: &str) -> Result<Option<i64>, StateError> {
+        validate_session_id(session_id)?;
+        self.connection
+            .query_row(
+                "SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1",
+                params![session_id, self.source_kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Ensures a `pending` delivery row exists for one session and sink, returning the current
+    /// record. The row is created idempotently on the `(session, endpoint, vault)` key so repeated
+    /// calls never duplicate a delivery target. Returns `None` when the session is unknown in this
+    /// source scope.
+    pub fn ensure_delivery_target(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        vault: &str,
+    ) -> Result<Option<DeliveryRecord>, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        self.connection.execute(
+            "INSERT INTO deliveries(
+                session_id,endpoint,vault,delivery_state,attempts,created_at_ms,updated_at_ms
+             ) VALUES (?1,?2,?3,'pending',0,?4,?4)
+             ON CONFLICT(session_id,endpoint,vault) DO NOTHING",
+            params![database_id, endpoint, vault, now],
+        )?;
+        self.get_delivery(session_id, endpoint, vault)
+    }
+
+    /// Reads the delivery record for one session and sink in this source scope, if any.
+    pub fn get_delivery(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+        vault: &str,
+    ) -> Result<Option<DeliveryRecord>, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT
+                    d.session_id,s.source_kind,s.source_session_id,d.endpoint,d.vault,
+                    d.note_path,d.delivered_revision,d.delivered_summary_hash,d.remote_hash,
+                    d.delivery_state,d.attempts,d.next_attempt_at_ms,d.last_error_category,
+                    d.updated_at_ms
+                 FROM deliveries d JOIN sessions s ON s.id=d.session_id
+                 WHERE d.session_id=?1 AND d.endpoint=?2 AND d.vault=?3",
+                params![database_id, endpoint, vault],
+                delivery_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Lists every recorded delivery across all sources, most recently updated first.
+    pub fn list_deliveries(&self) -> Result<Vec<DeliveryRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                d.session_id,s.source_kind,s.source_session_id,d.endpoint,d.vault,
+                d.note_path,d.delivered_revision,d.delivered_summary_hash,d.remote_hash,
+                d.delivery_state,d.attempts,d.next_attempt_at_ms,d.last_error_category,
+                d.updated_at_ms
+             FROM deliveries d JOIN sessions s ON s.id=d.session_id
+             ORDER BY d.updated_at_ms DESC,d.id DESC",
+        )?;
+        statement
+            .query_map([], delivery_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Records a successful delivery: stores the persisted remote note path, the delivered summary
+    /// revision and hash, clears retry bookkeeping, and marks the row `delivered`.
+    pub fn record_delivery_success(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        vault: &str,
+        success: &DeliverySuccess,
+    ) -> Result<(), StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        let now = now_ms();
+        self.connection.execute(
+            "UPDATE deliveries SET
+                note_path=?4,delivered_revision=?5,delivered_summary_hash=?6,remote_hash=?7,
+                delivery_state='delivered',attempts=0,next_attempt_at_ms=NULL,
+                last_error_category=NULL,updated_at_ms=?8
+             WHERE session_id=?1 AND endpoint=?2 AND vault=?3",
+            params![
+                database_id,
+                endpoint,
+                vault,
+                success.note_path,
+                i64::try_from(success.delivered_revision).unwrap_or(i64::MAX),
+                success.delivered_summary_hash,
+                success.remote_hash,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records a failed delivery attempt. Increments the attempt count, and either schedules the
+    /// next attempt at `next_attempt_at_ms` (bounded backoff) while under `max_attempts`, or parks
+    /// the row as a `dead-letter` once attempts are exhausted. Never touches archival state.
+    pub fn record_delivery_failure(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        vault: &str,
+        category: &str,
+        max_attempts: u32,
+        next_attempt_at_ms: i64,
+    ) -> Result<DeliveryRecord, StateError> {
+        let Some(_) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempts: u32 = transaction
+            .query_row(
+                "SELECT attempts FROM deliveries d
+                 JOIN sessions s ON s.id=d.session_id
+                 WHERE s.source_kind=?2 AND s.source_session_id=?1
+                   AND d.endpoint=?3 AND d.vault=?4",
+                params![session_id, self.source_kind, endpoint, vault],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let attempts = attempts.saturating_add(1);
+        let exhausted = attempts >= max_attempts;
+        let (state, next_attempt) = if exhausted {
+            ("dead-letter", None)
+        } else {
+            ("failed", Some(next_attempt_at_ms))
+        };
+        transaction.execute(
+            "UPDATE deliveries SET
+                delivery_state=?5,attempts=?6,next_attempt_at_ms=?7,
+                last_error_category=?8,updated_at_ms=?9
+             WHERE session_id=(
+                    SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
+                 ) AND endpoint=?3 AND vault=?4",
+            params![
+                session_id,
+                self.source_kind,
+                endpoint,
+                vault,
+                state,
+                attempts,
+                next_attempt,
+                category,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        self.get_delivery(session_id, endpoint, vault)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Resets a delivery row to `pending` so a subsequent delivery attempt is eligible, clearing
+    /// backoff. With `force`, a `dead-letter` row is revived and its attempt count reset.
+    pub fn reset_delivery_for_retry(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        vault: &str,
+        force: bool,
+    ) -> Result<Option<DeliveryRecord>, StateError> {
+        let Some(current) = self.get_delivery(session_id, endpoint, vault)? else {
+            return Ok(None);
+        };
+        if current.delivery_state == "dead-letter" && !force {
+            return Ok(Some(current));
+        }
+        let now = now_ms();
+        let reset_attempts = force || current.delivery_state == "dead-letter";
+        self.connection.execute(
+            "UPDATE deliveries SET
+                delivery_state='pending',next_attempt_at_ms=NULL,
+                attempts=CASE WHEN ?4 THEN 0 ELSE attempts END,updated_at_ms=?5
+             WHERE session_id=(
+                    SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
+                 ) AND endpoint=?3",
+            params![session_id, self.source_kind, endpoint, reset_attempts, now],
+        )?;
+        self.get_delivery(session_id, endpoint, vault)
+    }
+
     pub fn record_diagnostic(
         &mut self,
         operation: &str,
@@ -887,6 +1159,33 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         last_agent_stop_ms: row.get(31)?,
         last_session_end_ms: row.get(32)?,
         last_error_category: row.get(33)?,
+    })
+}
+
+fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
+    Ok(DeliveryRecord {
+        session_database_id: row.get(0)?,
+        source: SourceKind::from_agent_label(&row.get::<_, String>(1)?).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other("unknown source kind")),
+            )
+        })?,
+        session_id: row.get(2)?,
+        endpoint: row.get(3)?,
+        vault: row.get(4)?,
+        note_path: row.get(5)?,
+        delivered_revision: row
+            .get::<_, Option<i64>>(6)?
+            .map(|value| u64::try_from(value).unwrap_or_default()),
+        delivered_summary_hash: row.get(7)?,
+        remote_hash: row.get(8)?,
+        delivery_state: row.get(9)?,
+        attempts: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+        next_attempt_at_ms: row.get(11)?,
+        last_error_category: row.get(12)?,
+        updated_at_ms: row.get(13)?,
     })
 }
 

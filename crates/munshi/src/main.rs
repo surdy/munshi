@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
-    ArchiveConfig, ArchiveOutcome, HookEvent, HookFailure, HookResult, ProjectStatus,
-    RegisterConfig, SessionRecord, SessionReference, SourceKind, StateStore, StructuredSummary,
-    accept_disclosure_from_terminal, archive_session, handle_hook, parse_archive_markdown,
-    project_status, read_last_failure, register, run_archive_worker_for_source, run_recovery,
+    ArchiveConfig, ArchiveOutcome, DeliveryCredentialSource, DeliveryRunReport, DeliverySinkConfig,
+    DeliveryStatusReport, HookEvent, HookFailure, HookResult, ProjectStatus, RegisterConfig,
+    SessionRecord, SessionReference, SourceKind, StateStore, StructuredSummary,
+    accept_disclosure_from_terminal, archive_session, configure_delivery, delivery_backfill,
+    delivery_retry, delivery_status, handle_hook, parse_archive_markdown, project_status,
+    read_last_failure, register, run_archive_worker_for_source, run_recovery, set_delivery_enabled,
     set_project_enabled, unregister, wait_for_hook_result,
 };
 use serde::{Deserialize, Serialize};
@@ -114,6 +116,9 @@ enum Command {
     /// Enable, disable, or inspect future processing and delivery for one project.
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// Configure and operate opt-in Notesmith delivery of current summaries.
+    #[command(subcommand)]
+    Delivery(DeliveryCommand),
     /// Show overall operational status.
     Status {
         #[arg(long)]
@@ -246,6 +251,85 @@ enum ProjectCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DeliveryCommand {
+    /// Record the Notesmith sink (endpoint, vault, folder, credential source) without enabling it.
+    Configure {
+        /// Base URL of the Notesmith daemon, for example `http://127.0.0.1:27183`.
+        #[arg(long)]
+        endpoint: String,
+        /// Target Notesmith vault name.
+        #[arg(long)]
+        vault: String,
+        /// Optional vault-relative folder that Munshi-owned session notes are filed under.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Name of the environment variable holding the bearer credential.
+        #[arg(long, conflicts_with = "credential_keychain")]
+        credential_env: Option<String>,
+        /// OS credential-store entry as `service:account` holding the bearer credential.
+        #[arg(long, conflicts_with = "credential_env")]
+        credential_keychain: Option<String>,
+        /// Bounded number of delivery attempts before a session is parked as a dead letter.
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+    },
+    /// Enable delivery. Reports the pending backfill count; existing summaries need confirmation.
+    Enable {
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+    },
+    /// Disable delivery. Future delivery stops while delivery history is retained.
+    Disable {
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+    },
+    /// Show delivery configuration and per-session delivery state.
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish existing current archives. A dry run by default; `--confirm` publishes.
+    Backfill {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Publish the reported summaries instead of performing a dry run.
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry failed deliveries, or one session's delivery.
+    Retry {
+        /// A single session ID to retry; omit with `--all` to retry every failed delivery.
+        session_id: Option<String>,
+        /// Disambiguate when the same session ID exists under multiple sources.
+        #[arg(long)]
+        source: Option<String>,
+        /// Retry every failed delivery.
+        #[arg(long)]
+        all: bool,
+        /// Revive dead-letter deliveries and reset their bounded attempt count.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum HookCommand {
     AgentStop {
         #[arg(long)]
@@ -286,6 +370,24 @@ enum Outcome {
     Worker,
     Wait(HookResult),
     Project(ProjectStatus),
+    DeliveryConfigured {
+        settings: Box<munshi::DeliverySettings>,
+    },
+    DeliveryEnabled {
+        settings: Box<munshi::DeliverySettings>,
+        backfill: Option<Box<DeliveryRunReport>>,
+    },
+    DeliveryDisabled {
+        settings: Box<munshi::DeliverySettings>,
+    },
+    DeliveryStatus {
+        report: Box<DeliveryStatusReport>,
+        json: bool,
+    },
+    DeliveryRun {
+        report: Box<DeliveryRunReport>,
+        json: bool,
+    },
     Status {
         report: Box<StatusReport>,
         json: bool,
@@ -372,6 +474,7 @@ impl CaptureState {
 #[serde(rename_all = "kebab-case")]
 enum DeliveryState {
     Disabled,
+    Enabled,
     DeliveryRelated,
     Unknown,
 }
@@ -380,6 +483,7 @@ impl DeliveryState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
             Self::DeliveryRelated => "delivery-related",
             Self::Unknown => "unknown",
         }
@@ -479,6 +583,17 @@ struct ShowSessionView {
     project: Option<ProjectView>,
     source: Option<SourceProgressView>,
     summary: Option<StructuredSummary>,
+    delivery: Option<DeliveryView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeliveryView {
+    state: String,
+    note_path: Option<String>,
+    note_link: Option<String>,
+    delivered_revision: Option<u64>,
+    attempts: u32,
+    last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,7 +689,24 @@ struct RawStoredConfig {
     transcript_processing_accepted: Option<bool>,
     project_origin: Option<String>,
     remote_delivery: Option<bool>,
+    #[serde(default)]
+    delivery: Option<RawDelivery>,
     policy: Option<RawPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawDelivery {
+    endpoint: Option<String>,
+    vault: Option<String>,
+}
+
+impl RawDelivery {
+    fn is_addressable(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && self.vault.as_deref().is_some_and(|value| !value.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -655,6 +787,50 @@ fn main() -> ExitCode {
                 status.max_calls_per_day
             );
             ExitCode::SUCCESS
+        }
+        Ok(Outcome::DeliveryConfigured { settings }) => {
+            println!(
+                "configured Notesmith sink endpoint={} vault={}",
+                settings.endpoint.as_deref().unwrap_or("<unset>"),
+                settings.vault.as_deref().unwrap_or("<unset>")
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::DeliveryEnabled { settings, backfill }) => {
+            println!(
+                "delivery enabled (endpoint {}, vault {})",
+                settings.endpoint.as_deref().unwrap_or("<unset>"),
+                settings.vault.as_deref().unwrap_or("<unset>")
+            );
+            if let Some(backfill) = backfill {
+                backfill.print_human();
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::DeliveryDisabled { settings }) => {
+            let _ = settings;
+            println!("delivery disabled; existing delivery history is retained");
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::DeliveryStatus { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::DeliveryRun { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            if report.failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Ok(Outcome::Status { report, json }) => {
             if json {
@@ -873,6 +1049,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 &project_dir,
             )?))
         }
+        Command::Delivery(command) => run_delivery(command),
         Command::Status { state_dir, json } => {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Status {
@@ -997,6 +1174,126 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
     }
 }
 
+fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
+    match command {
+        DeliveryCommand::Configure {
+            endpoint,
+            vault,
+            folder,
+            credential_env,
+            credential_keychain,
+            max_attempts,
+            copilot_home,
+        } => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = copilot_home.join("munshi");
+            let credential = resolve_credential_source(credential_env, credential_keychain)?;
+            let settings = configure_delivery(
+                &copilot_home,
+                &state_directory,
+                DeliverySinkConfig {
+                    endpoint,
+                    vault,
+                    folder,
+                    credential,
+                    max_attempts,
+                },
+            )?;
+            Ok(Outcome::DeliveryConfigured {
+                settings: Box::new(settings),
+            })
+        }
+        DeliveryCommand::Enable { copilot_home } => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = copilot_home.join("munshi");
+            let settings = set_delivery_enabled(&copilot_home, &state_directory, true)?;
+            // Report the pending backfill as a dry run so existing summaries need confirmation.
+            let backfill = delivery_backfill(&state_directory, false, usize::MAX)
+                .ok()
+                .map(Box::new);
+            Ok(Outcome::DeliveryEnabled {
+                settings: Box::new(settings),
+                backfill,
+            })
+        }
+        DeliveryCommand::Disable { copilot_home } => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = copilot_home.join("munshi");
+            let settings = set_delivery_enabled(&copilot_home, &state_directory, false)?;
+            Ok(Outcome::DeliveryDisabled {
+                settings: Box::new(settings),
+            })
+        }
+        DeliveryCommand::Status { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::DeliveryStatus {
+                report: Box::new(delivery_status(&state_directory)?),
+                json,
+            })
+        }
+        DeliveryCommand::Backfill {
+            state_dir,
+            confirm,
+            limit,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::DeliveryRun {
+                report: Box::new(delivery_backfill(&state_directory, confirm, limit)?),
+                json,
+            })
+        }
+        DeliveryCommand::Retry {
+            session_id,
+            source,
+            all,
+            force,
+            state_dir,
+            limit,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            if session_id.is_none() && !all {
+                return Err("pass a session ID or --all to retry deliveries".into());
+            }
+            let source = source.as_deref().map(parse_source_selector).transpose()?;
+            Ok(Outcome::DeliveryRun {
+                report: Box::new(delivery_retry(
+                    &state_directory,
+                    source,
+                    session_id,
+                    all,
+                    force,
+                    limit,
+                )?),
+                json,
+            })
+        }
+    }
+}
+
+fn resolve_credential_source(
+    credential_env: Option<String>,
+    credential_keychain: Option<String>,
+) -> Result<Option<DeliveryCredentialSource>, Box<dyn Error>> {
+    if let Some(var) = credential_env {
+        return Ok(Some(DeliveryCredentialSource::Env { var }));
+    }
+    if let Some(entry) = credential_keychain {
+        let (service, account) = entry
+            .split_once(':')
+            .ok_or("--credential-keychain must be formatted as service:account")?;
+        if service.is_empty() || account.is_empty() {
+            return Err("--credential-keychain must be formatted as service:account".into());
+        }
+        return Ok(Some(DeliveryCredentialSource::Keychain {
+            service: service.to_owned(),
+            account: account.to_owned(),
+        }));
+    }
+    Ok(None)
+}
+
 fn build_status_report(state_directory: &Path) -> Result<StatusReport, Box<dyn Error>> {
     let configuration = inspect_configuration(state_directory);
     let sessions = load_sessions(state_directory)?;
@@ -1106,6 +1403,7 @@ fn build_show_report(
         });
 
     let state = operational_state(&record).to_owned();
+    let delivery = lookup_delivery_view(state_directory, record.source, &record.session_id);
     let view = ShowSessionView {
         source_kind: record.source.as_selector().to_owned(),
         session_id: record.session_id.clone(),
@@ -1121,6 +1419,7 @@ fn build_show_report(
         project,
         source,
         summary,
+        delivery,
     };
 
     Ok(ShowReport {
@@ -1564,7 +1863,17 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                     };
                     delivery_state = match config.remote_delivery {
                         Some(false) => DeliveryState::Disabled,
-                        Some(true) => DeliveryState::DeliveryRelated,
+                        Some(true) => {
+                            let addressable = config
+                                .delivery
+                                .as_ref()
+                                .is_some_and(RawDelivery::is_addressable);
+                            if addressable {
+                                DeliveryState::Enabled
+                            } else {
+                                DeliveryState::DeliveryRelated
+                            }
+                        }
                         None => DeliveryState::Unknown,
                     };
 
@@ -1600,11 +1909,17 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                             CheckStatus::Ok,
                             "delivery disabled".to_owned(),
                         ),
+                        DeliveryState::Enabled => push_check(
+                            &mut checks,
+                            "delivery-state",
+                            CheckStatus::Ok,
+                            "delivery enabled with an addressable Notesmith sink".to_owned(),
+                        ),
                         DeliveryState::DeliveryRelated => push_check(
                             &mut checks,
                             "delivery-state",
                             CheckStatus::Warning,
-                            "delivery-related configuration present".to_owned(),
+                            "delivery enabled but the Notesmith sink is not addressable".to_owned(),
                         ),
                         DeliveryState::Unknown => push_check(
                             &mut checks,
@@ -1751,7 +2066,10 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
 
                     config_recognized = config.version == Some(1)
                         && config.local_archival_enabled == Some(true)
-                        && delivery_state == DeliveryState::Disabled
+                        && matches!(
+                            delivery_state,
+                            DeliveryState::Disabled | DeliveryState::Enabled
+                        )
                         && config.transcript_processing_accepted == Some(true)
                         && config.project_origin.as_deref() == Some("agent_stop_cwd")
                         && policy.max_concurrency.unwrap_or_default() >= 1
@@ -2036,6 +2354,38 @@ fn load_sessions(state_directory: &Path) -> Result<Vec<SessionRecord>, Box<dyn E
     Ok(state.list_sessions()?)
 }
 
+/// Projects the delivery record for one session (if any) into the `show` contract, deriving a
+/// Notesmith deep link for a delivered note.
+fn lookup_delivery_view(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+) -> Option<DeliveryView> {
+    if !state_database_exists(state_directory) {
+        return None;
+    }
+    let state = StateStore::open(state_directory).ok()?;
+    let deliveries = state.list_deliveries().ok()?;
+    let record = deliveries
+        .into_iter()
+        .find(|delivery| delivery.source == source && delivery.session_id == session_id)?;
+    let note_link = record.note_path.as_ref().map(|path| {
+        format!(
+            "notesmith://app/v/{}/{}",
+            record.vault,
+            path.trim_start_matches('/')
+        )
+    });
+    Some(DeliveryView {
+        state: record.delivery_state,
+        note_path: record.note_path,
+        note_link,
+        delivered_revision: record.delivered_revision,
+        attempts: record.attempts,
+        last_error_code: record.last_error_category,
+    })
+}
+
 /// Result of resolving a session ID that may exist under more than one source.
 enum SessionTarget {
     NotFound,
@@ -2181,6 +2531,22 @@ fn print_show_human(report: &ShowReport) {
     }
     if let Some(path) = session.archive_path.as_deref() {
         println!("archive: {path}");
+    }
+    if let Some(delivery) = session.delivery.as_ref() {
+        println!(
+            "delivery: {}{}{}",
+            delivery.state,
+            delivery
+                .note_link
+                .as_deref()
+                .map(|link| format!(" {link}"))
+                .unwrap_or_default(),
+            delivery
+                .last_error_code
+                .as_deref()
+                .map(|code| format!(" error={code}"))
+                .unwrap_or_default(),
+        );
     }
     if let Some(summary) = session.summary.as_ref() {
         println!("title: {}", summary.title);

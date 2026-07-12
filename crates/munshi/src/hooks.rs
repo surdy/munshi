@@ -764,6 +764,20 @@ fn process_claim(
             false,
         )
         .map_err(HookWorkerError::PostPersist)?;
+    // Delivery is strictly downstream of the successful local archive above: a Notesmith outage
+    // or credential error is recorded as a bounded retry or a safe diagnostic and never changes
+    // the archived result the worker returns.
+    if let Err(error) =
+        crate::delivery::deliver_after_archive(state, stored, &claim.session.session_id)
+    {
+        let _ = error;
+        let _ = state.record_diagnostic(
+            "delivery",
+            "delivery-error",
+            None,
+            Some(&claim.session.session_id),
+        );
+    }
     Ok(HookResult::Archived {
         relative_path: relative_path.to_string_lossy().into_owned(),
     })
