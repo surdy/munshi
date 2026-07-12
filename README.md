@@ -706,6 +706,16 @@ actionable `remote-history-unavailable` status and never degrades to latest-only
 never affects the already-successful local archive, and recovers on retry once the capability is
 present.
 
+Because Notesmith commits stage the whole vault working tree, Munshi runs a clean-tree preflight
+before writing/committing: if the vault has unrelated uncommitted changes it blocks with
+`remote-history-dirty` (the session's own note is allowed to be dirty) rather than bundling
+unrelated work into the correlated commit. Delivery-then-commit is crash-safe: after a lost commit
+response, an idempotent no-op, or a rebuilt operational database, Munshi recovers the existing
+commit by an exact `git/log` message match, so one remote commit and its SHA survive a crash between
+the commit and the local database write. Munshi does not claim exclusive one-file commits: a write
+that races the narrow preflight-to-commit window can still be bundled and is surfaced as a
+diagnostic.
+
 ## Generic webhook versus raw Markdown
 
 Posting raw Markdown is simple, but it moves important metadata into ad hoc headers and offers no

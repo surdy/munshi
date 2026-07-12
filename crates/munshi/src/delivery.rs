@@ -348,6 +348,32 @@ impl HistoryCapability {
     }
 }
 
+/// The Notesmith vault's Git working-tree state (issue #9). Because Notesmith's commit endpoint
+/// stages the *entire* working tree (`notesmith-git::ops::commit_all`), Munshi requires the tree to
+/// be clean of unrelated changes before it writes and commits a delivered revision — otherwise an
+/// unrelated dirty file would be bundled into the Munshi-correlated commit.
+#[derive(Debug, Clone)]
+pub struct HistoryStatus {
+    pub clean: bool,
+    /// Every changed, staged, or untracked path reported by the vault.
+    pub dirty_paths: Vec<String>,
+}
+
+/// The outcome of a `git/commit` call: whether a commit was created and its id.
+#[derive(Debug, Clone)]
+pub struct CommitOutcome {
+    pub committed: bool,
+    pub sha: Option<String>,
+}
+
+/// A commit located in the vault's history by its exact Munshi correlation message (issue #9).
+#[derive(Debug, Clone)]
+pub struct HistoryCommit {
+    pub sha: String,
+    /// Number of files the commit changed; `1` confirms only the delivered note was committed.
+    pub files_changed: usize,
+}
+
 /// The Notesmith wire protocol Munshi depends on. Isolating it keeps the delivery orchestration
 /// testable and leaves room for issue #9's versioned, revision-history-preserving sink.
 pub trait NotesmithSink {
@@ -360,10 +386,18 @@ pub trait NotesmithSink {
     /// Verifies the revision-history capability and explicitly configures it when absent, so
     /// versioned delivery has a place to preserve correlated history.
     fn ensure_history_capability(&self) -> Result<HistoryCapability, SinkError>;
+    /// Reports the vault's Git working-tree state so Munshi can refuse to commit a revision while
+    /// unrelated changes are present (Notesmith commits stage the whole tree).
+    fn history_status(&self) -> Result<HistoryStatus, SinkError>;
     /// Commits the just-delivered note revision into the vault's history with a message that
-    /// correlates it to the local archive commit, returning the created commit id (or `None` when
-    /// there was nothing to commit). Requires an available history capability.
-    fn commit_revision(&self, message: &str) -> Result<Option<String>, SinkError>;
+    /// correlates it to the local archive commit. Returns whether a commit was created and its id
+    /// (a no-op `committed: false` when the tree already matched, e.g. after a crash-recovery
+    /// idempotent replace).
+    fn commit_revision(&self, message: &str) -> Result<CommitOutcome, SinkError>;
+    /// Finds a commit in the vault's history whose subject is *exactly* `message` (no prefix or
+    /// substring matching), returning its id and file count. Used to recover the correlated commit
+    /// after a lost commit response or a rebuilt operational database.
+    fn find_commit_by_message(&self, message: &str) -> Result<Option<HistoryCommit>, SinkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -596,28 +630,103 @@ pub(crate) fn deliver_one(
         revision: record.current_revision,
     };
 
+    // Issue #9 preflight: Notesmith's commit endpoint stages the *entire* working tree
+    // (`notesmith-git::ops::commit_all`), so before writing and committing a revision Munshi
+    // requires the vault tree to be clean of unrelated changes. The session's own note is allowed
+    // to be dirty (a prior attempt may have written it without committing). If any *other* path is
+    // dirty, block instead of bundling unrelated work into the correlated commit or overwriting
+    // the note. This clean-tree guard is the enforceable guarantee; see the post-commit check for
+    // the residual concurrency window.
+    if matches!(gate, HistoryGate::Available) {
+        match sink.history_status() {
+            Ok(status) if !status.clean => {
+                let owned: [Option<&str>; 2] = [
+                    Some(deterministic_path.as_str()),
+                    existing.note_path.as_deref(),
+                ];
+                let unrelated: Vec<String> = status
+                    .dirty_paths
+                    .iter()
+                    .filter(|path| {
+                        !owned
+                            .iter()
+                            .flatten()
+                            .any(|owned| normalize_note_path(owned) == normalize_note_path(path))
+                    })
+                    .cloned()
+                    .collect();
+                if !unrelated.is_empty() {
+                    state.record_delivery_blocked(
+                        &record.session_id,
+                        endpoint,
+                        vault,
+                        "remote-history-dirty",
+                    )?;
+                    return Ok(DeliveryOutcome::Blocked {
+                        reason: "remote-history-dirty".to_owned(),
+                        detail: Some(format!(
+                            "Notesmith vault has {} unrelated uncommitted change(s); commit or discard them before versioned delivery",
+                            unrelated.len()
+                        )),
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // The working-tree state could not be verified: fail (bounded retry) rather than
+                // risk committing while the tree is dirty.
+                let category = error.category();
+                let updated = state.record_delivery_failure(
+                    &record.session_id,
+                    endpoint,
+                    vault,
+                    category,
+                    delivery.max_attempts.max(1),
+                    now_ms().saturating_add(backoff_ms(existing.attempts.saturating_add(1))),
+                )?;
+                return Ok(DeliveryOutcome::Failed {
+                    category: category.to_owned(),
+                    dead_letter: updated.delivery_state == "dead-letter",
+                });
+            }
+        }
+    }
+
     let result = if let Some(path) = existing.note_path.as_deref() {
         replace_or_create(sink, path, &document, &create, &deterministic_path)
     } else {
         create_or_adopt(sink, &create, &document, &deterministic_path)
     };
-
     match result {
         Ok((note, created)) => {
             // In versioned mode, preserve this revision as a correlated commit in the vault's own
             // history before recording success. The commit message carries the same source-scoped
             // session identity and revision as the local archive commit, so the two histories
-            // correlate. A commit failure is treated as a delivery failure (bounded retry) rather
-            // than a silent latest-only success.
+            // correlate. Recovery is idempotent: a lost commit response or a rebuilt operational
+            // database resolves to the existing commit by its exact message rather than losing the
+            // correlation or degrading to a latest-only success.
             let history_commit = if matches!(gate, HistoryGate::Available) {
                 let message = format!(
                     "munshi: {source_selector}:{} revision {}",
                     record.session_id, record.current_revision
                 );
-                match sink.commit_revision(&message) {
-                    Ok(sha) => sha,
-                    Err(error) => {
-                        let category = error.category();
+                match commit_and_correlate(sink, &message) {
+                    CommitCorrelation::Committed(commit) => {
+                        if commit.files_changed > 1 {
+                            // A concurrent write landed in the narrow window between the clean-tree
+                            // preflight and the whole-tree commit, bundling other files. Notesmith
+                            // cannot split a commit, so this is recorded for visibility; Munshi does
+                            // not claim exclusive one-file commits (documented in ADR 0006).
+                            let _ = state.record_diagnostic(
+                                "delivery",
+                                "remote-history-conflated",
+                                None,
+                                Some(&record.session_id),
+                            );
+                        }
+                        Some(commit.sha)
+                    }
+                    CommitCorrelation::Failed { category } => {
                         let updated = state.record_delivery_failure(
                             &record.session_id,
                             endpoint,
@@ -676,6 +785,67 @@ pub(crate) fn deliver_one(
             })
         }
     }
+}
+
+/// The result of committing (or recovering the commit of) a delivered revision.
+enum CommitCorrelation {
+    Committed(HistoryCommit),
+    Failed { category: &'static str },
+}
+
+/// Commits the delivered revision and correlates it to a durable commit id, recovering idempotently
+/// from a lost commit response or a rebuilt operational database (issue #9).
+///
+/// The correlation uses the deterministic, source-qualified session+revision `message` and matches
+/// it *exactly* against the vault history, so a commit is never confused with an unrelated one:
+/// - a fresh commit is verified by looking its message up to capture the authoritative id and file
+///   count;
+/// - a `committed: false` no-op (the tree already matched — e.g. after a crash between the remote
+///   commit and the local database write, or an idempotent replace) is recovered by finding the
+///   existing commit; a missing commit is a failure, never a delivered-without-history success;
+/// - a transport error (the commit may have landed before its response was lost) triggers a lookup
+///   before the attempt is recorded as a failure.
+fn commit_and_correlate(sink: &dyn NotesmithSink, message: &str) -> CommitCorrelation {
+    match sink.commit_revision(message) {
+        Ok(outcome) if outcome.committed => match sink.find_commit_by_message(message) {
+            Ok(Some(commit)) => CommitCorrelation::Committed(commit),
+            Ok(None) => match outcome.sha {
+                // Committed, but the message could not be located (history rewritten between calls).
+                // Fall back to the returned id; the revision is still preserved in history.
+                Some(sha) => CommitCorrelation::Committed(HistoryCommit {
+                    sha,
+                    files_changed: 0,
+                }),
+                None => CommitCorrelation::Failed {
+                    category: "remote-history-missing",
+                },
+            },
+            Err(error) => CommitCorrelation::Failed {
+                category: error.category(),
+            },
+        },
+        Ok(_) => match sink.find_commit_by_message(message) {
+            Ok(Some(commit)) => CommitCorrelation::Committed(commit),
+            Ok(None) => CommitCorrelation::Failed {
+                category: "remote-history-missing",
+            },
+            Err(error) => CommitCorrelation::Failed {
+                category: error.category(),
+            },
+        },
+        Err(error) => match sink.find_commit_by_message(message) {
+            Ok(Some(commit)) => CommitCorrelation::Committed(commit),
+            _ => CommitCorrelation::Failed {
+                category: error.category(),
+            },
+        },
+    }
+}
+
+/// Normalizes a vault-relative note path for comparison against `git/status` paths (which never
+/// carry a leading slash).
+fn normalize_note_path(path: &str) -> &str {
+    path.trim_start_matches('/')
 }
 
 /// Replaces an existing note with the complete `document`, falling back to a create when the remote
@@ -891,10 +1061,7 @@ impl NotesmithSink for HttpNotesmithSink {
             200 => {
                 let value: serde_json::Value = serde_json::from_slice(&response.body)
                     .map_err(|error| SinkError::Protocol(error.to_string()))?;
-                if value
-                    .get("config")
-                    .is_some_and(git_enabled_in_config)
-                {
+                if value.get("config").is_some_and(git_enabled_in_config) {
                     Ok(HistoryCapability::available(true))
                 } else {
                     Err(SinkError::HistoryUnavailable(
@@ -908,7 +1075,42 @@ impl NotesmithSink for HttpNotesmithSink {
         }
     }
 
-    fn commit_revision(&self, message: &str) -> Result<Option<String>, SinkError> {
+    fn history_status(&self) -> Result<HistoryStatus, SinkError> {
+        let response = self.request(
+            "GET",
+            &format!("/api/v/{}/git/status", encode_path(&self.vault)),
+            None,
+        )?;
+        match response.status {
+            200 => {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .map_err(|error| SinkError::Protocol(error.to_string()))?;
+                let mut dirty_paths = Vec::new();
+                for key in ["changed", "staged", "untracked"] {
+                    if let Some(array) = value.get(key).and_then(serde_json::Value::as_array) {
+                        for path in array.iter().filter_map(serde_json::Value::as_str) {
+                            dirty_paths.push(path.to_owned());
+                        }
+                    }
+                }
+                let clean = value
+                    .get("clean")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(dirty_paths.is_empty());
+                Ok(HistoryStatus { clean, dirty_paths })
+            }
+            // 400 means the vault is not a git repository — treat as no history capability.
+            400 => Err(SinkError::HistoryUnavailable(
+                "vault is not a git repository".to_owned(),
+            )),
+            status => Err(SinkError::Server {
+                status,
+                body: response.body_text(),
+            }),
+        }
+    }
+
+    fn commit_revision(&self, message: &str) -> Result<CommitOutcome, SinkError> {
         let body = serde_json::json!({ "message": message });
         let payload =
             serde_json::to_vec(&body).map_err(|error| SinkError::Protocol(error.to_string()))?;
@@ -921,15 +1123,63 @@ impl NotesmithSink for HttpNotesmithSink {
             200 => {
                 let value: serde_json::Value = serde_json::from_slice(&response.body)
                     .map_err(|error| SinkError::Protocol(error.to_string()))?;
+                let committed = value
+                    .get("committed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 let sha = value
                     .get("sha")
                     .and_then(|value| value.as_str())
                     .map(ToOwned::to_owned);
-                Ok(sha)
+                Ok(CommitOutcome { committed, sha })
             }
             // Notesmith returns 400 when git is not enabled or the vault is not a repository.
             400 => Err(SinkError::HistoryUnavailable(
                 "vault git history is not enabled".to_owned(),
+            )),
+            status => Err(SinkError::Server {
+                status,
+                body: response.body_text(),
+            }),
+        }
+    }
+
+    fn find_commit_by_message(&self, message: &str) -> Result<Option<HistoryCommit>, SinkError> {
+        let response = self.request(
+            "GET",
+            &format!("/api/v/{}/git/log?limit=500", encode_path(&self.vault)),
+            None,
+        )?;
+        match response.status {
+            200 => {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .map_err(|error| SinkError::Protocol(error.to_string()))?;
+                let entries = value
+                    .as_array()
+                    .ok_or_else(|| SinkError::Protocol("git log is not an array".to_owned()))?;
+                for entry in entries {
+                    // Exact subject match only — never a prefix or substring — so a correlation
+                    // message is never confused with another commit that merely contains it.
+                    let subject = entry.get("subject").and_then(serde_json::Value::as_str);
+                    if subject == Some(message) {
+                        let sha = entry
+                            .get("sha")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                SinkError::Protocol("git log entry missing sha".to_owned())
+                            })?
+                            .to_owned();
+                        let files_changed = entry
+                            .get("filesChanged")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        return Ok(Some(HistoryCommit { sha, files_changed }));
+                    }
+                }
+                Ok(None)
+            }
+            400 => Err(SinkError::HistoryUnavailable(
+                "vault is not a git repository".to_owned(),
             )),
             status => Err(SinkError::Server {
                 status,

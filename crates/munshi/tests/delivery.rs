@@ -510,6 +510,11 @@ fn versioned_delivery_commits_correlated_revision_when_capability_present() {
     let item = &status["items"][0];
     assert_eq!(item["state"], "delivered");
     assert!(item["history_commit"].is_string());
+    // The correlated commit touched only the delivered note (clean-tree preflight held).
+    assert_eq!(
+        server.commit_files_changed(&format!("munshi: copilot:{SESSION_A} revision 1")),
+        Some(1)
+    );
 
     // A second revision preserves a second correlated commit.
     harness.revise_session(SESSION_A, &transcript, "GOAL_TWO", "answer two");
@@ -622,6 +627,120 @@ fn later_revision_blocks_without_overwriting_the_delivered_note() {
     assert_eq!(server.commits().len(), 1, "no new commit while blocked");
 }
 
+#[test]
+fn versioned_delivery_blocks_when_the_vault_has_unrelated_dirty_changes() {
+    // Because Notesmith commits stage the whole working tree, Munshi must not write/commit a
+    // revision while unrelated changes are present (they would be bundled into the correlated
+    // commit). Delivery blocks with an actionable status; the local archive/Git remain valid.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start_with_history();
+    harness.register_versioned();
+    harness.configure(&server.endpoint());
+    harness.enable();
+    server.add_unrelated_dirty("Journal/unrelated.md");
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivery_blocked(SESSION_A);
+
+    let item = harness.delivery_status_json()["items"][0].clone();
+    assert_eq!(item["state"], "blocked");
+    assert_eq!(item["last_error_category"], "remote-history-dirty");
+    assert_eq!(
+        server.note_count(),
+        0,
+        "no note may be written while the vault has unrelated dirty changes"
+    );
+    assert!(
+        server.commits().is_empty(),
+        "no commit may bundle unrelated changes"
+    );
+    // The local archive committed the revision regardless of the remote block.
+    assert!(
+        harness
+            .archive_git_log()
+            .iter()
+            .any(|subject| subject.contains(&format!("copilot:{SESSION_A} revision 1")))
+    );
+
+    // Once the operator resolves the unrelated change, a retry delivers and commits cleanly.
+    server.clear_unrelated_dirty();
+    let retry = harness.delivery_retry_all_json(false);
+    let created = retry["created"].as_u64().unwrap_or(0);
+    let replaced = retry["replaced"].as_u64().unwrap_or(0);
+    assert_eq!(created + replaced, 1, "retry={retry}");
+    assert_eq!(server.note_count(), 1);
+    assert_eq!(
+        server.commit_files_changed(&format!("munshi: copilot:{SESSION_A} revision 1")),
+        Some(1),
+        "the recovered commit touches only the delivered note"
+    );
+}
+
+#[test]
+fn dropped_commit_response_recovers_the_correlated_commit() {
+    // The remote commit lands but its response is lost. Munshi recovers the exact commit by its
+    // deterministic correlation message, so exactly one commit exists and its SHA is persisted.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start_with_history();
+    harness.register_versioned();
+    harness.configure(&server.endpoint());
+    harness.enable();
+    // Drop only the commit response; the recovery log lookup still succeeds.
+    server.drop_next_commit(0);
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivered_revision(SESSION_A, 1);
+
+    assert_eq!(
+        server.commits().len(),
+        1,
+        "the dropped response must not produce a duplicate commit"
+    );
+    let item = harness.delivery_status_json()["items"][0].clone();
+    assert_eq!(item["state"], "delivered");
+    assert_eq!(
+        item["history_commit"], "commit0001",
+        "the recovered commit SHA must be persisted"
+    );
+}
+
+#[test]
+fn crash_after_commit_before_db_recovers_sha_on_retry() {
+    // Simulates a crash after the remote commit lands but before the operational database records
+    // success (the commit response and the recovery lookup are both lost on the first attempt). On
+    // retry, the clean idempotent replace yields committed=false and Munshi recovers the existing
+    // commit's SHA by exact message — proving one remote commit and a persisted SHA.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start_with_history();
+    harness.register_versioned();
+    harness.configure(&server.endpoint());
+    harness.enable();
+    // Drop the commit response and the immediate recovery lookup, forcing a recorded failure while
+    // the commit has actually landed server-side.
+    server.drop_next_commit(1);
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivery_failed(SESSION_A);
+    assert_eq!(
+        server.commits().len(),
+        1,
+        "the commit landed server-side despite the lost response"
+    );
+
+    // Retry: the note already matches, so git/commit is a no-op and the SHA is recovered by lookup.
+    let retry = harness.delivery_retry_all_json(false);
+    let created = retry["created"].as_u64().unwrap_or(0);
+    let replaced = retry["replaced"].as_u64().unwrap_or(0);
+    assert_eq!(created + replaced, 1, "retry={retry}");
+    harness.wait_for_delivered_revision(SESSION_A, 1);
+
+    assert_eq!(
+        server.commits().len(),
+        1,
+        "recovery must not create a second remote commit"
+    );
+    let item = harness.delivery_status_json()["items"][0].clone();
+    assert_eq!(item["state"], "delivered");
+    assert_eq!(item["history_commit"], "commit0001");
+}
+
 /// Counts the number of complete YAML frontmatter blocks in a note document.
 fn frontmatter_block_count(document: &str) -> usize {
     document
@@ -635,6 +754,12 @@ fn frontmatter_block_count(document: &str) -> usize {
 // Fake Notesmith daemon
 // ---------------------------------------------------------------------------
 
+struct FakeCommit {
+    message: String,
+    sha: String,
+    files_changed: usize,
+}
+
 struct FakeState {
     notes: HashMap<String, String>,
     requests: usize,
@@ -643,8 +768,17 @@ struct FakeState {
     last_auth: Option<String>,
     /// Whether the vault's per-vault Git revision history is enabled (issue #9 capability).
     git_enabled: bool,
-    /// Commit messages recorded by `git/commit`, newest last — the vault's correlated history.
-    commits: Vec<String>,
+    /// Commits recorded by `git/commit`, newest last — the vault's correlated history.
+    commits: Vec<FakeCommit>,
+    /// The last committed content per note path, so a note counts as "dirty" until committed.
+    committed_notes: HashMap<String, String>,
+    /// Injected unrelated dirty working-tree paths (files Munshi does not own).
+    extra_dirty: Vec<String>,
+    /// When set, the next `git/commit` records its commit but drops the HTTP response (simulating a
+    /// lost commit response or a crash between the remote commit and the local database write).
+    drop_commit_response_once: bool,
+    /// Number of subsequent `git/log` responses to drop (simulating an unreachable lookup).
+    drop_log_responses: u32,
     /// Bumped on every config write so the ETag changes, mirroring Notesmith's hash-based ETag.
     config_generation: u64,
 }
@@ -680,6 +814,10 @@ impl FakeNotesmith {
             last_auth: None,
             git_enabled,
             commits: Vec::new(),
+            committed_notes: HashMap::new(),
+            extra_dirty: Vec::new(),
+            drop_commit_response_once: false,
+            drop_log_responses: 0,
             config_generation: 0,
         }));
         let outage = Arc::new(AtomicBool::new(false));
@@ -742,9 +880,45 @@ impl FakeNotesmith {
         self.state.lock().unwrap().git_enabled = enabled;
     }
 
+    /// Injects an unrelated dirty working-tree path (a file Munshi does not own).
+    fn add_unrelated_dirty(&self, path: &str) {
+        self.state.lock().unwrap().extra_dirty.push(path.to_owned());
+    }
+
+    /// Clears injected unrelated dirty paths, simulating an operator committing or discarding them.
+    fn clear_unrelated_dirty(&self) {
+        self.state.lock().unwrap().extra_dirty.clear();
+    }
+
+    /// Arranges for the next `git/commit` to record its commit but drop the HTTP response, and for
+    /// the next `drop_logs` `git/log` lookups to be dropped too — simulating a crash/lost response
+    /// after the remote commit lands but before Munshi records success.
+    fn drop_next_commit(&self, drop_logs: u32) {
+        let mut guard = self.state.lock().unwrap();
+        guard.drop_commit_response_once = true;
+        guard.drop_log_responses = drop_logs;
+    }
+
     /// The commit messages recorded by `git/commit`, in order — the vault's correlated history.
     fn commits(&self) -> Vec<String> {
-        self.state.lock().unwrap().commits.clone()
+        self.state
+            .lock()
+            .unwrap()
+            .commits
+            .iter()
+            .map(|commit| commit.message.clone())
+            .collect()
+    }
+
+    /// The number of files changed by the commit carrying `message`, if any.
+    fn commit_files_changed(&self, message: &str) -> Option<usize> {
+        self.state
+            .lock()
+            .unwrap()
+            .commits
+            .iter()
+            .find(|commit| commit.message == message)
+            .map(|commit| commit.files_changed)
     }
 }
 
@@ -867,7 +1041,56 @@ fn route(
         }
     }
 
-    // Git commit: preserves a delivered revision as a correlated commit. Requires git.enabled.
+    // Git working-tree status: notes differing from their last committed content, plus any injected
+    // unrelated dirty files. Mirrors notes-method `git/status`.
+    if method == "GET" && target == format!("/api/v/{VAULT}/git/status") {
+        if !state.git_enabled {
+            return json_response(400, &json!({ "error": "vault is not a git repository" }));
+        }
+        let dirty = fake_dirty_paths(state);
+        return json_response(
+            200,
+            &json!({
+                "changed": dirty,
+                "staged": [],
+                "untracked": [],
+                "clean": dirty.is_empty(),
+            }),
+        );
+    }
+
+    // Git log: the vault's commit history, newest first, with per-commit subject and file count.
+    if method == "GET" && target.starts_with(&format!("/api/v/{VAULT}/git/log")) {
+        if !state.git_enabled {
+            return json_response(400, &json!({ "error": "vault is not a git repository" }));
+        }
+        if state.drop_log_responses > 0 {
+            state.drop_log_responses -= 1;
+            return String::new();
+        }
+        let entries: Vec<Value> = state
+            .commits
+            .iter()
+            .rev()
+            .map(|commit| {
+                json!({
+                    "sha": commit.sha,
+                    "shortSha": commit.sha,
+                    "author": "munshi",
+                    "authorEmail": "munshi@localhost",
+                    "timestampSecs": 0,
+                    "subject": commit.message,
+                    "filesChanged": commit.files_changed,
+                    "insertions": 0,
+                    "deletions": 0,
+                })
+            })
+            .collect();
+        return json_response_array(200, &entries);
+    }
+
+    // Git commit: stages the *whole* working tree (dirty notes + unrelated files), mirroring
+    // notes-method `commit_all`. Requires git.enabled. A no-op returns committed=false/sha=null.
     if method == "POST" && target == format!("/api/v/{VAULT}/git/commit") {
         if !state.git_enabled {
             return json_response(
@@ -875,11 +1098,33 @@ fn route(
                 &json!({ "error": "git integration is not enabled for this vault" }),
             );
         }
+        let dirty = fake_dirty_paths(state);
+        if dirty.is_empty() {
+            return json_response(
+                200,
+                &json!({ "committed": false, "sha": Value::Null, "files": [] }),
+            );
+        }
         let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let message = payload["message"].as_str().unwrap_or("").to_owned();
-        state.commits.push(message);
-        let sha = format!("commit{:04}", state.commits.len());
-        return json_response(200, &json!({ "committed": true, "sha": sha, "files": [] }));
+        let sha = format!("commit{:04}", state.commits.len() + 1);
+        state.commits.push(FakeCommit {
+            message,
+            sha: sha.clone(),
+            files_changed: dirty.len(),
+        });
+        // The whole working tree is now committed: notes match their content and unrelated files
+        // are recorded as committed.
+        state.committed_notes = state.notes.clone();
+        state.extra_dirty.clear();
+        if state.drop_commit_response_once {
+            state.drop_commit_response_once = false;
+            return String::new();
+        }
+        return json_response(
+            200,
+            &json!({ "committed": true, "sha": sha, "files": dirty }),
+        );
     }
 
     // target: /api/v/{vault}/notes  or  /api/v/{vault}/notes/{path...}
@@ -888,10 +1133,13 @@ fn route(
         let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let folder = payload["folder"].as_str().unwrap_or("");
         let title = payload["title"].as_str().unwrap_or("note");
-        // Notesmith assembles the stored document from the body plus a separate frontmatter map.
+        // Notesmith assembles the stored document from the body plus a separate frontmatter map,
+        // and its save pipeline canonicalizes the note. Munshi's replace document already
+        // canonicalizes the body with `trim_end`, so mirror that here: create and replace of the
+        // same revision converge to identical bytes (a re-delivery is then a no-op).
         let document = build_note_document(
             &payload["frontmatter"],
-            payload["content"].as_str().unwrap_or(""),
+            payload["content"].as_str().unwrap_or("").trim_end(),
         );
         let path = if folder.is_empty() {
             format!("{title}.md")
@@ -935,6 +1183,25 @@ fn json_response(status: u16, value: &Value) -> String {
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+fn json_response_array(status: u16, entries: &[Value]) -> String {
+    json_response(status, &Value::Array(entries.to_vec()))
+}
+
+/// The vault's dirty working-tree paths: notes whose content differs from their last committed
+/// content, plus any injected unrelated dirty files.
+fn fake_dirty_paths(state: &FakeState) -> Vec<String> {
+    let mut dirty: Vec<String> = state
+        .notes
+        .iter()
+        .filter(|(path, content)| state.committed_notes.get(*path) != Some(*content))
+        .map(|(path, _)| path.clone())
+        .collect();
+    dirty.extend(state.extra_dirty.iter().cloned());
+    dirty.sort();
+    dirty.dedup();
+    dirty
 }
 
 struct FakeRequest {

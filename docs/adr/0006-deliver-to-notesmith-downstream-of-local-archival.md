@@ -45,3 +45,19 @@ message correlated to the local archive commit by source-scoped session identity
 the capability is absent, versioned delivery is blocked with an actionable `remote-history-unavailable`
 status instead of degrading to latest-only storage, and the block never affects the already-durable
 local archive (consistent with ADR 0003).
+
+Notesmith's commit endpoint stages the **entire** working tree (`notesmith-git::ops::commit_all`),
+so Munshi cannot ask it to commit a single file. To keep each Munshi revision commit correlated to
+only its own note, Munshi runs a **clean-tree preflight** (`git/status`) before writing and
+committing: if any path other than the session's own note is dirty, delivery is blocked with
+`remote-history-dirty` rather than bundling unrelated work into the correlated commit or overwriting
+the note. This is the enforceable guarantee. A residual concurrency window remains — an unrelated
+write that lands between the preflight and the commit would still be bundled — so Munshi verifies the
+resulting commit's file count for observability but does **not** claim exclusive one-file commits.
+
+Delivery-then-commit is made crash-safe by correlating on the deterministic, source-qualified
+`munshi: <source>:<session> revision <n>` message: after a lost commit response, a `committed: false`
+no-op (e.g. a rebuilt operational database or an idempotent replace), or a commit transport error,
+Munshi recovers the existing commit by an **exact** (never prefix/substring) message lookup in
+`git/log`, so a crash between the remote commit and the local database write yields one remote commit
+and a persisted SHA rather than a lost correlation or a latest-only success.
