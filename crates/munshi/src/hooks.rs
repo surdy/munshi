@@ -114,57 +114,88 @@ pub fn run_archive_worker(job_path: &Path) -> Result<HookResult, RegistrationErr
         .and_then(Path::parent)
         .ok_or_else(|| RegistrationError::UnsafePath(job_path.to_path_buf()))?;
     let lock_path = worker_lock_path(state_directory, &job.session_id);
-    let result = run_archive_worker_inner(state_directory, &job);
-    match result {
-        Ok(result) => {
-            durable_remove(job_path)?;
-            if let Err(error) = durable_remove(&lock_path) {
-                record_failure(
-                    state_directory,
-                    failure(
-                        "archive-worker",
-                        "worker-lock-remove-failed",
-                        Some(job.session_id.clone()),
-                    ),
-                );
-                return Err(error);
-            }
-            atomic_json_replace(&result_path(state_directory, &job.session_id), &result)?;
-            Ok(result)
-        }
-        Err(archive_failure) => {
-            record_failure(state_directory, archive_failure.clone());
-            let result = HookResult::Failed {
+    let (result, archive_failure) = match run_archive_worker_inner(state_directory, &job) {
+        Ok(result) => (result, None),
+        Err(archive_failure) => (
+            HookResult::Failed {
                 code: archive_failure.code.clone(),
-            };
-            if let Err(error) = durable_remove(job_path) {
-                let _ =
-                    atomic_json_replace(&result_path(state_directory, &job.session_id), &result);
-                let mut cleanup_failure = failure(
-                    "archive-worker",
-                    "job-remove-failed",
-                    Some(job.session_id.clone()),
-                );
-                cleanup_failure.cause_code = Some(archive_failure.code);
-                record_failure(state_directory, cleanup_failure);
-                let _ = durable_remove(&lock_path);
-                return Err(error);
-            }
-            if let Err(error) = durable_remove(&lock_path) {
-                let _ =
-                    atomic_json_replace(&result_path(state_directory, &job.session_id), &result);
-                let mut cleanup_failure = failure(
-                    "archive-worker",
-                    "worker-lock-remove-failed",
-                    Some(job.session_id.clone()),
-                );
-                cleanup_failure.cause_code = Some(archive_failure.code);
-                record_failure(state_directory, cleanup_failure);
-                return Err(error);
-            }
-            atomic_json_replace(&result_path(state_directory, &job.session_id), &result)?;
-            Ok(result)
-        }
+            },
+            Some(archive_failure),
+        ),
+    };
+    finalize_worker(
+        &job.session_id,
+        result,
+        archive_failure,
+        || durable_remove(job_path),
+        || durable_remove(&lock_path),
+        |result| atomic_json_replace(&result_path(state_directory, &job.session_id), result),
+        |diagnostic| record_failure(state_directory, diagnostic),
+    )
+}
+
+fn finalize_worker<RemoveJob, RemoveLock, Publish, Record>(
+    session_id: &str,
+    result: HookResult,
+    archive_failure: Option<HookFailure>,
+    mut remove_job: RemoveJob,
+    mut remove_lock: RemoveLock,
+    mut publish: Publish,
+    mut record: Record,
+) -> Result<HookResult, RegistrationError>
+where
+    RemoveJob: FnMut() -> Result<(), RegistrationError>,
+    RemoveLock: FnMut() -> Result<(), RegistrationError>,
+    Publish: FnMut(&HookResult) -> Result<(), RegistrationError>,
+    Record: FnMut(HookFailure),
+{
+    if let Some(archive_failure) = archive_failure.as_ref() {
+        record(archive_failure.clone());
+    }
+
+    let job_error = remove_job().err();
+    let lock_error = remove_lock().err();
+    let publish_error = publish(&result).err();
+
+    if job_error.is_some() || lock_error.is_some() || publish_error.is_some() {
+        let mut diagnostic = failure(
+            "archive-worker",
+            finalization_failure_code(
+                publish_error.is_some(),
+                job_error.is_some(),
+                lock_error.is_some(),
+            ),
+            Some(session_id.to_owned()),
+        );
+        diagnostic.cause_code = archive_failure.map(|failure| failure.code);
+        record(diagnostic);
+    }
+
+    if let Some(error) = publish_error {
+        Err(error)
+    } else if let Some(error) = job_error {
+        Err(error)
+    } else if let Some(error) = lock_error {
+        Err(error)
+    } else {
+        Ok(result)
+    }
+}
+
+fn finalization_failure_code(
+    publish_failed: bool,
+    job_failed: bool,
+    lock_failed: bool,
+) -> &'static str {
+    match (publish_failed, job_failed, lock_failed) {
+        (false, true, false) => "job-remove-failed",
+        (false, false, true) => "worker-lock-remove-failed",
+        (false, true, true) => "job-and-worker-lock-remove-failed",
+        (true, false, false) => "result-write-failed",
+        (true, true, false) => "result-write-and-job-remove-failed",
+        (true, false, true) => "result-write-and-worker-lock-remove-failed",
+        (true, true, true) => "result-write-job-and-worker-lock-remove-failed",
+        (false, false, false) => unreachable!("called only when finalization failed"),
     }
 }
 
@@ -558,5 +589,80 @@ fn archive_error_code(error: &ArchiveError) -> &'static str {
         ArchiveError::Project(_) => "project-failed",
         ArchiveError::Summary(_) => "summary-failed",
         ArchiveError::Render(_) => "archive-write-failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+
+    #[test]
+    fn successful_result_is_published_when_job_removal_fails() {
+        let lock_attempted = Cell::new(false);
+        let published = RefCell::new(None);
+        let diagnostics = RefCell::new(Vec::new());
+        let outcome = HookResult::Archived {
+            relative_path: "project/session.md".to_owned(),
+        };
+
+        let finalized = finalize_worker(
+            "session",
+            outcome.clone(),
+            None,
+            || Err(injected_error()),
+            || {
+                lock_attempted.set(true);
+                Ok(())
+            },
+            |result| {
+                published.replace(Some(result.clone()));
+                Ok(())
+            },
+            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
+        );
+
+        assert!(finalized.is_err());
+        assert!(lock_attempted.get());
+        assert_eq!(published.into_inner(), Some(outcome));
+        let diagnostics = diagnostics.into_inner();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "job-remove-failed");
+    }
+
+    #[test]
+    fn successful_result_is_published_when_lock_removal_fails() {
+        let job_attempted = Cell::new(false);
+        let published = RefCell::new(None);
+        let diagnostics = RefCell::new(Vec::new());
+        let outcome = HookResult::NotArchiveWorthy;
+
+        let finalized = finalize_worker(
+            "session",
+            outcome.clone(),
+            None,
+            || {
+                job_attempted.set(true);
+                Ok(())
+            },
+            || Err(injected_error()),
+            |result| {
+                published.replace(Some(result.clone()));
+                Ok(())
+            },
+            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
+        );
+
+        assert!(finalized.is_err());
+        assert!(job_attempted.get());
+        assert_eq!(published.into_inner(), Some(outcome));
+        let diagnostics = diagnostics.into_inner();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "worker-lock-remove-failed");
+    }
+
+    fn injected_error() -> RegistrationError {
+        RegistrationError::Io(io::Error::other("injected finalization failure"))
     }
 }
