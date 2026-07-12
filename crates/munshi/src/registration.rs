@@ -464,6 +464,14 @@ impl ManagedFile for HookFile {
     }
 }
 
+/// Whether a Munshi-owned `config.json` exists in `state_directory`, without validating its
+/// contents. Lets read-only status queries (e.g. `munshi delivery status`) distinguish "never
+/// registered here" — which should degrade to empty/default output, like `sessions`/`status`/`show`
+/// already do — from a genuine I/O or malformed-file error while loading it.
+pub(crate) fn stored_config_exists(state_directory: &Path) -> bool {
+    state_directory.join(CONFIG_FILE_NAME).is_file()
+}
+
 pub(crate) fn load_stored_config(
     state_directory: &Path,
 ) -> Result<StoredConfig, RegistrationError> {

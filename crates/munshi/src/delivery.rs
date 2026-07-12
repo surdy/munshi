@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::registration::{
     DEFAULT_MAX_DELIVERY_ATTEMPTS, RegistrationError, StoredConfig, StoredCredential,
-    StoredDelivery, load_stored_config, update_stored_config,
+    StoredDelivery, load_stored_config, stored_config_exists, update_stored_config,
 };
 use crate::state::{
     DeliveryRecord, DeliverySuccess, SessionRecord, StateError, StateStore, now_ms,
@@ -129,6 +129,20 @@ impl DeliverySettings {
             max_attempts: config.delivery.max_attempts,
             versioned: config.archive_git_history && config.remote_delivery,
             provision_history: config.delivery.provision_history,
+        }
+    }
+
+    /// The view for a state directory that has never been registered: delivery is off and
+    /// unaddressable, with no recorded settings.
+    fn unregistered() -> Self {
+        Self {
+            enabled: false,
+            addressable: false,
+            endpoint: None,
+            vault: None,
+            folder: None,
+            credential_source: None,
+            max_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
         }
     }
 }
@@ -1682,7 +1696,25 @@ pub fn set_enabled(
 }
 
 /// Builds the status contract: current settings plus every recorded delivery.
+///
+/// A state directory that has never been registered (no `config.json` yet — the common case for
+/// an external caller such as Madari probing a project it hasn't set up Munshi in) degrades to an
+/// empty, disabled report instead of an I/O error, matching `sessions`/`status`/`show`/`retry`,
+/// which already return a valid `schema_version: 1` contract with no registration present.
 pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryError> {
+    if !stored_config_exists(state_directory) {
+        return Ok(DeliveryStatusReport {
+            schema_version: 1,
+            command: "delivery-status",
+            settings: DeliverySettings::unregistered(),
+            total: 0,
+            delivered: 0,
+            pending: 0,
+            failed: 0,
+            dead_letter: 0,
+            items: Vec::new(),
+        });
+    }
     let config = load_stored_config(state_directory)?;
     let settings = DeliverySettings::from_config(&config);
     let deliveries = if StateStore::database_path(state_directory).exists() {

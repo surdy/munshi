@@ -19,7 +19,9 @@ durable archive. Operational status/query/retry contracts are now available thro
 Opt-in Notesmith delivery is now implemented (disabled by default) through the `munshi delivery`
 commands: latest-revision create/replace with bounded retry and a dead-letter state, confirmed
 backfill of existing summaries, and delivery state surfaced in `status`, `doctor`, and `show`.
-The mandatory remote revision-history capability remains a later slice. See
+The mandatory remote revision-history capability remains a later slice. Madari's optional status
+and action integration (issue #10) is implemented as a pure CLI/JSON consumer of the contract
+above; see [ADR 0007](docs/adr/0007-madari-status-and-actions-over-cli-json-only.md). See also
 [`docs/automatic-archive.md`](docs/automatic-archive.md) and
 [ADR 0006](docs/adr/0006-deliver-to-notesmith-downstream-of-local-archival.md).
 
@@ -768,39 +770,52 @@ Madari already provides:
 - Status-pill and notification commands.
 - Markdown rendering.
 
-### Initial integration
+### Initial integration (implemented, issue #10)
 
-A Munshi hook running inside Madari inherits the Madari context variables. It can report lifecycle
-state without requiring an embedded plugin:
-
-```bash
-madari set-status --tab "$MADARI_TAB_ID" munshi "Summarizing"
-madari notify "Session archived" "The Munshi summary is ready."
-madari clear-status --tab "$MADARI_TAB_ID" munshi
-```
-
-Munshi should expose:
+Madari shells out to the standalone `munshi` executable and parses its `--json` output; it never
+opens Munshi's SQLite state store. The commands Madari drives, mapped to the actions listed above:
 
 ```bash
-munshi sessions --json
-munshi status --session <id> --json
-munshi summarize <id> --json
-munshi show <id> --json
+munshi sessions --json                                   # list + states, for the session browser
+munshi show <session-id> --source <source> --json         # local summary + Notesmith note link
+munshi retry <session-id> --source <source> --json        # "Summarize now" / retry a pending session
+munshi retry <session-id> --source <source> --force --json  # retry past a permanent-failure marker
+munshi delivery status --json                              # delivery settings + per-session state
+munshi delivery retry <session-id> --source <source> --json # retry one failed delivery
 ```
 
-Madari can then add:
+`<source>` is `copilot`, `claude-code`, or `codex` — Madari's own harness ids `copilot`/`claude`/
+`codex` map to these one-to-one (`claude` → `claude-code`); Madari does not surface Munshi status for
+its other two harnesses (Gemini, OpenCode), which Munshi does not capture.
 
-- `summarizing`, `archived`, and `delivery failed` states to agent sessions.
-- A "View summary" action in the agent-session browser.
-- A "Summarize now" action.
+Every response carries `schema_version: 1` and a `command` discriminator (see
+["Commands and validation"](#commands-and-validation) above for the full contract). A consumer that
+only knows a project directory — the common case before the user has ever run `munshi register`
+there — gets a valid, empty contract rather than an error: `sessions`, `status`, `show`, `retry`, and
+`delivery status` all degrade to `total: 0` / `found: false` / disabled settings instead of failing,
+so Madari can probe freely without first checking whether Munshi has been set up.
+
+Madari surfaces, per agent session:
+
+- `summarizing` (Munshi's `processing`/`summary-pending`/`revision-pending`/`interrupted`),
+  `archived`, `delivery failed` (`delivery-related`), `failed`, and `disabled` (`disabled-project`)
+  states, read from `sessions --json`.
+- A "View summary" action in the agent-session browser, backed by `show --json`.
+- A "Summarize now" / "Retry" action, backed by `retry --json` (and `delivery retry --json` for a
+  delivery-only failure).
 - A rendered summary panel using its existing Markdown support.
-- A link to the Notesmith note.
-- A retry action for failed delivery.
+- A link to the Notesmith note (`show --json` → `session.delivery.note_link`, a `notesmith://`
+  deep link Madari opens with its existing URL opener).
 
 ### Integration boundary
 
-Prefer a subprocess/JSON interface initially. This keeps Munshi independently releasable and avoids
-making Madari responsible for hook installation, Copilot authentication, or background retries.
+Madari never invokes Munshi's hidden `hook`/`hook-worker` subcommands and never writes to Munshi's
+SQLite state store; only the documented `--json` commands above are a stable contract. This keeps
+Munshi independently releasable and avoids making Madari responsible for hook installation, Copilot
+authentication, or background retries. Munshi remains fully usable from a terminal with Madari
+absent, and Madari treats the `munshi` executable as optional: an absent, unresolvable, or
+incompatible binary (non-zero exit, non-JSON stdout, or an unexpected `schema_version`) simply hides
+the Munshi status/actions surface rather than failing anything else in Madari.
 
 If repeated parsing code becomes a maintenance problem, extract only stable normalized types and
 session-source parsers into a small reusable Rust crate. Do not share a writable SQLite database

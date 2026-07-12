@@ -25,6 +25,29 @@ const VAULT: &str = "work";
 const TOKEN_ENV: &str = "MUNSHI_TEST_DELIVERY_TOKEN";
 const CLAUDE_SESSION: &str = "0c1a0de0-0000-4000-8000-000000000001";
 
+/// A caller that only knows a project directory (e.g. Madari probing before the user has ever run
+/// `munshi register` there) must get a valid, empty `schema_version: 1` contract from `delivery
+/// status --json`, exactly like `sessions`/`status`/`show`/`retry` already do when unregistered —
+/// never a bare, unparseable error string on stdout.
+#[test]
+fn delivery_status_json_on_an_unregistered_state_directory_degrades_to_empty_contract() {
+    let harness = Harness::new();
+
+    let status = harness.delivery_status_json();
+
+    assert_eq!(status["schema_version"], 1);
+    assert_eq!(status["command"], "delivery-status");
+    assert_eq!(status["settings"]["enabled"], false);
+    assert_eq!(status["settings"]["addressable"], false);
+    assert_eq!(status["settings"]["endpoint"], Value::Null);
+    assert_eq!(status["total"], 0);
+    assert_eq!(status["delivered"], 0);
+    assert_eq!(status["pending"], 0);
+    assert_eq!(status["failed"], 0);
+    assert_eq!(status["dead_letter"], 0);
+    assert_eq!(status["items"], serde_json::json!([]));
+}
+
 #[test]
 fn backfill_dry_run_reports_candidates_without_contacting_the_sink() {
     let harness = Harness::new();
