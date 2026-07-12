@@ -54,3 +54,7 @@ the per-session create-new worker marker is temporary operational state and a cr
 stale. There is no worker-marker recovery, interrupted-session scan, resumed delta, revision
 increment, transcript rewrite recovery, or guaranteed retry schedule. Those operational guarantees
 belong to issue #4. Remote delivery remains disabled.
+
+A worker that reaches a graceful archive failure records a redacted failed result and durably
+removes both its pending job and worker marker; issue #3 does not retain attempted jobs for retry.
+Only a process crash can leave those temporary files stale for issue #4 recovery.

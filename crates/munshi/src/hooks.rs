@@ -36,6 +36,8 @@ pub enum HookResult {
 pub struct HookFailure {
     pub operation: String,
     pub code: String,
+    #[serde(default)]
+    pub cause_code: Option<String>,
     pub session_id: Option<String>,
     pub recorded_at_unix_ms: u128,
 }
@@ -113,21 +115,57 @@ pub fn run_archive_worker(job_path: &Path) -> Result<HookResult, RegistrationErr
         .ok_or_else(|| RegistrationError::UnsafePath(job_path.to_path_buf()))?;
     let lock_path = worker_lock_path(state_directory, &job.session_id);
     let result = run_archive_worker_inner(state_directory, &job);
-    let finalized = (|| match result {
+    match result {
         Ok(result) => {
             durable_remove(job_path)?;
+            if let Err(error) = durable_remove(&lock_path) {
+                record_failure(
+                    state_directory,
+                    failure(
+                        "archive-worker",
+                        "worker-lock-remove-failed",
+                        Some(job.session_id.clone()),
+                    ),
+                );
+                return Err(error);
+            }
             atomic_json_replace(&result_path(state_directory, &job.session_id), &result)?;
             Ok(result)
         }
-        Err(failure) => {
-            record_failure(state_directory, failure.clone());
-            let result = HookResult::Failed { code: failure.code };
+        Err(archive_failure) => {
+            record_failure(state_directory, archive_failure.clone());
+            let result = HookResult::Failed {
+                code: archive_failure.code.clone(),
+            };
+            if let Err(error) = durable_remove(job_path) {
+                let _ =
+                    atomic_json_replace(&result_path(state_directory, &job.session_id), &result);
+                let mut cleanup_failure = failure(
+                    "archive-worker",
+                    "job-remove-failed",
+                    Some(job.session_id.clone()),
+                );
+                cleanup_failure.cause_code = Some(archive_failure.code);
+                record_failure(state_directory, cleanup_failure);
+                let _ = durable_remove(&lock_path);
+                return Err(error);
+            }
+            if let Err(error) = durable_remove(&lock_path) {
+                let _ =
+                    atomic_json_replace(&result_path(state_directory, &job.session_id), &result);
+                let mut cleanup_failure = failure(
+                    "archive-worker",
+                    "worker-lock-remove-failed",
+                    Some(job.session_id.clone()),
+                );
+                cleanup_failure.cause_code = Some(archive_failure.code);
+                record_failure(state_directory, cleanup_failure);
+                return Err(error);
+            }
             atomic_json_replace(&result_path(state_directory, &job.session_id), &result)?;
             Ok(result)
         }
-    })();
-    let _ = durable_remove(&lock_path);
-    finalized
+    }
 }
 
 pub fn wait_for_hook_result(
@@ -501,6 +539,7 @@ fn failure(operation: &str, code: &str, session_id: Option<String>) -> HookFailu
     HookFailure {
         operation: operation.to_owned(),
         code: code.to_owned(),
+        cause_code: None,
         session_id,
         recorded_at_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)

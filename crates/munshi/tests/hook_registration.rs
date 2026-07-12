@@ -436,6 +436,25 @@ fn session_end_returns_quickly_and_reports_detached_failure_deterministically() 
     let failure = fs::read_to_string(paths.state.join("failures/last.json")).unwrap();
     assert!(failure.contains("summary-failed"));
     assert!(!failure.contains(project.to_string_lossy().as_ref()));
+    assert!(
+        !paths
+            .state
+            .join(format!("pending/{SESSION_ID}.json"))
+            .exists()
+    );
+    assert!(
+        !paths
+            .state
+            .join(format!("workers/{SESSION_ID}.lock"))
+            .exists()
+    );
+    assert!(paths.state.join("failures/last.json").is_file());
+    assert!(
+        paths
+            .state
+            .join(format!("results/{SESSION_ID}.json"))
+            .is_file()
+    );
 }
 
 #[test]
