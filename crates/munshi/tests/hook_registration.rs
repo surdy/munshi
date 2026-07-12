@@ -1,6 +1,7 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Cursor;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -97,6 +98,12 @@ fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema(
         let output = unregister_command(&paths);
         assert_success(&output);
     }
+    let registration_lock = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    assert!(registration_lock.is_file());
+    assert_eq!(
+        fs::metadata(&registration_lock).unwrap().mode() & 0o777,
+        0o600
+    );
     assert!(!hook_path.exists());
     assert!(!paths.state.join("config.json").exists());
     assert!(paths.copilot_home.join("hooks/other.json").exists());
@@ -122,6 +129,25 @@ fn registration_rejects_symlinked_or_malformed_owned_paths() {
 
     fs::remove_file(paths.copilot_home.join("hooks")).unwrap();
     fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
+    let lock_target = elsewhere.join("lock-target");
+    fs::write(&lock_target, b"lock-target-bytes").unwrap();
+    symlink(
+        &lock_target,
+        paths.copilot_home.join("hooks/.munshi-registration.lock"),
+    )
+    .unwrap();
+    let output = register_command(&paths, fake("success.sh"), 2_000, true);
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&lock_target).unwrap(), b"lock-target-bytes");
+    fs::remove_file(paths.copilot_home.join("hooks/.munshi-registration.lock")).unwrap();
+
+    let unsafe_lock = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    fs::write(&unsafe_lock, b"").unwrap();
+    fs::set_permissions(&unsafe_lock, fs::Permissions::from_mode(0o666)).unwrap();
+    let output = register_command(&paths, fake("success.sh"), 2_000, true);
+    assert!(!output.status.success());
+    fs::remove_file(&unsafe_lock).unwrap();
+
     let target = elsewhere.join("target.json");
     fs::write(&target, b"target-bytes").unwrap();
     symlink(&target, paths.copilot_home.join("hooks/munshi.json")).unwrap();
@@ -153,6 +179,71 @@ fn registration_rejects_symlinked_or_malformed_owned_paths() {
     let output = register_command(&paths, fake("success.sh"), 2_000, true);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ownership"));
+}
+
+#[test]
+fn stale_registration_lock_is_reusable_for_register_and_unregister() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
+    let lock = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    assert!(lock.is_file());
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let output = unregister_command(&paths);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("another Munshi registration operation is active")
+    );
+    assert!(paths.copilot_home.join("hooks/munshi.json").exists());
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(held);
+    assert_success(&unregister_command(&paths));
+    assert!(lock.is_file());
+}
+
+#[test]
+fn active_registration_lock_reports_distinct_contention() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
+    let lock_path = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let output = register_command(&paths, fake("success.sh"), 2_000, true);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("another Munshi registration operation is active")
+    );
+    assert!(!paths.copilot_home.join("hooks/munshi.json").exists());
+    assert!(!paths.state.join("config.json").exists());
+
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
 }
 
 #[test]

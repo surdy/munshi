@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -56,6 +57,8 @@ pub enum RegistrationError {
     UnsafePath(PathBuf),
     #[error("the existing Munshi-owned file is malformed or was not created by this version")]
     MalformedOwnedFile,
+    #[error("another Munshi registration operation is active")]
+    RegistrationBusy,
     #[error("configuration contains a non-UTF-8 argument or path")]
     NonUtf8Configuration,
     #[error("registration I/O failed")]
@@ -177,56 +180,38 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     let hook = HookFile::new(config)?;
     let hook_path = hooks_directory.join(HOOK_FILE_NAME);
     let config_path = config.state_directory.join(CONFIG_FILE_NAME);
+    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let _lock = acquire_registration_lock(&lock_path)?;
     validate_owned_file::<StoredConfig>(&config_path)?;
     validate_owned_file::<HookFile>(&hook_path)?;
-    let lock_path = hooks_directory.join(".munshi-registration.lock");
-    let Some(lock) = create_owned_lock(&lock_path)? else {
-        return Err(RegistrationError::UnsafePath(lock_path));
-    };
-    drop(lock);
-    let result = (|| {
-        validate_owned_file::<HookFile>(&hook_path)?;
-        let state_directory = ensure_directory(&config.state_directory)?;
-        ensure_child_directory(&state_directory, "sessions")?;
-        ensure_child_directory(&state_directory, "pending")?;
-        ensure_child_directory(&state_directory, "workers")?;
-        ensure_child_directory(&state_directory, "results")?;
-        ensure_child_directory(&state_directory, "failures")?;
-        install_or_update_json(&config_path, &stored)?;
-        install_or_update_json(&hook_path, &hook)
-    })();
-    let _ = durable_remove(&lock_path);
-    result
+    let state_directory = ensure_directory(&config.state_directory)?;
+    ensure_child_directory(&state_directory, "sessions")?;
+    ensure_child_directory(&state_directory, "pending")?;
+    ensure_child_directory(&state_directory, "workers")?;
+    ensure_child_directory(&state_directory, "results")?;
+    ensure_child_directory(&state_directory, "failures")?;
+    install_or_update_json(&config_path, &stored)?;
+    install_or_update_json(&hook_path, &hook)
 }
 
 pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), RegistrationError> {
     if !copilot_home.is_absolute() || !state_directory.is_absolute() {
         return Err(RegistrationError::RelativePath);
     }
-    let hooks = copilot_home.join("hooks");
     validate_existing_directory_if_present(copilot_home)?;
-    validate_existing_directory_if_present(&hooks)?;
     validate_existing_directory_if_present(state_directory)?;
+    if !copilot_home.exists() {
+        return Ok(());
+    }
+    let hooks = ensure_child_directory(copilot_home, "hooks")?;
     let hook_path = hooks.join(HOOK_FILE_NAME);
     let config_path = state_directory.join(CONFIG_FILE_NAME);
+    let lock_path = hooks.join(".munshi-registration.lock");
+    let _lock = acquire_registration_lock(&lock_path)?;
     validate_owned_file::<HookFile>(&hook_path)?;
     validate_owned_file::<StoredConfig>(&config_path)?;
-    if !hooks.exists() {
-        return durable_remove(&config_path);
-    }
-    let lock_path = hooks.join(".munshi-registration.lock");
-    let Some(lock) = create_owned_lock(&lock_path)? else {
-        return Err(RegistrationError::UnsafePath(lock_path));
-    };
-    drop(lock);
-    let result = (|| {
-        validate_owned_file::<HookFile>(&hook_path)?;
-        validate_owned_file::<StoredConfig>(&config_path)?;
-        durable_remove(&hook_path)?;
-        durable_remove(&config_path)
-    })();
-    let _ = durable_remove(&lock_path);
-    result
+    durable_remove(&hook_path)?;
+    durable_remove(&config_path)
 }
 
 impl StoredConfig {
@@ -456,6 +441,98 @@ pub(crate) fn create_owned_lock(path: &Path) -> Result<Option<File>, Registratio
             Ok(None)
         }
         Err(error) => Err(RegistrationError::Io(error)),
+    }
+}
+
+struct RegistrationLock {
+    _file: File,
+}
+
+fn acquire_registration_lock(path: &Path) -> Result<RegistrationLock, RegistrationError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RegistrationError::UnsafePath(path.to_path_buf()))?;
+    validate_existing_directory_if_present(parent)?;
+
+    let (file, created) = loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                validate_registration_lock_metadata(path, &metadata)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|error| lock_open_error(path, error))?;
+                break (file, false);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+                {
+                    Ok(file) => break (file, true),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(lock_open_error(path, error)),
+                }
+            }
+            Err(error) => return Err(RegistrationError::Io(error)),
+        }
+    };
+
+    if created {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(RegistrationError::Io)?;
+        file.sync_all().map_err(RegistrationError::Io)?;
+        sync_directory(parent)?;
+    }
+    let opened = file.metadata().map_err(RegistrationError::Io)?;
+    validate_registration_lock_metadata(path, &opened)?;
+
+    let lock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result == -1 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Err(RegistrationError::RegistrationBusy)
+        } else {
+            Err(RegistrationError::Io(error))
+        };
+    }
+
+    let current = fs::symlink_metadata(path)
+        .map_err(|_| RegistrationError::UnsafePath(path.to_path_buf()))?;
+    validate_registration_lock_metadata(path, &current)?;
+    if current.dev() != opened.dev() || current.ino() != opened.ino() {
+        return Err(RegistrationError::UnsafePath(path.to_path_buf()));
+    }
+    Ok(RegistrationLock { _file: file })
+}
+
+fn validate_registration_lock_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), RegistrationError> {
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        Err(RegistrationError::UnsafePath(path.to_path_buf()))
+    } else {
+        Ok(())
+    }
+}
+
+fn lock_open_error(path: &Path, error: io::Error) -> RegistrationError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        RegistrationError::UnsafePath(path.to_path_buf())
+    } else {
+        RegistrationError::Io(error)
     }
 }
 

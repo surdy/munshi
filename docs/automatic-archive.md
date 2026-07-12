@@ -27,6 +27,11 @@ files, rejects symlinked or wrongly owned managed paths, and does not rewrite eq
 `munshi unregister` removes only those two positively recognized files; archives and pending
 diagnostic state remain.
 
+Register and unregister serialize changes with a persistent owner-only
+`hooks/.munshi-registration.lock` file and a nonblocking OS advisory lock held for the complete
+operation. The file is intentionally not unlinked; an unheld file is immediately reusable, and the
+kernel releases an active lock if the process exits or crashes.
+
 The hooks use direct `exec`/`args` fields with a two-second timeout, read exactly one bounded JSON
 object, and emit nothing. `agentStop` atomically records only the required session metadata,
 preserving the first recorded working directory as the origin project. A clean `sessionEnd` writes
@@ -42,7 +47,8 @@ is not treated as evidence that the schema changed.
 
 ## Temporary file-state limitations
 
-This issue intentionally does not add SQLite. A create-new marker suppresses concurrent duplicate
-workers, but a crash can leave a stale marker. There is no crash recovery, interrupted-session
-scan, resumed delta, revision increment, transcript rewrite recovery, or guaranteed retry schedule.
-Those operational guarantees belong to issue #4. Remote delivery remains disabled.
+This issue intentionally does not add SQLite. Unlike the crash-safe registration advisory lock,
+the per-session create-new worker marker is temporary operational state and a crash can leave it
+stale. There is no worker-marker recovery, interrupted-session scan, resumed delta, revision
+increment, transcript rewrite recovery, or guaranteed retry schedule. Those operational guarantees
+belong to issue #4. Remote delivery remains disabled.
