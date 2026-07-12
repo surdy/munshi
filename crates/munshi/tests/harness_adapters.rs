@@ -435,6 +435,52 @@ fn hydrate_scopes_to_the_store_source_only() {
     assert!(codex_store.get_session(SHARED_ID).unwrap().is_none());
 }
 
+/// The `retry` CLI must refuse to act on an ambiguous session ID shared by two sources
+/// unless a `--source` selector is given, and must target exactly the selected source.
+#[test]
+fn retry_cli_requires_a_source_selector_when_ambiguous() {
+    let harness = StateHarness::new();
+    let claude = harness.copy_transcript_for(
+        SourceKind::ClaudeCode,
+        &fixture(
+            "claude-code-2.1.44",
+            "normal",
+            &format!("{CLAUDE_NORMAL}.jsonl"),
+        ),
+        SHARED_ID,
+    );
+    let codex = harness.copy_transcript_for(
+        SourceKind::Codex,
+        &fixture(
+            "codex-rollout-0.x",
+            "normal",
+            &format!("{CODEX_NORMAL}.jsonl"),
+        ),
+        SHARED_ID,
+    );
+    harness.archive(SourceKind::ClaudeCode, SHARED_ID, &claude, "complete");
+    harness.archive(SourceKind::Codex, SHARED_ID, &codex, "complete");
+
+    // Without --source the command must fail rather than pick a source arbitrarily.
+    let ambiguous = harness.retry_cli(SHARED_ID, None);
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(stderr.contains("multiple sources"), "stderr: {stderr}");
+    assert!(stderr.contains("claude-code") && stderr.contains("codex"));
+
+    // With an explicit selector the retry targets exactly that source.
+    let targeted = harness.retry_cli(SHARED_ID, Some("codex"));
+    assert!(
+        targeted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&targeted.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&targeted.stdout).unwrap();
+    assert_eq!(report["command"], "retry");
+    assert_eq!(report["source"], "codex");
+    assert_eq!(report["session_id"], SHARED_ID);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -624,6 +670,39 @@ impl StateHarness {
         let target = dir.join(format!("{session_id}.jsonl"));
         fs::copy(source_path, &target).unwrap();
         target
+    }
+
+    /// Copy a transcript into a per-source subdirectory so the same session ID can be
+    /// staged for two different sources without the files colliding.
+    fn copy_transcript_for(
+        &self,
+        source: SourceKind,
+        source_path: &Path,
+        session_id: &str,
+    ) -> PathBuf {
+        let dir = self
+            .directory
+            .path()
+            .join("transcripts")
+            .join(source.as_selector());
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(format!("{session_id}.jsonl"));
+        fs::copy(source_path, &target).unwrap();
+        target
+    }
+
+    fn retry_cli(&self, session_id: &str, source: Option<&str>) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
+        command
+            .arg("retry")
+            .arg(session_id)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--json");
+        if let Some(source) = source {
+            command.arg("--source").arg(source);
+        }
+        command.output().unwrap()
     }
 
     fn append_line(&self, transcript: &Path, line: &str) {

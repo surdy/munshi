@@ -34,6 +34,23 @@ hydration, and rebuild dedup are keyed by `(SourceKind, session_id)` to match th
 `UNIQUE(source_kind, source_session_id)` constraint, so same-ID sessions from different sources are
 both retained and never cross-imported.
 
+## Operational CLI contracts
+
+The operational CLI is source-aware while preserving Copilot's existing behavior:
+
+- `munshi sessions --json` list items include a `source` field (the source selector, e.g.
+  `copilot`, `claude-code`, `codex`) and list sessions across all sources.
+- `munshi show <id> --json` includes `session.source_kind`. The existing `session.source` field
+  (transcript progress) is unchanged.
+- `munshi retry <id>` and `munshi show <id>` accept an optional `--source <selector>`. When a
+  session ID exists under more than one source and no selector is given, the command fails with an
+  explicit ambiguity error instead of guessing; `retry --json` reports the resolved `source`, and
+  `retry-all` items carry a `source`. The internal `hook-worker` accepts `--source` so recovery and
+  retry route each session to its own adapter and source-scoped state.
+
+These are additive fields on the `schema_version: 1` status contracts; Copilot output keeps
+`copilot`/`copilot:<id>` identities and its flat archive layout.
+
 Adapter-specific records that carry no archive-worthy conversation content (Claude `summary`/
 `system` bookkeeping, Codex `session_meta`/`turn_context`/`compacted`/`reasoning`) are treated as
 ignored metadata. Model reasoning is deliberately dropped and never normalized into events.
