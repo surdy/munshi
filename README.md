@@ -50,6 +50,9 @@ This repository currently contains the implementation plan. No production code e
 | Future remote sink | Versioned generic webhook |
 | Platforms | macOS and Linux |
 | Operation | Hook-driven commands; no daemon initially |
+| Default consent | Registration enables local summarization for all projects; projects may opt out |
+| Transcript protection | No secret redaction or granular event filtering in the first release |
+| Summary history | Latest only by default; optional dedicated Git history |
 | License target | Apache-2.0 or MIT; do not copy GPL Clerk code |
 
 Rust is preferred because Madari already implements Rust-based agent-session discovery, filesystem
@@ -117,7 +120,7 @@ Session source adapter
 Normalized session and event model
     |
     v
-Redaction and transcript budgeting
+Project policy and transcript budgeting
     |
     v
 Summarizer runner
@@ -216,6 +219,13 @@ The compatibility spike must verify that command hooks fire during:
 - Resumed sessions.
 - Interrupted and force-closed sessions.
 
+A session becomes archive-worthy only after at least one user request and agent-produced content or
+tool activity. Empty or cancelled starts may be recorded diagnostically but do not create Markdown.
+
+If a session has activity but no clean `sessionEnd`, Munshi marks it interrupted and recovers it
+opportunistically on a later hook or user-invoked command. The recovered summary records the
+interrupted completion reason.
+
 Private files such as Copilot's internal session SQLite database may be inspected by a future
 best-effort adapter, but the MVP must not depend on their schema.
 
@@ -228,7 +238,12 @@ copilot:<session-id>
 ```
 
 The identity does not include the end timestamp because resumed sessions must update the same
-report.
+report. It also does not include a repository: one source session remains one logical session even
+when it changes working directories or touches multiple repositories.
+
+The first detected Git repository is the session's origin project and remains its routing
+association. Project identity uses a normalized canonical remote when available so clones and
+worktrees group together, with a locally assigned identity for repositories without a remote.
 
 State tracked per session:
 
@@ -256,7 +271,7 @@ When a session is resumed:
 4. The summarizer returns a complete revised summary, not an append-only fragment.
 5. The local Markdown file is replaced atomically.
 6. `summary_revision` is incremented.
-7. Notesmith is updated using optimistic concurrency.
+7. Notesmith replaces its Munshi-managed copy when delivery is enabled.
 
 If cursor validation fails because the transcript was truncated or rewritten, Munshi falls back to
 a complete re-read and records the reason.
@@ -283,7 +298,7 @@ The runner must provide:
 - Output-size limits.
 - Clear classification of authentication, quota, timeout, malformed-output, and transient errors.
 - Exponential retry only for transient failures.
-- Redaction of configured environment-variable values from logs.
+- No logging of transcript input or child-process environment.
 - No fallback that silently reports success with an empty or partial summary.
 
 ### Structured output
@@ -333,26 +348,29 @@ Munshi should include:
 - Configurable maximum transcript size.
 - A dry-run mode that captures and renders fixtures without invoking Copilot.
 - Status output showing calls, failures, and estimated input volume.
-- Explicit opt-in per project.
+- Project-level opt-out.
+- Opportunistic retry of deferred work on later hooks and Munshi commands.
 
-## Privacy and redaction
+## Privacy and disclosure
 
 The MVP archives summaries only. Raw transcripts remain at their existing local source and are not
-sent to Notesmith.
+sent to Notesmith. They are sent as-is to Copilot CLI for summarization.
 
-Before invoking the summarizer, Munshi should support:
+The first release intentionally does not implement secret redaction, user regexes, file exclusions,
+or transcript-event filtering. Registration must prominently disclose that:
 
-- Secret-pattern masking.
-- Explicit environment-variable value masking.
-- Optional home-directory and username masking.
-- User-provided regular expressions.
-- Excluding selected transcript event types.
-- Excluding files or repositories by pattern.
-- A project-level disable switch.
+- summarization is enabled by default after registration;
+- transcript content is processed by the configured Copilot model;
+- projects can be disabled before or after registration;
+- disabling a project stops future processing but does not delete existing archives.
 
 The transcript has already passed through the original Copilot session, but a second summarization
 call is still a separate disclosure and cost event. Logs must never contain complete prompts or raw
-transcripts by default.
+transcripts.
+
+Generated summaries are structured work records, not compressed transcripts. They should capture
+goals, decisions, meaningful changes, commands and validation, and open items without verbatim
+prompts, raw tool output, secrets, or substantial code excerpts.
 
 ## Markdown output
 
@@ -425,10 +443,24 @@ Suggested local layout:
 Platform-specific base directories should come from the standard operating-system directory APIs
 rather than hardcoded paths.
 
+Archive files are Munshi-owned and may be atomically replaced. Human annotations belong in
+separate notes.
+
+Git history is optional. When disabled, Munshi retains only the current summary text. When enabled:
+
+- the configured archive output directory is a dedicated Git repository;
+- Munshi never commits summaries into source-code repositories;
+- each successful summary revision produces one commit containing that archive-file change;
+- the commit records the stable session ID and summary revision;
+- local Git history may be enabled without a remote sink;
+- if Notesmith delivery is enabled, Notesmith must preserve a separate correlated Git history or
+  delivery is blocked.
+
 ## State and concurrency
 
-SQLite should store session state, cursors, report revisions, and delivery attempts. Markdown
-remains the durable human-readable output.
+SQLite should store session state, cursors, and delivery attempts. Markdown, with optional Git
+history, remains the durable record; SQLite is rebuildable operational state rather than the
+authority for an existing archive.
 
 Requirements:
 
@@ -479,12 +511,7 @@ max_input_bytes = 1000000
 [output]
 directory = "~/.local/share/munshi/summaries"
 include_absolute_paths = false
-
-[redaction]
-mask_home_directory = true
-mask_usernames = true
-environment_variables = ["GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"]
-patterns = []
+git_history = false
 
 [sinks.filesystem]
 enabled = true
@@ -532,14 +559,18 @@ Content-Type: application/json
 An existing note can be replaced through the Notesmith note update endpoint using its returned path
 and `expected_hash`. Munshi should persist both values in SQLite.
 
-Therefore the initial Notesmith sink requires no Notesmith server modification.
+Latest-only delivery requires no Notesmith server modification. Versioned delivery may require a
+capability check or integration work to ensure the target vault preserves a correlated Git history.
 
 Delivery behavior:
 
 - Create on the first successful summary.
 - Update on resumed-session revisions.
 - Treat a matching existing Munshi ID as the same logical report.
-- Use optimistic concurrency rather than blind overwrite.
+- Treat delivered notes as Munshi-owned and overwrite remote edits.
+- When Git history is enabled locally, require Notesmith revision history before delivering.
+- When delivery is first enabled, offer a count/dry run and require confirmation before backfilling
+  existing current summaries.
 - Retry timeouts and server errors with exponential backoff and jitter.
 - Do not retry validation or authentication errors indefinitely.
 - Place exhausted deliveries in a dead-letter state.
@@ -731,13 +762,13 @@ not raw transcript content.
 - Hook payload parsing.
 - Session identity and revision behavior.
 - Cursor validation and fallback.
-- Redaction rules.
 - Transcript chunking.
 - Structured summary validation.
 - Markdown golden files.
 - Configuration precedence.
 - Retry classification.
 - Notesmith request construction.
+- Archive Git commit behavior.
 
 ### Adapter conformance tests
 
@@ -785,8 +816,10 @@ produce a validated summary from its transcript.
 - Copilot source adapter.
 - SQLite state store.
 - Copilot CLI summarizer.
-- Context budgeting and redaction.
+- Context budgeting and explicit registration disclosure.
 - Markdown renderer and filesystem sink.
+- Project disablement.
+- Optional dedicated archive Git history.
 - Resumed-session revision behavior.
 - Status, retry, show, doctor, and JSON output.
 
@@ -796,7 +829,9 @@ Markdown report.
 ### Phase 2: Notesmith
 
 - Notesmith-native sink.
-- Create and optimistic update.
+- Create and Munshi-owned replacement.
+- Confirmed backfill of existing current summaries.
+- Versioned-delivery capability enforcement when local Git history is enabled.
 - Retry and dead-letter state.
 - Project folder routing.
 - Link stored in local state and JSON output.
@@ -842,7 +877,7 @@ round-trip backup.
 | Copilot hook or transcript format changes | Prefer documented payloads; version adapters; maintain fixtures and probes |
 | Unexpected AI Credit usage | Finalize once, process deltas, impose limits, show usage |
 | Summarizer hangs | Hard timeout and process-tree cancellation |
-| Transcript contains secrets | Redact before summarization; never log prompts |
+| Transcript contains secrets | Prominent setup disclosure and project opt-out; redaction is deferred beyond v1 |
 | Concurrent hook executions | Per-session locks and SQLite transactions |
 | Notesmith unavailable | Local-first persistence, retry, dead-letter state |
 | Resumed session creates duplicate note | Stable ID and revisioned update |
@@ -861,9 +896,8 @@ These should be resolved during Phase 0 rather than guessed:
 - Whether the first release should keep state in one SQLite file or separate operational and
   delivery databases.
 - Notesmith authentication as deployed behind the current reverse proxy.
+- How Notesmith exposes or verifies per-note Git revision history for versioned delivery.
 - Naming and routing rules for Notesmith folders.
-- Whether local summaries should be grouped by repository identity, filesystem project slug, or
-  both.
 
 ## Reference links
 
@@ -873,4 +907,3 @@ These should be resolved during Phase 0 rather than guessed:
 - [GitHub Copilot CLI documentation](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)
 - [Running Copilot CLI programmatically](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)
 - [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference)
-
