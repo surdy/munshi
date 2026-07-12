@@ -142,9 +142,13 @@ pub fn run_summary_probe(
 
     let result: Phase0Summary =
         serde_json::from_slice(&stdout.bytes).map_err(SummaryProbeError::MalformedJson)?;
-    validate_field("title", &result.title, TITLE_LIMIT)?;
-    validate_field("summary", &result.summary, SUMMARY_LIMIT)?;
-    Ok(result)
+    let normalized = Phase0Summary {
+        title: result.title.trim().to_owned(),
+        summary: result.summary.trim().to_owned(),
+    };
+    validate_field("title", &normalized.title, TITLE_LIMIT)?;
+    validate_field("summary", &normalized.summary, SUMMARY_LIMIT)?;
+    Ok(normalized)
 }
 
 struct BoundedRead {
@@ -210,7 +214,7 @@ fn validate_exit(status: ExitStatus, stderr_bytes: usize) -> Result<(), SummaryP
 }
 
 fn validate_field(field: &'static str, value: &str, max: usize) -> Result<(), SummaryProbeError> {
-    let length = value.trim().chars().count();
+    let length = value.chars().count();
     if length == 0 || length > max {
         Err(SummaryProbeError::InvalidShape { field, max })
     } else {

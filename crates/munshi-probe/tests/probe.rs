@@ -164,6 +164,28 @@ fn invalid_summary_shape_is_explicit() {
 }
 
 #[test]
+fn summary_fields_are_trimmed_before_returned_limits_are_enforced() {
+    let directory = test_directory();
+    let padding = " ".repeat(500);
+    let output = serde_json::json!({
+        "title": format!("{padding}Probe{padding}"),
+        "summary": format!("{padding}Concise result.{padding}"),
+    });
+    let script = executable_script(
+        directory.path(),
+        "padded-summary.sh",
+        &format!("printf '%s' '{}'\n", output),
+    );
+
+    let result = run_summary_probe(&config(script), Vec::new()).unwrap();
+
+    assert_eq!(result.title, "Probe");
+    assert_eq!(result.summary, "Concise result.");
+    assert!(result.title.chars().count() <= 200);
+    assert!(result.summary.chars().count() <= 2_000);
+}
+
+#[test]
 fn non_zero_exit_is_explicit_without_echoing_stderr() {
     let directory = test_directory();
     let script = executable_script(
