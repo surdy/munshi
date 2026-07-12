@@ -806,6 +806,10 @@ consume credits without explicit enablement.
 - Measure transcript sizes and summary latency.
 - Confirm how Copilot quota and authentication failures surface.
 
+The code-only probe foundation and safe usage instructions are documented in
+[`docs/phase-0-probe.md`](docs/phase-0-probe.md). Live results belong in the explicitly unobserved
+[`docs/phase-0-findings.md`](docs/phase-0-findings.md) matrix.
+
 Exit criterion: one manually installed hook can identify a session and a standalone command can
 produce a validated summary from its transcript.
 
