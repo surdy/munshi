@@ -1,9 +1,10 @@
 # Phase 0 Copilot CLI 1.0.70 findings
 
 These findings combine official documentation, privacy-safe static inspection of installed Copilot
-CLI 1.0.70, sanitized hook fixtures, and reported aggregate live observations from macOS. The final
-integration pass did not inspect raw personal session content or invoke Copilot. The temporary hook
-configuration used for live observation was removed.
+CLI 1.0.70, sanitized hook fixtures, a fully synthetic transcript-envelope fixture, and reported
+aggregate live observations from macOS. The final integration passes did not inspect raw personal
+session content or invoke Copilot. The temporary hook configuration used for live observation was
+removed.
 
 ## Environment and evidence
 
@@ -12,7 +13,7 @@ configuration used for live observation was removed.
 | Observation date | 2026-07-11 |
 | Platform | macOS |
 | Copilot CLI | 1.0.70 |
-| Committed evidence | Sanitized hook JSON under `fixtures/copilot-1.0.70/` |
+| Committed evidence | Sanitized hook JSON plus synthetic JSONL envelope fixture under `fixtures/copilot-1.0.70/` |
 | Raw transcripts | Not committed or inspected during integration |
 | Structured-summary input | Synthetic only |
 | Force-close attempts | Two |
@@ -57,6 +58,14 @@ evidence; its absent hooks are retained as path evidence.
 ## Transcript structural matrix
 
 Only aggregate structural results are recorded. No raw JSONL is committed.
+
+`fixtures/copilot-1.0.70/transcript/synthetic-envelope.jsonl` is sanitized synthetic content, not a
+copy or transformation of a personal transcript. Its envelope and event categories are shaped only
+from the aggregate observations above and the installed 1.0.70 schema. It contains one record for
+each of `session.start`, `user.message`, `assistant.turn_start`, `assistant.message`,
+`assistant.turn_end`, `hook.start`, `hook.end`, `session.resume`, and `session.shutdown`, plus one
+optional `agentId` example. Minimal `data` objects intentionally make no claim about private
+semantic schemas.
 
 | Scenario | Bytes | Valid lines | Top-level keys | `type` counts | Status |
 | --- | ---: | ---: | --- | --- | --- |

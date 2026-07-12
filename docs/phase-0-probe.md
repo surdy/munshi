@@ -45,6 +45,18 @@ Metrics include bytes read, logical line count, JSON-valid line count, top-level
 and selected top-level discriminator counts. Discriminator labels are JSON scalar literals. Select
 only keys whose values are known to be non-sensitive.
 
+The committed compatibility fixture can exercise this path without private content:
+
+```bash
+munshi-probe inspect-transcript \
+  --input fixtures/copilot-1.0.70/transcript/synthetic-envelope.jsonl \
+  --discriminator-key type
+```
+
+That JSONL is fully synthetic and redacted. It was shaped from aggregate 1.0.70 observations and
+the installed envelope schema; it is not copied from or sanitized out of a raw personal transcript.
+Its minimal `data` objects establish envelope and discriminator compatibility only.
+
 ## Probe structured summary invocation
 
 The executable is required; there is no default Copilot command. Input comes from `--input` or
@@ -125,9 +137,10 @@ the recorded live observations establish these boundaries:
   existence-validated `$COPILOT_HOME/session-state/<sessionId>/events.jsonl` fallback. This installed
   path is private, not a public compatibility promise.
 
-Committed fixtures under `fixtures/copilot-1.0.70/` contain sanitized hook payloads only. No raw
-transcript or personal prompt content is committed. Exact quota behavior and broader model-output
-reliability remain unobserved.
+Committed fixtures under `fixtures/copilot-1.0.70/` contain sanitized hook payloads and one fully
+synthetic/redacted transcript-envelope JSONL fixture. This satisfies hook and transcript fixture
+coverage without committing raw event content, personal prompts, responses, paths, identifiers, or
+source code. Exact quota behavior and broader model-output reliability remain unobserved.
 
 Authoritative references:
 

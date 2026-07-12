@@ -1,0 +1,9 @@
+{"id":"<event-01>","timestamp":1,"parentId":null,"type":"session.start","data":{"synthetic":true}}
+{"id":"<event-02>","timestamp":2,"parentId":"<event-01>","type":"user.message","data":{"synthetic":true}}
+{"id":"<event-03>","timestamp":3,"parentId":"<event-02>","type":"assistant.turn_start","data":{"synthetic":true}}
+{"id":"<event-04>","timestamp":4,"parentId":"<event-03>","type":"assistant.message","data":{"synthetic":true},"agentId":"<agent>"}
+{"id":"<event-05>","timestamp":5,"parentId":"<event-04>","type":"assistant.turn_end","data":{"synthetic":true}}
+{"id":"<event-06>","timestamp":6,"parentId":"<event-05>","type":"hook.start","data":{"synthetic":true}}
+{"id":"<event-07>","timestamp":7,"parentId":"<event-06>","type":"hook.end","data":{"synthetic":true}}
+{"id":"<event-08>","timestamp":8,"parentId":"<event-07>","type":"session.resume","data":{"synthetic":true}}
+{"id":"<event-09>","timestamp":9,"parentId":"<event-08>","type":"session.shutdown","data":{"synthetic":true}}

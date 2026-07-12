@@ -111,6 +111,44 @@ fn transcript_inspection_reports_only_structural_metrics() {
 }
 
 #[test]
+fn committed_transcript_fixture_has_expected_envelope_and_discriminators() {
+    let transcript = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/copilot-1.0.70/transcript/synthetic-envelope.jsonl");
+
+    let report = inspect_transcript(&transcript, &BTreeSet::from(["type".to_owned()])).unwrap();
+
+    assert_eq!(report.bytes, 986);
+    assert_eq!(report.bytes, fs::metadata(&transcript).unwrap().len());
+    assert_eq!(report.lines, 9);
+    assert_eq!(report.json_valid_lines, 9);
+    assert_eq!(
+        report.top_level_key_frequency,
+        BTreeMap::from([
+            ("agentId".to_owned(), 1),
+            ("data".to_owned(), 9),
+            ("id".to_owned(), 9),
+            ("parentId".to_owned(), 9),
+            ("timestamp".to_owned(), 9),
+            ("type".to_owned(), 9),
+        ])
+    );
+    assert_eq!(
+        report.discriminator_value_counts["type"],
+        BTreeMap::from([
+            ("\"assistant.message\"".to_owned(), 1),
+            ("\"assistant.turn_end\"".to_owned(), 1),
+            ("\"assistant.turn_start\"".to_owned(), 1),
+            ("\"hook.end\"".to_owned(), 1),
+            ("\"hook.start\"".to_owned(), 1),
+            ("\"session.resume\"".to_owned(), 1),
+            ("\"session.shutdown\"".to_owned(), 1),
+            ("\"session.start\"".to_owned(), 1),
+            ("\"user.message\"".to_owned(), 1),
+        ])
+    );
+}
+
+#[test]
 fn fake_summary_executable_receives_stdin_and_returns_valid_json() {
     let directory = test_directory();
     let script = executable_script(
@@ -272,6 +310,7 @@ fn committed_live_fixtures_contain_only_allowlisted_sanitized_values() {
         "noninteractive/session-end.json",
         "resumed/agent-stop.json",
         "resumed/session-end.json",
+        "transcript/synthetic-envelope.jsonl",
     ];
     let relative: Vec<_> = files
         .iter()
@@ -289,8 +328,18 @@ fn committed_live_fixtures_contain_only_allowlisted_sanitized_values() {
         assert!(!contents.contains("/Users/"));
         assert!(!contents.contains("/home/"));
         assert!(!contents.contains("surdy"));
-        let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_sanitized_strings(&value);
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            for line in contents.lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_sanitized_strings(&value);
+            }
+        } else {
+            let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert_sanitized_strings(&value);
+        }
     }
 }
 
@@ -320,7 +369,29 @@ fn assert_sanitized_strings(value: &serde_json::Value) {
         serde_json::Value::String(value) => assert!(
             matches!(
                 value.as_str(),
-                "<redacted>" | "end_turn" | "complete" | "user_exit"
+                "<redacted>"
+                    | "<agent>"
+                    | "<event-01>"
+                    | "<event-02>"
+                    | "<event-03>"
+                    | "<event-04>"
+                    | "<event-05>"
+                    | "<event-06>"
+                    | "<event-07>"
+                    | "<event-08>"
+                    | "<event-09>"
+                    | "assistant.message"
+                    | "assistant.turn_end"
+                    | "assistant.turn_start"
+                    | "complete"
+                    | "end_turn"
+                    | "hook.end"
+                    | "hook.start"
+                    | "session.resume"
+                    | "session.shutdown"
+                    | "session.start"
+                    | "user.message"
+                    | "user_exit"
             ),
             "unexpected fixture string value"
         ),
