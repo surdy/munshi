@@ -31,7 +31,7 @@ fn disclosure_requires_explicit_noninteractive_acceptance_and_prompt_is_testable
 }
 
 #[test]
-fn register_and_unregister_are_idempotent_and_preserve_unrelated_files() {
+fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
     fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
