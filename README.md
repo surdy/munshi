@@ -628,28 +628,40 @@ full user-editable global TOML file and environment-variable overrides remain la
 
 ## Notesmith delivery
 
-Notesmith already exposes a suitable JSON API:
+Notesmith's create route assembles a note from a separate `frontmatter` map plus a body-only
+`content` field, so Munshi sends the durable summary **body only** as `content` (the local archive's
+own frontmatter is stripped) and supplies its Munshi-owned identity frontmatter separately:
 
 ```http
 POST /api/v/{vault}/notes
 Content-Type: application/json
 
 {
-  "title": "Implement session archival",
-  "folder": "Agent Sessions/munshi",
+  "title": "copilot-abc123",
+  "folder": "Agent Sessions/munshi-<hash>",
   "content": "# Implement session archival\n...",
   "frontmatter": {
-    "id": "copilot:abc123",
-    "agent": "copilot-cli",
-    "summary_revision": 1
+    "munshi_session": "abc123",
+    "munshi_source": "copilot",
+    "munshi_project": "github.com/owner/repo",
+    "munshi_revision": 1
   }
 }
 ```
 
-An existing note is replaced through the Notesmith note update endpoint using its returned path.
-Munshi persists the returned note path, the delivered summary revision, and the last summary hash
-in SQLite (schema-version 3 `deliveries` table). Because Munshi owns delivered notes, the replace
-is sent without `expected_hash` so a later revision overwrites any remote edits.
+An existing note is replaced through the Notesmith update endpoint using its returned path. Unlike
+create, the update endpoint writes the request `content` verbatim, so Munshi sends a **complete,
+single-frontmatter-block document** (identity frontmatter plus body) on replace — the
+`munshi_session`/`munshi_source`/`munshi_project`/`munshi_revision` fields therefore stay present
+and update on every revision. Munshi persists the returned note path, the delivered summary
+revision, and the last summary hash in SQLite (schema-version 3 `deliveries` table). Because Munshi
+owns delivered notes, the replace is sent without `expected_hash` so a later revision overwrites any
+remote edits.
+
+Notesmith itself is unauthenticated and defers authentication to a reverse proxy (notes-method
+ADR 0010). When a credential source is configured, Munshi resolves a bearer token at delivery time
+and sends `Authorization: Bearer <token>`; the token is never written to configuration, logged, or
+echoed in any diagnostic.
 
 Notes are routed by stable identity, not by the mutable summary title: a note is filed under
 `<folder>/<origin-project-component>/` with the stable filename `<source>-<session-id>.md`, so the

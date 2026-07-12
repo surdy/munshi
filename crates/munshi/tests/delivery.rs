@@ -5,6 +5,7 @@
 //! prevention, backfill dry run/confirmation, and — crucially — that local archival is fully
 //! independent of delivery success.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,11 +15,15 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
+use munshi::{CompletionReason, SourceKind, StateStore, run_archive_worker_for_source};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const VAULT: &str = "work";
+const TOKEN_ENV: &str = "MUNSHI_TEST_DELIVERY_TOKEN";
+const CLAUDE_SESSION: &str = "0c1a0de0-0000-4000-8000-000000000001";
 
 #[test]
 fn backfill_dry_run_reports_candidates_without_contacting_the_sink() {
@@ -73,6 +78,7 @@ fn backfill_confirm_creates_then_replaces_the_same_note() {
 
     // A newer summary revision replaces the persisted note in place (worker auto-delivers).
     harness.revise_session(SESSION_A, &transcript, "GOAL_TWO", "answer two");
+    harness.wait_for_delivered_revision(SESSION_A, 2);
 
     assert_eq!(
         server.note_count(),
@@ -106,6 +112,7 @@ fn replace_overwrites_remote_edits() {
     server.set_note_body(&note_path, "---\ntitle: hand edited\n---\nlocal edit");
 
     harness.revise_session(SESSION_A, &transcript, "GOAL_TWO", "answer two");
+    harness.wait_for_delivered_revision(SESSION_A, 2);
 
     let body = server.note_body(&note_path).expect("note present");
     assert!(
@@ -126,6 +133,7 @@ fn outage_never_rolls_back_local_archive_and_retry_recovers() {
     // Deliver during a total outage: the archive must still succeed locally.
     server.set_outage(true);
     let _ = harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivery_failed(SESSION_A);
 
     let show = harness.show_json(SESSION_A);
     assert_eq!(
@@ -229,6 +237,194 @@ fn disabled_project_stops_future_delivery_but_retains_history() {
     assert_eq!(server.note_count(), 1);
 }
 
+#[test]
+fn bearer_token_is_required_and_never_leaked() {
+    let token = "s3cr3t-delivery-token-value";
+    let harness = Harness::new();
+    let server = FakeNotesmith::start_requiring_token(token);
+    harness.register();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.configure_with_credential(&server.endpoint());
+    harness.enable();
+
+    // A wrong token is rejected with an exact-match 401; nothing is delivered.
+    harness.set_token(Some("wrong-token"));
+    let bad = harness.delivery_backfill_json(true);
+    assert_eq!(bad["created"], 0);
+    assert_eq!(bad["failed"], 1);
+    assert!(server.unauthorized_count() >= 1);
+    assert_eq!(server.note_count(), 0);
+
+    // The exact bearer token is accepted and the note is delivered.
+    harness.set_token(Some(token));
+    let good = harness.delivery_retry_all_json(false);
+    assert_eq!(good["created"], 1);
+    assert_eq!(server.note_count(), 1);
+    assert_eq!(
+        server.last_auth().as_deref(),
+        Some(format!("Bearer {token}").as_str())
+    );
+
+    // The credential never appears in operational output or diagnostics.
+    assert!(!harness.delivery_status_json().to_string().contains(token));
+    assert!(!harness.show_json(SESSION_A).to_string().contains(token));
+}
+
+#[test]
+fn create_then_replace_keeps_one_frontmatter_block_with_updated_identity() {
+    let harness = Harness::new();
+    let server = FakeNotesmith::start();
+    harness.register();
+    let transcript = harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.configure(&server.endpoint());
+    harness.enable();
+    assert_eq!(harness.delivery_backfill_json(true)["created"], 1);
+
+    let note_path = harness.delivery_status_json()["items"][0]["note_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let created = server.note_body(&note_path).unwrap();
+    assert_eq!(
+        frontmatter_block_count(&created),
+        1,
+        "create must not stack a second frontmatter block:\n{created}"
+    );
+    assert!(created.contains("munshi_session: \"11111111"));
+    assert!(created.contains("munshi_revision: 1"));
+    assert!(created.contains("# Contract summary title"));
+    // The archive's own frontmatter must not leak into the delivered note body.
+    assert!(!created.contains("schema_version"));
+
+    harness.revise_session(SESSION_A, &transcript, "GOAL_TWO", "answer two");
+    harness.wait_for_delivered_revision(SESSION_A, 2);
+    let replaced = server.note_body(&note_path).unwrap();
+    assert_eq!(
+        frontmatter_block_count(&replaced),
+        1,
+        "replace must write exactly one frontmatter block:\n{replaced}"
+    );
+    assert!(replaced.contains("munshi_session: \"11111111"));
+    assert!(
+        replaced.contains("munshi_revision: 2"),
+        "munshi_* identity must persist and update on every revision:\n{replaced}"
+    );
+    assert!(replaced.contains("# Contract summary title"));
+}
+
+#[test]
+fn backfill_is_idempotent_across_claude_and_copilot_sources() {
+    let harness = Harness::new();
+    let server = FakeNotesmith::start();
+    harness.register();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.archive_claude_session(CLAUDE_SESSION);
+    harness.configure(&server.endpoint());
+    harness.enable();
+
+    let run = harness.delivery_backfill_json(true);
+    assert_eq!(run["candidates"], 2, "both sources are backfill candidates");
+    assert_eq!(run["created"], 2);
+    assert_eq!(server.note_count(), 2);
+
+    // A second confirmed backfill must be idempotent for BOTH sources. Regression: a Copilot-scoped
+    // delivery lookup previously hid Claude/Codex rows and re-delivered them every backfill.
+    let again = harness.delivery_backfill_json(true);
+    assert_eq!(
+        again["candidates"], 0,
+        "already-delivered sources are skipped"
+    );
+    assert_eq!(server.note_count(), 2);
+    assert_eq!(harness.delivery_status_json()["delivered"], 2);
+}
+
+#[test]
+fn retry_all_recovers_a_failed_claude_delivery() {
+    let harness = Harness::new();
+    let server = FakeNotesmith::start();
+    harness.register();
+    harness.configure(&server.endpoint());
+    harness.enable();
+
+    // The worker auto-delivers the Claude archive during an outage, leaving a failed delivery.
+    server.set_outage(true);
+    harness.archive_claude_session(CLAUDE_SESSION);
+    server.set_outage(false);
+
+    assert_eq!(harness.delivery_status_json()["failed"], 1);
+
+    // Regression: a Copilot-scoped candidate lookup never selected non-Copilot failed rows, so
+    // retry could never recover a Claude/Codex delivery.
+    let retry = harness.delivery_retry_all_json(false);
+    assert_eq!(retry["created"], 1);
+    assert_eq!(server.note_count(), 1);
+    assert_eq!(harness.delivery_status_json()["delivered"], 1);
+}
+
+#[test]
+fn reset_delivery_for_retry_is_scoped_to_endpoint_and_vault() {
+    let harness = Harness::new();
+    harness.register();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+
+    let endpoint = "http://127.0.0.1:1";
+    let future = 4_000_000_000_000_i64;
+    let mut store = harness.open_state();
+    store
+        .ensure_delivery_target(SESSION_A, endpoint, "vault-a")
+        .unwrap();
+    store
+        .ensure_delivery_target(SESSION_A, endpoint, "vault-b")
+        .unwrap();
+    store
+        .record_delivery_failure(
+            SESSION_A,
+            endpoint,
+            "vault-a",
+            "delivery-transport",
+            5,
+            future,
+        )
+        .unwrap();
+    store
+        .record_delivery_failure(
+            SESSION_A,
+            endpoint,
+            "vault-b",
+            "delivery-transport",
+            5,
+            future,
+        )
+        .unwrap();
+
+    // Resetting one vault must not touch the same endpoint's other vault row.
+    store
+        .reset_delivery_for_retry(SESSION_A, endpoint, "vault-a", true)
+        .unwrap();
+    let vault_a = store
+        .get_delivery(SESSION_A, endpoint, "vault-a")
+        .unwrap()
+        .unwrap();
+    let vault_b = store
+        .get_delivery(SESSION_A, endpoint, "vault-b")
+        .unwrap()
+        .unwrap();
+    assert_eq!(vault_a.delivery_state, "pending");
+    assert_eq!(
+        vault_b.delivery_state, "failed",
+        "the same endpoint's other vault row must be untouched"
+    );
+}
+
+/// Counts the number of complete YAML frontmatter blocks in a note document.
+fn frontmatter_block_count(document: &str) -> usize {
+    document
+        .lines()
+        .filter(|line| line.trim_end() == "---")
+        .count()
+        / 2
+}
+
 // ---------------------------------------------------------------------------
 // Fake Notesmith daemon
 // ---------------------------------------------------------------------------
@@ -236,6 +432,9 @@ fn disabled_project_stops_future_delivery_but_retains_history() {
 struct FakeState {
     notes: HashMap<String, String>,
     requests: usize,
+    unauthorized: usize,
+    required_token: Option<String>,
+    last_auth: Option<String>,
 }
 
 struct FakeNotesmith {
@@ -246,11 +445,22 @@ struct FakeNotesmith {
 
 impl FakeNotesmith {
     fn start() -> Self {
+        Self::start_inner(None)
+    }
+
+    fn start_requiring_token(token: &str) -> Self {
+        Self::start_inner(Some(token.to_owned()))
+    }
+
+    fn start_inner(required_token: Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(FakeState {
             notes: HashMap::new(),
             requests: 0,
+            unauthorized: 0,
+            required_token,
+            last_auth: None,
         }));
         let outage = Arc::new(AtomicBool::new(false));
         let thread_state = Arc::clone(&state);
@@ -284,6 +494,14 @@ impl FakeNotesmith {
         self.state.lock().unwrap().requests
     }
 
+    fn unauthorized_count(&self) -> usize {
+        self.state.lock().unwrap().unauthorized
+    }
+
+    fn last_auth(&self) -> Option<String> {
+        self.state.lock().unwrap().last_auth.clone()
+    }
+
     fn note_body(&self, path: &str) -> Option<String> {
         self.state.lock().unwrap().notes.get(path).cloned()
     }
@@ -302,7 +520,7 @@ fn handle_connection(
     state: &Arc<Mutex<FakeState>>,
     outage: &Arc<AtomicBool>,
 ) {
-    let Some((method, target, body)) = read_request(&mut stream) else {
+    let Some(request) = read_request(&mut stream) else {
         return;
     };
     if outage.load(Ordering::SeqCst) {
@@ -313,10 +531,40 @@ fn handle_connection(
         return;
     }
     let mut guard = state.lock().unwrap();
+    guard.last_auth = request.auth.clone();
+    // Enforce exact bearer auth when a token is required (reverse-proxy trust model).
+    if let Some(required) = guard.required_token.clone() {
+        let expected = format!("Bearer {required}");
+        if request.auth.as_deref() != Some(expected.as_str()) {
+            guard.unauthorized += 1;
+            drop(guard);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        }
+    }
     guard.requests += 1;
-    let response = route(&method, &target, &body, &mut guard);
+    let response = route(&request.method, &request.target, &request.body, &mut guard);
     drop(guard);
     let _ = stream.write_all(response.as_bytes());
+}
+
+/// Reproduces Notesmith's create note assembly: a single YAML frontmatter block built from the
+/// request's `frontmatter` map, followed by the request `content` (body only).
+fn build_note_document(frontmatter: &Value, content: &str) -> String {
+    let mut yaml = String::new();
+    if let Some(map) = frontmatter.as_object() {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for key in keys {
+            match &map[key] {
+                Value::Number(number) => yaml.push_str(&format!("{key}: {number}\n")),
+                value => yaml.push_str(&format!("{key}: \"{}\"\n", value.as_str().unwrap_or(""))),
+            }
+        }
+    }
+    format!("---\n{yaml}---\n{content}\n")
 }
 
 fn route(method: &str, target: &str, body: &str, state: &mut FakeState) -> String {
@@ -326,7 +574,11 @@ fn route(method: &str, target: &str, body: &str, state: &mut FakeState) -> Strin
         let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let folder = payload["folder"].as_str().unwrap_or("");
         let title = payload["title"].as_str().unwrap_or("note");
-        let content = payload["content"].as_str().unwrap_or("").to_owned();
+        // Notesmith assembles the stored document from the body plus a separate frontmatter map.
+        let document = build_note_document(
+            &payload["frontmatter"],
+            payload["content"].as_str().unwrap_or(""),
+        );
         let path = if folder.is_empty() {
             format!("{title}.md")
         } else {
@@ -335,13 +587,14 @@ fn route(method: &str, target: &str, body: &str, state: &mut FakeState) -> Strin
         if state.notes.contains_key(&path) {
             return json_response(409, &json!({ "error": "exists" }));
         }
-        let hash = simple_hash(&content);
-        state.notes.insert(path.clone(), content);
+        let hash = simple_hash(&document);
+        state.notes.insert(path.clone(), document);
         return json_response(201, &json!({ "path": path, "hash": hash }));
     }
     if method == "PUT" && target.starts_with(&format!("{prefix}/")) {
         let path = decode(&target[prefix.len() + 1..]);
         let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        // PUT writes the complete document Munshi sends, verbatim.
         let content = payload["content"].as_str().unwrap_or("").to_owned();
         if !state.notes.contains_key(&path) {
             return json_response(404, &json!({ "error": "not found" }));
@@ -358,6 +611,7 @@ fn json_response(status: u16, value: &Value) -> String {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
         _ => "Status",
@@ -368,7 +622,14 @@ fn json_response(status: u16, value: &Value) -> String {
     )
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
+struct FakeRequest {
+    method: String,
+    target: String,
+    body: String,
+    auth: Option<String>,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
     let header_end = loop {
@@ -391,9 +652,15 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
     let method = parts.next()?.to_owned();
     let target = parts.next()?.to_owned();
     let mut content_length = 0usize;
+    let mut auth = None;
     for line in lines {
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("authorization:") {
+            auth = line
+                .split_once(':')
+                .map(|(_, value)| value.trim().to_owned());
         }
     }
     let mut body = buffer[header_end + 4..].to_vec();
@@ -405,7 +672,12 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(content_length);
-    Some((method, target, String::from_utf8_lossy(&body).into_owned()))
+    Some(FakeRequest {
+        method,
+        target,
+        body: String::from_utf8_lossy(&body).into_owned(),
+        auth,
+    })
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -454,6 +726,7 @@ struct Harness {
     state: PathBuf,
     output: PathBuf,
     project: PathBuf,
+    token: RefCell<Option<String>>,
 }
 
 impl Harness {
@@ -491,11 +764,27 @@ impl Harness {
             copilot_home,
             project,
             directory,
+            token: RefCell::new(None),
         }
     }
 
+    /// Sets the bearer token the CLI should present, delivered through the credential env var so it
+    /// is never written to configuration.
+    fn set_token(&self, token: Option<&str>) {
+        *self.token.borrow_mut() = token.map(ToOwned::to_owned);
+    }
+
     fn munshi(&self) -> Command {
-        Command::new(env!("CARGO_BIN_EXE_munshi"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
+        match self.token.borrow().as_deref() {
+            Some(token) => {
+                command.env(TOKEN_ENV, token);
+            }
+            None => {
+                command.env_remove(TOKEN_ENV);
+            }
+        }
+        command
     }
 
     fn register(&self) {
@@ -527,6 +816,26 @@ impl Harness {
             .args(["delivery", "configure", "--endpoint"])
             .arg(endpoint)
             .args(["--vault", VAULT, "--folder", folder])
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+
+    fn configure_with_credential(&self, endpoint: &str) {
+        let output = self
+            .munshi()
+            .args(["delivery", "configure", "--endpoint"])
+            .arg(endpoint)
+            .args([
+                "--vault",
+                VAULT,
+                "--folder",
+                "Munshi",
+                "--credential-env",
+                TOKEN_ENV,
+            ])
             .arg("--copilot-home")
             .arg(&self.copilot_home)
             .output()
@@ -681,6 +990,82 @@ impl Harness {
         self.agent_stop(session_id, transcript, 20_000);
         self.session_end(session_id, 20_001);
         assert_success(&self.wait(session_id));
+    }
+
+    /// Archives a Claude Code session through the source-neutral library pipeline (ingest +
+    /// worker), so delivery can be exercised across more than one source. Uses the shared
+    /// `run_archive_worker_for_source` path the CLI drives for non-Copilot sources.
+    fn archive_claude_session(&self, session_id: &str) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/claude-code-2.1.44/normal")
+            .join(format!("{session_id}.jsonl"));
+        let transcript_dir = self.state.parent().unwrap().join("claude-transcripts");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join(format!("{session_id}.jsonl"));
+        std::fs::copy(&fixture, &transcript).unwrap();
+
+        {
+            let mut store =
+                StateStore::open_for_source(&self.state, SourceKind::ClaudeCode).unwrap();
+            store
+                .ingest_agent_stop(session_id, 30_000, &self.project, &transcript)
+                .unwrap();
+            store
+                .ingest_session_end(
+                    session_id,
+                    30_001,
+                    &self.project,
+                    "complete",
+                    CompletionReason::Complete,
+                    None,
+                )
+                .unwrap();
+        }
+        run_archive_worker_for_source(&self.state, SourceKind::ClaudeCode, session_id).unwrap();
+        // Confirm the Claude session archived locally regardless of any delivery outcome.
+        let store = StateStore::open_for_source(&self.state, SourceKind::ClaudeCode).unwrap();
+        let record = store.get_session(session_id).unwrap().unwrap();
+        assert_eq!(record.lifecycle_state, "archived");
+    }
+
+    fn open_state(&self) -> StateStore {
+        StateStore::open(&self.state)
+            .or_else(|_| StateStore::open_for_source(&self.state, SourceKind::Copilot))
+            .unwrap()
+    }
+
+    /// Delivery is best-effort and runs *after* a session is marked archived, so a `hook wait`
+    /// can return before delivery settles. These waiters let assertions observe the settled
+    /// delivery outcome deterministically.
+    fn wait_for_delivery_failed(&self, session_id: &str) {
+        self.wait_for_delivery(session_id, |item| item["state"] == "failed");
+    }
+
+    fn wait_for_delivered_revision(&self, session_id: &str, revision: u64) {
+        self.wait_for_delivery(session_id, |item| {
+            item["state"] == "delivered" && item["delivered_revision"] == revision
+        });
+    }
+
+    fn wait_for_delivery(&self, session_id: &str, predicate: impl Fn(&Value) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = self.delivery_status_json();
+            if let Some(items) = status["items"].as_array()
+                && items
+                    .iter()
+                    .any(|item| item["session_id"] == session_id && predicate(item))
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for delivery of {session_id}; status={}",
+                    status
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn hook(&self, event: &str, payload: &Value) -> Output {
