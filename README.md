@@ -10,7 +10,10 @@ rendering, or delivery to one vendor.
 
 ## Status
 
-This repository currently contains the implementation plan. No production code exists yet.
+The workspace includes the Phase 0 `munshi-probe` compatibility tool and a production-facing
+`munshi archive` manual path for one Copilot session. Hook registration, SQLite-backed revisions,
+recovery, and remote delivery remain later slices. See
+[`docs/manual-archive.md`](docs/manual-archive.md) for safe usage and current boundaries.
 
 ## Goals
 

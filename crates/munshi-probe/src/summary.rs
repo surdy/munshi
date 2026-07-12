@@ -1,13 +1,9 @@
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
-use std::os::unix::process::CommandExt;
+use std::io;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use munshi_runner::{RunnerConfig, RunnerError, run_bounded};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -56,92 +52,19 @@ pub fn run_summary_probe(
     config: &SummaryProbeConfig,
     input: Vec<u8>,
 ) -> Result<Phase0Summary, SummaryProbeError> {
-    let mut command = Command::new(&config.binary);
-    command
-        .args(&config.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-
-    let mut child = command.spawn().map_err(SummaryProbeError::Spawn)?;
-    let pid = child.id();
-    let mut stdin = child.stdin.take().expect("piped stdin is available");
-    let stdout = child.stdout.take().expect("piped stdout is available");
-    let stderr = child.stderr.take().expect("piped stderr is available");
-
-    let stdin_worker = thread::spawn(move || {
-        let result = stdin.write_all(&input);
-        drop(stdin);
-        result
-    });
-    let stdout_exceeded = Arc::new(AtomicBool::new(false));
-    let stderr_exceeded = Arc::new(AtomicBool::new(false));
-    let stdout_worker = spawn_bounded_reader(stdout, config.stdout_limit, stdout_exceeded.clone());
-    let stderr_worker = spawn_bounded_reader(stderr, config.stderr_limit, stderr_exceeded.clone());
-
-    let started = Instant::now();
-    let status = loop {
-        if stdout_exceeded.load(Ordering::Relaxed) {
-            terminate_process_group(&mut child, pid);
-            let (_stdin, _stdout, _stderr) =
-                join_workers(stdin_worker, stdout_worker, stderr_worker)?;
-            return Err(SummaryProbeError::OutputLimit {
-                stream: "stdout",
-                limit: config.stdout_limit,
-            });
-        }
-        if stderr_exceeded.load(Ordering::Relaxed) {
-            terminate_process_group(&mut child, pid);
-            let (_stdin, _stdout, _stderr) =
-                join_workers(stdin_worker, stdout_worker, stderr_worker)?;
-            return Err(SummaryProbeError::OutputLimit {
-                stream: "stderr",
-                limit: config.stderr_limit,
-            });
-        }
-        if started.elapsed() >= config.timeout {
-            terminate_process_group(&mut child, pid);
-            let (_stdin, _stdout, _stderr) =
-                join_workers(stdin_worker, stdout_worker, stderr_worker)?;
-            return Err(SummaryProbeError::Timeout(config.timeout));
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(error) => {
-                terminate_process_group(&mut child, pid);
-                let (_stdin, _stdout, _stderr) =
-                    join_workers(stdin_worker, stdout_worker, stderr_worker)?;
-                return Err(SummaryProbeError::Io(error));
-            }
-        }
-    };
-
-    kill_remaining_group(pid);
-    let (stdin_result, stdout, stderr) = join_workers(stdin_worker, stdout_worker, stderr_worker)?;
-    if let Err(error) = stdin_result {
-        if error.kind() != io::ErrorKind::BrokenPipe {
-            return Err(SummaryProbeError::Io(error));
-        }
-    }
-    if stdout.exceeded {
-        return Err(SummaryProbeError::OutputLimit {
-            stream: "stdout",
-            limit: config.stdout_limit,
-        });
-    }
-    if stderr.exceeded {
-        return Err(SummaryProbeError::OutputLimit {
-            stream: "stderr",
-            limit: config.stderr_limit,
-        });
-    }
-    validate_exit(status, stderr.bytes.len())?;
-
+    let stdout = run_bounded(
+        &RunnerConfig {
+            binary: config.binary.clone(),
+            args: config.args.clone(),
+            timeout: config.timeout,
+            stdout_limit: config.stdout_limit,
+            stderr_limit: config.stderr_limit,
+        },
+        input,
+    )
+    .map_err(map_runner_error)?;
     let result: Phase0Summary =
-        serde_json::from_slice(&stdout.bytes).map_err(SummaryProbeError::MalformedJson)?;
+        serde_json::from_slice(&stdout).map_err(SummaryProbeError::MalformedJson)?;
     let normalized = Phase0Summary {
         title: result.title.trim().to_owned(),
         summary: result.summary.trim().to_owned(),
@@ -151,65 +74,18 @@ pub fn run_summary_probe(
     Ok(normalized)
 }
 
-struct BoundedRead {
-    bytes: Vec<u8>,
-    exceeded: bool,
-}
-
-type ReaderWorker = thread::JoinHandle<io::Result<BoundedRead>>;
-type StdinWorker = thread::JoinHandle<io::Result<()>>;
-
-fn spawn_bounded_reader(
-    mut reader: impl Read + Send + 'static,
-    limit: usize,
-    exceeded: Arc<AtomicBool>,
-) -> ReaderWorker {
-    thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
-        let mut buffer = [0_u8; 8 * 1024];
-        let mut hit_limit = false;
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            let remaining = limit.saturating_sub(bytes.len());
-            bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-            if count > remaining {
-                hit_limit = true;
-                exceeded.store(true, Ordering::Relaxed);
-            }
+fn map_runner_error(error: RunnerError) -> SummaryProbeError {
+    match error {
+        RunnerError::Spawn(error) => SummaryProbeError::Spawn(error),
+        RunnerError::Io(error) => SummaryProbeError::Io(error),
+        RunnerError::Timeout(timeout) => SummaryProbeError::Timeout(timeout),
+        RunnerError::OutputLimit { stream, limit } => {
+            SummaryProbeError::OutputLimit { stream, limit }
         }
-        Ok(BoundedRead {
-            bytes,
-            exceeded: hit_limit,
-        })
-    })
-}
-
-fn join_workers(
-    stdin: StdinWorker,
-    stdout: ReaderWorker,
-    stderr: ReaderWorker,
-) -> Result<(io::Result<()>, BoundedRead, BoundedRead), SummaryProbeError> {
-    let stdin = stdin.join().map_err(|_| SummaryProbeError::WorkerPanic)?;
-    let stdout = stdout
-        .join()
-        .map_err(|_| SummaryProbeError::WorkerPanic)??;
-    let stderr = stderr
-        .join()
-        .map_err(|_| SummaryProbeError::WorkerPanic)??;
-    Ok((stdin, stdout, stderr))
-}
-
-fn validate_exit(status: ExitStatus, stderr_bytes: usize) -> Result<(), SummaryProbeError> {
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SummaryProbeError::NonZeroExit {
-            code: status.code(),
-            stderr_bytes,
-        })
+        RunnerError::NonZeroExit { code, stderr_bytes } => {
+            SummaryProbeError::NonZeroExit { code, stderr_bytes }
+        }
+        RunnerError::WorkerPanic => SummaryProbeError::WorkerPanic,
     }
 }
 
@@ -219,18 +95,5 @@ fn validate_field(field: &'static str, value: &str, max: usize) -> Result<(), Su
         Err(SummaryProbeError::InvalidShape { field, max })
     } else {
         Ok(())
-    }
-}
-
-fn terminate_process_group(child: &mut Child, pid: u32) {
-    kill_remaining_group(pid);
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn kill_remaining_group(pid: u32) {
-    // The child starts a fresh process group, so a negative PID targets it and its descendants.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }

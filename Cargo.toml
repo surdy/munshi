@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/munshi-probe"]
+members = ["crates/munshi", "crates/munshi-probe", "crates/munshi-runner"]
 resolver = "3"
 
 [workspace.package]
@@ -10,8 +10,10 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 clap = { version = "4.5.41", features = ["derive"] }
+chrono = { version = "0.4.41", default-features = false, features = ["std"] }
 libc = "0.2.174"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.141"
+sha2 = "0.10.9"
 tempfile = "3.20.0"
 thiserror = "2.0.12"

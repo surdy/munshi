@@ -1,14 +1,19 @@
 [package]
-name = "munshi-probe"
+name = "munshi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
 munshi-runner = { path = "../munshi-runner" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,3 @@
+{"id":"33333333-0000-4000-8000-000000000001","timestamp":"2026-07-12T00:00:00.000Z","parentId":null,"type":"user.message","data":{"content":"This transcript is intentionally malformed."}}
+this is not json
+{"id":"33333333-0000-4000-8000-000000000003","timestamp":"2026-07-12T00:00:02.000Z","parentId":"33333333-0000-4000-8000-000000000001","type":"assistant.message","data":{"content":"This line must not make the session archiveable.","messageId":"33333333-0000-4000-8000-000000000004"}}

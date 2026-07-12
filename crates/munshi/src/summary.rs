@@ -1,0 +1,201 @@
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use munshi_runner::{RunnerConfig, RunnerError, run_bounded};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::project::ProjectIdentity;
+use crate::source::NormalizedSession;
+
+const TITLE_LIMIT: usize = 200;
+const GOAL_LIMIT: usize = 4_000;
+const ITEM_LIMIT: usize = 4_000;
+const TAG_LIMIT: usize = 100;
+const LIST_LIMIT: usize = 200;
+
+#[derive(Debug, Clone)]
+pub struct SummarizerConfig {
+    pub binary: PathBuf,
+    pub args: Vec<OsString>,
+    pub timeout: Duration,
+    pub stdout_limit: usize,
+    pub stderr_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredSummary {
+    pub title: String,
+    pub goal: String,
+    pub work_completed: Vec<String>,
+    pub decisions: Vec<String>,
+    pub files_changed: Vec<String>,
+    pub commands_and_validation: Vec<String>,
+    pub open_items: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SummaryRequest<'a> {
+    instruction: &'static str,
+    required_schema: RequiredSchema,
+    session: SummarySession<'a>,
+    events: &'a [crate::source::NormalizedEvent],
+    ignored_unknown_event_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RequiredSchema {
+    title: &'static str,
+    goal: &'static str,
+    work_completed: &'static str,
+    decisions: &'static str,
+    files_changed: &'static str,
+    commands_and_validation: &'static str,
+    open_items: &'static str,
+    tags: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SummarySession<'a> {
+    id: String,
+    source_agent: &'static str,
+    session_id: &'a str,
+    project_identity: &'a str,
+    repository: Option<&'a str>,
+}
+
+#[derive(Debug, Error)]
+pub enum SummaryError {
+    #[error("failed to construct summarizer input")]
+    InputSerialization(#[source] serde_json::Error),
+    #[error("normalized summarizer input exceeds the configured {limit}-byte limit")]
+    InputLimit { limit: usize },
+    #[error(transparent)]
+    Runner(#[from] RunnerError),
+    #[error("summary stdout was not one valid JSON object")]
+    MalformedJson(#[source] serde_json::Error),
+    #[error("summary field {field} must contain between 1 and {max} characters")]
+    InvalidText { field: &'static str, max: usize },
+    #[error("summary list {field} exceeds its {max}-item limit")]
+    InvalidListLength { field: &'static str, max: usize },
+    #[error("summary list {field} must contain at least one item")]
+    MissingListItems { field: &'static str },
+}
+
+pub fn build_summary_input(
+    session: &NormalizedSession,
+    project: &ProjectIdentity,
+    input_limit: usize,
+) -> Result<Vec<u8>, SummaryError> {
+    let request = SummaryRequest {
+        instruction: concat!(
+            "Summarize this coding session as exactly one JSON object matching required_schema. ",
+            "Return every required field. Capture goals, meaningful completed work, decisions, ",
+            "files changed, commands and validation, and open items. Do not quote prompts, raw ",
+            "tool output, secrets, or substantial code. Use concise strings and arrays of strings. ",
+            "Return JSON only, with no Markdown fence or commentary."
+        ),
+        required_schema: RequiredSchema {
+            title: "non-empty string",
+            goal: "non-empty string",
+            work_completed: "array of strings",
+            decisions: "array of strings",
+            files_changed: "array of strings",
+            commands_and_validation: "array of strings",
+            open_items: "array of strings",
+            tags: "array of strings",
+        },
+        session: SummarySession {
+            id: format!("copilot:{}", session.session_id),
+            source_agent: "copilot-cli",
+            session_id: &session.session_id,
+            project_identity: &project.identity,
+            repository: project.repository.as_deref(),
+        },
+        events: &session.events,
+        ignored_unknown_event_count: session.ignored_events,
+    };
+    let bytes = serde_json::to_vec(&request).map_err(SummaryError::InputSerialization)?;
+    if bytes.len() > input_limit {
+        return Err(SummaryError::InputLimit { limit: input_limit });
+    }
+    Ok(bytes)
+}
+
+pub fn run_summary(
+    config: &SummarizerConfig,
+    input: Vec<u8>,
+) -> Result<StructuredSummary, SummaryError> {
+    let stdout = run_bounded(
+        &RunnerConfig {
+            binary: config.binary.clone(),
+            args: config.args.clone(),
+            timeout: config.timeout,
+            stdout_limit: config.stdout_limit,
+            stderr_limit: config.stderr_limit,
+        },
+        input,
+    )?;
+    let summary: StructuredSummary =
+        serde_json::from_slice(&stdout).map_err(SummaryError::MalformedJson)?;
+    validate_summary(summary)
+}
+
+fn validate_summary(mut summary: StructuredSummary) -> Result<StructuredSummary, SummaryError> {
+    summary.title = validate_text("title", summary.title, TITLE_LIMIT, true)?;
+    summary.goal = validate_text("goal", summary.goal, GOAL_LIMIT, false)?;
+    summary.work_completed = validate_list("work_completed", summary.work_completed, ITEM_LIMIT)?;
+    if summary.work_completed.is_empty() {
+        return Err(SummaryError::MissingListItems {
+            field: "work_completed",
+        });
+    }
+    summary.decisions = validate_list("decisions", summary.decisions, ITEM_LIMIT)?;
+    summary.files_changed = validate_list("files_changed", summary.files_changed, ITEM_LIMIT)?;
+    summary.commands_and_validation = validate_list(
+        "commands_and_validation",
+        summary.commands_and_validation,
+        ITEM_LIMIT,
+    )?;
+    summary.open_items = validate_list("open_items", summary.open_items, ITEM_LIMIT)?;
+    summary.tags = validate_list("tags", summary.tags, TAG_LIMIT)?;
+    Ok(summary)
+}
+
+fn validate_list(
+    field: &'static str,
+    values: Vec<String>,
+    item_limit: usize,
+) -> Result<Vec<String>, SummaryError> {
+    if values.len() > LIST_LIMIT {
+        return Err(SummaryError::InvalidListLength {
+            field,
+            max: LIST_LIMIT,
+        });
+    }
+    values
+        .into_iter()
+        .map(|value| validate_text(field, value, item_limit, true))
+        .collect()
+}
+
+fn validate_text(
+    field: &'static str,
+    value: String,
+    max: usize,
+    single_line: bool,
+) -> Result<String, SummaryError> {
+    let value = value.trim().replace("\r\n", "\n").replace('\r', "\n");
+    let valid_controls = value
+        .chars()
+        .all(|character| !character.is_control() || matches!(character, '\n' | '\t'));
+    let length = value.chars().count();
+    if length == 0 || length > max || !valid_controls || (single_line && value.contains('\n')) {
+        Err(SummaryError::InvalidText { field, max })
+    } else {
+        Ok(value)
+    }
+}

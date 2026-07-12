@@ -1,0 +1,5 @@
+{"id":"eeeeeeee-0000-4000-8000-000000000001","timestamp":"2026-07-12T00:00:00.000Z","parentId":null,"type":"user.message","data":{"content":"Archive a session containing a future event."}}
+{"id":"eeeeeeee-0000-4000-8000-000000000002","timestamp":"2026-07-12T00:00:01.000Z","parentId":"eeeeeeee-0000-4000-8000-000000000001","type":"future.private_event","data":"unknown event content must never be normalized"}
+{"id":"eeeeeeee-0000-4000-8000-000000000003","timestamp":"2026-07-12T00:00:02.000Z","parentId":"eeeeeeee-0000-4000-8000-000000000002","type":"assistant.message","data":"malformed known event content must be ignored"}
+{"id":"eeeeeeee-0000-4000-8000-000000000004","timestamp":"2026-07-12T00:00:03.000Z","parentId":"eeeeeeee-0000-4000-8000-000000000003","type":"assistant.message","data":{"content":"Handled the known event safely.","messageId":"ffffffff-0000-4000-8000-000000000001"}}
+{"id":"eeeeeeee-0000-4000-8000-000000000005","timestamp":"2026-07-12T00:00:04.000Z","parentId":"eeeeeeee-0000-4000-8000-000000000004","type":"tool.execution_start","data":{"toolCallId":"ffffffff-0000-4000-8000-000000000002","toolName":"test","arguments":{"scope":"synthetic"}}}
