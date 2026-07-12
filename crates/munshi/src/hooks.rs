@@ -69,6 +69,8 @@ pub enum HookWorkerError {
     Registration(#[from] RegistrationError),
     #[error(transparent)]
     Source(#[from] SourceError),
+    #[error("rewritten transcript is no longer archive-worthy")]
+    SourceNoLongerArchiveWorthy,
     #[error(transparent)]
     Project(#[from] ProjectIdentityError),
     #[error(transparent)]
@@ -189,8 +191,15 @@ pub fn run_recovery(
     force_retry: bool,
     rebuild: bool,
 ) -> Result<(), HookWorkerError> {
-    let Some(_recovery_lock) = try_acquire_session_lock(state_directory, "_recovery")? else {
-        return Err(StateError::LockBusy.into());
+    let recovery_deadline = Instant::now() + Duration::from_secs(1);
+    let _recovery_lock = loop {
+        if let Some(lock) = try_acquire_session_lock(state_directory, "_recovery")? {
+            break lock;
+        }
+        if Instant::now() >= recovery_deadline {
+            return Err(StateError::LockBusy.into());
+        }
+        thread::sleep(Duration::from_millis(10));
     };
     let stored = load_stored_config(state_directory)?;
     if rebuild {
@@ -482,7 +491,7 @@ fn process_claim(
         && update.mode == TranscriptLoadMode::Full
         && !update.session.is_archive_worthy()
     {
-        return Err(SourceError::UnsupportedEnvelope.into());
+        return Err(HookWorkerError::SourceNoLongerArchiveWorthy);
     }
 
     let project = match claim.session.project.clone() {
@@ -963,8 +972,10 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
         HookWorkerError::PostPersistWrite(_) => "archive-finalize-failed",
         HookWorkerError::Registration(_) => "config-invalid",
         HookWorkerError::Source(SourceError::ChangedDuringRead) => "source-changed",
+        HookWorkerError::Source(SourceError::IncompleteTrailingRecord) => "source-incomplete",
         HookWorkerError::Source(SourceError::TranscriptNotFound) => "transcript-unresolved",
         HookWorkerError::Source(_) => "source-failed",
+        HookWorkerError::SourceNoLongerArchiveWorthy => "source-not-archive-worthy",
         HookWorkerError::Project(_) => "project-failed",
         HookWorkerError::Summary(_) => "summary-failed",
         HookWorkerError::Render(_) => "archive-write-failed",
@@ -976,8 +987,11 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
 fn worker_error_retryable(error: &HookWorkerError) -> bool {
     matches!(
         error,
-        HookWorkerError::Source(SourceError::ChangedDuringRead | SourceError::TranscriptNotFound)
-            | HookWorkerError::Summary(_)
+        HookWorkerError::Source(
+            SourceError::ChangedDuringRead
+                | SourceError::IncompleteTrailingRecord
+                | SourceError::TranscriptNotFound
+        ) | HookWorkerError::Summary(_)
             | HookWorkerError::Io(_)
             | HookWorkerError::State(_)
             | HookWorkerError::PostPersist(_)

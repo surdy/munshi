@@ -85,6 +85,11 @@ transcript is a no-op. A validated append sends only its delta. Truncation, rewr
 cursor format triggers a complete reread and fresh full summary; a failure leaves the previous
 Markdown readable and does not advance its revision or cursor.
 
+An unterminated invalid final JSONL record is classified as a retryable in-progress tail and never
+advances the cursor. If a complete rewrite/truncation rereads as no longer archive-worthy, Munshi
+preserves the previous archive and records `source-not-archive-worthy` rather than reporting a
+successful revision or misclassifying the envelope.
+
 ## Interrupted and force-close recovery
 
 `sessionEnd` has no transcript path. If no earlier `agentStop` supplied one, the Copilot CLI 1.0.70

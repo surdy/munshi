@@ -149,6 +149,66 @@ fn malformed_delta_fails_without_advancing_revision_or_cursor() {
 }
 
 #[test]
+fn unterminated_trailing_record_is_retryable_without_cursor_advancement() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("partial-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    let archive_path = harness.archive_path(SESSION_A);
+    let before_markdown = fs::read(&archive_path).unwrap();
+    let before = session_cursor(&harness, SESSION_A);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(br#"{"id":"partial""#)
+        .unwrap();
+    harness.complete_lifecycle(SESSION_A, &transcript, 20, 21);
+    let waited = harness.wait(SESSION_A, 5_000);
+    assert!(!waited.status.success());
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("source-incomplete"));
+    assert_eq!(session_cursor(&harness, SESSION_A), before);
+    assert_eq!(fs::read(&archive_path).unwrap(), before_markdown);
+}
+
+#[test]
+fn unworthy_full_fallback_preserves_archive_with_a_distinct_failure() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("unworthy-rewrite-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    let archive_path = harness.archive_path(SESSION_A);
+    let before_markdown = fs::read(&archive_path).unwrap();
+    let before = session_cursor(&harness, SESSION_A);
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({
+                "id": "rewritten-start",
+                "timestamp": "2026-07-12T00:02:00.000Z",
+                "parentId": null,
+                "type": "session.start",
+                "data": {"sessionId": SESSION_A},
+            })
+        ),
+    )
+    .unwrap();
+
+    harness.complete_lifecycle(SESSION_A, &transcript, 20, 21);
+    let waited = harness.wait(SESSION_A, 5_000);
+    assert!(!waited.status.success());
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("source-not-archive-worthy"));
+    assert_eq!(session_cursor(&harness, SESSION_A), before);
+    assert_eq!(fs::read(&archive_path).unwrap(), before_markdown);
+}
+
+#[test]
 fn interrupted_session_end_uses_guarded_fallback_and_records_reason() {
     let harness = Harness::new();
     let summarizer = harness.revision_summarizer("interrupted-count");

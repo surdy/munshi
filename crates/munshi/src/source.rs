@@ -153,6 +153,8 @@ pub enum SourceError {
     EventContentLimit,
     #[error("transcript changed while it was being read")]
     ChangedDuringRead,
+    #[error("transcript ends with an incomplete JSON record")]
+    IncompleteTrailingRecord,
     #[error("transcript does not match the version-pinned Copilot event envelope")]
     UnsupportedEnvelope,
 }
@@ -243,6 +245,7 @@ pub fn load_session_update(
     previous: Option<&PreviousSource>,
 ) -> Result<TranscriptUpdate, SourceError> {
     let (bytes, snapshot) = read_stable_source(&resolved.events_path, max_source_bytes)?;
+    validate_trailing_record(&bytes)?;
     let source_hash = sha256(&bytes);
 
     let (mode, fallback_reason, normalized, total_records) = match previous {
@@ -579,6 +582,19 @@ fn count_records(bytes: &[u8]) -> u64 {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .count() as u64
+}
+
+fn validate_trailing_record(bytes: &[u8]) -> Result<(), SourceError> {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(());
+    }
+    let tail = bytes
+        .rsplit(|byte| *byte == b'\n')
+        .next()
+        .expect("a nonempty byte slice has a final segment");
+    serde_json::from_slice::<Value>(tail)
+        .map(|_| ())
+        .map_err(|_| SourceError::IncompleteTrailingRecord)
 }
 
 fn sha256(bytes: &[u8]) -> String {
