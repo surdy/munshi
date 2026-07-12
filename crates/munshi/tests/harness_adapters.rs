@@ -481,6 +481,147 @@ fn retry_cli_requires_a_source_selector_when_ambiguous() {
     assert_eq!(report["session_id"], SHARED_ID);
 }
 
+/// A stale/interrupted Claude session recovered by `run_recovery` must be marked and
+/// worked through the Claude adapter — never mis-attributed to Copilot and never given a
+/// duplicate Copilot row.
+#[test]
+fn claude_stale_session_recovers_through_the_claude_adapter() {
+    let harness = StateHarness::new();
+    let transcript = harness.copy_transcript(
+        &fixture(
+            "claude-code-2.1.44",
+            "normal",
+            &format!("{CLAUDE_NORMAL}.jsonl"),
+        ),
+        CLAUDE_NORMAL,
+    );
+    // agent-stop with no session-end models an interrupted/crashed Claude session.
+    harness.ingest_agent_stop_only(SourceKind::ClaudeCode, CLAUDE_NORMAL, &transcript);
+
+    let recover = harness.recover_cli(0);
+    assert!(
+        recover.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+
+    let record = harness
+        .wait_for_archived(
+            SourceKind::ClaudeCode,
+            CLAUDE_NORMAL,
+            Duration::from_secs(15),
+        )
+        .expect("Claude session must archive through the Claude adapter");
+    assert_eq!(record.source, SourceKind::ClaudeCode);
+    let markdown = harness.read_archive(SourceKind::ClaudeCode, CLAUDE_NORMAL);
+    assert_eq!(markdown.source, SourceKind::ClaudeCode);
+    // Recovery records the interrupted (unknown end) completion reason.
+    assert_eq!(markdown.completion_reason, "unknown");
+
+    // No duplicate Copilot row was created for the same session ID.
+    let copilot = StateStore::open(&harness.state).unwrap();
+    assert!(copilot.get_session(CLAUDE_NORMAL).unwrap().is_none());
+}
+
+/// The same for Codex: recovery must route the stale session to the Codex adapter and
+/// leave no Copilot duplicate.
+#[test]
+fn codex_stale_session_recovers_through_the_codex_adapter() {
+    let harness = StateHarness::new();
+    let transcript = harness.copy_transcript(
+        &fixture(
+            "codex-rollout-0.x",
+            "normal",
+            &format!("{CODEX_NORMAL}.jsonl"),
+        ),
+        CODEX_NORMAL,
+    );
+    harness.ingest_agent_stop_only(SourceKind::Codex, CODEX_NORMAL, &transcript);
+
+    let recover = harness.recover_cli(0);
+    assert!(
+        recover.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+
+    let record = harness
+        .wait_for_archived(SourceKind::Codex, CODEX_NORMAL, Duration::from_secs(15))
+        .expect("Codex session must archive through the Codex adapter");
+    assert_eq!(record.source, SourceKind::Codex);
+    let markdown = harness.read_archive(SourceKind::Codex, CODEX_NORMAL);
+    assert_eq!(markdown.source, SourceKind::Codex);
+
+    let copilot = StateStore::open(&harness.state).unwrap();
+    assert!(copilot.get_session(CODEX_NORMAL).unwrap().is_none());
+}
+
+/// Archive Git commit subjects must carry each source's durable identity (matching the
+/// Markdown frontmatter `id`), and same-ID cross-source archives must produce distinct,
+/// idempotent commits.
+#[test]
+fn archive_git_subjects_match_identity_and_stay_distinct_per_source() {
+    let harness = StateHarness::new_with_git_history();
+    let claude = harness.copy_transcript_for(
+        SourceKind::ClaudeCode,
+        &fixture(
+            "claude-code-2.1.44",
+            "normal",
+            &format!("{CLAUDE_NORMAL}.jsonl"),
+        ),
+        SHARED_ID,
+    );
+    let codex = harness.copy_transcript_for(
+        SourceKind::Codex,
+        &fixture(
+            "codex-rollout-0.x",
+            "normal",
+            &format!("{CODEX_NORMAL}.jsonl"),
+        ),
+        SHARED_ID,
+    );
+
+    let HookResult::Archived {
+        relative_path: claude_rel,
+    } = harness.archive(SourceKind::ClaudeCode, SHARED_ID, &claude, "complete")
+    else {
+        panic!("claude archive expected");
+    };
+    let HookResult::Archived {
+        relative_path: codex_rel,
+    } = harness.archive(SourceKind::Codex, SHARED_ID, &codex, "complete")
+    else {
+        panic!("codex archive expected");
+    };
+
+    // Subjects match the Markdown identity `<source-prefix>:<session_id>`.
+    let claude_md = harness.read_archive(SourceKind::ClaudeCode, SHARED_ID);
+    let codex_md = harness.read_archive(SourceKind::Codex, SHARED_ID);
+    assert_eq!(claude_md.source, SourceKind::ClaudeCode);
+    assert_eq!(codex_md.source, SourceKind::Codex);
+    let subjects = harness.archive_commit_subjects();
+    assert!(
+        subjects.contains(&format!("archive: claude-code:{SHARED_ID} revision 1")),
+        "subjects: {subjects:?}"
+    );
+    assert!(
+        subjects.contains(&format!("archive: codex:{SHARED_ID} revision 1")),
+        "subjects: {subjects:?}"
+    );
+    assert!(!subjects.iter().any(|subject| subject.contains("copilot:")));
+
+    // Two distinct commits, each scoped to its own source-nested file.
+    assert_eq!(harness.archive_commit_count(), 2);
+    assert_ne!(claude_rel, codex_rel);
+    assert_eq!(harness.archive_commits_touching(&claude_rel), 1);
+    assert_eq!(harness.archive_commits_touching(&codex_rel), 1);
+
+    // Idempotent: re-archiving the same unchanged source creates no new commit.
+    harness.archive(SourceKind::ClaudeCode, SHARED_ID, &claude, "complete");
+    assert_eq!(harness.archive_commit_count(), 2);
+    assert_eq!(harness.archive_commits_touching(&claude_rel), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -634,13 +775,22 @@ struct StateHarness {
 
 impl StateHarness {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    fn new_with_git_history() -> Self {
+        Self::build(true)
+    }
+
+    fn build(git_history: bool) -> Self {
         let directory = test_directory();
         let project = git_project(directory.path());
         let copilot_home = directory.path().join("copilot-home");
         let state = copilot_home.join("munshi");
         let output = directory.path().join("archives");
         let summarizer = adapter_summarizer(directory.path());
-        let register = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
+        command
             .arg("register")
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
@@ -651,9 +801,11 @@ impl StateHarness {
             .arg(&summarizer)
             .arg("--timeout-ms")
             .arg("10000")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(Stdio::null());
+        if git_history {
+            command.arg("--archive-git-history");
+        }
+        let register = command.output().unwrap();
         assert!(register.status.success(), "register failed: {register:?}");
         Self {
             state,
@@ -705,6 +857,51 @@ impl StateHarness {
         command.output().unwrap()
     }
 
+    /// Ingest a single agent-stop observation (with no session-end) to model an
+    /// interrupted/crashed session for the given source.
+    fn ingest_agent_stop_only(&self, source: SourceKind, session_id: &str, transcript: &Path) {
+        let mut store = StateStore::open_for_source(&self.state, source).unwrap();
+        let ts = self.clock.get();
+        self.clock.set(ts + 10);
+        store
+            .ingest_agent_stop(session_id, ts, &self.project, transcript)
+            .unwrap();
+    }
+
+    fn recover_cli(&self, stale_after_ms: u64) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("hook")
+            .arg("recover")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--stale-after-ms")
+            .arg(stale_after_ms.to_string())
+            .output()
+            .unwrap()
+    }
+
+    fn wait_for_archived(
+        &self,
+        source: SourceKind,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Option<munshi::SessionRecord> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let store = StateStore::open_for_source(&self.state, source).unwrap();
+            if let Some(record) = store.get_session(session_id).unwrap() {
+                if record.lifecycle_state == "archived" {
+                    return Some(record);
+                }
+            }
+            drop(store);
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn append_line(&self, transcript: &Path, line: &str) {
         let mut contents = fs::read_to_string(transcript).unwrap();
         if !contents.ends_with('\n') {
@@ -747,6 +944,43 @@ impl StateHarness {
         let record = store.get_session(session_id).unwrap().unwrap();
         let relative = record.markdown_relative_path.unwrap();
         parse_archive_markdown(&fs::read_to_string(self.output.join(relative)).unwrap()).unwrap()
+    }
+
+    fn archive_commit_count(&self) -> usize {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["rev-list", "--count", "--all"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn archive_commit_subjects(&self) -> Vec<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["log", "--format=%s"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn archive_commits_touching(&self, relative_path: &str) -> usize {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["log", "--format=%H", "--"])
+            .arg(relative_path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().count()
     }
 }
 

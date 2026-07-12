@@ -51,6 +51,23 @@ The operational CLI is source-aware while preserving Copilot's existing behavior
 These are additive fields on the `schema_version: 1` status contracts; Copilot output keeps
 `copilot`/`copilot:<id>` identities and its flat archive layout.
 
+## Recovery and archive Git history are source-scoped
+
+Interrupted/stale recovery (`munshi hook recover` / `run_recovery`) reads work lists across all
+sources but performs each per-session mutation against a store scoped to that session's own
+`SourceKind`, and validates staleness with that session's adapter envelope. This prevents a
+non-Copilot session from being skipped, mis-routed to the Copilot adapter, or given a duplicate
+Copilot row. Session-ID-only transcript discovery remains intentionally Copilot-only, because only
+Copilot has a safe, version-pinned `session-state/<id>/events.jsonl` fallback; other sources are
+left pending rather than guessed.
+
+When optional archive Git history is enabled, each commit subject carries the durable archive
+identity `<source-prefix>:<session_id>` (matching the Markdown frontmatter `id`), and the commit
+body records `id`/`source`/`session_id`/`summary_revision`. Because archive files are source-scoped
+paths, same-ID cross-source revisions land on different files and produce distinct commits; the
+crash-recovery dedup correlates by the source-qualified `id` line (with a legacy `session_id`
+fallback for pre-source Copilot archives), so re-commits remain idempotent.
+
 Adapter-specific records that carry no archive-worthy conversation content (Claude `summary`/
 `system` bookkeeping, Codex `session_meta`/`turn_context`/`compacted`/`reasoning`) are treated as
 ignored metadata. Model reasoning is deliberately dropped and never normalized into events.

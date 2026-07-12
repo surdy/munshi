@@ -9,6 +9,7 @@ use munshi_runner::{RunnerConfig, RunnerError, run_bounded};
 use thiserror::Error;
 
 use crate::project::inspect_project;
+use crate::source::SourceKind;
 use crate::state::{StateError, try_acquire_session_lock};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,6 +64,7 @@ pub fn commit_archive_revision(
     output_directory: &Path,
     markdown_relative_path: &Path,
     source_project_identity: Option<&str>,
+    source: SourceKind,
     session_id: &str,
     summary_revision: u64,
 ) -> Result<(), ArchiveGitError> {
@@ -99,14 +101,23 @@ pub fn commit_archive_revision(
     if archive_commit_exists(
         &repository_root,
         markdown_relative_path,
+        source,
         session_id,
         summary_revision,
     )? {
         return Ok(());
     }
 
-    let commit_subject = format!("archive: copilot:{session_id} revision {summary_revision}");
-    let commit_body = format!("session_id: {session_id}\nsummary_revision: {summary_revision}\n");
+    // The subject carries the durable archive identity `<source-prefix>:<session_id>`,
+    // matching the Markdown frontmatter `id`. The body records the same identity plus the
+    // legacy `session_id` line so crash-recovery dedup correlates by source and revision and
+    // remains compatible with archives committed before sources were distinguished.
+    let archive_id = format!("{}:{session_id}", source.id_prefix());
+    let commit_subject = format!("archive: {archive_id} revision {summary_revision}");
+    let commit_body = format!(
+        "id: {archive_id}\nsource: {}\nsession_id: {session_id}\nsummary_revision: {summary_revision}\n",
+        source.as_selector()
+    );
     run_git(
         &repository_root,
         vec![
@@ -144,12 +155,14 @@ pub fn commit_archive_revision(
 fn archive_commit_exists(
     repository_root: &Path,
     markdown_relative_path: &Path,
+    source: SourceKind,
     session_id: &str,
     summary_revision: u64,
 ) -> Result<bool, ArchiveGitError> {
     if !repository_has_commits(repository_root)? {
         return Ok(false);
     }
+    let expected_id_line = format!("id: {}:{session_id}", source.id_prefix());
     let expected_session_line = format!("session_id: {session_id}");
     let expected_revision_line = format!("summary_revision: {summary_revision}");
     let bytes = run_git(
@@ -162,20 +175,31 @@ fn archive_commit_exists(
         ],
         Vec::new(),
     )?;
+    // The Markdown path is already source-scoped, so this log only contains one source's
+    // commits. A commit matches when the revision matches and either its explicit `id:`
+    // line matches this source's identity, or (for legacy pre-source archives that carry no
+    // `id:` line) its `session_id:` line matches.
     for message in bytes.split(|byte| *byte == 0x1e) {
         let body = String::from_utf8_lossy(message);
+        let mut id_match = false;
         let mut session_match = false;
         let mut revision_match = false;
+        let mut has_id_line = false;
         for line in body.lines() {
             let line = line.trim_end_matches('\r');
-            if line == expected_session_line {
+            if line.starts_with("id: ") {
+                has_id_line = true;
+            }
+            if line == expected_id_line {
+                id_match = true;
+            } else if line == expected_session_line {
                 session_match = true;
             } else if line == expected_revision_line {
                 revision_match = true;
             }
-            if session_match && revision_match {
-                return Ok(true);
-            }
+        }
+        if revision_match && (id_match || (session_match && !has_id_line)) {
+            return Ok(true);
         }
     }
     Ok(false)

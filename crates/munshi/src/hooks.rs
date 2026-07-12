@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -255,7 +256,22 @@ pub fn run_recovery(
     )?;
     let cutoff = now_ms().saturating_sub(stale_after.as_millis().try_into().unwrap_or(i64::MAX));
     let mut reserved_sessions: Vec<(SourceKind, String)> = Vec::new();
-    for session in state.unresolved_sessions()? {
+    // Per-session recovery mutations must run against the session's own source scope so
+    // they never create a duplicate Copilot row or route a non-Copilot session through the
+    // Copilot adapter. The Copilot store is `state`; other sources use cached stores.
+    let mut source_stores: BTreeMap<SourceKind, StateStore> = BTreeMap::new();
+
+    // Read the work lists up front so later per-source mutations don't overlap the borrow.
+    let unresolved = state.unresolved_sessions()?;
+    let stale = state.stale_known_sessions(cutoff)?;
+
+    for session in unresolved {
+        // Only Copilot has a safe, version-pinned session-ID transcript fallback
+        // (`session-state/<id>/events.jsonl`). Other sources are left pending rather than
+        // guessed, matching the recovery policy.
+        if session.source != SourceKind::Copilot {
+            continue;
+        }
         let Ok(path) = resolve_fallback_transcript(state_directory, &session.session_id) else {
             continue;
         };
@@ -270,14 +286,20 @@ pub fn run_recovery(
             reserved_sessions.push((session.source, session.session_id));
         }
     }
-    for session in state.stale_known_sessions(cutoff)? {
+    for session in stale {
         let Some(path) = session.transcript_path.as_deref() else {
             continue;
         };
         let Some(origin) = session.origin_cwd.as_deref() else {
             continue;
         };
-        if !source_is_stale_and_supported(path, cutoff, stored.limits.max_source_bytes) {
+        // Validate staleness with the session's own adapter envelope, not a hardcoded one.
+        if !source_is_stale_and_supported(
+            session.source,
+            path,
+            cutoff,
+            stored.limits.max_source_bytes,
+        ) {
             continue;
         }
         let metadata = fs::metadata(path)?;
@@ -287,7 +309,13 @@ pub fn run_recovery(
             metadata.mtime(),
             metadata.mtime_nsec()
         );
-        if state.mark_recovery_interrupted(&session.session_id, path, Some(origin), &evidence)? {
+        let store = recovery_store(
+            &mut state,
+            &mut source_stores,
+            state_directory,
+            session.source,
+        )?;
+        if store.mark_recovery_interrupted(&session.session_id, path, Some(origin), &evidence)? {
             reserved_sessions.push((session.source, session.session_id));
         }
     }
@@ -302,12 +330,33 @@ pub fn run_recovery(
     reserved_sessions.dedup();
     for (source, session_id) in reserved_sessions {
         if spawn_worker(state_directory, source, &session_id).is_err() {
-            let _ = state.clear_worker_reservation(&session_id);
+            let store = recovery_store(&mut state, &mut source_stores, state_directory, source)?;
+            let _ = store.clear_worker_reservation(&session_id);
             let _ =
-                state.record_diagnostic("recovery", "worker-spawn-failed", None, Some(&session_id));
+                store.record_diagnostic("recovery", "worker-spawn-failed", None, Some(&session_id));
         }
     }
     Ok(())
+}
+
+/// Return a mutable state store scoped to `source`. Copilot reuses the recovery-owned
+/// `state` store (preserving Copilot behavior exactly); other sources use a cached
+/// source-scoped store so their per-session mutations target the correct `source_kind`.
+fn recovery_store<'a>(
+    state: &'a mut StateStore,
+    source_stores: &'a mut BTreeMap<SourceKind, StateStore>,
+    state_directory: &Path,
+    source: SourceKind,
+) -> Result<&'a mut StateStore, StateError> {
+    if source == SourceKind::Copilot {
+        return Ok(state);
+    }
+    match source_stores.entry(source) {
+        std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            Ok(entry.insert(StateStore::open_for_source(state_directory, source)?))
+        }
+    }
 }
 
 pub fn wait_for_hook_result(
@@ -674,6 +723,7 @@ fn process_claim(
             &output_directory,
             &relative_path,
             Some(project.identity.as_str()),
+            source,
             &claim.session.session_id,
             revision,
         ) {
@@ -760,6 +810,7 @@ fn reconcile_persisted_attempt(
             output_directory,
             &plan.plan.markdown_relative_path,
             Some(markdown.project.identity.as_str()),
+            markdown.source,
             session_id,
             markdown.summary_revision,
         )?;
@@ -993,7 +1044,12 @@ fn discover_unknown_sessions(
             Ok(resolved) => resolved,
             Err(_) => continue,
         };
-        if !source_is_stale_and_supported(&resolved.events_path, cutoff_ms, max_source_bytes) {
+        if !source_is_stale_and_supported(
+            SourceKind::Copilot,
+            &resolved.events_path,
+            cutoff_ms,
+            max_source_bytes,
+        ) {
             continue;
         }
         let metadata = fs::metadata(&resolved.events_path)?;
@@ -1010,7 +1066,12 @@ fn discover_unknown_sessions(
     Ok(())
 }
 
-fn source_is_stale_and_supported(path: &Path, cutoff_ms: i64, max_source_bytes: usize) -> bool {
+fn source_is_stale_and_supported(
+    source: SourceKind,
+    path: &Path,
+    cutoff_ms: i64,
+    max_source_bytes: usize,
+) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
@@ -1018,8 +1079,7 @@ fn source_is_stale_and_supported(path: &Path, cutoff_ms: i64, max_source_bytes: 
         .mtime()
         .saturating_mul(1_000)
         .saturating_add(metadata.mtime_nsec() / 1_000_000);
-    modified_ms <= cutoff_ms
-        && validate_transcript_envelope(SourceKind::Copilot, path, max_source_bytes).is_ok()
+    modified_ms <= cutoff_ms && validate_transcript_envelope(source, path, max_source_bytes).is_ok()
 }
 
 fn spawn_worker(state_directory: &Path, source: SourceKind, session_id: &str) -> io::Result<()> {
