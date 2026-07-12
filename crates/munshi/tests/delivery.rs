@@ -40,11 +40,14 @@ fn delivery_status_json_on_an_unregistered_state_directory_degrades_to_empty_con
     assert_eq!(status["settings"]["enabled"], false);
     assert_eq!(status["settings"]["addressable"], false);
     assert_eq!(status["settings"]["endpoint"], Value::Null);
+    assert_eq!(status["settings"]["versioned"], false);
+    assert_eq!(status["settings"]["provision_history"], false);
     assert_eq!(status["total"], 0);
     assert_eq!(status["delivered"], 0);
     assert_eq!(status["pending"], 0);
     assert_eq!(status["failed"], 0);
     assert_eq!(status["dead_letter"], 0);
+    assert_eq!(status["blocked"], 0);
     assert_eq!(status["items"], serde_json::json!([]));
 }
 

@@ -143,6 +143,8 @@ impl DeliverySettings {
             folder: None,
             credential_source: None,
             max_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
+            versioned: false,
+            provision_history: false,
         }
     }
 }
@@ -1712,6 +1714,7 @@ pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryEr
             pending: 0,
             failed: 0,
             dead_letter: 0,
+            blocked: 0,
             items: Vec::new(),
         });
     }

@@ -802,10 +802,13 @@ Madari surfaces, per agent session:
   states, read from `sessions --json`.
 - A "View summary" action in the agent-session browser, backed by `show --json`.
 - A "Summarize now" / "Retry" action, backed by `retry --json` (and `delivery retry --json` for a
-  delivery-only failure).
+  delivery-only failure, including a `blocked` delivery — issue #9's versioned delivery blocks
+  rather than silently degrading when the Notesmith vault cannot preserve correlated revision
+  history, or has unrelated uncommitted changes).
 - A rendered summary panel using its existing Markdown support.
 - A link to the Notesmith note (`show --json` → `session.delivery.note_link`, a `notesmith://`
-  deep link Madari opens with its existing URL opener).
+  deep link Madari opens with its existing URL opener) and, when versioned delivery is active, the
+  correlated remote history commit (`session.delivery.history_commit`).
 
 ### Integration boundary
 
