@@ -9,12 +9,10 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, HookEvent, HookFailure, HookResult, ProjectStatus,
-    RegisterConfig,
-    SessionRecord, SessionReference, StateStore, StructuredSummary,
+    RegisterConfig, SessionRecord, SessionReference, StateStore, StructuredSummary,
     accept_disclosure_from_terminal, archive_session, handle_hook, parse_archive_markdown,
     project_status, read_last_failure, register, run_archive_worker, run_recovery,
-    set_project_enabled, unregister,
-    wait_for_hook_result,
+    set_project_enabled, unregister, wait_for_hook_result,
 };
 use serde::{Deserialize, Serialize};
 

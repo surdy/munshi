@@ -113,7 +113,10 @@ fn status_sessions_and_show_json_contracts_cover_required_states() {
     let disabled_events = harness.write_transcript(disabled, "DISABLED_REQUEST", "blocked");
     harness.complete_lifecycle(disabled, &disabled_events, 15_000, 15_001);
     let disabled_wait = harness.wait(disabled, 5_000);
-    assert!(!disabled_wait.status.success(), "disabled-project wait should fail");
+    assert!(
+        !disabled_wait.status.success(),
+        "disabled-project wait should fail"
+    );
 
     let status = harness.status_json();
     assert_eq!(status["schema_version"], 1);
@@ -328,11 +331,7 @@ fn doctor_json_reports_runtime_failures() {
 #[test]
 fn doctor_checks_archive_git_repository_when_enabled() {
     let harness = Harness::new();
-    assert_success(&harness.register_with_options(
-        fake("status-contract.sh"),
-        2_000,
-        true,
-    ));
+    assert_success(&harness.register_with_options(fake("status-contract.sh"), 2_000, true));
 
     let healthy = harness.doctor_json();
     let git_check = healthy["checks"]
