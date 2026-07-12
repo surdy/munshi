@@ -1702,7 +1702,7 @@ impl StateStore {
         output_directory: &Path,
         session_id: &str,
     ) -> Result<bool, StateError> {
-        let records = scan_archives(output_directory, Some(session_id))?;
+        let records = scan_archives(output_directory, Some((&self.source_kind, session_id)))?;
         let Some(record) = records
             .into_iter()
             .max_by_key(|record| record.archive.summary_revision)
@@ -1715,14 +1715,19 @@ impl StateStore {
 
     pub fn rebuild_from_archives(&mut self, output_directory: &Path) -> Result<usize, StateError> {
         let records = scan_archives(output_directory, None)?;
-        let mut latest = std::collections::BTreeMap::<String, OwnedArchive>::new();
+        // Group by the full (source, session_id) identity so cross-source sessions
+        // that share a session ID are both retained and never overwrite each other.
+        let mut latest = std::collections::BTreeMap::<(String, String), OwnedArchive>::new();
         for record in records {
-            let session_id = record.archive.session_id.clone();
+            let key = (
+                record.archive.source.agent_label().to_owned(),
+                record.archive.session_id.clone(),
+            );
             if latest
-                .get(&session_id)
+                .get(&key)
                 .is_none_or(|old| old.archive.summary_revision < record.archive.summary_revision)
             {
-                latest.insert(session_id, record);
+                latest.insert(key, record);
             }
         }
         for record in latest.values() {
@@ -2021,7 +2026,7 @@ struct OwnedArchive {
 
 fn scan_archives(
     output_directory: &Path,
-    wanted_session_id: Option<&str>,
+    wanted: Option<(&str, &str)>,
 ) -> Result<Vec<OwnedArchive>, StateError> {
     if !output_directory.exists() {
         return Ok(Vec::new());
@@ -2030,70 +2035,94 @@ fn scan_archives(
     if !root.is_dir() {
         return Err(StateError::InvalidState);
     }
+    let mut files = Vec::new();
+    collect_archive_files(&root, 0, &mut files)?;
     let mut records = Vec::new();
-    for project_entry in fs::read_dir(&root)? {
-        let project_entry = project_entry?;
-        let project_type = project_entry.file_type()?;
-        if project_type.is_symlink() || !project_type.is_dir() {
+    for path in files {
+        if validate_regular_owned_file(&path).is_err() {
             continue;
         }
-        for entry in fs::read_dir(project_entry.path())? {
-            let entry = entry?;
-            if entry.file_type()?.is_symlink() || !entry.metadata()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(OsStr::to_str) != Some("md") {
-                continue;
-            }
-            if validate_regular_owned_file(&path).is_err() {
-                continue;
-            }
-            if let Some(wanted) = wanted_session_id {
-                if path.file_stem().and_then(OsStr::to_str) != Some(wanted) {
-                    continue;
-                }
-            }
-            let bytes = fs::read(&path)?;
-            let text = match std::str::from_utf8(&bytes) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
-            let mut archive = match parse_archive_markdown(text) {
-                Ok(archive) => archive,
-                Err(_) => continue,
-            };
-            if path.file_stem().and_then(OsStr::to_str) != Some(&archive.session_id) {
-                continue;
-            }
-            let relative_path = path
-                .strip_prefix(&root)
-                .map_err(|_| StateError::InvalidState)?
-                .to_path_buf();
-            if archive.project.component.is_empty() {
-                archive.project.component = relative_path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("project")
-                    .to_owned();
-            }
-            if relative_path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(OsStr::to_str)
-                != Some(&archive.project.component)
+        if path.file_stem().and_then(OsStr::to_str).is_none() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let mut archive = match parse_archive_markdown(text) {
+            Ok(archive) => archive,
+            Err(_) => continue,
+        };
+        if let Some((wanted_source, wanted_session)) = wanted {
+            if archive.source.agent_label() != wanted_source || archive.session_id != wanted_session
             {
                 continue;
             }
-            records.push(OwnedArchive {
-                relative_path,
-                markdown_hash: content_hash(&bytes),
-                archive,
-            });
         }
+        let relative_path = path
+            .strip_prefix(&root)
+            .map_err(|_| StateError::InvalidState)?
+            .to_path_buf();
+        // Schema-1 records omit the project component; recover it from the
+        // component directory, which sits one level up for Copilot's flat layout
+        // and two levels up for the source-nested layout.
+        if archive.project.component.is_empty() {
+            let component_dir = match archive.source {
+                SourceKind::Copilot => relative_path.parent(),
+                _ => relative_path.parent().and_then(Path::parent),
+            };
+            archive.project.component = component_dir
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                .unwrap_or("project")
+                .to_owned();
+        }
+        // Accept a record only when it sits at the exact source-scoped path Munshi
+        // would write it to. This ties the file location to (source, component,
+        // session_id) and rejects misplaced or spoofed archives.
+        let expected = crate::render::archive_relative_path(
+            archive.source,
+            &archive.project.component,
+            &archive.session_id,
+        );
+        if relative_path != expected {
+            continue;
+        }
+        records.push(OwnedArchive {
+            relative_path,
+            markdown_hash: content_hash(&bytes),
+            archive,
+        });
     }
     Ok(records)
+}
+
+/// Depth-bounded, symlink-safe walk collecting `.md` files under the archive root.
+/// The depth bound covers both Copilot's `<component>/<file>` layout and the
+/// source-nested `<component>/<source>/<file>` layout without following symlinks.
+fn collect_archive_files(
+    directory: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), StateError> {
+    if depth > 3 {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_archive_files(&path, depth + 1, out)?;
+        } else if file_type.is_file() && path.extension().and_then(OsStr::to_str) == Some("md") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 pub struct SessionLock {

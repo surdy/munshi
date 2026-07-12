@@ -26,6 +26,14 @@ tool activity. Identity is `"<source-prefix>:<session-id>"` and the archive fron
 hashing, truncation detection, concurrency snapshotting, and revision machinery are source-neutral
 and shared unchanged across all adapters.
 
+Durable archive files are scoped by source so that two harnesses that share a project component and
+session ID never collide. Copilot keeps its original `<component>/<session_id>.md` layout for
+backward compatibility; every other source nests under a `<source-prefix>/` segment
+(`<component>/claude-code/<session_id>.md`, `<component>/codex/<session_id>.md`). Archive scanning,
+hydration, and rebuild dedup are keyed by `(SourceKind, session_id)` to match the SQLite
+`UNIQUE(source_kind, source_session_id)` constraint, so same-ID sessions from different sources are
+both retained and never cross-imported.
+
 Adapter-specific records that carry no archive-worthy conversation content (Claude `summary`/
 `system` bookkeeping, Codex `session_meta`/`turn_context`/`compacted`/`reasoning`) are treated as
 ignored metadata. Model reasoning is deliberately dropped and never normalized into events.

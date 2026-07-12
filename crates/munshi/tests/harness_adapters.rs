@@ -342,11 +342,178 @@ fn state_store_isolates_sessions_by_source() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-source identity: shared path collisions and rebuild/hydrate scoping
+// ---------------------------------------------------------------------------
+
+const SHARED_ID: &str = "5ha4ed00-0000-4000-8000-000000000001";
+
+/// Two different harnesses that share one project and one session ID must archive
+/// to distinct Markdown files instead of overwriting each other.
+#[test]
+fn two_sources_sharing_project_and_session_id_do_not_collide() {
+    let shared = SharedArchives::new();
+    let (claude_rel, claude_md) = shared.archive(SourceKind::ClaudeCode);
+    let (codex_rel, codex_md) = shared.archive(SourceKind::Codex);
+
+    assert_ne!(claude_rel, codex_rel);
+    assert!(shared.output.join(&claude_rel).is_file());
+    assert!(shared.output.join(&codex_rel).is_file());
+    // Both files survive: neither archive was overwritten by the other source.
+    assert_eq!(claude_md.source, SourceKind::ClaudeCode);
+    assert_eq!(codex_md.source, SourceKind::Codex);
+    assert_eq!(claude_md.session_id, SHARED_ID);
+    assert_eq!(codex_md.session_id, SHARED_ID);
+    // Layout: <component>/<source-prefix>/<session_id>.md, sharing the project
+    // component but separated by a per-source segment.
+    let claude_parts = path_parts(&claude_rel);
+    let codex_parts = path_parts(&codex_rel);
+    assert_eq!(claude_parts.len(), 3);
+    assert_eq!(codex_parts.len(), 3);
+    assert_eq!(claude_parts[0], codex_parts[0], "same project component");
+    assert_eq!(claude_parts[1], "claude-code");
+    assert_eq!(codex_parts[1], "codex");
+    assert_eq!(claude_parts[2], format!("{SHARED_ID}.md"));
+    assert_eq!(codex_parts[2], format!("{SHARED_ID}.md"));
+}
+
+/// A rebuild must retain both same-ID sessions and import each under its own source,
+/// never cross-importing one source's archive into another.
+#[test]
+fn rebuild_retains_both_sources_and_never_cross_imports() {
+    let shared = SharedArchives::new();
+    let (claude_rel, _) = shared.archive(SourceKind::ClaudeCode);
+    let (codex_rel, _) = shared.archive(SourceKind::Codex);
+
+    let state = shared.dir.path().join("state");
+    let mut store = StateStore::open(&state).unwrap();
+    let count = store.rebuild_from_archives(&shared.output).unwrap();
+    assert_eq!(
+        count, 2,
+        "both same-ID cross-source archives must be retained"
+    );
+    drop(store);
+
+    let claude_store = StateStore::open_for_source(&state, SourceKind::ClaudeCode).unwrap();
+    let claude = claude_store.get_session(SHARED_ID).unwrap().unwrap();
+    assert_eq!(
+        claude.markdown_relative_path.as_deref(),
+        Some(claude_rel.as_path())
+    );
+
+    let codex_store = StateStore::open_for_source(&state, SourceKind::Codex).unwrap();
+    let codex = codex_store.get_session(SHARED_ID).unwrap().unwrap();
+    assert_eq!(
+        codex.markdown_relative_path.as_deref(),
+        Some(codex_rel.as_path())
+    );
+}
+
+/// Hydrating a single session scopes to the store's source, so it never pulls in a
+/// different source's archive that happens to share the session ID.
+#[test]
+fn hydrate_scopes_to_the_store_source_only() {
+    let shared = SharedArchives::new();
+    let (claude_rel, _) = shared.archive(SourceKind::ClaudeCode);
+    shared.archive(SourceKind::Codex);
+
+    let state = shared.dir.path().join("state");
+    let mut claude_store = StateStore::open_for_source(&state, SourceKind::ClaudeCode).unwrap();
+    assert!(
+        claude_store
+            .hydrate_session_from_archives(&shared.output, SHARED_ID)
+            .unwrap()
+    );
+    let claude = claude_store.get_session(SHARED_ID).unwrap().unwrap();
+    assert_eq!(
+        claude.markdown_relative_path.as_deref(),
+        Some(claude_rel.as_path())
+    );
+    drop(claude_store);
+
+    // The Claude-scoped hydrate must not have imported the Codex archive.
+    let codex_store = StateStore::open_for_source(&state, SourceKind::Codex).unwrap();
+    assert!(codex_store.get_session(SHARED_ID).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+fn path_parts(path: &Path) -> Vec<String> {
+    path.iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Shared output directory and project used to archive several sources under the
+/// same project component and session ID, to exercise cross-source collisions.
+struct SharedArchives {
+    dir: TempDir,
+    output: PathBuf,
+    project: PathBuf,
+    summarizer: PathBuf,
+}
+
+impl SharedArchives {
+    fn new() -> Self {
+        let dir = test_directory();
+        let project = git_project(dir.path());
+        let output = dir.path().join("archives");
+        let summarizer = adapter_summarizer(dir.path());
+        Self {
+            dir,
+            output,
+            project,
+            summarizer,
+        }
+    }
+
+    fn archive(&self, source: SourceKind) -> (PathBuf, munshi::ArchivedMarkdown) {
+        let (family, scenario, id) = match source {
+            SourceKind::ClaudeCode => ("claude-code-2.1.44", "normal", CLAUDE_NORMAL),
+            SourceKind::Codex => ("codex-rollout-0.x", "normal", CODEX_NORMAL),
+            SourceKind::Copilot => panic!("copilot resolution requires an events.jsonl parent dir"),
+        };
+        // Copy the source fixture to a transcript whose stem is the shared session ID.
+        let transcripts = self.dir.path().join(format!("t-{}", source.as_selector()));
+        fs::create_dir_all(&transcripts).unwrap();
+        let transcript = transcripts.join(format!("{SHARED_ID}.jsonl"));
+        fs::copy(
+            fixture(family, scenario, &format!("{id}.jsonl")),
+            &transcript,
+        )
+        .unwrap();
+
+        let outcome = archive_session(&ArchiveConfig {
+            reference: SessionReference {
+                source,
+                session_id: Some(SHARED_ID.to_owned()),
+                events_path: Some(transcript),
+                copilot_home: None,
+            },
+            project_directory: self.project.clone(),
+            output_directory: self.output.clone(),
+            summarizer_binary: self.summarizer.clone(),
+            summarizer_args: Vec::new(),
+            timeout: Duration::from_secs(5),
+            max_source_bytes: 1 << 20,
+            max_input_bytes: 1 << 20,
+            max_stdout_bytes: 16 * 1024,
+            max_stderr_bytes: 4 * 1024,
+        })
+        .unwrap();
+        let ArchiveOutcome::Archived { relative_path, .. } = outcome else {
+            panic!("expected archived outcome for {source:?}");
+        };
+        let markdown =
+            parse_archive_markdown(&fs::read_to_string(self.output.join(&relative_path)).unwrap())
+                .unwrap();
+        (relative_path, markdown)
+    }
 }
 
 fn fixture(family: &str, scenario: &str, file: &str) -> PathBuf {

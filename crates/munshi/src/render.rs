@@ -357,9 +357,29 @@ pub fn atomic_replace(output: &Path, bytes: &[u8]) -> Result<(), RenderError> {
 }
 
 pub fn archive_path(output_directory: &Path, metadata: &ArchiveMetadata<'_>) -> PathBuf {
-    output_directory
-        .join(&metadata.project.component)
-        .join(format!("{}.md", metadata.session.session_id))
+    output_directory.join(archive_relative_path(
+        metadata.session.source,
+        &metadata.project.component,
+        &metadata.session.session_id,
+    ))
+}
+
+/// Durable archive path relative to the output directory, scoped by source.
+///
+/// Different harnesses that share a project component and session ID must never
+/// resolve to the same Markdown file. Copilot keeps its original
+/// `<component>/<session_id>.md` layout for backward compatibility; every other
+/// source nests its records under a `<source-prefix>/` segment.
+pub(crate) fn archive_relative_path(
+    source: SourceKind,
+    component: &str,
+    session_id: &str,
+) -> PathBuf {
+    let file = format!("{session_id}.md");
+    match source {
+        SourceKind::Copilot => Path::new(component).join(file),
+        other => Path::new(component).join(other.id_prefix()).join(file),
+    }
 }
 
 fn line_number(output: &mut String, key: &str, value: impl std::fmt::Display) {
