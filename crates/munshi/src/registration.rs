@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 use thiserror::Error;
 
+use crate::archive_git::{ArchiveGitError, ensure_archive_repository};
 use crate::policy::{GlobalPolicy, ResolvedPolicy, resolve_policy};
 use crate::project::{ProjectIdentityError, inspect_project};
 use crate::state::{StateStore, migrate_legacy_state};
@@ -36,6 +37,7 @@ pub struct RegisterConfig {
     pub copilot_home: PathBuf,
     pub state_directory: PathBuf,
     pub output_directory: PathBuf,
+    pub archive_git_history: bool,
     pub summarizer_binary: PathBuf,
     pub summarizer_args: Vec<OsString>,
     pub timeout: Duration,
@@ -75,6 +77,8 @@ pub enum RegistrationError {
     Io(#[source] io::Error),
     #[error("registration JSON failed")]
     Json(#[source] serde_json::Error),
+    #[error("archive Git history registration failed")]
+    ArchiveGit(#[source] ArchiveGitError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +88,8 @@ pub(crate) struct StoredConfig {
     pub summarizer: StoredCommand,
     pub output_directory: String,
     pub state_directory: String,
+    #[serde(default)]
+    pub archive_git_history: bool,
     pub local_archival_enabled: bool,
     pub transcript_processing_accepted: bool,
     pub project_origin: String,
@@ -230,6 +236,10 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     // Re-registration must not silently re-enable projects an explicit `project disable` excluded.
     let disabled_projects = existing_disabled_projects(&config_path)?;
     let stored = StoredConfig::from_register(config, disabled_projects)?;
+    if config.archive_git_history {
+        ensure_archive_repository(&config.output_directory)
+            .map_err(RegistrationError::ArchiveGit)?;
+    }
     let state_directory = ensure_directory(&config.state_directory)?;
     ensure_child_directory(&state_directory, "locks")?;
     install_or_update_json(&config_path, &stored)?;
@@ -308,6 +318,7 @@ impl StoredConfig {
             },
             output_directory: utf8(&config.output_directory)?,
             state_directory: utf8(&config.state_directory)?,
+            archive_git_history: config.archive_git_history,
             local_archival_enabled: true,
             transcript_processing_accepted: true,
             project_origin: "agent_stop_cwd".to_owned(),

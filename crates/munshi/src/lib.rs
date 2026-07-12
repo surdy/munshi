@@ -1,4 +1,5 @@
 mod archive;
+mod archive_git;
 mod hooks;
 mod policy;
 mod project;

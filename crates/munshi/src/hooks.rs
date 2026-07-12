@@ -11,6 +11,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::archive_git::{ArchiveGitError, commit_archive_revision};
 use crate::policy::resolve_policy;
 use crate::project::{ProjectIdentity, ProjectIdentityError, inspect_project};
 use crate::registration::{RegistrationError, load_stored_config};
@@ -75,6 +76,8 @@ pub enum HookWorkerError {
     SourceNoLongerArchiveWorthy,
     #[error(transparent)]
     Project(#[from] ProjectIdentityError),
+    #[error(transparent)]
+    ArchiveGit(#[from] ArchiveGitError),
     #[error(transparent)]
     Summary(#[from] SummaryError),
     #[error(transparent)]
@@ -615,6 +618,7 @@ fn process_claim(
     } else {
         archive_path(&output_directory, &metadata)
     };
+    let previous_markdown = fs::read(&output).ok();
     let relative_path = output
         .strip_prefix(&output_directory)
         .map_err(|_| StateError::InvalidState)?
@@ -641,6 +645,23 @@ fn process_claim(
             return Err(HookWorkerError::PostPersistWrite(error));
         }
         return Err(error.into());
+    }
+    if stored.archive_git_history && !cursor_only {
+        if let Err(error) = commit_archive_revision(
+            state_directory,
+            &output_directory,
+            &relative_path,
+            Some(project.identity.as_str()),
+            &claim.session.session_id,
+            revision,
+        ) {
+            if let Err(rollback) =
+                rollback_markdown_after_failed_commit(&output, previous_markdown.as_deref())
+            {
+                return Err(HookWorkerError::PostPersistWrite(rollback));
+            }
+            return Err(error.into());
+        }
     }
     let summary_json = serde_json::to_vec(&summary)?;
     state
@@ -764,6 +785,24 @@ fn reconcile_persisted_attempt(
             .to_string_lossy()
             .into_owned(),
     }))
+}
+
+fn rollback_markdown_after_failed_commit(
+    output: &Path,
+    previous_markdown: Option<&[u8]>,
+) -> Result<(), RenderError> {
+    if let Some(previous_markdown) = previous_markdown {
+        return atomic_replace(output, previous_markdown);
+    }
+    if output.exists() {
+        fs::remove_file(output).map_err(RenderError::Io)?;
+        if let Some(parent) = output.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(RenderError::Io)?;
+        }
+    }
+    Ok(())
 }
 
 fn load_prior_archive(
@@ -1087,6 +1126,14 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
         HookWorkerError::Source(_) => "source-failed",
         HookWorkerError::SourceNoLongerArchiveWorthy => "source-not-archive-worthy",
         HookWorkerError::Project(_) => "project-failed",
+        HookWorkerError::ArchiveGit(ArchiveGitError::LockBusy) => "archive-git-busy",
+        HookWorkerError::ArchiveGit(ArchiveGitError::RepositoryNotDedicated) => {
+            "archive-git-invalid-repo"
+        }
+        HookWorkerError::ArchiveGit(ArchiveGitError::SourceRepositoryForbidden) => {
+            "archive-git-source-repo"
+        }
+        HookWorkerError::ArchiveGit(_) => "archive-git-failed",
         HookWorkerError::Summary(_) => "summary-failed",
         HookWorkerError::Render(_) => "archive-write-failed",
         HookWorkerError::Io(_) => "io-failed",
@@ -1107,5 +1154,6 @@ fn worker_error_retryable(error: &HookWorkerError) -> bool {
             | HookWorkerError::State(_)
             | HookWorkerError::PostPersist(_)
             | HookWorkerError::PostPersistWrite(_)
+            | HookWorkerError::ArchiveGit(ArchiveGitError::LockBusy)
     )
 }

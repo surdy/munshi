@@ -69,6 +69,9 @@ enum Command {
         /// Root directory for Munshi-owned Markdown archives.
         #[arg(long)]
         output_dir: PathBuf,
+        /// Enable one Git commit per successful non-cursor summary revision.
+        #[arg(long)]
+        archive_git_history: bool,
         /// Explicit compatible summary executable.
         #[arg(long)]
         summarizer: PathBuf,
@@ -265,6 +268,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             dry_run,
             copilot_home,
             output_dir,
+            archive_git_history,
             summarizer,
             summarizer_args,
             timeout_ms,
@@ -296,6 +300,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 copilot_home: copilot_home.clone(),
                 state_directory,
                 output_directory: output_dir,
+                archive_git_history,
                 summarizer_binary: summarizer,
                 summarizer_args,
                 timeout: Duration::from_millis(timeout_ms),

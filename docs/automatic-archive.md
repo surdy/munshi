@@ -7,6 +7,7 @@ munshi register --accept-transcript-processing \
   --summarizer /absolute/path/to/copilot \
   --summarizer-arg=-s \
   --summarizer-arg=--no-ask-user \
+  --archive-git-history \
   --output-dir /absolute/path/to/munshi-summaries
 ```
 
@@ -16,6 +17,9 @@ disclosure states that transcript summarization becomes default-on for all proje
 transcript is sent again to the configured summarizer and may consume credits, v1 does not redact
 secrets or provide granular filtering, output is local Markdown, and remote delivery remains
 disabled.
+
+Archive Git history is disabled by default. `--archive-git-history` enables one commit per
+successful non-cursor summary revision in the configured output directory's dedicated repository.
 
 The default locations are:
 
@@ -89,6 +93,19 @@ An unterminated invalid final JSONL record is classified as a retryable in-progr
 advances the cursor. If a complete rewrite/truncation rereads as no longer archive-worthy, Munshi
 preserves the previous archive and records `source-not-archive-worthy` rather than reporting a
 successful revision or misclassifying the envelope.
+
+## Optional archive Git history
+
+When registration enables `--archive-git-history`:
+
+- Munshi initializes or validates only the configured output directory as the archive repository.
+- The archive repository must be dedicated; Munshi rejects commits when it resolves to the
+  session's origin source project identity.
+- Each successful non-cursor summary revision creates exactly one commit for exactly one archive
+  file path.
+- Commit messages include stable `session_id` and `summary_revision` correlation metadata.
+- Commit failures leave SQLite archival state unchanged and clear partial staged changes before the
+  attempt is marked failed.
 
 ## Interrupted and force-close recovery
 
@@ -184,5 +201,4 @@ or by `munshi hook recover`, once concurrency frees up, the budget window rolls 
 is re-enabled. No diagnostic category or log ever contains transcript content. See
 [ADR 0005](adr/0005-defer-project-policy-and-budgets-never-drop.md).
 
-Remote delivery, optional Git history, and broad status/retry/query commands remain out of scope.
-
+Remote delivery and broad status/retry/query commands remain out of scope.

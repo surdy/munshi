@@ -82,6 +82,94 @@ fn resumed_delta_revises_stable_path_and_same_source_is_a_noop() {
 }
 
 #[test]
+fn git_history_commits_revisions_in_archive_repo_only() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("git-history-count");
+    fs::write(harness.project.join("source.md"), "source baseline\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&harness.project)
+            .args(["add", "source.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&harness.project)
+            .args([
+                "-c",
+                "user.name=Source",
+                "-c",
+                "user.email=source@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "source baseline",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let source_commits_before = harness.commit_count(&harness.project);
+
+    assert_success(&harness.register_with_git_history(&summarizer, 10_000, true));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    assert_eq!(harness.archive_commit_count(), 1);
+    let relative_archive = harness
+        .archive_path(SESSION_A)
+        .strip_prefix(&harness.output)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        harness.archive_latest_commit_files(),
+        vec![relative_archive.clone()]
+    );
+    let first_message = harness.archive_latest_commit_message();
+    assert!(first_message.contains(&format!("session_id: {SESSION_A}")));
+    assert!(first_message.contains("summary_revision: 1"));
+
+    harness.append_turn(&transcript, "DELTA_REQUEST", "delta answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 20, 21);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    assert_eq!(harness.archive_commit_count(), 2);
+    let second_message = harness.archive_latest_commit_message();
+    assert!(second_message.contains("summary_revision: 2"));
+
+    harness.complete_lifecycle(SESSION_A, &transcript, 30, 31);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    assert_eq!(harness.archive_commit_count(), 2);
+
+    assert_eq!(
+        harness.commit_count(&harness.project),
+        source_commits_before
+    );
+    assert!(harness.git_status_porcelain(&harness.project).is_empty());
+}
+
+#[test]
+fn git_history_rejects_origin_source_repository_output() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("source-repo-reject-count");
+    assert_success(&harness.register_with_output(&summarizer, 10_000, &harness.project, true));
+    let source_commits_before = harness.commit_count(&harness.project);
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    let waited = harness.wait(SESSION_A, 5_000);
+    assert!(!waited.status.success());
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("archive-git-source-repo"));
+    assert_eq!(
+        harness.commit_count(&harness.project),
+        source_commits_before
+    );
+}
+
+#[test]
 fn truncation_and_rewrite_force_full_resummaries_with_safe_reasons() {
     let harness = Harness::new();
     let summarizer = harness.revision_summarizer("fallback-count");
@@ -120,6 +208,36 @@ fn truncation_and_rewrite_force_full_resummaries_with_safe_reasons() {
         fs::read_to_string(harness.root().join("fallback-count")).unwrap(),
         "xxx"
     );
+}
+
+#[test]
+fn git_commit_failure_does_not_advance_state_or_leave_staged_changes() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("git-failure-count");
+    assert_success(&harness.register_with_git_history(&summarizer, 10_000, true));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    let before_cursor = session_cursor(&harness, SESSION_A);
+    let archive_path = harness.archive_path(SESSION_A);
+    let before_markdown = fs::read(&archive_path).unwrap();
+    assert_eq!(harness.archive_commit_count(), 1);
+
+    harness.append_turn(&transcript, "DELTA_REQUEST", "delta answer");
+    harness.queue_direct(SESSION_A, &transcript, 20, 21);
+    let git_directory = harness.output.join(".git");
+    fs::set_permissions(&git_directory, fs::Permissions::from_mode(0o500)).unwrap();
+    let worker = harness.worker(SESSION_A);
+    fs::set_permissions(&git_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(worker.status.success());
+
+    let waited = harness.wait(SESSION_A, 5_000);
+    assert!(!waited.status.success());
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("archive-git"));
+    assert_eq!(session_cursor(&harness, SESSION_A), before_cursor);
+    assert_eq!(fs::read(&archive_path).unwrap(), before_markdown);
+    assert_eq!(harness.archive_commit_count(), 1);
+    assert!(harness.git_status_porcelain(&harness.output).is_empty());
 }
 
 #[test]
@@ -786,20 +904,100 @@ impl Harness {
     }
 
     fn register(&self, summarizer: &Path, timeout_ms: u64) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_munshi"))
+        self.register_with_git_history(summarizer, timeout_ms, false)
+    }
+
+    fn register_with_git_history(
+        &self,
+        summarizer: &Path,
+        timeout_ms: u64,
+        archive_git_history: bool,
+    ) -> Output {
+        self.register_with_output(summarizer, timeout_ms, &self.output, archive_git_history)
+    }
+
+    fn register_with_output(
+        &self,
+        summarizer: &Path,
+        timeout_ms: u64,
+        output_directory: &Path,
+        archive_git_history: bool,
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
+        command
             .arg("register")
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
             .arg(&self.copilot_home)
             .arg("--output-dir")
-            .arg(&self.output)
+            .arg(output_directory)
             .arg("--summarizer")
             .arg(summarizer)
             .arg("--timeout-ms")
             .arg(timeout_ms.to_string())
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+        if archive_git_history {
+            command.arg("--archive-git-history");
+        }
+        command.output().unwrap()
+    }
+
+    fn commit_count(&self, repository: &Path) -> usize {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["rev-list", "--count", "--all"])
             .output()
+            .unwrap();
+        assert_success(&output);
+        String::from_utf8(output.stdout)
             .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn archive_commit_count(&self) -> usize {
+        self.commit_count(&self.output)
+    }
+
+    fn archive_latest_commit_message(&self) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["log", "-1", "--format=%B"])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn archive_latest_commit_files(&self) -> Vec<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["show", "-1", "--pretty=format:", "--name-only"])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn git_status_porcelain(&self, repository: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     fn hook(&self, event: &str, payload: &Value) -> Output {

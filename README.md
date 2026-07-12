@@ -12,9 +12,9 @@ rendering, or delivery to one vendor.
 
 The workspace includes the Phase 0 `munshi-probe`, standalone `munshi archive`, user-level hook
 registration, SQLite-backed automatic archival with resumed revisions and interrupted-session
-recovery, and per-project policy with bounded hourly/daily/input/timeout/concurrency budgets that
-defer rather than drop work. Markdown remains the durable archive; remote delivery, optional Git
-history, and broad status/query commands remain later slices. See
+recovery, per-project policy with bounded hourly/daily/input/timeout/concurrency budgets that
+defer rather than drop work, and optional dedicated archive Git history. Markdown remains the
+durable archive; remote delivery and broad status/query commands remain later slices. See
 [`docs/automatic-archive.md`](docs/automatic-archive.md).
 
 

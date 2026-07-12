@@ -77,6 +77,7 @@ fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema(
     let config: Value =
         serde_json::from_slice(&fs::read(paths.state.join("config.json")).unwrap()).unwrap();
     assert_eq!(config["remote_delivery"], false);
+    assert_eq!(config["archive_git_history"], false);
     assert_eq!(config["local_archival_enabled"], true);
     assert_eq!(config["transcript_processing_accepted"], true);
     assert_eq!(config["project_origin"], "agent_stop_cwd");
