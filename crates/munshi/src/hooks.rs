@@ -184,13 +184,6 @@ fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), Hoo
             Some(payload.session_id),
         ));
     }
-    let metadata = SessionMetadata {
-        version: 1,
-        session_id: payload.session_id.clone(),
-        transcript_path: payload.transcript_path,
-        origin_cwd: payload.cwd,
-        agent_stop_timestamp: payload.timestamp,
-    };
     durable_remove(&result_path(state_directory, &payload.session_id)).map_err(|_| {
         failure(
             "agent-stop",
@@ -206,7 +199,49 @@ fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), Hoo
             Some(payload.session_id.clone()),
         )
     })?;
-    atomic_json_replace(&directory.join("latest.json"), &metadata)
+    let metadata_path = directory.join("latest.json");
+    let origin_cwd = if metadata_path.exists() {
+        validate_regular_owned_file(&metadata_path).map_err(|_| {
+            failure(
+                "agent-stop",
+                "state-invalid",
+                Some(payload.session_id.clone()),
+            )
+        })?;
+        let previous: SessionMetadata =
+            serde_json::from_slice(&fs::read(&metadata_path).map_err(|_| {
+                failure(
+                    "agent-stop",
+                    "state-read-failed",
+                    Some(payload.session_id.clone()),
+                )
+            })?)
+            .map_err(|_| {
+                failure(
+                    "agent-stop",
+                    "state-malformed",
+                    Some(payload.session_id.clone()),
+                )
+            })?;
+        if previous.version != 1 || previous.session_id != payload.session_id {
+            return Err(failure(
+                "agent-stop",
+                "state-mismatch",
+                Some(payload.session_id),
+            ));
+        }
+        previous.origin_cwd
+    } else {
+        payload.cwd
+    };
+    let metadata = SessionMetadata {
+        version: 1,
+        session_id: payload.session_id.clone(),
+        transcript_path: payload.transcript_path,
+        origin_cwd,
+        agent_stop_timestamp: payload.timestamp,
+    };
+    atomic_json_replace(&metadata_path, &metadata)
         .map_err(|_| failure("agent-stop", "state-write-failed", Some(payload.session_id)))
 }
 

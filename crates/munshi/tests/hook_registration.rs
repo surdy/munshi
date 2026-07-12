@@ -236,6 +236,15 @@ fn agent_stop_uses_an_atomic_minimal_metadata_handoff() {
         "agent-stop",
         payload.to_string().as_bytes(),
     ));
+    let later_project = directory.path().join("later-project");
+    fs::create_dir_all(&later_project).unwrap();
+    assert_success(&hook_command(
+        &paths,
+        "agent-stop",
+        agent_stop_payload(&later_project, &transcript)
+            .to_string()
+            .as_bytes(),
+    ));
 
     let pending_path = paths
         .state

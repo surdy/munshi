@@ -29,11 +29,12 @@ diagnostic state remain.
 
 The hooks use nested direct `exec`/`args` command objects with a two-second timeout, read exactly one
 bounded JSON object, and emit nothing. `agentStop` atomically records only the required session
-metadata. A clean `sessionEnd` writes a durable pending job and starts a detached worker with its
-working directory and inherited standard streams closed. The worker invokes the same archive path
-as `munshi archive`. Hook validation and local archival failures always return success to Copilot;
-a content-free error category is stored at `failures/last.json`. Tests can use the hidden
-`munshi hook wait` command to await a worker deterministically.
+metadata, preserving the first recorded working directory as the origin project. A clean
+`sessionEnd` writes a durable pending job and starts a detached worker with its working directory
+and inherited standard streams closed. The worker invokes the same archive path as
+`munshi archive`. Hook validation and local archival failures always return success to Copilot; a
+content-free error category is stored at `failures/last.json`. Tests can use the hidden `munshi hook
+wait` command to await a worker deterministically.
 
 That hook shape is intentionally guarded as a version-pinned Copilot CLI 1.0.70 compatibility
 contract from Phase 0. Generic web documentation or a different locally installed Copilot version
