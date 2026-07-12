@@ -448,7 +448,8 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
                 Some(payload.session_id.clone()),
             )
         })?;
-    if reserved && spawn_worker(state_directory, SourceKind::Copilot, &payload.session_id).is_err() {
+    if reserved && spawn_worker(state_directory, SourceKind::Copilot, &payload.session_id).is_err()
+    {
         let _ = state.clear_worker_reservation(&payload.session_id);
         return Err(failure(
             "session-end",

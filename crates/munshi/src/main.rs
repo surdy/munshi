@@ -1180,10 +1180,11 @@ fn build_retry_report(
         let _ = state.reserve_worker(session_id, force)?;
     }
 
-    let hook = run_archive_worker_for_source(state_directory, target_source, session_id)
-        .unwrap_or(HookResult::Failed {
+    let hook = run_archive_worker_for_source(state_directory, target_source, session_id).unwrap_or(
+        HookResult::Failed {
             code: "worker-error".to_owned(),
-        });
+        },
+    );
     let (result, code, archive_path) = retry_fields_from_hook(hook);
     let state_after = resolved_operational_state(state_directory, target_source, session_id)?
         .or(Some(before_state.clone()));
@@ -2062,7 +2063,9 @@ fn resolve_session_target(
         .collect();
     match matches.len() {
         0 => Ok(SessionTarget::NotFound),
-        1 => Ok(SessionTarget::One(Box::new(matches.pop().expect("one match")))),
+        1 => Ok(SessionTarget::One(Box::new(
+            matches.pop().expect("one match"),
+        ))),
         _ => {
             let mut sources: Vec<String> = matches
                 .iter()
