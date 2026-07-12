@@ -1252,3 +1252,94 @@ fn print_settings(settings: &DeliverySettings) {
         settings.max_attempts,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_route_uses_stable_project_and_session_identity() {
+        let (dir, title) = note_route(Some("Munshi"), "acme-abc123", "copilot", "sess-1");
+        assert_eq!(dir, "Munshi/acme-abc123");
+        assert_eq!(title, "copilot-sess-1");
+        assert_eq!(
+            note_path(Some("Munshi"), "acme-abc123", "copilot", "sess-1"),
+            "Munshi/acme-abc123/copilot-sess-1.md"
+        );
+    }
+
+    #[test]
+    fn note_route_without_folder_files_under_the_component() {
+        let (dir, title) = note_route(None, "acme-abc123", "codex", "sess-2");
+        assert_eq!(dir, "acme-abc123");
+        assert_eq!(title, "codex-sess-2");
+        // An empty folder is treated the same as no folder.
+        assert_eq!(
+            note_route(Some(""), "c", "codex", "s"),
+            ("c".to_owned(), "codex-s".to_owned())
+        );
+    }
+
+    #[test]
+    fn backoff_is_bounded_and_monotonic() {
+        assert_eq!(backoff_ms(1), BASE_BACKOFF_MS);
+        assert_eq!(backoff_ms(2), BASE_BACKOFF_MS * 2);
+        assert!(backoff_ms(3) > backoff_ms(2));
+        assert_eq!(backoff_ms(100), MAX_BACKOFF_MS);
+    }
+
+    #[test]
+    fn parses_http_endpoints_and_rejects_others() {
+        assert_eq!(
+            parse_http_endpoint("http://127.0.0.1:27183").unwrap(),
+            ("127.0.0.1".to_owned(), 27183)
+        );
+        assert_eq!(
+            parse_http_endpoint("http://localhost").unwrap(),
+            ("localhost".to_owned(), 80)
+        );
+        assert!(parse_http_endpoint("https://example.com").is_err());
+        assert!(parse_http_endpoint("ftp://host").is_err());
+    }
+
+    #[test]
+    fn encode_path_preserves_slashes_and_escapes_spaces() {
+        assert_eq!(encode_path("Munshi/a b.md"), "Munshi/a%20b.md");
+        assert_eq!(encode_path("plain-note.md"), "plain-note.md");
+    }
+
+    #[test]
+    fn dechunks_a_chunked_body() {
+        let chunked = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        assert_eq!(dechunk(chunked).unwrap(), b"Wikipedia");
+    }
+
+    #[test]
+    fn parses_a_content_length_response() {
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 13\r\n\r\n{\"path\":\"x\"}\n";
+        let response = parse_http_response(raw).unwrap();
+        assert_eq!(response.status, 201);
+    }
+
+    #[test]
+    fn resolves_a_credential_from_the_environment() {
+        // SAFETY: single-threaded unit test manipulating a uniquely-named variable.
+        unsafe {
+            std::env::set_var("MUNSHI_TEST_DELIVERY_TOKEN", "secret-token");
+        }
+        let token = resolve_credential(&StoredCredential::Env {
+            var: "MUNSHI_TEST_DELIVERY_TOKEN".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(token, "secret-token");
+        unsafe {
+            std::env::remove_var("MUNSHI_TEST_DELIVERY_TOKEN");
+        }
+        assert!(
+            resolve_credential(&StoredCredential::Env {
+                var: "MUNSHI_TEST_DELIVERY_TOKEN".to_owned(),
+            })
+            .is_err()
+        );
+    }
+}
