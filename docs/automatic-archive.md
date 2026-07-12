@@ -27,10 +27,12 @@ files, rejects symlinked or wrongly owned managed paths, and does not rewrite eq
 `munshi unregister` removes only those two positively recognized files; archives and pending
 diagnostic state remain.
 
-Register and unregister serialize changes with a persistent owner-only
-`hooks/.munshi-registration.lock` file and a nonblocking OS advisory lock held for the complete
-operation. The file is intentionally not unlinked; an unheld file is immediately reusable, and the
-kernel releases an active lock if the process exits or crashes.
+Register, and unregister when an existing hooks directory contains managed removal work, serialize
+changes with a persistent owner-only `hooks/.munshi-registration.lock` file and a nonblocking OS
+advisory lock held for the complete operation. The file is intentionally not unlinked; an unheld
+file is immediately reusable, and the kernel releases an active lock if the process exits or
+crashes. Unregister does not create a missing hooks directory or lock; it may remove a positively
+recognized config directly when no hooks directory exists.
 
 The hooks use direct `exec`/`args` fields with a two-second timeout, read exactly one bounded JSON
 object, and emit nothing. `agentStop` atomically records only the required session metadata,

@@ -182,7 +182,38 @@ fn registration_rejects_symlinked_or_malformed_owned_paths() {
 }
 
 #[test]
-fn stale_registration_lock_is_reusable_for_register_and_unregister() {
+fn fresh_unregister_creates_no_hooks_or_lock() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    fs::create_dir_all(&paths.copilot_home).unwrap();
+    let settings = paths.copilot_home.join("settings.json");
+    fs::write(&settings, b"{\"unchanged\":true}\n").unwrap();
+
+    assert_success(&unregister_command(&paths));
+
+    assert!(!paths.copilot_home.join("hooks").exists());
+    assert_eq!(fs::read(settings).unwrap(), b"{\"unchanged\":true}\n");
+}
+
+#[test]
+fn absent_hooks_cleanup_removes_only_recognized_config_without_creating_hooks() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    fs::remove_file(paths.copilot_home.join("hooks/munshi.json")).unwrap();
+    fs::remove_file(paths.copilot_home.join("hooks/.munshi-registration.lock")).unwrap();
+    fs::remove_dir(paths.copilot_home.join("hooks")).unwrap();
+    fs::set_permissions(&paths.copilot_home, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = unregister_command(&paths);
+    fs::set_permissions(&paths.copilot_home, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_success(&output);
+    assert!(!paths.state.join("config.json").exists());
+    assert!(!paths.copilot_home.join("hooks").exists());
+}
+
+#[test]
+fn stale_lock_is_reusable_and_existing_hook_unregister_honors_contention() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
     fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();

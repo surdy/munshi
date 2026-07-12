@@ -200,12 +200,22 @@ pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), Reg
     }
     validate_existing_directory_if_present(copilot_home)?;
     validate_existing_directory_if_present(state_directory)?;
+    let hooks = copilot_home.join("hooks");
+    validate_existing_directory_if_present(&hooks)?;
     if !copilot_home.exists() {
         return Ok(());
     }
-    let hooks = ensure_child_directory(copilot_home, "hooks")?;
     let hook_path = hooks.join(HOOK_FILE_NAME);
     let config_path = state_directory.join(CONFIG_FILE_NAME);
+    if !hooks.exists() {
+        validate_owned_file::<StoredConfig>(&config_path)?;
+        return durable_remove(&config_path);
+    }
+    let hook_exists = recognized_owned_file_exists::<HookFile>(&hook_path)?;
+    let config_exists = recognized_owned_file_exists::<StoredConfig>(&config_path)?;
+    if !hook_exists && !config_exists {
+        return Ok(());
+    }
     let lock_path = hooks.join(".munshi-registration.lock");
     let _lock = acquire_registration_lock(&lock_path)?;
     validate_owned_file::<HookFile>(&hook_path)?;
@@ -634,18 +644,24 @@ fn validate_regular_file(path: &Path) -> Result<(), RegistrationError> {
 fn validate_owned_file<T: for<'de> Deserialize<'de> + ManagedFile>(
     path: &Path,
 ) -> Result<(), RegistrationError> {
+    recognized_owned_file_exists::<T>(path).map(|_| ())
+}
+
+fn recognized_owned_file_exists<T: for<'de> Deserialize<'de> + ManagedFile>(
+    path: &Path,
+) -> Result<bool, RegistrationError> {
     if !path.exists() {
         if fs::symlink_metadata(path).is_ok() {
             return Err(RegistrationError::UnsafePath(path.to_path_buf()));
         }
-        return Ok(());
+        return Ok(false);
     }
     validate_regular_owned_file(path)?;
     let bytes = fs::read(path).map_err(RegistrationError::Io)?;
     let value =
         serde_json::from_slice::<T>(&bytes).map_err(|_| RegistrationError::MalformedOwnedFile)?;
     if value.is_recognized() {
-        Ok(())
+        Ok(true)
     } else {
         Err(RegistrationError::MalformedOwnedFile)
     }
