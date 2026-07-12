@@ -201,4 +201,6 @@ or by `munshi hook recover`, once concurrency frees up, the budget window rolls 
 is re-enabled. No diagnostic category or log ever contains transcript content. See
 [ADR 0005](adr/0005-defer-project-policy-and-budgets-never-drop.md).
 
-Remote delivery and broad status/retry/query commands remain out of scope.
+Remote delivery remains out of scope. Operational inspection and repair now use stable `status`,
+`sessions`, `show`, `retry`, `retry-all`, `doctor`, and `configuration-check` commands (with
+`--json` machine contracts).

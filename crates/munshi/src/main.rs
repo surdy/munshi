@@ -1,16 +1,22 @@
 use std::error::Error;
 use std::ffi::OsString;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
-    ArchiveConfig, ArchiveOutcome, HookEvent, HookResult, ProjectStatus, RegisterConfig,
-    SessionReference, accept_disclosure_from_terminal, archive_session, handle_hook,
-    project_status, register, run_archive_worker, run_recovery, set_project_enabled, unregister,
+    ArchiveConfig, ArchiveOutcome, HookEvent, HookFailure, HookResult, ProjectStatus,
+    RegisterConfig,
+    SessionRecord, SessionReference, StateStore, StructuredSummary,
+    accept_disclosure_from_terminal, archive_session, handle_hook, parse_archive_markdown,
+    project_status, read_last_failure, register, run_archive_worker, run_recovery,
+    set_project_enabled, unregister,
     wait_for_hook_result,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(about = "Archive coding-agent sessions as durable Markdown", version)]
@@ -106,6 +112,76 @@ enum Command {
     /// Enable, disable, or inspect future processing and delivery for one project.
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// Show overall operational status.
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List sessions and their operational states.
+    Sessions {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum)]
+        state: Option<SessionStateFilter>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show one session and its current summary.
+    Show {
+        session_id: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry one pending/failed session using the normal worker state machine.
+    Retry {
+        session_id: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Force failed sessions past backoff/permanent retry markers.
+        #[arg(long)]
+        force: bool,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry all currently eligible sessions using the normal worker state machine.
+    RetryAll {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Force failed sessions past backoff/permanent retry markers.
+        #[arg(long)]
+        force: bool,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 32)]
+        limit: usize,
+    },
+    /// Diagnose registration, dependencies, and runtime readiness.
+    Doctor {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate current registration/configuration contracts.
+    ConfigurationCheck {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
     #[command(hide = true, subcommand)]
     Hook(HookCommand),
     #[command(hide = true)]
@@ -115,6 +191,22 @@ enum Command {
         #[arg(long)]
         session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum SessionStateFilter {
+    Archived,
+    RevisionPending,
+    SummaryPending,
+    Interrupted,
+    Failed,
+    DeliveryRelated,
+    DisabledProject,
+    Processing,
+    Observed,
+    NotArchiveWorthy,
+    Unknown,
 }
 
 #[derive(Debug, Subcommand)]
@@ -174,13 +266,337 @@ enum HookCommand {
 
 enum Outcome {
     Archive(ArchiveOutcome),
-    Registered { hook_path: PathBuf },
+    Registered {
+        hook_path: PathBuf,
+    },
     Unregistered,
     DryRun,
     Hook,
     Worker,
     Wait(HookResult),
     Project(ProjectStatus),
+    Status {
+        report: Box<StatusReport>,
+        json: bool,
+    },
+    Sessions {
+        report: Box<SessionsReport>,
+        json: bool,
+    },
+    Show {
+        report: Box<ShowReport>,
+        json: bool,
+    },
+    Retry {
+        report: Box<RetryReport>,
+        json: bool,
+    },
+    RetryAll {
+        report: Box<RetryAllReport>,
+        json: bool,
+    },
+    Doctor {
+        report: Box<DoctorReport>,
+        json: bool,
+    },
+    ConfigurationCheck {
+        report: Box<ConfigurationCheckReport>,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CheckStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+impl CheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Ok => "[ok]",
+            Self::Warning => "[warn]",
+            Self::Error => "[error]",
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Error, _) | (_, Self::Error) => Self::Error,
+            (Self::Warning, _) | (_, Self::Warning) => Self::Warning,
+            _ => Self::Ok,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CaptureState {
+    Enabled,
+    DisabledProject,
+    Unknown,
+}
+
+impl CaptureState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::DisabledProject => "disabled-project",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DeliveryState {
+    Disabled,
+    DeliveryRelated,
+    Unknown,
+}
+
+impl DeliveryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::DeliveryRelated => "delivery-related",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CheckResult {
+    code: &'static str,
+    status: CheckStatus,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigurationAssessment {
+    status: CheckStatus,
+    runtime_compatible: bool,
+    capture_state: CaptureState,
+    delivery_state: DeliveryState,
+    archive_git_history: Option<bool>,
+    disabled_projects: usize,
+    config_path: String,
+    hook_path: String,
+    summarizer_executable: Option<String>,
+    output_directory: Option<String>,
+    checks: Vec<CheckResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct SessionStateSummary {
+    total: usize,
+    archived: usize,
+    revision_pending: usize,
+    summary_pending: usize,
+    interrupted: usize,
+    failed: usize,
+    delivery_related: usize,
+    disabled_project: usize,
+    processing: usize,
+    observed: usize,
+    not_archive_worthy: usize,
+    unknown: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusReport {
+    schema_version: u32,
+    command: &'static str,
+    state_directory: String,
+    configuration: ConfigurationAssessment,
+    sessions: SessionStateSummary,
+    last_failure: Option<HookFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionsReport {
+    schema_version: u32,
+    command: &'static str,
+    filter: Option<String>,
+    total: usize,
+    returned: usize,
+    items: Vec<SessionListItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionListItem {
+    session_id: String,
+    state: String,
+    lifecycle_state: String,
+    revision: u64,
+    completion_reason: Option<String>,
+    summary_title: Option<String>,
+    archive_path: Option<String>,
+    last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ShowReport {
+    schema_version: u32,
+    command: &'static str,
+    found: bool,
+    session: Option<ShowSessionView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ShowSessionView {
+    session_id: String,
+    state: String,
+    lifecycle_state: String,
+    revision: u64,
+    completion_reason: Option<String>,
+    summary_title: Option<String>,
+    archive_path: Option<String>,
+    last_error_code: Option<String>,
+    project: Option<ProjectView>,
+    source: Option<SourceProgressView>,
+    summary: Option<StructuredSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectView {
+    identity: String,
+    component: String,
+    project: String,
+    repository: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SourceProgressView {
+    normalizer_version: u32,
+    record_count: u64,
+    byte_offset: u64,
+    prefix_hash: String,
+    source_hash: String,
+    source_bytes: u64,
+    started_at: Option<String>,
+    updated_at: Option<String>,
+    user_requests: usize,
+    assistant_messages: usize,
+    tool_activities: usize,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetryReport {
+    schema_version: u32,
+    command: &'static str,
+    session_id: String,
+    force: bool,
+    result: String,
+    code: Option<String>,
+    state_before: Option<String>,
+    state_after: Option<String>,
+    archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetryAllReport {
+    schema_version: u32,
+    command: &'static str,
+    force: bool,
+    requested_limit: usize,
+    attempted: usize,
+    archived: usize,
+    not_archive_worthy: usize,
+    not_eligible: usize,
+    failed: usize,
+    items: Vec<RetryItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetryItem {
+    session_id: String,
+    result: String,
+    code: Option<String>,
+    archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigurationCheckReport {
+    schema_version: u32,
+    command: &'static str,
+    state_directory: String,
+    configuration: ConfigurationAssessment,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorReport {
+    schema_version: u32,
+    command: &'static str,
+    state_directory: String,
+    status: CheckStatus,
+    configuration: ConfigurationAssessment,
+    checks: Vec<CheckResult>,
+    sessions: SessionStateSummary,
+    last_failure: Option<HookFailure>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawStoredConfig {
+    version: Option<u32>,
+    summarizer: Option<RawStoredCommand>,
+    output_directory: Option<String>,
+    state_directory: Option<String>,
+    archive_git_history: Option<bool>,
+    local_archival_enabled: Option<bool>,
+    transcript_processing_accepted: Option<bool>,
+    project_origin: Option<String>,
+    remote_delivery: Option<bool>,
+    policy: Option<RawPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawStoredCommand {
+    executable: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawPolicy {
+    max_calls_per_hour: Option<u32>,
+    max_calls_per_day: Option<u32>,
+    max_concurrency: Option<usize>,
+    disabled_projects: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawHookFile {
+    version: Option<u32>,
+    hooks: Option<RawHookEvents>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawHookEvents {
+    #[serde(rename = "agentStop")]
+    agent_stop: Option<Vec<RawHookCommand>>,
+    #[serde(rename = "sessionEnd")]
+    session_end: Option<Vec<RawHookCommand>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawHookCommand {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    exec: Option<String>,
+    args: Option<Vec<String>>,
+    #[serde(rename = "timeoutSec")]
+    timeout_seconds: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -224,6 +640,82 @@ fn main() -> ExitCode {
                 status.max_calls_per_day
             );
             ExitCode::SUCCESS
+        }
+        Ok(Outcome::Status { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_status_human(&report);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::Sessions { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_sessions_human(&report);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::Show { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_show_human(&report);
+            }
+            if report.found {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            }
+        }
+        Ok(Outcome::Retry { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_retry_human(&report);
+            }
+            if matches!(report.result.as_str(), "failed" | "not-found") {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(Outcome::RetryAll { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_retry_all_human(&report);
+            }
+            if report.failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(Outcome::ConfigurationCheck { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_configuration_check_human(&report);
+            }
+            if report.configuration.status == CheckStatus::Error {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(Outcome::Doctor { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_doctor_human(&report);
+            }
+            if report.status == CheckStatus::Error {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => {
             eprintln!("error: {error}");
@@ -360,6 +852,74 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 &project_dir,
             )?))
         }
+        Command::Status { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Status {
+                report: Box::new(build_status_report(&state_directory)?),
+                json,
+            })
+        }
+        Command::Sessions {
+            state_dir,
+            json,
+            state,
+            limit,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Sessions {
+                report: Box::new(build_sessions_report(&state_directory, state, limit)?),
+                json,
+            })
+        }
+        Command::Show {
+            session_id,
+            state_dir,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Show {
+                report: Box::new(build_show_report(&state_directory, &session_id)?),
+                json,
+            })
+        }
+        Command::Retry {
+            session_id,
+            state_dir,
+            force,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Retry {
+                report: Box::new(build_retry_report(&state_directory, &session_id, force)?),
+                json,
+            })
+        }
+        Command::RetryAll {
+            state_dir,
+            force,
+            json,
+            limit,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::RetryAll {
+                report: Box::new(build_retry_all_report(&state_directory, force, limit)?),
+                json,
+            })
+        }
+        Command::Doctor { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Doctor {
+                report: Box::new(build_doctor_report(&state_directory)?),
+                json,
+            })
+        }
+        Command::ConfigurationCheck { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::ConfigurationCheck {
+                report: Box::new(build_configuration_check_report(&state_directory)),
+                json,
+            })
+        }
         Command::Hook(HookCommand::AgentStop { state_dir }) => {
             if let Ok(state_dir) = resolve_state_directory(state_dir) {
                 handle_hook(HookEvent::AgentStop, &state_dir, std::io::stdin().lock());
@@ -403,6 +963,1240 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             Ok(Outcome::Worker)
         }
     }
+}
+
+fn build_status_report(state_directory: &Path) -> Result<StatusReport, Box<dyn Error>> {
+    let configuration = inspect_configuration(state_directory);
+    let sessions = load_sessions(state_directory)?;
+    Ok(StatusReport {
+        schema_version: 1,
+        command: "status",
+        state_directory: state_directory.display().to_string(),
+        configuration,
+        sessions: summarize_sessions(&sessions),
+        last_failure: read_last_failure_if_available(state_directory),
+    })
+}
+
+fn build_sessions_report(
+    state_directory: &Path,
+    filter: Option<SessionStateFilter>,
+    limit: usize,
+) -> Result<SessionsReport, Box<dyn Error>> {
+    let sessions = load_sessions(state_directory)?;
+    let wanted = filter.map(session_filter_name);
+    let mut items = sessions
+        .iter()
+        .map(session_record_to_item)
+        .collect::<Vec<_>>();
+    if let Some(wanted) = wanted {
+        items.retain(|item| item.state == wanted);
+    }
+    let total = items.len();
+    items.truncate(limit);
+    Ok(SessionsReport {
+        schema_version: 1,
+        command: "sessions",
+        filter: filter.map(session_filter_name).map(ToOwned::to_owned),
+        total,
+        returned: items.len(),
+        items,
+    })
+}
+
+fn build_show_report(
+    state_directory: &Path,
+    session_id: &str,
+) -> Result<ShowReport, Box<dyn Error>> {
+    let Some(record) = load_session_record(state_directory, session_id)? else {
+        return Ok(ShowReport {
+            schema_version: 1,
+            command: "show",
+            found: false,
+            session: None,
+        });
+    };
+
+    let configuration = inspect_configuration(state_directory);
+    let mut summary = record.current_summary.clone();
+    let mut project = record.project.clone().map(|project| ProjectView {
+        identity: project.identity,
+        component: project.component,
+        project: project.project,
+        repository: project.repository,
+        branch: project.branch,
+    });
+
+    if let (None, Some(output_directory), Some(relative)) = (
+        summary.as_ref(),
+        configuration.output_directory.as_deref(),
+        record.markdown_relative_path.as_deref(),
+    ) {
+        if let Ok(markdown) = fs::read_to_string(Path::new(output_directory).join(relative))
+            && let Ok(parsed) = parse_archive_markdown(&markdown)
+        {
+            summary = Some(parsed.summary);
+            if project.is_none() {
+                project = Some(ProjectView {
+                    identity: parsed.project.identity,
+                    component: parsed.project.component,
+                    project: parsed.project.project,
+                    repository: parsed.project.repository,
+                    branch: parsed.project.branch,
+                });
+            }
+        }
+    }
+
+    let source = record
+        .previous_source
+        .clone()
+        .map(|source| SourceProgressView {
+            normalizer_version: source.normalizer_version,
+            record_count: source.record_count,
+            byte_offset: source.byte_offset,
+            prefix_hash: source.prefix_hash,
+            source_hash: source.source_hash,
+            source_bytes: source.source_bytes,
+            started_at: source.started_at,
+            updated_at: source.updated_at,
+            user_requests: source.user_requests,
+            assistant_messages: source.assistant_messages,
+            tool_activities: source.tool_activities,
+            fallback_reason: record.fallback_reason.clone(),
+        });
+
+    let state = operational_state(&record).to_owned();
+    let view = ShowSessionView {
+        session_id: record.session_id.clone(),
+        state,
+        lifecycle_state: record.lifecycle_state.clone(),
+        revision: record.current_revision,
+        completion_reason: record.completion_reason.clone(),
+        summary_title: summary.as_ref().map(|summary| summary.title.clone()),
+        archive_path: record
+            .markdown_relative_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        last_error_code: record.last_error_category.clone(),
+        project,
+        source,
+        summary,
+    };
+
+    Ok(ShowReport {
+        schema_version: 1,
+        command: "show",
+        found: true,
+        session: Some(view),
+    })
+}
+
+fn build_retry_report(
+    state_directory: &Path,
+    session_id: &str,
+    force: bool,
+) -> Result<RetryReport, Box<dyn Error>> {
+    let Some(before) = load_session_record(state_directory, session_id)? else {
+        return Ok(RetryReport {
+            schema_version: 1,
+            command: "retry",
+            session_id: session_id.to_owned(),
+            force,
+            result: "not-found".to_owned(),
+            code: None,
+            state_before: None,
+            state_after: None,
+            archive_path: None,
+        });
+    };
+    let before_state = operational_state(&before).to_owned();
+
+    if !is_retryable_lifecycle(&before.lifecycle_state) {
+        return Ok(RetryReport {
+            schema_version: 1,
+            command: "retry",
+            session_id: session_id.to_owned(),
+            force,
+            result: "not-eligible".to_owned(),
+            code: None,
+            state_before: Some(before_state.clone()),
+            state_after: Some(before_state),
+            archive_path: None,
+        });
+    }
+
+    if state_database_exists(state_directory) {
+        let mut state = StateStore::open(state_directory)?;
+        let _ = state.reserve_worker(session_id, force)?;
+    }
+
+    let hook = run_archive_worker(state_directory, session_id).unwrap_or(HookResult::Failed {
+        code: "worker-error".to_owned(),
+    });
+    let (result, code, archive_path) = retry_fields_from_hook(hook);
+    let state_after = load_session_record(state_directory, session_id)?
+        .map(|record| operational_state(&record).to_owned())
+        .or(Some(before_state.clone()));
+
+    Ok(RetryReport {
+        schema_version: 1,
+        command: "retry",
+        session_id: session_id.to_owned(),
+        force,
+        result,
+        code,
+        state_before: Some(before_state),
+        state_after,
+        archive_path,
+    })
+}
+
+fn build_retry_all_report(
+    state_directory: &Path,
+    force: bool,
+    limit: usize,
+) -> Result<RetryAllReport, Box<dyn Error>> {
+    if !state_database_exists(state_directory) {
+        return Ok(RetryAllReport {
+            schema_version: 1,
+            command: "retry-all",
+            force,
+            requested_limit: limit,
+            attempted: 0,
+            archived: 0,
+            not_archive_worthy: 0,
+            not_eligible: 0,
+            failed: 0,
+            items: Vec::new(),
+        });
+    }
+
+    let mut state = StateStore::open(state_directory)?;
+    let session_ids = state.reserve_eligible_workers(force, limit)?;
+    drop(state);
+
+    let mut items = Vec::new();
+    let mut archived = 0;
+    let mut not_archive_worthy = 0;
+    let mut not_eligible = 0;
+    let mut failed = 0;
+
+    for session_id in session_ids {
+        let hook = run_archive_worker(state_directory, &session_id).unwrap_or(HookResult::Failed {
+            code: "worker-error".to_owned(),
+        });
+        let (result, code, archive_path) = retry_fields_from_hook(hook);
+        match result.as_str() {
+            "archived" => archived += 1,
+            "not-archive-worthy" => not_archive_worthy += 1,
+            "not-eligible" => not_eligible += 1,
+            _ => failed += 1,
+        }
+        items.push(RetryItem {
+            session_id,
+            result,
+            code,
+            archive_path,
+        });
+    }
+
+    Ok(RetryAllReport {
+        schema_version: 1,
+        command: "retry-all",
+        force,
+        requested_limit: limit,
+        attempted: items.len(),
+        archived,
+        not_archive_worthy,
+        not_eligible,
+        failed,
+        items,
+    })
+}
+
+fn build_configuration_check_report(state_directory: &Path) -> ConfigurationCheckReport {
+    ConfigurationCheckReport {
+        schema_version: 1,
+        command: "configuration-check",
+        state_directory: state_directory.display().to_string(),
+        configuration: inspect_configuration(state_directory),
+    }
+}
+
+fn build_doctor_report(state_directory: &Path) -> Result<DoctorReport, Box<dyn Error>> {
+    let configuration = inspect_configuration(state_directory);
+    let mut checks = configuration.checks.clone();
+
+    if state_directory.exists() {
+        if is_writable_directory(state_directory) {
+            push_check(
+                &mut checks,
+                "state-directory",
+                CheckStatus::Ok,
+                format!("{} is writable", state_directory.display()),
+            );
+        } else {
+            push_check(
+                &mut checks,
+                "state-directory",
+                CheckStatus::Error,
+                format!("{} is not writable", state_directory.display()),
+            );
+        }
+    } else {
+        push_check(
+            &mut checks,
+            "state-directory",
+            CheckStatus::Warning,
+            format!("{} does not exist", state_directory.display()),
+        );
+    }
+
+    if state_database_exists(state_directory) {
+        match StateStore::open(state_directory) {
+            Ok(state) => match state.schema_version() {
+                Ok(version) => push_check(
+                    &mut checks,
+                    "state-schema",
+                    CheckStatus::Ok,
+                    format!("schema_migrations version {version}"),
+                ),
+                Err(error) => push_check(
+                    &mut checks,
+                    "state-schema",
+                    CheckStatus::Error,
+                    format!("failed to read schema version: {error}"),
+                ),
+            },
+            Err(error) => push_check(
+                &mut checks,
+                "state-open",
+                CheckStatus::Error,
+                format!("failed to open SQLite state: {error}"),
+            ),
+        }
+    } else {
+        push_check(
+            &mut checks,
+            "state-open",
+            CheckStatus::Warning,
+            "no SQLite state database found".to_owned(),
+        );
+    }
+
+    if let Some(executable) = configuration.summarizer_executable.as_deref() {
+        let path = Path::new(executable);
+        if is_executable_file(path) {
+            push_check(
+                &mut checks,
+                "summarizer-executable",
+                CheckStatus::Ok,
+                format!("{} is executable", path.display()),
+            );
+        } else {
+            push_check(
+                &mut checks,
+                "summarizer-executable",
+                CheckStatus::Error,
+                format!("{} is missing or not executable", path.display()),
+            );
+        }
+    } else {
+        push_check(
+            &mut checks,
+            "summarizer-executable",
+            CheckStatus::Warning,
+            "summarizer executable is not configured".to_owned(),
+        );
+    }
+
+    if let Some(output) = configuration.output_directory.as_deref() {
+        let output_path = Path::new(output);
+        if output_path.exists() {
+            if is_writable_directory(output_path) {
+                push_check(
+                    &mut checks,
+                    "output-directory",
+                    CheckStatus::Ok,
+                    format!("{} is writable", output_path.display()),
+                );
+            } else {
+                push_check(
+                    &mut checks,
+                    "output-directory",
+                    CheckStatus::Error,
+                    format!("{} is not writable", output_path.display()),
+                );
+            }
+        } else if output_path
+            .parent()
+            .is_some_and(|parent| parent.exists() && is_writable_directory(parent))
+        {
+            push_check(
+                &mut checks,
+                "output-directory",
+                CheckStatus::Ok,
+                format!("{} is creatable", output_path.display()),
+            );
+        } else {
+            push_check(
+                &mut checks,
+                "output-directory",
+                CheckStatus::Error,
+                format!("{} is not writable or creatable", output_path.display()),
+            );
+        }
+    }
+
+    match configuration.archive_git_history {
+        Some(true) => {
+            if let Some(output) = configuration.output_directory.as_deref() {
+                let output_path = Path::new(output);
+                if output_path.exists() {
+                    if output_path.join(".git").is_dir() {
+                        push_check(
+                            &mut checks,
+                            "archive-git-repository",
+                            CheckStatus::Ok,
+                            format!("{} is a Git repository", output_path.display()),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "archive-git-repository",
+                            CheckStatus::Error,
+                            format!(
+                                "{} is missing .git while archive Git history is enabled",
+                                output_path.display()
+                            ),
+                        );
+                    }
+                } else {
+                    push_check(
+                        &mut checks,
+                        "archive-git-repository",
+                        CheckStatus::Warning,
+                        format!(
+                            "{} does not exist yet; archive repository will be created on demand",
+                            output_path.display()
+                        ),
+                    );
+                }
+            } else {
+                push_check(
+                    &mut checks,
+                    "archive-git-repository",
+                    CheckStatus::Warning,
+                    "archive Git history enabled but output directory is not configured".to_owned(),
+                );
+            }
+        }
+        Some(false) => push_check(
+            &mut checks,
+            "archive-git-repository",
+            CheckStatus::Ok,
+            "archive Git history disabled".to_owned(),
+        ),
+        None => push_check(
+            &mut checks,
+            "archive-git-repository",
+            CheckStatus::Warning,
+            "archive Git history setting is unknown".to_owned(),
+        ),
+    }
+
+    let sessions = load_sessions(state_directory)?;
+    let status = overall_status(&checks);
+
+    Ok(DoctorReport {
+        schema_version: 1,
+        command: "doctor",
+        state_directory: state_directory.display().to_string(),
+        status,
+        configuration,
+        checks,
+        sessions: summarize_sessions(&sessions),
+        last_failure: read_last_failure_if_available(state_directory),
+    })
+}
+
+fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
+    let config_path = state_directory.join("config.json");
+    let hook_path = state_directory
+        .parent()
+        .map(|parent| parent.join("hooks/munshi.json"))
+        .unwrap_or_else(|| PathBuf::from("hooks/munshi.json"));
+
+    let mut checks = Vec::new();
+    let mut capture_state = CaptureState::Unknown;
+    let mut delivery_state = DeliveryState::Unknown;
+    let mut summarizer_executable = None;
+    let mut output_directory = None;
+    let mut archive_git_history = None;
+    let mut disabled_projects = 0usize;
+
+    let mut config_recognized = false;
+    if !config_path.exists() {
+        push_check(
+            &mut checks,
+            "config-file",
+            CheckStatus::Error,
+            format!("missing {}", config_path.display()),
+        );
+    } else {
+        match fs::read(&config_path) {
+            Ok(bytes) => match serde_json::from_slice::<RawStoredConfig>(&bytes) {
+                Ok(config) => {
+                    push_check(
+                        &mut checks,
+                        "config-file",
+                        CheckStatus::Ok,
+                        format!("loaded {}", config_path.display()),
+                    );
+                    if config.version == Some(1) {
+                        push_check(
+                            &mut checks,
+                            "config-version",
+                            CheckStatus::Ok,
+                            "version 1".to_owned(),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "config-version",
+                            CheckStatus::Warning,
+                            format!("unsupported version {:?}; expected 1", config.version),
+                        );
+                    }
+
+                    summarizer_executable =
+                        config.summarizer.and_then(|command| command.executable);
+                    output_directory = config.output_directory;
+                    archive_git_history = config.archive_git_history;
+                    let policy = config.policy.unwrap_or(RawPolicy {
+                        max_calls_per_hour: None,
+                        max_calls_per_day: None,
+                        max_concurrency: None,
+                        disabled_projects: None,
+                    });
+                    let disabled = policy.disabled_projects.clone().unwrap_or_default();
+                    disabled_projects = disabled.len();
+
+                    capture_state = if config.local_archival_enabled == Some(true) {
+                        if disabled_projects > 0 {
+                            CaptureState::DisabledProject
+                        } else {
+                            CaptureState::Enabled
+                        }
+                    } else {
+                        CaptureState::Unknown
+                    };
+                    delivery_state = match config.remote_delivery {
+                        Some(false) => DeliveryState::Disabled,
+                        Some(true) => DeliveryState::DeliveryRelated,
+                        None => DeliveryState::Unknown,
+                    };
+
+                    match capture_state {
+                        CaptureState::Enabled => push_check(
+                            &mut checks,
+                            "capture-state",
+                            CheckStatus::Ok,
+                            "local archival enabled".to_owned(),
+                        ),
+                        CaptureState::DisabledProject => push_check(
+                            &mut checks,
+                            "capture-state",
+                            CheckStatus::Warning,
+                            format!(
+                                "{} explicitly disabled project identity{}",
+                                disabled_projects,
+                                if disabled_projects == 1 { "" } else { "ies" }
+                            ),
+                        ),
+                        CaptureState::Unknown => push_check(
+                            &mut checks,
+                            "capture-state",
+                            CheckStatus::Warning,
+                            "local archival state is unknown or malformed".to_owned(),
+                        ),
+                    }
+
+                    match delivery_state {
+                        DeliveryState::Disabled => push_check(
+                            &mut checks,
+                            "delivery-state",
+                            CheckStatus::Ok,
+                            "delivery disabled".to_owned(),
+                        ),
+                        DeliveryState::DeliveryRelated => push_check(
+                            &mut checks,
+                            "delivery-state",
+                            CheckStatus::Warning,
+                            "delivery-related configuration present".to_owned(),
+                        ),
+                        DeliveryState::Unknown => push_check(
+                            &mut checks,
+                            "delivery-state",
+                            CheckStatus::Warning,
+                            "delivery state is unknown".to_owned(),
+                        ),
+                    }
+
+                    let state_dir_matches = config
+                        .state_directory
+                        .as_deref()
+                        .is_some_and(|value| Path::new(value) == state_directory);
+                    if state_dir_matches {
+                        push_check(
+                            &mut checks,
+                            "state-directory-match",
+                            CheckStatus::Ok,
+                            "config state_directory matches command scope".to_owned(),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "state-directory-match",
+                            CheckStatus::Error,
+                            "config state_directory does not match command scope".to_owned(),
+                        );
+                    }
+
+                    if config.transcript_processing_accepted == Some(true) {
+                        push_check(
+                            &mut checks,
+                            "transcript-disclosure",
+                            CheckStatus::Ok,
+                            "transcript disclosure accepted".to_owned(),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "transcript-disclosure",
+                            CheckStatus::Warning,
+                            "transcript disclosure not accepted".to_owned(),
+                        );
+                    }
+
+                    if config.project_origin.as_deref() == Some("agent_stop_cwd") {
+                        push_check(
+                            &mut checks,
+                            "project-origin",
+                            CheckStatus::Ok,
+                            "project_origin=agent_stop_cwd".to_owned(),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "project-origin",
+                            CheckStatus::Warning,
+                            format!("unexpected project_origin {:?}", config.project_origin),
+                        );
+                    }
+
+                    let policy_checks = (
+                        policy.max_calls_per_hour,
+                        policy.max_calls_per_day,
+                        policy.max_concurrency,
+                    );
+                    if let (Some(hourly), Some(daily), Some(concurrency)) = policy_checks {
+                        let status = if hourly > 0 && daily > 0 && concurrency >= 1 {
+                            CheckStatus::Ok
+                        } else {
+                            CheckStatus::Error
+                        };
+                        let message = format!(
+                            "policy max_calls_per_hour={hourly}, max_calls_per_day={daily}, max_concurrency={concurrency}"
+                        );
+                        push_check(&mut checks, "policy", status, message);
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "policy",
+                            CheckStatus::Warning,
+                            "policy section is missing expected budget/concurrency values"
+                                .to_owned(),
+                        );
+                    }
+
+                    match archive_git_history {
+                        Some(true) => push_check(
+                            &mut checks,
+                            "archive-git-history",
+                            CheckStatus::Ok,
+                            "archive Git history is enabled".to_owned(),
+                        ),
+                        Some(false) => push_check(
+                            &mut checks,
+                            "archive-git-history",
+                            CheckStatus::Ok,
+                            "archive Git history is disabled".to_owned(),
+                        ),
+                        None => push_check(
+                            &mut checks,
+                            "archive-git-history",
+                            CheckStatus::Warning,
+                            "archive_git_history is missing from configuration".to_owned(),
+                        ),
+                    }
+
+                    let summarizer_absolute = summarizer_executable
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_absolute());
+                    let output_absolute = output_directory
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_absolute());
+                    if summarizer_absolute {
+                        push_check(
+                            &mut checks,
+                            "summarizer-path",
+                            CheckStatus::Ok,
+                            "summarizer executable path is absolute".to_owned(),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "summarizer-path",
+                            CheckStatus::Error,
+                            "summarizer executable path is missing or relative".to_owned(),
+                        );
+                    }
+                    if output_absolute {
+                        push_check(
+                            &mut checks,
+                            "output-path",
+                            CheckStatus::Ok,
+                            "output directory path is absolute".to_owned(),
+                        );
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "output-path",
+                            CheckStatus::Error,
+                            "output directory path is missing or relative".to_owned(),
+                        );
+                    }
+
+                    config_recognized = config.version == Some(1)
+                        && config.local_archival_enabled == Some(true)
+                        && delivery_state == DeliveryState::Disabled
+                        && config.transcript_processing_accepted == Some(true)
+                        && config.project_origin.as_deref() == Some("agent_stop_cwd")
+                        && policy.max_concurrency.unwrap_or_default() >= 1
+                        && state_dir_matches
+                        && summarizer_absolute
+                        && output_absolute;
+                }
+                Err(error) => push_check(
+                    &mut checks,
+                    "config-parse",
+                    CheckStatus::Error,
+                    format!("invalid JSON at {}: {error}", config_path.display()),
+                ),
+            },
+            Err(error) => push_check(
+                &mut checks,
+                "config-read",
+                CheckStatus::Error,
+                format!("failed to read {}: {error}", config_path.display()),
+            ),
+        }
+    }
+
+    let hook_recognized = if !hook_path.exists() {
+        push_check(
+            &mut checks,
+            "hook-file",
+            CheckStatus::Error,
+            format!("missing {}", hook_path.display()),
+        );
+        false
+    } else {
+        match fs::read(&hook_path) {
+            Ok(bytes) => match serde_json::from_slice::<RawHookFile>(&bytes) {
+                Ok(hook) => {
+                    if hook_is_recognized(&hook) {
+                        push_check(
+                            &mut checks,
+                            "hook-contract",
+                            CheckStatus::Ok,
+                            "hook file matches the 1.0.70 managed contract".to_owned(),
+                        );
+                        true
+                    } else {
+                        push_check(
+                            &mut checks,
+                            "hook-contract",
+                            CheckStatus::Error,
+                            "hook file does not match the managed contract".to_owned(),
+                        );
+                        false
+                    }
+                }
+                Err(error) => {
+                    push_check(
+                        &mut checks,
+                        "hook-parse",
+                        CheckStatus::Error,
+                        format!("invalid JSON at {}: {error}", hook_path.display()),
+                    );
+                    false
+                }
+            },
+            Err(error) => {
+                push_check(
+                    &mut checks,
+                    "hook-read",
+                    CheckStatus::Error,
+                    format!("failed to read {}: {error}", hook_path.display()),
+                );
+                false
+            }
+        }
+    };
+
+    let runtime_compatible = config_recognized && hook_recognized;
+    if runtime_compatible {
+        push_check(
+            &mut checks,
+            "runtime-compatible",
+            CheckStatus::Ok,
+            "configuration is compatible with current automatic workers".to_owned(),
+        );
+    } else {
+        push_check(
+            &mut checks,
+            "runtime-compatible",
+            CheckStatus::Warning,
+            "configuration is not fully compatible with current automatic workers".to_owned(),
+        );
+    }
+
+    ConfigurationAssessment {
+        status: overall_status(&checks),
+        runtime_compatible,
+        capture_state,
+        delivery_state,
+        archive_git_history,
+        disabled_projects,
+        config_path: config_path.display().to_string(),
+        hook_path: hook_path.display().to_string(),
+        summarizer_executable,
+        output_directory,
+        checks,
+    }
+}
+
+fn hook_is_recognized(hook: &RawHookFile) -> bool {
+    if hook.version != Some(1) {
+        return false;
+    }
+    let Some(events) = hook.hooks.as_ref() else {
+        return false;
+    };
+    hook_command_is_recognized(events.agent_stop.as_deref(), "agent-stop")
+        && hook_command_is_recognized(events.session_end.as_deref(), "session-end")
+}
+
+fn hook_command_is_recognized(commands: Option<&[RawHookCommand]>, event: &str) -> bool {
+    let Some(commands) = commands else {
+        return false;
+    };
+    if commands.len() != 1 {
+        return false;
+    }
+    let command = &commands[0];
+    command.kind.as_deref() == Some("command")
+        && command.timeout_seconds == Some(2)
+        && command
+            .exec
+            .as_deref()
+            .is_some_and(|exec| Path::new(exec).is_absolute())
+        && command.args.as_deref() == Some(&["hook".to_owned(), event.to_owned()])
+}
+
+fn push_check(
+    checks: &mut Vec<CheckResult>,
+    code: &'static str,
+    status: CheckStatus,
+    message: String,
+) {
+    checks.push(CheckResult {
+        code,
+        status,
+        message,
+    });
+}
+
+fn overall_status(checks: &[CheckResult]) -> CheckStatus {
+    checks.iter().fold(CheckStatus::Ok, |current, check| {
+        current.combine(check.status)
+    })
+}
+
+fn build_session_item(record: &SessionRecord) -> SessionListItem {
+    SessionListItem {
+        session_id: record.session_id.clone(),
+        state: operational_state(record).to_owned(),
+        lifecycle_state: record.lifecycle_state.clone(),
+        revision: record.current_revision,
+        completion_reason: record.completion_reason.clone(),
+        summary_title: record
+            .current_summary
+            .as_ref()
+            .map(|summary| summary.title.clone()),
+        archive_path: record
+            .markdown_relative_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        last_error_code: record.last_error_category.clone(),
+    }
+}
+
+fn session_record_to_item(record: &SessionRecord) -> SessionListItem {
+    build_session_item(record)
+}
+
+fn summarize_sessions(records: &[SessionRecord]) -> SessionStateSummary {
+    let mut summary = SessionStateSummary {
+        total: records.len(),
+        ..SessionStateSummary::default()
+    };
+    for record in records {
+        match operational_state(record) {
+            "archived" => summary.archived += 1,
+            "revision-pending" => summary.revision_pending += 1,
+            "summary-pending" => summary.summary_pending += 1,
+            "interrupted" => summary.interrupted += 1,
+            "failed" => summary.failed += 1,
+            "delivery-related" => summary.delivery_related += 1,
+            "disabled-project" => summary.disabled_project += 1,
+            "processing" => summary.processing += 1,
+            "observed" => summary.observed += 1,
+            "not-archive-worthy" => summary.not_archive_worthy += 1,
+            _ => summary.unknown += 1,
+        }
+    }
+    summary
+}
+
+fn operational_state(record: &SessionRecord) -> &'static str {
+    let disabled_project = record.last_error_category.as_deref().is_some_and(|code| {
+        matches!(
+            code,
+            "project-disabled" | "project-override-disabled" | "project-override-invalid"
+        )
+    });
+    if disabled_project && record.lifecycle_state != "archived" {
+        return "disabled-project";
+    }
+    match record.lifecycle_state.as_str() {
+        "archived" => "archived",
+        "revision-pending" => "revision-pending",
+        "summary-pending" => "summary-pending",
+        "interrupted" => "interrupted",
+        "failed" => {
+            if record
+                .last_error_category
+                .as_deref()
+                .is_some_and(|code| code.starts_with("delivery-"))
+            {
+                "delivery-related"
+            } else {
+                "failed"
+            }
+        }
+        "processing" => "processing",
+        "observed" if record.current_revision == 0 && record.last_session_end_ms.is_some() => {
+            "not-archive-worthy"
+        }
+        "observed" => "observed",
+        _ => "unknown",
+    }
+}
+
+fn is_retryable_lifecycle(state: &str) -> bool {
+    matches!(
+        state,
+        "summary-pending" | "revision-pending" | "interrupted" | "failed" | "processing"
+    )
+}
+
+fn retry_fields_from_hook(hook: HookResult) -> (String, Option<String>, Option<String>) {
+    match hook {
+        HookResult::Archived { relative_path } => {
+            ("archived".to_owned(), None, Some(relative_path))
+        }
+        HookResult::NotArchiveWorthy => ("not-archive-worthy".to_owned(), None, None),
+        HookResult::Failed { code } if code == "work-not-claimable" => {
+            ("not-eligible".to_owned(), Some(code), None)
+        }
+        HookResult::Failed { code } => ("failed".to_owned(), Some(code), None),
+    }
+}
+
+fn session_filter_name(filter: SessionStateFilter) -> &'static str {
+    match filter {
+        SessionStateFilter::Archived => "archived",
+        SessionStateFilter::RevisionPending => "revision-pending",
+        SessionStateFilter::SummaryPending => "summary-pending",
+        SessionStateFilter::Interrupted => "interrupted",
+        SessionStateFilter::Failed => "failed",
+        SessionStateFilter::DeliveryRelated => "delivery-related",
+        SessionStateFilter::DisabledProject => "disabled-project",
+        SessionStateFilter::Processing => "processing",
+        SessionStateFilter::Observed => "observed",
+        SessionStateFilter::NotArchiveWorthy => "not-archive-worthy",
+        SessionStateFilter::Unknown => "unknown",
+    }
+}
+
+fn state_database_exists(state_directory: &Path) -> bool {
+    StateStore::database_path(state_directory).exists()
+}
+
+fn load_sessions(state_directory: &Path) -> Result<Vec<SessionRecord>, Box<dyn Error>> {
+    if !state_database_exists(state_directory) {
+        return Ok(Vec::new());
+    }
+    let state = StateStore::open(state_directory)?;
+    Ok(state.list_sessions()?)
+}
+
+fn load_session_record(
+    state_directory: &Path,
+    session_id: &str,
+) -> Result<Option<SessionRecord>, Box<dyn Error>> {
+    if !state_database_exists(state_directory) {
+        return Ok(None);
+    }
+    let state = StateStore::open(state_directory)?;
+    Ok(state.get_session(session_id)?)
+}
+
+fn read_last_failure_if_available(state_directory: &Path) -> Option<HookFailure> {
+    if !state_database_exists(state_directory) {
+        return None;
+    }
+    read_last_failure(state_directory).ok().flatten()
+}
+
+fn is_writable_directory(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_dir() && metadata.permissions().mode() & 0o200 != 0)
+        .unwrap_or(false)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn print_status_human(report: &StatusReport) {
+    println!("state directory: {}", report.state_directory);
+    println!(
+        "configuration: {} (capture {}, delivery {}, git-history {}, disabled-projects {}, runtime-compatible {})",
+        report.configuration.status.as_str(),
+        report.configuration.capture_state.as_str(),
+        report.configuration.delivery_state.as_str(),
+        report
+            .configuration
+            .archive_git_history
+            .map(|value| if value { "enabled" } else { "disabled" })
+            .unwrap_or("unknown"),
+        report.configuration.disabled_projects,
+        report.configuration.runtime_compatible
+    );
+    println!(
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        report.sessions.total,
+        report.sessions.archived,
+        report.sessions.revision_pending,
+        report.sessions.summary_pending,
+        report.sessions.interrupted,
+        report.sessions.failed,
+        report.sessions.delivery_related,
+        report.sessions.disabled_project,
+        report.sessions.processing,
+        report.sessions.observed,
+        report.sessions.not_archive_worthy,
+        report.sessions.unknown
+    );
+    if let Some(failure) = &report.last_failure {
+        println!(
+            "last failure: operation={} code={} session={}",
+            failure.operation,
+            failure.code,
+            failure.session_id.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
+fn print_sessions_human(report: &SessionsReport) {
+    if report.items.is_empty() {
+        println!("no sessions");
+        return;
+    }
+    println!("sessions returned {} of {}", report.returned, report.total);
+    for item in &report.items {
+        println!(
+            "{}  {}  rev={}{}",
+            item.session_id,
+            item.state,
+            item.revision,
+            item.last_error_code
+                .as_deref()
+                .map(|code| format!(" error={code}"))
+                .unwrap_or_default()
+        );
+    }
+}
+
+fn print_show_human(report: &ShowReport) {
+    let Some(session) = report.session.as_ref() else {
+        println!("session not found");
+        return;
+    };
+    println!("session: {}", session.session_id);
+    println!(
+        "state: {} (lifecycle {})",
+        session.state, session.lifecycle_state
+    );
+    println!("revision: {}", session.revision);
+    if let Some(completion) = session.completion_reason.as_deref() {
+        println!("completion: {completion}");
+    }
+    if let Some(path) = session.archive_path.as_deref() {
+        println!("archive: {path}");
+    }
+    if let Some(summary) = session.summary.as_ref() {
+        println!("title: {}", summary.title);
+        println!("goal: {}", summary.goal);
+        if !summary.work_completed.is_empty() {
+            println!("work completed:");
+            for item in &summary.work_completed {
+                println!("- {item}");
+            }
+        }
+    }
+}
+
+fn print_retry_human(report: &RetryReport) {
+    println!(
+        "retry {} -> {}{}",
+        report.session_id,
+        report.result,
+        report
+            .code
+            .as_deref()
+            .map(|code| format!(" ({code})"))
+            .unwrap_or_default()
+    );
+}
+
+fn print_retry_all_human(report: &RetryAllReport) {
+    println!(
+        "retry-all attempted={} archived={} not-archive-worthy={} not-eligible={} failed={}",
+        report.attempted,
+        report.archived,
+        report.not_archive_worthy,
+        report.not_eligible,
+        report.failed
+    );
+    for item in &report.items {
+        println!(
+            "{} -> {}{}",
+            item.session_id,
+            item.result,
+            item.code
+                .as_deref()
+                .map(|code| format!(" ({code})"))
+                .unwrap_or_default()
+        );
+    }
+}
+
+fn print_configuration_check_human(report: &ConfigurationCheckReport) {
+    println!(
+        "configuration status: {}",
+        report.configuration.status.as_str()
+    );
+    println!(
+        "capture: {}, delivery: {}, git-history: {}, disabled-projects: {}, runtime-compatible: {}",
+        report.configuration.capture_state.as_str(),
+        report.configuration.delivery_state.as_str(),
+        report
+            .configuration
+            .archive_git_history
+            .map(|value| if value { "enabled" } else { "disabled" })
+            .unwrap_or("unknown"),
+        report.configuration.disabled_projects,
+        report.configuration.runtime_compatible
+    );
+    for check in &report.configuration.checks {
+        println!(
+            "{} {} - {}",
+            check.status.marker(),
+            check.code,
+            check.message
+        );
+    }
+}
+
+fn print_doctor_human(report: &DoctorReport) {
+    println!("doctor status: {}", report.status.as_str());
+    println!(
+        "capture: {}, delivery: {}, git-history: {}, disabled-projects: {}, runtime-compatible: {}",
+        report.configuration.capture_state.as_str(),
+        report.configuration.delivery_state.as_str(),
+        report
+            .configuration
+            .archive_git_history
+            .map(|value| if value { "enabled" } else { "disabled" })
+            .unwrap_or("unknown"),
+        report.configuration.disabled_projects,
+        report.configuration.runtime_compatible
+    );
+    for check in &report.checks {
+        println!(
+            "{} {} - {}",
+            check.status.marker(),
+            check.code,
+            check.message
+        );
+    }
+    println!(
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        report.sessions.total,
+        report.sessions.archived,
+        report.sessions.revision_pending,
+        report.sessions.summary_pending,
+        report.sessions.interrupted,
+        report.sessions.failed,
+        report.sessions.delivery_related,
+        report.sessions.disabled_project,
+        report.sessions.processing,
+        report.sessions.observed,
+        report.sessions.not_archive_worthy,
+        report.sessions.unknown
+    );
+    if let Some(failure) = &report.last_failure {
+        println!(
+            "last failure: operation={} code={} session={}",
+            failure.operation,
+            failure.code,
+            failure.session_id.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
+fn emit_json(value: &impl Serialize) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).expect("JSON serialization succeeds")
+    );
 }
 
 fn resolve_state_directory(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {

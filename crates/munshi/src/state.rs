@@ -580,7 +580,7 @@ impl StateStore {
             |row| row.get(0),
         )?;
         let reserved = if can_spawn {
-            reserve_worker_in_transaction(&transaction, database_id, now)?
+            reserve_worker_in_transaction(&transaction, database_id, now, false)?
         } else {
             false
         };
@@ -610,6 +610,30 @@ impl StateStore {
                 session_from_row,
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                id,source_session_id,origin_cwd,
+                origin_project_identity,origin_project_component,origin_project_name,
+                origin_repository,origin_branch,transcript_path,lifecycle_state,
+                completion_reason,source_end_reason,current_summary_revision,
+                current_summary_json,current_summary_hash,current_markdown_relative_path,
+                current_markdown_hash,normalizer_version,source_cursor_records,
+                source_cursor_bytes,source_prefix_hash,source_hash,source_bytes,
+                source_started_at,source_updated_at,source_user_requests,
+                source_assistant_messages,source_tool_activities,last_fallback_reason,
+                state_generation,active,last_agent_stop_ms,last_session_end_ms,
+                last_error_category
+             FROM sessions
+             WHERE source_kind='copilot-cli'
+             ORDER BY updated_at_ms DESC,id DESC",
+        )?;
+        statement
+            .query_map([], session_from_row)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
@@ -722,6 +746,7 @@ fn reserve_worker_in_transaction(
     transaction: &Transaction<'_>,
     database_id: i64,
     now: i64,
+    force: bool,
 ) -> Result<bool, StateError> {
     let changed = transaction.execute(
         "UPDATE sessions SET
@@ -742,9 +767,10 @@ fn reserve_worker_in_transaction(
                   AND a.lease_expires_at_ms <= ?2
            ))
            AND (lifecycle_state <> 'failed'
+                OR ?4
                 OR next_retry_at_ms IS NULL
                 OR (next_retry_at_ms >= 0 AND next_retry_at_ms <= ?2))",
-        params![database_id, now, now - WORKER_RESERVATION_STALE_MS],
+        params![database_id, now, now - WORKER_RESERVATION_STALE_MS, force],
     )?;
     Ok(changed == 1)
 }
@@ -918,14 +944,6 @@ impl StateStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if force {
-            transaction.execute(
-                "UPDATE sessions SET next_retry_at_ms=NULL
-                 WHERE source_kind='copilot-cli' AND source_session_id=?1
-                   AND lifecycle_state='failed'",
-                [session_id],
-            )?;
-        }
         let database_id = transaction
             .query_row(
                 "SELECT id FROM sessions
@@ -934,12 +952,25 @@ impl StateStore {
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        let reserved = match database_id {
-            Some(database_id) => reserve_worker_in_transaction(&transaction, database_id, now)?,
-            None => false,
+        let reserved_database_id = match database_id {
+            Some(database_id)
+                if reserve_worker_in_transaction(&transaction, database_id, now, force)? =>
+            {
+                Some(database_id)
+            }
+            _ => None,
         };
+        if force {
+            if let Some(database_id) = reserved_database_id {
+                transaction.execute(
+                    "UPDATE sessions SET next_retry_at_ms=NULL
+                     WHERE id=?1 AND lifecycle_state='failed'",
+                    [database_id],
+                )?;
+            }
+        }
         transaction.commit()?;
-        Ok(reserved)
+        Ok(reserved_database_id.is_some())
     }
 
     pub fn reserve_eligible_workers(
@@ -951,13 +982,6 @@ impl StateStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if force {
-            transaction.execute(
-                "UPDATE sessions SET next_retry_at_ms=NULL
-                 WHERE lifecycle_state='failed'",
-                [],
-            )?;
-        }
         let mut statement = transaction.prepare(
             "SELECT id,source_session_id
              FROM sessions
@@ -974,21 +998,29 @@ impl StateStore {
                       AND a.lease_expires_at_ms <= ?2
                ))
                AND (lifecycle_state <> 'failed'
+                    OR ?3
                     OR next_retry_at_ms IS NULL
                     OR (next_retry_at_ms >= 0 AND next_retry_at_ms <= ?2))
              ORDER BY updated_at_ms,id
-             LIMIT ?3",
+             LIMIT ?4",
         )?;
         let rows = statement
             .query_map(
-                params![now - WORKER_RESERVATION_STALE_MS, now, limit as i64],
+                params![now - WORKER_RESERVATION_STALE_MS, now, force, limit as i64],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut reserved = Vec::new();
         for (database_id, session_id) in rows {
-            if reserve_worker_in_transaction(&transaction, database_id, now)? {
+            if reserve_worker_in_transaction(&transaction, database_id, now, force)? {
+                if force {
+                    transaction.execute(
+                        "UPDATE sessions SET next_retry_at_ms=NULL
+                         WHERE id=?1 AND lifecycle_state='failed'",
+                        [database_id],
+                    )?;
+                }
                 reserved.push(session_id);
             }
         }
@@ -1873,7 +1905,7 @@ impl StateStore {
             )?;
         }
         let reserved = if inserted == 1 {
-            reserve_worker_in_transaction(&transaction, database_id, now)?
+            reserve_worker_in_transaction(&transaction, database_id, now, false)?
         } else {
             false
         };
@@ -1933,7 +1965,7 @@ impl StateStore {
             )?;
         }
         let reserved = if inserted == 1 {
-            reserve_worker_in_transaction(&transaction, database_id, now)?
+            reserve_worker_in_transaction(&transaction, database_id, now, false)?
         } else {
             false
         };

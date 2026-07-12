@@ -14,7 +14,9 @@ The workspace includes the Phase 0 `munshi-probe`, standalone `munshi archive`, 
 registration, SQLite-backed automatic archival with resumed revisions and interrupted-session
 recovery, per-project policy with bounded hourly/daily/input/timeout/concurrency budgets that
 defer rather than drop work, and optional dedicated archive Git history. Markdown remains the
-durable archive; remote delivery and broad status/query commands remain later slices. See
+durable archive. Operational status/query/retry contracts are now available through
+`status`, `sessions`, `show`, `retry`, `retry-all`, `doctor`, and `configuration-check`.
+Remote delivery remains a later slice. See
 [`docs/automatic-archive.md`](docs/automatic-archive.md).
 
 
@@ -504,7 +506,36 @@ Implemented guarantees:
 - Concurrent terminal sessions must not block unrelated session IDs.
 
 `munshi hook recover` is an internal recovery/testing path used by later hooks and explicit repair
-work. Broad status, retry, query, and doctor commands remain issue #7 scope.
+work.
+
+## Operational CLI contracts
+
+The following commands expose stable human-readable output and stable machine output with `--json`:
+
+- `munshi status`
+- `munshi sessions [--state <kebab-state>] [--limit N]`
+- `munshi show <session-id>`
+- `munshi retry <session-id> [--force]`
+- `munshi retry-all [--limit N] [--force]`
+- `munshi doctor`
+- `munshi configuration-check`
+
+Every JSON response emits `schema_version: 1` and a command discriminator. Session states are
+classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, `failed`,
+`delivery-related`, `disabled-project`, `processing`, `observed`, `not-archive-worthy`, or
+`unknown`.
+
+`configuration-check` and `doctor` report:
+
+- capture state (`enabled`, `disabled-project`, `unknown`) from real issue #5 policy state
+  (`policy.disabled_projects`) rather than a local-archival approximation,
+- delivery state (`disabled`, `delivery-related`, `unknown`),
+- archive Git-history configuration and repository health checks when enabled.
+
+Retry commands are idempotent and use the same session lock, claim path, and state machine as hook
+workers. By default they respect existing backoff and permanent-failure markers; `--force`
+overrides those markers only for selected retry targets. No query or retry command exposes raw
+transcript content.
 
 ## Configuration
 
