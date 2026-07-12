@@ -332,10 +332,7 @@ fn valid_tool_complete(data: &Map<String, Value>) -> bool {
         return false;
     }
     if let Some(result) = data.get("result") {
-        let Some(result) = result.as_object() else {
-            return false;
-        };
-        if !result.get("content").is_some_and(Value::is_string) {
+        if !valid_tool_result(result) {
             return false;
         }
     }
@@ -348,6 +345,25 @@ fn valid_tool_complete(data: &Map<String, Value>) -> bool {
         }
     }
     true
+}
+
+fn valid_tool_result(result: &Value) -> bool {
+    let Some(result) = result.as_object() else {
+        return false;
+    };
+    let has_content = match result.get("content") {
+        Some(Value::String(_)) => true,
+        Some(_) => return false,
+        None => false,
+    };
+    let has_textual_contents = match result.get("contents") {
+        Some(Value::Array(contents)) => contents
+            .iter()
+            .any(|content| extract_tool_result_text(content).is_some()),
+        Some(_) => return false,
+        None => false,
+    };
+    has_content || has_textual_contents
 }
 
 fn extract_tool_start(data: &Map<String, Value>) -> Result<String, SourceError> {

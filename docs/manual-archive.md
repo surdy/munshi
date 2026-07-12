@@ -56,8 +56,9 @@ The manual record always has revision 1, a source-line cursor, and a SHA-256 sou
   request/assistant text. Transformed content, reasoning, encrypted/opaque content, and system
   messages are excluded.
 - Tool activity is `tool.execution_start` or `tool.execution_complete`, validated by required
-  tool-call fields. Arguments stay opaque JSON; completion normalization uses `result.content`,
-  safe textual `result.contents` variants, or `error.message`, never base64 assets.
+  tool-call fields. Arguments stay opaque JSON; completion results may provide string
+  `result.content`, processable textual `result.contents`, or both. Normalization also retains
+  `error.message`, never base64 assets or resource links.
 - Envelope timestamps are accepted only as RFC 3339 strings. The shutdown event's separate
   millisecond `sessionStartTime` is not treated as an envelope timestamp.
 

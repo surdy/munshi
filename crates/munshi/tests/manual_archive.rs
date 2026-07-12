@@ -17,6 +17,7 @@ const NORMAL_ID: &str = "11111111-1111-4111-8111-111111111111";
 const UNKNOWN_ID: &str = "22222222-2222-4222-8222-222222222222";
 const MALFORMED_ID: &str = "33333333-3333-4333-8333-333333333333";
 const CANCELLED_ID: &str = "44444444-4444-4444-8444-444444444444";
+const CONTENTS_ONLY_ID: &str = "77777777-7777-4777-8777-777777777777";
 
 #[test]
 fn normal_session_archives_to_deterministic_golden_markdown() {
@@ -43,6 +44,28 @@ fn normal_session_archives_to_deterministic_golden_markdown() {
         include_str!("../../../fixtures/manual/expected/normal.md")
     );
     assert!(!markdown.contains(directory.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn contents_only_tool_completion_is_archive_worthy_and_forwards_safe_text() {
+    let directory = test_directory();
+    let project = git_project(directory.path());
+    let output = directory.path().join("archives");
+
+    let outcome = archive_session(&config(
+        CONTENTS_ONLY_ID,
+        fixture_events(CONTENTS_ONLY_ID),
+        &project,
+        &output,
+        fake("contents-only.sh"),
+    ))
+    .unwrap();
+
+    let ArchiveOutcome::Archived { id, relative_path } = outcome else {
+        panic!("expected contents-only completion to archive");
+    };
+    assert_eq!(id, format!("copilot:{CONTENTS_ONLY_ID}"));
+    assert!(output.join(relative_path).is_file());
 }
 
 #[test]
@@ -136,6 +159,64 @@ fn archive_predicate_uses_only_authoritative_content_and_tool_events() {
             events,
             directory.path(),
             &directory.path().join(format!("archives-{session_id}")),
+            directory.path().join("does-not-exist"),
+        ))
+        .unwrap();
+        assert!(matches!(outcome, ArchiveOutcome::NotArchiveWorthy { .. }));
+    }
+}
+
+#[test]
+fn result_free_completion_is_valid_but_wrong_result_field_types_are_not() {
+    let directory = test_directory();
+    let valid_id = "88888888-8888-4888-8888-888888888888";
+    let valid_events = directory.path().join(valid_id).join("events.jsonl");
+    fs::create_dir_all(valid_events.parent().unwrap()).unwrap();
+    fs::write(
+        &valid_events,
+        concat!(
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"A real request.\"}}\n",
+            "{\"type\":\"tool.execution_complete\",\"data\":{\"toolCallId\":\"call-1\",\"success\":true}}\n"
+        ),
+    )
+    .unwrap();
+    let valid = archive_session(&config(
+        valid_id,
+        valid_events,
+        directory.path(),
+        &directory.path().join("valid-archives"),
+        fake("tool-only.sh"),
+    ))
+    .unwrap();
+    assert!(matches!(valid, ArchiveOutcome::Archived { .. }));
+
+    for (session_id, result) in [
+        ("99999999-9999-4999-8999-999999999999", r#"{"content":7}"#),
+        (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            r#"{"contents":{"type":"text","text":"wrong container"}}"#,
+        ),
+    ] {
+        let events = directory.path().join(session_id).join("events.jsonl");
+        fs::create_dir_all(events.parent().unwrap()).unwrap();
+        fs::write(
+            &events,
+            format!(
+                concat!(
+                    "{{\"type\":\"user.message\",\"data\":{{\"content\":\"A real request.\"}}}}\n",
+                    "{{\"type\":\"tool.execution_complete\",\"data\":{{\"toolCallId\":\"call-1\",\"success\":true,\"result\":{}}}}}\n"
+                ),
+                result
+            ),
+        )
+        .unwrap();
+        let outcome = archive_session(&config(
+            session_id,
+            events,
+            directory.path(),
+            &directory
+                .path()
+                .join(format!("invalid-archives-{session_id}")),
             directory.path().join("does-not-exist"),
         ))
         .unwrap();
