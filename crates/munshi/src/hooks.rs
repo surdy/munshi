@@ -162,7 +162,9 @@ fn run_archive_worker_inner(
     {
         let _ = state.hydrate_session_from_archives(&output_directory, session_id)?;
     }
-    if let Some(result) = reconcile_persisted_attempt(&mut state, &output_directory, session_id)? {
+    if let Some(result) =
+        reconcile_persisted_attempt(&mut state, state_directory, &output_directory, session_id)?
+    {
         return Ok(result);
     }
     if state
@@ -623,6 +625,7 @@ fn process_claim(
         .strip_prefix(&output_directory)
         .map_err(|_| StateError::InvalidState)?
         .to_path_buf();
+    let archive_git_history = stored.archive_git_history && !cursor_only;
     let markdown_hash = content_hash(markdown.as_bytes());
     let plan = PlannedArchive {
         revision,
@@ -633,6 +636,7 @@ fn process_claim(
         source_bytes: update.session.source_bytes,
         markdown_relative_path: relative_path.clone(),
         markdown_hash: markdown_hash.clone(),
+        archive_git_history,
         completion_reason: completion.to_owned(),
         fallback_reason: fallback_reason.map(ToOwned::to_owned),
     };
@@ -646,7 +650,7 @@ fn process_claim(
         }
         return Err(error.into());
     }
-    if stored.archive_git_history && !cursor_only {
+    if archive_git_history {
         if let Err(error) = commit_archive_revision(
             state_directory,
             &output_directory,
@@ -685,6 +689,7 @@ fn process_claim(
                 user_requests: update.session.user_requests,
                 assistant_messages: update.session.assistant_messages,
                 tool_activities: update.session.tool_activities,
+                archive_git_history,
                 completion_reason: completion.to_owned(),
                 fallback_reason: fallback_reason.map(ToOwned::to_owned),
             },
@@ -698,6 +703,7 @@ fn process_claim(
 
 fn reconcile_persisted_attempt(
     state: &mut StateStore,
+    state_directory: &Path,
     output_directory: &Path,
     session_id: &str,
 ) -> Result<Option<HookResult>, HookWorkerError> {
@@ -729,6 +735,16 @@ fn reconcile_persisted_attempt(
         || cursor.source_hash != plan.plan.source_hash
     {
         return Ok(None);
+    }
+    if plan.plan.archive_git_history {
+        commit_archive_revision(
+            state_directory,
+            output_directory,
+            &plan.plan.markdown_relative_path,
+            Some(markdown.project.identity.as_str()),
+            session_id,
+            markdown.summary_revision,
+        )?;
     }
     let session = state
         .get_session(session_id)?
@@ -773,6 +789,7 @@ fn reconcile_persisted_attempt(
                 .previous_source
                 .as_ref()
                 .map_or(0, |source| source.tool_activities),
+            archive_git_history: plan.plan.archive_git_history,
             completion_reason: markdown.completion_reason,
             fallback_reason: markdown.cursor_fallback_reason,
         },

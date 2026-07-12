@@ -104,6 +104,7 @@ pub struct PlannedArchive {
     pub source_bytes: u64,
     pub markdown_relative_path: PathBuf,
     pub markdown_hash: String,
+    pub archive_git_history: bool,
     pub completion_reason: String,
     pub fallback_reason: Option<String>,
 }
@@ -136,6 +137,7 @@ pub struct PersistedArchive {
     pub user_requests: usize,
     pub assistant_messages: usize,
     pub tool_activities: usize,
+    pub archive_git_history: bool,
     pub completion_reason: String,
     pub fallback_reason: Option<String>,
 }
@@ -325,6 +327,7 @@ impl StateStore {
                     planned_source_bytes INTEGER,
                     planned_markdown_relative_path TEXT,
                     planned_markdown_hash TEXT,
+                    planned_archive_git_history INTEGER NOT NULL DEFAULT 0,
                     planned_completion_reason TEXT,
                     planned_fallback_reason TEXT
                  );
@@ -381,6 +384,7 @@ impl StateStore {
         if user_version > SCHEMA_VERSION {
             return Err(StateError::NewerSchema);
         }
+        ensure_processing_attempts_git_history_column(&self.connection)?;
         Ok(())
     }
 
@@ -846,6 +850,32 @@ fn path_text(path: &Path) -> Result<&str, StateError> {
     path.to_str().ok_or(StateError::InvalidState)
 }
 
+fn ensure_processing_attempts_git_history_column(
+    connection: &Connection,
+) -> Result<(), StateError> {
+    let has_column = {
+        let mut statement = connection.prepare("PRAGMA table_info(processing_attempts)")?;
+        let mut rows = statement.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "planned_archive_git_history" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE processing_attempts
+             ADD COLUMN planned_archive_git_history INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn dedupe_key(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
@@ -1073,6 +1103,7 @@ impl StateStore {
                         a.planned_revision,a.planned_record_count,a.planned_byte_offset,
                         a.planned_prefix_hash,a.planned_source_hash,a.planned_source_bytes,
                         a.planned_markdown_relative_path,a.planned_markdown_hash,
+                        a.planned_archive_git_history,
                         a.planned_completion_reason,a.planned_fallback_reason
                  FROM processing_attempts a
                  JOIN sessions s ON s.id=a.session_id
@@ -1096,8 +1127,9 @@ impl StateStore {
                             source_bytes: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
                             markdown_relative_path: PathBuf::from(row.get::<_, String>(10)?),
                             markdown_hash: row.get(11)?,
-                            completion_reason: row.get(12)?,
-                            fallback_reason: row.get(13)?,
+                            archive_git_history: row.get::<_, i64>(12)? != 0,
+                            completion_reason: row.get(13)?,
+                            fallback_reason: row.get(14)?,
                         },
                     })
                 },
@@ -1296,8 +1328,9 @@ impl StateStore {
                 planned_revision=?2,planned_record_count=?3,planned_byte_offset=?4,
                 planned_prefix_hash=?5,planned_source_hash=?6,planned_source_bytes=?7,
                 planned_markdown_relative_path=?8,planned_markdown_hash=?9,
-                planned_completion_reason=?10,planned_fallback_reason=?11
-             WHERE id=?1 AND lease_token=?12 AND outcome='processing'",
+                planned_archive_git_history=?10,
+                planned_completion_reason=?11,planned_fallback_reason=?12
+             WHERE id=?1 AND lease_token=?13 AND outcome='processing'",
             params![
                 claim.attempt_id,
                 plan.revision as i64,
@@ -1308,6 +1341,11 @@ impl StateStore {
                 plan.source_bytes as i64,
                 path_text(&plan.markdown_relative_path)?,
                 plan.markdown_hash,
+                if plan.archive_git_history {
+                    1_i64
+                } else {
+                    0_i64
+                },
                 plan.completion_reason,
                 plan.fallback_reason,
                 claim.token
@@ -1343,6 +1381,7 @@ impl StateStore {
                 "SELECT planned_revision,planned_record_count,planned_byte_offset,
                         planned_prefix_hash,planned_source_hash,planned_source_bytes,
                         planned_markdown_relative_path,planned_markdown_hash,
+                        planned_archive_git_history,
                         planned_completion_reason,planned_fallback_reason
                  FROM processing_attempts
                  WHERE id=?1 AND lease_token=?2 AND outcome='processing'",
@@ -1357,8 +1396,9 @@ impl StateStore {
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(8)?,
                         row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                     ))
                 },
             )
@@ -1374,8 +1414,9 @@ impl StateStore {
             || planned.5 != Some(persisted.source_bytes as i64)
             || planned.6.as_deref() != Some(path_text(&persisted.markdown_relative_path)?)
             || planned.7.as_deref() != Some(&persisted.markdown_hash)
-            || planned.8.as_deref() != Some(&persisted.completion_reason)
-            || planned.9.as_deref() != persisted.fallback_reason.as_deref()
+            || planned.8 != Some(if persisted.archive_git_history { 1 } else { 0 })
+            || planned.9.as_deref() != Some(&persisted.completion_reason)
+            || planned.10.as_deref() != persisted.fallback_reason.as_deref()
         {
             return Err(StateError::InvalidState);
         }

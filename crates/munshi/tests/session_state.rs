@@ -567,6 +567,208 @@ fn post_persist_worker_crash_is_reconciled_without_second_summary_call() {
 }
 
 #[test]
+fn post_persist_recovery_creates_missing_git_commit() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("reconcile-missing-git-count");
+    assert_success(&harness.register_with_git_history(&summarizer, 10_000, true));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    harness.append_turn(&transcript, "DELTA_REQUEST", "delta answer");
+    harness.queue_direct(SESSION_A, &transcript, 20, 21);
+
+    let resolved = resolve_session_reference(&SessionReference {
+        session_id: Some(SESSION_A.to_owned()),
+        events_path: Some(transcript),
+        copilot_home: None,
+    })
+    .unwrap();
+    let session = load_session(&resolved, 1024 * 1024).unwrap();
+    let project = inspect_project(&harness.project).unwrap();
+    let summary = StructuredSummary {
+        title: "Recovered persisted revision".to_owned(),
+        goal: "Finalize a revision written before a worker crash.".to_owned(),
+        work_completed: vec!["Persisted Markdown before the simulated crash.".to_owned()],
+        decisions: Vec::new(),
+        files_changed: Vec::new(),
+        commands_and_validation: Vec::new(),
+        open_items: Vec::new(),
+        tags: vec!["recovery".to_owned()],
+    };
+    let markdown = render_revision_markdown(
+        &ArchiveMetadata {
+            session: &session,
+            project: &project,
+        },
+        &summary,
+        2,
+        "complete",
+        None,
+    );
+    let archive_path = harness.archive_path(SESSION_A);
+    atomic_replace(&archive_path, markdown.as_bytes()).unwrap();
+    let relative = archive_path.strip_prefix(&harness.output).unwrap();
+    let markdown_hash = content_hash(markdown.as_bytes());
+    assert_eq!(harness.archive_commit_count(), 1);
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let (database_id, generation): (i64, i64) = connection
+        .query_row(
+            "SELECT id,state_generation FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO processing_attempts(
+                session_id,state_generation,retry_state,lease_token,owner_pid,
+                started_at_ms,lease_expires_at_ms,outcome,
+                planned_revision,planned_record_count,planned_byte_offset,
+                planned_prefix_hash,planned_source_hash,planned_source_bytes,
+                planned_markdown_relative_path,planned_markdown_hash,
+                planned_archive_git_history,planned_completion_reason
+             ) VALUES (
+                ?1,?2,'revision-pending','post-persist-git-missing-token',999999,1,2,'processing',
+                2,?3,?4,?5,?6,?7,?8,?9,1,'complete'
+             )",
+            params![
+                database_id,
+                generation,
+                session.source_cursor as i64,
+                session.source_byte_cursor as i64,
+                session.source_prefix_hash,
+                session.source_hash,
+                session.source_bytes as i64,
+                relative.to_string_lossy(),
+                markdown_hash,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET lifecycle_state='processing',retry_state='revision-pending',
+                claim_token='post-persist-git-missing-token',claim_started_at_ms=1,
+                worker_generation=NULL,worker_spawned_at_ms=NULL
+             WHERE id=?1",
+            [database_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_success(&harness.recover(0, true, false));
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    assert_eq!(
+        fs::read_to_string(harness.root().join("reconcile-missing-git-count")).unwrap(),
+        "x"
+    );
+    assert_eq!(harness.archive_commit_count(), 2);
+    let latest = harness.archive_latest_commit_message();
+    assert!(latest.contains(&format!("session_id: {SESSION_A}")));
+    assert!(latest.contains("summary_revision: 2"));
+}
+
+#[test]
+fn post_persist_recovery_skips_duplicate_git_commit() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("reconcile-existing-git-count");
+    assert_success(&harness.register_with_git_history(&summarizer, 10_000, true));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    harness.append_turn(&transcript, "DELTA_REQUEST", "delta answer");
+    harness.queue_direct(SESSION_A, &transcript, 20, 21);
+
+    let resolved = resolve_session_reference(&SessionReference {
+        session_id: Some(SESSION_A.to_owned()),
+        events_path: Some(transcript),
+        copilot_home: None,
+    })
+    .unwrap();
+    let session = load_session(&resolved, 1024 * 1024).unwrap();
+    let project = inspect_project(&harness.project).unwrap();
+    let summary = StructuredSummary {
+        title: "Recovered persisted revision".to_owned(),
+        goal: "Finalize a revision written before a worker crash.".to_owned(),
+        work_completed: vec!["Persisted Markdown before the simulated crash.".to_owned()],
+        decisions: Vec::new(),
+        files_changed: Vec::new(),
+        commands_and_validation: Vec::new(),
+        open_items: Vec::new(),
+        tags: vec!["recovery".to_owned()],
+    };
+    let markdown = render_revision_markdown(
+        &ArchiveMetadata {
+            session: &session,
+            project: &project,
+        },
+        &summary,
+        2,
+        "complete",
+        None,
+    );
+    let archive_path = harness.archive_path(SESSION_A);
+    atomic_replace(&archive_path, markdown.as_bytes()).unwrap();
+    let relative = archive_path.strip_prefix(&harness.output).unwrap();
+    let markdown_hash = content_hash(markdown.as_bytes());
+    harness.commit_archive_revision(relative, SESSION_A, 2);
+    assert_eq!(harness.archive_commit_count(), 2);
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let (database_id, generation): (i64, i64) = connection
+        .query_row(
+            "SELECT id,state_generation FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO processing_attempts(
+                session_id,state_generation,retry_state,lease_token,owner_pid,
+                started_at_ms,lease_expires_at_ms,outcome,
+                planned_revision,planned_record_count,planned_byte_offset,
+                planned_prefix_hash,planned_source_hash,planned_source_bytes,
+                planned_markdown_relative_path,planned_markdown_hash,
+                planned_archive_git_history,planned_completion_reason
+             ) VALUES (
+                ?1,?2,'revision-pending','post-persist-git-existing-token',999999,1,2,'processing',
+                2,?3,?4,?5,?6,?7,?8,?9,1,'complete'
+             )",
+            params![
+                database_id,
+                generation,
+                session.source_cursor as i64,
+                session.source_byte_cursor as i64,
+                session.source_prefix_hash,
+                session.source_hash,
+                session.source_bytes as i64,
+                relative.to_string_lossy(),
+                markdown_hash,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET lifecycle_state='processing',retry_state='revision-pending',
+                claim_token='post-persist-git-existing-token',claim_started_at_ms=1,
+                worker_generation=NULL,worker_spawned_at_ms=NULL
+             WHERE id=?1",
+            [database_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_success(&harness.recover(0, true, false));
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    assert_eq!(
+        fs::read_to_string(harness.root().join("reconcile-existing-git-count")).unwrap(),
+        "x"
+    );
+    assert_eq!(harness.archive_commit_count(), 2);
+}
+
+#[test]
 fn two_processes_same_session_produce_one_revision() {
     let harness = Harness::new();
     let summarizer = harness.sleeping_summarizer("same-count", 1);
@@ -987,6 +1189,47 @@ impl Harness {
             .filter(|line| !line.is_empty())
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    fn commit_archive_revision(
+        &self,
+        relative_path: &Path,
+        session_id: &str,
+        summary_revision: u64,
+    ) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.output)
+                .arg("add")
+                .arg("--")
+                .arg(relative_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.output)
+                .args([
+                    "-c",
+                    "user.name=Munshi",
+                    "-c",
+                    "user.email=munshi@localhost",
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("archive: copilot:{session_id} revision {summary_revision}"),
+                    "-m",
+                    &format!("session_id: {session_id}\nsummary_revision: {summary_revision}\n"),
+                    "--",
+                ])
+                .arg(relative_path)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn git_status_porcelain(&self, repository: &Path) -> String {

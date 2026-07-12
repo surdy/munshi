@@ -96,6 +96,14 @@ pub fn commit_archive_revision(
     if !canonical_archive.starts_with(&repository_root) {
         return Err(ArchiveGitError::InvalidArchivePath);
     }
+    if archive_commit_exists(
+        &repository_root,
+        markdown_relative_path,
+        session_id,
+        summary_revision,
+    )? {
+        return Ok(());
+    }
 
     let commit_subject = format!("archive: copilot:{session_id} revision {summary_revision}");
     let commit_body = format!("session_id: {session_id}\nsummary_revision: {summary_revision}\n");
@@ -131,6 +139,51 @@ pub fn commit_archive_revision(
         return Err(error.into());
     }
     Ok(())
+}
+
+fn archive_commit_exists(
+    repository_root: &Path,
+    markdown_relative_path: &Path,
+    session_id: &str,
+    summary_revision: u64,
+) -> Result<bool, ArchiveGitError> {
+    if !repository_has_commits(repository_root)? {
+        return Ok(false);
+    }
+    let bytes = run_git(
+        repository_root,
+        vec![
+            OsString::from("log"),
+            OsString::from("--fixed-strings"),
+            OsString::from("--all-match"),
+            OsString::from("--grep"),
+            OsString::from(format!("session_id: {session_id}")),
+            OsString::from("--grep"),
+            OsString::from(format!("summary_revision: {summary_revision}")),
+            OsString::from("--format=%H"),
+            OsString::from("-n"),
+            OsString::from("1"),
+            OsString::from("--"),
+            markdown_relative_path.as_os_str().to_owned(),
+        ],
+        Vec::new(),
+    )?;
+    let output = String::from_utf8(bytes).map_err(|_| ArchiveGitError::RepositoryNotDedicated)?;
+    Ok(!output.trim().is_empty())
+}
+
+fn repository_has_commits(directory: &Path) -> Result<bool, ArchiveGitError> {
+    let bytes = run_git(
+        directory,
+        vec![
+            OsString::from("rev-list"),
+            OsString::from("--count"),
+            OsString::from("--all"),
+        ],
+        Vec::new(),
+    )?;
+    let count = String::from_utf8(bytes).map_err(|_| ArchiveGitError::RepositoryNotDedicated)?;
+    Ok(count.trim().parse::<u64>().unwrap_or_default() > 0)
 }
 
 fn map_state_lock_error(error: StateError) -> ArchiveGitError {
