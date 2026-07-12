@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, archive_session};
 use crate::registration::{
-    RegistrationError, atomic_json_replace, create_owned_lock, durable_remove, load_stored_config,
-    validate_regular_owned_file,
+    RegistrationError, atomic_json_replace, create_owned_lock, durable_remove, ensure_directory,
+    load_stored_config, validate_regular_owned_file,
 };
 use crate::source::SessionReference;
 
@@ -67,11 +67,23 @@ struct SessionEndPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PendingSession {
+struct SessionMetadata {
     version: u32,
     session_id: String,
     transcript_path: String,
     origin_cwd: String,
+    agent_stop_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveJob {
+    version: u32,
+    session_id: String,
+    transcript_path: String,
+    origin_cwd: String,
+    agent_stop_timestamp: u64,
+    session_end_timestamp: u64,
 }
 
 pub fn handle_hook(event: HookEvent, state_directory: &Path, input: impl Read) {
@@ -84,25 +96,33 @@ pub fn handle_hook(event: HookEvent, state_directory: &Path, input: impl Read) {
     }
 }
 
-pub fn run_archive_worker(
-    state_directory: &Path,
-    session_id: &str,
-) -> Result<HookResult, RegistrationError> {
-    validate_session_id(session_id)?;
-    let lock_path = worker_lock_path(state_directory, session_id);
-    let result = run_archive_worker_inner(state_directory, session_id);
+pub fn run_archive_worker(job_path: &Path) -> Result<HookResult, RegistrationError> {
+    validate_regular_owned_file(job_path)?;
+    let job: ArchiveJob =
+        serde_json::from_slice(&fs::read(job_path).map_err(RegistrationError::Io)?)
+            .map_err(RegistrationError::Json)?;
+    validate_session_id(&job.session_id)?;
+    if job_path.file_name().and_then(|name| name.to_str())
+        != Some(&format!("{}.json", job.session_id))
+    {
+        return Err(RegistrationError::MalformedOwnedFile);
+    }
+    let state_directory = job_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| RegistrationError::UnsafePath(job_path.to_path_buf()))?;
+    let lock_path = worker_lock_path(state_directory, &job.session_id);
+    let result = run_archive_worker_inner(state_directory, &job);
     let finalized = (|| match result {
         Ok(result) => {
-            if !matches!(result, HookResult::Failed { .. }) {
-                durable_remove(&pending_path(state_directory, session_id))?;
-            }
-            atomic_json_replace(&result_path(state_directory, session_id), &result)?;
+            durable_remove(job_path)?;
+            atomic_json_replace(&result_path(state_directory, &job.session_id), &result)?;
             Ok(result)
         }
         Err(failure) => {
             record_failure(state_directory, failure.clone());
             let result = HookResult::Failed { code: failure.code };
-            atomic_json_replace(&result_path(state_directory, session_id), &result)?;
+            atomic_json_replace(&result_path(state_directory, &job.session_id), &result)?;
             Ok(result)
         }
     })();
@@ -164,11 +184,12 @@ fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), Hoo
             Some(payload.session_id),
         ));
     }
-    let pending = PendingSession {
+    let metadata = SessionMetadata {
         version: 1,
         session_id: payload.session_id.clone(),
         transcript_path: payload.transcript_path,
         origin_cwd: payload.cwd,
+        agent_stop_timestamp: payload.timestamp,
     };
     durable_remove(&result_path(state_directory, &payload.session_id)).map_err(|_| {
         failure(
@@ -177,11 +198,16 @@ fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), Hoo
             Some(payload.session_id.clone()),
         )
     })?;
-    atomic_json_replace(
-        &pending_path(state_directory, &payload.session_id),
-        &pending,
-    )
-    .map_err(|_| failure("agent-stop", "state-write-failed", Some(payload.session_id)))
+    let directory = ensure_directory(&state_directory.join("sessions").join(&payload.session_id))
+        .map_err(|_| {
+        failure(
+            "agent-stop",
+            "state-directory-failed",
+            Some(payload.session_id.clone()),
+        )
+    })?;
+    atomic_json_replace(&directory.join("latest.json"), &metadata)
+        .map_err(|_| failure("agent-stop", "state-write-failed", Some(payload.session_id)))
 }
 
 fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), HookFailure> {
@@ -201,38 +227,90 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
         ));
     }
     let _ = payload.error;
-    let pending = pending_path(state_directory, &payload.session_id);
-    if !pending.exists() {
+    if payload.reason != "complete" {
         return Ok(());
     }
-    let lock_path = worker_lock_path(state_directory, &payload.session_id);
+
+    let metadata_path = session_metadata_path(state_directory, &payload.session_id);
+    if !metadata_path.exists() {
+        return Ok(());
+    }
+    validate_regular_owned_file(&metadata_path).map_err(|_| {
+        failure(
+            "session-end",
+            "session-state-invalid",
+            Some(payload.session_id.clone()),
+        )
+    })?;
+    let metadata: SessionMetadata =
+        serde_json::from_slice(&fs::read(&metadata_path).map_err(|_| {
+            failure(
+                "session-end",
+                "session-state-read-failed",
+                Some(payload.session_id.clone()),
+            )
+        })?)
+        .map_err(|_| {
+            failure(
+                "session-end",
+                "session-state-malformed",
+                Some(payload.session_id.clone()),
+            )
+        })?;
+    if metadata.version != 1 || metadata.session_id != payload.session_id {
+        return Err(failure(
+            "session-end",
+            "session-state-mismatch",
+            Some(payload.session_id),
+        ));
+    }
+    let job = ArchiveJob {
+        version: 1,
+        session_id: metadata.session_id,
+        transcript_path: metadata.transcript_path,
+        origin_cwd: metadata.origin_cwd,
+        agent_stop_timestamp: metadata.agent_stop_timestamp,
+        session_end_timestamp: payload.timestamp,
+    };
+    let job_path = pending_path(state_directory, &job.session_id);
+    atomic_json_replace(&job_path, &job).map_err(|_| {
+        failure(
+            "session-end",
+            "job-write-failed",
+            Some(job.session_id.clone()),
+        )
+    })?;
+    let lock_path = worker_lock_path(state_directory, &job.session_id);
     let Some(lock) = create_owned_lock(&lock_path).map_err(|_| {
         failure(
             "session-end",
             "worker-lock-failed",
-            Some(payload.session_id.clone()),
+            Some(job.session_id.clone()),
         )
     })?
     else {
         return Ok(());
     };
     drop(lock);
+    if result_path(state_directory, &job.session_id).exists() {
+        let _ = durable_remove(&job_path);
+        let _ = durable_remove(&lock_path);
+        return Ok(());
+    }
 
     let executable = std::env::current_exe().map_err(|_| {
         failure(
             "session-end",
             "current-executable-failed",
-            Some(payload.session_id.clone()),
+            Some(job.session_id.clone()),
         )
     })?;
     let mut command = Command::new(executable);
     command
-        .arg("hook")
-        .arg("archive-worker")
-        .arg("--state-dir")
-        .arg(state_directory)
-        .arg("--session-id")
-        .arg(&payload.session_id)
+        .arg("hook-worker")
+        .arg("--job")
+        .arg(&job_path)
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -249,7 +327,7 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
         return Err(failure(
             "session-end",
             "worker-spawn-failed",
-            Some(payload.session_id),
+            Some(job.session_id),
         ));
     }
     Ok(())
@@ -257,55 +335,33 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
 
 fn run_archive_worker_inner(
     state_directory: &Path,
-    session_id: &str,
+    job: &ArchiveJob,
 ) -> Result<HookResult, HookFailure> {
-    let pending_path = pending_path(state_directory, session_id);
-    validate_regular_owned_file(&pending_path).map_err(|_| {
-        failure(
-            "archive-worker",
-            "pending-state-invalid",
-            Some(session_id.to_owned()),
-        )
-    })?;
-    let pending_bytes = fs::read(&pending_path).map_err(|_| {
-        failure(
-            "archive-worker",
-            "pending-state-read-failed",
-            Some(session_id.to_owned()),
-        )
-    })?;
-    let pending: PendingSession = serde_json::from_slice(&pending_bytes).map_err(|_| {
-        failure(
-            "archive-worker",
-            "pending-state-malformed",
-            Some(session_id.to_owned()),
-        )
-    })?;
-    if pending.version != 1 || pending.session_id != session_id {
+    if job.version != 1 {
         return Err(failure(
             "archive-worker",
-            "pending-state-mismatch",
-            Some(session_id.to_owned()),
+            "job-version-unsupported",
+            Some(job.session_id.clone()),
         ));
     }
-    validate_absolute_string(&pending.transcript_path)
-        .map_err(|code| failure("archive-worker", code, Some(session_id.to_owned())))?;
-    validate_absolute_string(&pending.origin_cwd)
-        .map_err(|code| failure("archive-worker", code, Some(session_id.to_owned())))?;
+    validate_absolute_string(&job.transcript_path)
+        .map_err(|code| failure("archive-worker", code, Some(job.session_id.clone())))?;
+    validate_absolute_string(&job.origin_cwd)
+        .map_err(|code| failure("archive-worker", code, Some(job.session_id.clone())))?;
     let stored = load_stored_config(state_directory).map_err(|_| {
         failure(
             "archive-worker",
             "config-invalid",
-            Some(session_id.to_owned()),
+            Some(job.session_id.clone()),
         )
     })?;
     let outcome = archive_session(&ArchiveConfig {
         reference: SessionReference {
-            session_id: Some(session_id.to_owned()),
-            events_path: Some(PathBuf::from(pending.transcript_path)),
+            session_id: Some(job.session_id.clone()),
+            events_path: Some(PathBuf::from(&job.transcript_path)),
             copilot_home: None,
         },
-        project_directory: PathBuf::from(pending.origin_cwd),
+        project_directory: PathBuf::from(&job.origin_cwd),
         output_directory: PathBuf::from(stored.output_directory),
         summarizer_binary: PathBuf::from(stored.summarizer.executable),
         summarizer_args: stored.summarizer.args.into_iter().map(Into::into).collect(),
@@ -319,7 +375,7 @@ fn run_archive_worker_inner(
         failure(
             "archive-worker",
             archive_error_code(&error),
-            Some(session_id.to_owned()),
+            Some(job.session_id.clone()),
         )
     })?;
     Ok(match outcome {
@@ -379,6 +435,13 @@ fn validate_session_id(value: &str) -> Result<(), RegistrationError> {
     } else {
         Ok(())
     }
+}
+
+fn session_metadata_path(state_directory: &Path, session_id: &str) -> PathBuf {
+    state_directory
+        .join("sessions")
+        .join(session_id)
+        .join("latest.json")
 }
 
 fn pending_path(state_directory: &Path, session_id: &str) -> PathBuf {

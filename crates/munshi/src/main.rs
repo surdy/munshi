@@ -57,14 +57,14 @@ enum Command {
     /// Disclose transcript processing, save configuration, and install user hooks.
     Register {
         /// Explicitly accept the displayed v1 transcript-processing disclosure.
+        #[arg(long, visible_alias = "accept-disclosure")]
+        accept_transcript_processing: bool,
+        /// Print the intended managed paths without writing files.
         #[arg(long)]
-        accept_disclosure: bool,
+        dry_run: bool,
         /// Copilot home whose hooks directory should contain Munshi's dedicated file.
         #[arg(long)]
         copilot_home: Option<PathBuf>,
-        /// Durable Munshi operational state directory. Defaults below COPILOT_HOME.
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
         /// Root directory for Munshi-owned Markdown archives.
         #[arg(long)]
         output_dir: PathBuf,
@@ -89,28 +89,25 @@ enum Command {
     Unregister {
         #[arg(long)]
         copilot_home: Option<PathBuf>,
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
     },
     #[command(hide = true, subcommand)]
     Hook(HookCommand),
+    #[command(hide = true)]
+    HookWorker {
+        #[arg(long)]
+        job: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum HookCommand {
     AgentStop {
         #[arg(long)]
-        state_dir: PathBuf,
+        state_dir: Option<PathBuf>,
     },
     SessionEnd {
         #[arg(long)]
-        state_dir: PathBuf,
-    },
-    ArchiveWorker {
-        #[arg(long)]
-        state_dir: PathBuf,
-        #[arg(long)]
-        session_id: String,
+        state_dir: Option<PathBuf>,
     },
     Wait {
         #[arg(long)]
@@ -126,6 +123,7 @@ enum Outcome {
     Archive(ArchiveOutcome),
     Registered { hook_path: PathBuf },
     Unregistered,
+    DryRun,
     Hook,
     Worker,
     Wait(HookResult),
@@ -149,6 +147,7 @@ fn main() -> ExitCode {
             println!("unregistered Munshi hooks");
             ExitCode::SUCCESS
         }
+        Ok(Outcome::DryRun) => ExitCode::SUCCESS,
         Ok(Outcome::Hook | Outcome::Worker) => ExitCode::SUCCESS,
         Ok(Outcome::Wait(result)) => {
             println!(
@@ -200,9 +199,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_stderr_bytes,
         })?)),
         Command::Register {
-            accept_disclosure,
+            accept_transcript_processing,
+            dry_run,
             copilot_home,
-            state_dir,
             output_dir,
             summarizer,
             summarizer_args,
@@ -212,10 +211,22 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_stdout_bytes,
             max_stderr_bytes,
         } => {
-            accept_disclosure_from_terminal(accept_disclosure)?;
+            eprintln!(
+                "Configured local output directory: {}",
+                output_dir.display()
+            );
+            accept_disclosure_from_terminal(accept_transcript_processing)?;
             let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = state_dir.unwrap_or_else(|| copilot_home.join("munshi"));
+            let state_directory = copilot_home.join("munshi");
             let executable = std::env::current_exe()?.canonicalize()?;
+            if dry_run {
+                println!(
+                    "would write {} and {}",
+                    copilot_home.join("hooks/munshi.json").display(),
+                    state_directory.join("config.json").display()
+                );
+                return Ok(Outcome::DryRun);
+            }
             register(&RegisterConfig {
                 copilot_home: copilot_home.clone(),
                 state_directory,
@@ -233,28 +244,26 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 hook_path: copilot_home.join("hooks/munshi.json"),
             })
         }
-        Command::Unregister {
-            copilot_home,
-            state_dir,
-        } => {
+        Command::Unregister { copilot_home } => {
             let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = state_dir.unwrap_or_else(|| copilot_home.join("munshi"));
+            let state_directory = copilot_home.join("munshi");
             unregister(&copilot_home, &state_directory)?;
             Ok(Outcome::Unregistered)
         }
         Command::Hook(HookCommand::AgentStop { state_dir }) => {
-            handle_hook(HookEvent::AgentStop, &state_dir, std::io::stdin().lock());
+            if let Ok(state_dir) = resolve_state_directory(state_dir) {
+                handle_hook(HookEvent::AgentStop, &state_dir, std::io::stdin().lock());
+            }
             Ok(Outcome::Hook)
         }
         Command::Hook(HookCommand::SessionEnd { state_dir }) => {
-            handle_hook(HookEvent::SessionEnd, &state_dir, std::io::stdin().lock());
+            if let Ok(state_dir) = resolve_state_directory(state_dir) {
+                handle_hook(HookEvent::SessionEnd, &state_dir, std::io::stdin().lock());
+            }
             Ok(Outcome::Hook)
         }
-        Command::Hook(HookCommand::ArchiveWorker {
-            state_dir,
-            session_id,
-        }) => {
-            let _ = run_archive_worker(&state_dir, &session_id)?;
+        Command::HookWorker { job } => {
+            let _ = run_archive_worker(&job)?;
             Ok(Outcome::Worker)
         }
         Command::Hook(HookCommand::Wait {
@@ -266,6 +275,13 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             &session_id,
             Duration::from_millis(timeout_ms),
         )?)),
+    }
+}
+
+fn resolve_state_directory(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {
+    match value {
+        Some(value) => Ok(value),
+        None => Ok(resolve_copilot_home(None)?.join("munshi")),
     }
 }
 

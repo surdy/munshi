@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Cursor;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -15,11 +15,11 @@ const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 fn disclosure_requires_explicit_noninteractive_acceptance_and_prompt_is_testable() {
     let mut output = Vec::new();
     let error = accept_disclosure(false, &mut Cursor::new(b""), false, &mut output).unwrap_err();
-    assert!(error.to_string().contains("--accept-disclosure"));
+    assert!(error.to_string().contains("--accept-transcript-processing"));
     let text = String::from_utf8(output).unwrap();
     assert!(text.contains("summarization is ON by default"));
     assert!(text.contains("NO secret redaction"));
-    assert!(text.contains("sent to the summarizer executable"));
+    assert!(text.contains("sent again to the configured summarizer"));
     assert!(text.contains("local Markdown"));
     assert!(text.contains("Remote delivery remains DISABLED"));
 
@@ -40,18 +40,24 @@ fn register_and_unregister_are_idempotent_and_preserve_unrelated_files() {
         b"{\"version\":1}\n",
     )
     .unwrap();
+    fs::write(paths.copilot_home.join("hooks/broken.json"), b"{broken").unwrap();
     fs::write(
         paths.copilot_home.join("settings.json"),
         b"{\"theme\":\"dark\"}\n",
     )
     .unwrap();
 
-    for _ in 0..2 {
-        let output = register_command(&paths, fake("success.sh"), 2_000, true);
-        assert_success(&output);
-    }
-
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
     let hook_path = paths.copilot_home.join("hooks/munshi.json");
+    let original_inode = fs::metadata(&hook_path).unwrap().ino();
+    let config_path = paths.state.join("config.json");
+    let original_config_inode = fs::metadata(&config_path).unwrap().ino();
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    assert_eq!(fs::metadata(&hook_path).unwrap().ino(), original_inode);
+    assert_eq!(
+        fs::metadata(&config_path).unwrap().ino(),
+        original_config_inode
+    );
     let hook: Value = serde_json::from_slice(&fs::read(&hook_path).unwrap()).unwrap();
     let executable = Path::new(env!("CARGO_BIN_EXE_munshi"))
         .canonicalize()
@@ -60,18 +66,22 @@ fn register_and_unregister_are_idempotent_and_preserve_unrelated_files() {
     for (event, command) in [("agentStop", "agent-stop"), ("sessionEnd", "session-end")] {
         let entry = &hook["hooks"][event][0];
         assert_eq!(entry["type"], "command");
-        assert_eq!(entry["exec"], executable.to_string_lossy().as_ref());
         assert_eq!(
-            entry["args"],
-            json!(["hook", command, "--state-dir", paths.state])
+            entry["command"]["exec"],
+            executable.to_string_lossy().as_ref()
         );
-        assert_eq!(entry["timeoutSec"], 5);
+        assert_eq!(entry["command"]["args"], json!(["hook", command]));
+        assert_eq!(entry["timeoutSec"], 2);
+        assert!(entry.get("exec").is_none());
+        assert!(entry.get("args").is_none());
         assert!(entry.get("bash").is_none());
-        assert!(entry.get("command").is_none());
     }
     let config: Value =
         serde_json::from_slice(&fs::read(paths.state.join("config.json")).unwrap()).unwrap();
     assert_eq!(config["remote_delivery"], false);
+    assert_eq!(config["local_archival_enabled"], true);
+    assert_eq!(config["transcript_processing_accepted"], true);
+    assert_eq!(config["project_origin"], "agent_stop_cwd");
     assert_eq!(
         config["summarizer"]["executable"],
         fake("success.sh").to_string_lossy().as_ref()
@@ -81,6 +91,10 @@ fn register_and_unregister_are_idempotent_and_preserve_unrelated_files() {
         paths.output.to_string_lossy().as_ref()
     );
     assert!(paths.copilot_home.join("hooks/other.json").exists());
+    assert_eq!(
+        fs::read(paths.copilot_home.join("hooks/broken.json")).unwrap(),
+        b"{broken"
+    );
     assert!(paths.copilot_home.join("settings.json").exists());
 
     for _ in 0..2 {
@@ -90,6 +104,10 @@ fn register_and_unregister_are_idempotent_and_preserve_unrelated_files() {
     assert!(!hook_path.exists());
     assert!(!paths.state.join("config.json").exists());
     assert!(paths.copilot_home.join("hooks/other.json").exists());
+    assert_eq!(
+        fs::read(paths.copilot_home.join("hooks/broken.json")).unwrap(),
+        b"{broken"
+    );
     assert!(paths.copilot_home.join("settings.json").exists());
 }
 
@@ -128,6 +146,20 @@ fn registration_rejects_symlinked_or_malformed_owned_paths() {
 }
 
 #[test]
+fn malformed_config_blocks_unregister_without_partial_removal() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    let config = paths.state.join("config.json");
+    fs::write(&config, b"{not-json").unwrap();
+
+    let output = unregister_command(&paths);
+    assert!(!output.status.success());
+    assert!(paths.copilot_home.join("hooks/munshi.json").exists());
+    assert_eq!(fs::read(config).unwrap(), b"{not-json");
+}
+
+#[test]
 fn hook_payload_errors_fail_open_without_echoing_private_content() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
@@ -152,6 +184,46 @@ fn hook_payload_errors_fail_open_without_echoing_private_content() {
 }
 
 #[test]
+fn missing_agent_stop_and_nonclean_session_end_are_harmless_noops() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    let project = git_project(directory.path());
+    assert_success(&hook_command(
+        &paths,
+        "session-end",
+        session_end_payload(&project).to_string().as_bytes(),
+    ));
+    assert!(
+        !paths
+            .state
+            .join(format!("pending/{SESSION_ID}.json"))
+            .exists()
+    );
+
+    assert_success(&hook_command(
+        &paths,
+        "agent-stop",
+        agent_stop_payload(&project, &fixture_events())
+            .to_string()
+            .as_bytes(),
+    ));
+    let mut interrupted = session_end_payload(&project);
+    interrupted["reason"] = json!("user_exit");
+    assert_success(&hook_command(
+        &paths,
+        "session-end",
+        interrupted.to_string().as_bytes(),
+    ));
+    assert!(
+        !paths
+            .state
+            .join(format!("pending/{SESSION_ID}.json"))
+            .exists()
+    );
+}
+
+#[test]
 fn agent_stop_uses_an_atomic_minimal_metadata_handoff() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
@@ -165,7 +237,9 @@ fn agent_stop_uses_an_atomic_minimal_metadata_handoff() {
         payload.to_string().as_bytes(),
     ));
 
-    let pending_path = paths.state.join(format!("pending/{SESSION_ID}.json"));
+    let pending_path = paths
+        .state
+        .join(format!("sessions/{SESSION_ID}/latest.json"));
     let pending: Value = serde_json::from_slice(&fs::read(pending_path).unwrap()).unwrap();
     assert_eq!(
         pending,
@@ -174,10 +248,11 @@ fn agent_stop_uses_an_atomic_minimal_metadata_handoff() {
             "session_id": SESSION_ID,
             "transcript_path": transcript,
             "origin_cwd": project,
+            "agent_stop_timestamp": 1783817107011_u64,
         })
     );
     assert!(
-        fs::read_dir(paths.state.join("pending"))
+        fs::read_dir(paths.state.join(format!("sessions/{SESSION_ID}")))
             .unwrap()
             .all(|entry| {
                 !entry
@@ -233,14 +308,20 @@ fn duplicate_clean_hooks_start_one_worker_and_full_lifecycle_matches_manual_arch
     fs::write(
         &summarizer,
         format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf x >> '{}'\nprintf '%s' '{}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"--configured\" ] || exit 12\ncat >/dev/null\nprintf x >> '{}'\nprintf '%s' '{}'\n",
             count.display(),
             r#"{"title":"Implement manual archival","goal":"Archive one synthetic Copilot session safely.","work_completed":["Added defensive transcript normalization.","Rendered one deterministic Markdown record."],"decisions":["Use stable source identity instead of the title."],"files_changed":["crates/munshi/src/archive.rs"],"commands_and_validation":["cargo test --workspace"],"open_items":["Add resumed revisions in issue #3."],"tags":["rust","copilot-cli"]}"#
         ),
     )
     .unwrap();
     fs::set_permissions(&summarizer, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_success(&register_command(&paths, summarizer, 2_000, true));
+    assert_success(&register_command_args(
+        &paths,
+        summarizer,
+        2_000,
+        true,
+        &["--configured"],
+    ));
     assert_success(&hook_command(
         &paths,
         "agent-stop",
@@ -283,8 +364,57 @@ fn cli_noninteractive_registration_refuses_without_acceptance() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("summarization is ON by default"));
-    assert!(stderr.contains("--accept-disclosure"));
+    assert!(stderr.contains("--accept-transcript-processing"));
     assert!(!paths.copilot_home.join("hooks/munshi.json").exists());
+}
+
+#[test]
+fn dry_run_writes_nothing_and_direct_exec_preserves_spaces() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("register")
+        .arg("--dry-run")
+        .arg("--accept-transcript-processing")
+        .arg("--copilot-home")
+        .arg(&paths.copilot_home)
+        .arg("--output-dir")
+        .arg(&paths.output)
+        .arg("--summarizer")
+        .arg(fake("success.sh"))
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(!paths.copilot_home.exists());
+
+    let binary_directory = directory.path().join("bin with spaces");
+    fs::create_dir_all(&binary_directory).unwrap();
+    let copied_binary = binary_directory.join("munshi executable");
+    fs::copy(env!("CARGO_BIN_EXE_munshi"), &copied_binary).unwrap();
+    fs::set_permissions(&copied_binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(&copied_binary)
+        .arg("register")
+        .arg("--accept-transcript-processing")
+        .arg("--copilot-home")
+        .arg(&paths.copilot_home)
+        .arg("--output-dir")
+        .arg(&paths.output)
+        .arg("--summarizer")
+        .arg(fake("success.sh"))
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let hook: Value =
+        serde_json::from_slice(&fs::read(paths.copilot_home.join("hooks/munshi.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        hook["hooks"]["agentStop"][0]["command"]["exec"],
+        copied_binary
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
 }
 
 struct Paths {
@@ -297,20 +427,28 @@ impl Paths {
     fn new(directory: &TempDir) -> Self {
         Self {
             copilot_home: directory.path().join("copilot-home"),
-            state: directory.path().join("state"),
+            state: directory.path().join("copilot-home/munshi"),
             output: directory.path().join("archives"),
         }
     }
 }
 
 fn register_command(paths: &Paths, summarizer: PathBuf, timeout_ms: u64, accepted: bool) -> Output {
+    register_command_args(paths, summarizer, timeout_ms, accepted, &[])
+}
+
+fn register_command_args(
+    paths: &Paths,
+    summarizer: PathBuf,
+    timeout_ms: u64,
+    accepted: bool,
+    summarizer_args: &[&str],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
     command
         .arg("register")
         .arg("--copilot-home")
         .arg(&paths.copilot_home)
-        .arg("--state-dir")
-        .arg(&paths.state)
         .arg("--output-dir")
         .arg(&paths.output)
         .arg("--summarizer")
@@ -318,8 +456,11 @@ fn register_command(paths: &Paths, summarizer: PathBuf, timeout_ms: u64, accepte
         .arg("--timeout-ms")
         .arg(timeout_ms.to_string())
         .stdin(Stdio::null());
+    for argument in summarizer_args {
+        command.arg(format!("--summarizer-arg={argument}"));
+    }
     if accepted {
-        command.arg("--accept-disclosure");
+        command.arg("--accept-transcript-processing");
     }
     command.output().unwrap()
 }
@@ -329,8 +470,6 @@ fn unregister_command(paths: &Paths) -> Output {
         .arg("unregister")
         .arg("--copilot-home")
         .arg(&paths.copilot_home)
-        .arg("--state-dir")
-        .arg(&paths.state)
         .output()
         .unwrap()
 }
@@ -339,8 +478,7 @@ fn hook_command(paths: &Paths, event: &str, input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
         .arg("hook")
         .arg(event)
-        .arg("--state-dir")
-        .arg(&paths.state)
+        .env("COPILOT_HOME", &paths.copilot_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -15,11 +15,12 @@ const CONFIG_FILE_NAME: &str = "config.json";
 pub const DISCLOSURE: &str = "\
 IMPORTANT: MUNSHI TRANSCRIPT PROCESSING DISCLOSURE
 
-After registration, transcript summarization is ON by default for cleanly ended sessions.
+After registration, local transcript summarization is ON by default for all projects.
+The full Copilot transcript is sent again to the configured summarizer and may consume credits or incur cost.
 Munshi v1 has NO secret redaction or granular transcript filtering.
-Transcript content is sent to the summarizer executable configured below.
-Summaries are written as local Markdown files.
+Summaries are written as local Markdown files in the configured output directory.
 Remote delivery remains DISABLED.
+Disabling future project capture does not delete summaries already written.
 ";
 
 #[derive(Debug, Clone)]
@@ -47,7 +48,7 @@ pub enum DisclosureDecision {
 pub enum RegistrationError {
     #[error("registration disclosure was not accepted")]
     DisclosureDeclined,
-    #[error("noninteractive registration requires --accept-disclosure")]
+    #[error("noninteractive registration requires --accept-transcript-processing")]
     NoninteractiveAcceptanceRequired,
     #[error("registration paths and executables must be absolute")]
     RelativePath,
@@ -70,6 +71,9 @@ pub(crate) struct StoredConfig {
     pub summarizer: StoredCommand,
     pub output_directory: String,
     pub state_directory: String,
+    pub local_archival_enabled: bool,
+    pub transcript_processing_accepted: bool,
+    pub project_origin: String,
     pub limits: StoredLimits,
     pub remote_delivery: bool,
 }
@@ -112,10 +116,16 @@ struct HookEvents {
 struct HookCommand {
     #[serde(rename = "type")]
     kind: String,
-    exec: String,
-    args: Vec<String>,
+    command: DirectCommand,
     #[serde(rename = "timeoutSec")]
     timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectCommand {
+    exec: String,
+    args: Vec<String>,
 }
 
 pub fn accept_disclosure(
@@ -162,23 +172,37 @@ pub fn accept_disclosure_from_terminal(
 
 pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     validate_absolute_paths(config)?;
+    if config.state_directory != config.copilot_home.join("munshi") {
+        return Err(RegistrationError::UnsafePath(
+            config.state_directory.clone(),
+        ));
+    }
     let copilot_home = ensure_directory(&config.copilot_home)?;
     let hooks_directory = ensure_child_directory(&copilot_home, "hooks")?;
-    let state_directory = ensure_directory(&config.state_directory)?;
-    ensure_child_directory(&state_directory, "pending")?;
-    ensure_child_directory(&state_directory, "workers")?;
-    ensure_child_directory(&state_directory, "results")?;
-    ensure_child_directory(&state_directory, "failures")?;
-
     let stored = StoredConfig::from_register(config)?;
     let hook = HookFile::new(config)?;
-    let config_path = state_directory.join(CONFIG_FILE_NAME);
     let hook_path = hooks_directory.join(HOOK_FILE_NAME);
+    let config_path = config.state_directory.join(CONFIG_FILE_NAME);
     validate_owned_file::<StoredConfig>(&config_path)?;
     validate_owned_file::<HookFile>(&hook_path)?;
-    atomic_json_replace(&config_path, &stored)?;
-    atomic_json_replace(&hook_path, &hook)?;
-    Ok(())
+    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let Some(lock) = create_owned_lock(&lock_path)? else {
+        return Err(RegistrationError::UnsafePath(lock_path));
+    };
+    drop(lock);
+    let result = (|| {
+        validate_owned_file::<HookFile>(&hook_path)?;
+        let state_directory = ensure_directory(&config.state_directory)?;
+        ensure_child_directory(&state_directory, "sessions")?;
+        ensure_child_directory(&state_directory, "pending")?;
+        ensure_child_directory(&state_directory, "workers")?;
+        ensure_child_directory(&state_directory, "results")?;
+        ensure_child_directory(&state_directory, "failures")?;
+        install_or_update_json(&config_path, &stored)?;
+        install_or_update_json(&hook_path, &hook)
+    })();
+    let _ = durable_remove(&lock_path);
+    result
 }
 
 pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), RegistrationError> {
@@ -189,9 +213,26 @@ pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), Reg
     validate_existing_directory_if_present(copilot_home)?;
     validate_existing_directory_if_present(&hooks)?;
     validate_existing_directory_if_present(state_directory)?;
-    remove_owned_file::<HookFile>(&hooks.join(HOOK_FILE_NAME))?;
-    remove_owned_file::<StoredConfig>(&state_directory.join(CONFIG_FILE_NAME))?;
-    Ok(())
+    let hook_path = hooks.join(HOOK_FILE_NAME);
+    let config_path = state_directory.join(CONFIG_FILE_NAME);
+    validate_owned_file::<HookFile>(&hook_path)?;
+    validate_owned_file::<StoredConfig>(&config_path)?;
+    if !hooks.exists() {
+        return durable_remove(&config_path);
+    }
+    let lock_path = hooks.join(".munshi-registration.lock");
+    let Some(lock) = create_owned_lock(&lock_path)? else {
+        return Err(RegistrationError::UnsafePath(lock_path));
+    };
+    drop(lock);
+    let result = (|| {
+        validate_owned_file::<HookFile>(&hook_path)?;
+        validate_owned_file::<StoredConfig>(&config_path)?;
+        durable_remove(&hook_path)?;
+        durable_remove(&config_path)
+    })();
+    let _ = durable_remove(&lock_path);
+    result
 }
 
 impl StoredConfig {
@@ -213,6 +254,9 @@ impl StoredConfig {
             },
             output_directory: utf8(&config.output_directory)?,
             state_directory: utf8(&config.state_directory)?,
+            local_archival_enabled: true,
+            transcript_processing_accepted: true,
+            project_origin: "agent_stop_cwd".to_owned(),
             limits: StoredLimits {
                 timeout_ms: config.timeout.as_millis().try_into().unwrap_or(u64::MAX),
                 max_source_bytes: config.max_source_bytes,
@@ -225,20 +269,33 @@ impl StoredConfig {
     }
 }
 
+trait ManagedFile {
+    fn is_recognized(&self) -> bool;
+}
+
+impl ManagedFile for StoredConfig {
+    fn is_recognized(&self) -> bool {
+        self.version == 1
+            && !self.remote_delivery
+            && self.local_archival_enabled
+            && self.transcript_processing_accepted
+            && self.project_origin == "agent_stop_cwd"
+            && Path::new(&self.output_directory).is_absolute()
+            && Path::new(&self.state_directory).is_absolute()
+            && Path::new(&self.summarizer.executable).is_absolute()
+    }
+}
+
 impl HookFile {
     fn new(config: &RegisterConfig) -> Result<Self, RegistrationError> {
         let executable = utf8(&config.executable)?;
-        let state = utf8(&config.state_directory)?;
         let command = |event: &str| HookCommand {
             kind: "command".to_owned(),
-            exec: executable.clone(),
-            args: vec![
-                "hook".to_owned(),
-                event.to_owned(),
-                "--state-dir".to_owned(),
-                state.clone(),
-            ],
-            timeout_seconds: 5,
+            command: DirectCommand {
+                exec: executable.clone(),
+                args: vec!["hook".to_owned(), event.to_owned()],
+            },
+            timeout_seconds: 2,
         };
         Ok(Self {
             version: 1,
@@ -247,6 +304,21 @@ impl HookFile {
                 session_end: vec![command("session-end")],
             },
         })
+    }
+}
+
+impl ManagedFile for HookFile {
+    fn is_recognized(&self) -> bool {
+        let valid = |commands: &[HookCommand], event: &str| {
+            commands.len() == 1
+                && commands[0].kind == "command"
+                && commands[0].timeout_seconds == 2
+                && Path::new(&commands[0].command.exec).is_absolute()
+                && commands[0].command.args == ["hook", event]
+        };
+        self.version == 1
+            && valid(&self.hooks.agent_stop, "agent-stop")
+            && valid(&self.hooks.session_end, "session-end")
     }
 }
 
@@ -259,6 +331,9 @@ pub(crate) fn load_stored_config(
     let config: StoredConfig = serde_json::from_slice(&bytes).map_err(RegistrationError::Json)?;
     if config.version != 1
         || config.remote_delivery
+        || !config.local_archival_enabled
+        || !config.transcript_processing_accepted
+        || config.project_origin != "agent_stop_cwd"
         || Path::new(&config.state_directory) != state_directory
     {
         return Err(RegistrationError::MalformedOwnedFile);
@@ -285,6 +360,7 @@ pub(crate) fn atomic_bytes_replace(path: &Path, bytes: &[u8]) -> Result<(), Regi
     } else if fs::symlink_metadata(path).is_ok() {
         return Err(RegistrationError::UnsafePath(path.to_path_buf()));
     }
+
     let mut temporary = Builder::new()
         .prefix(".munshi-")
         .tempfile_in(parent)
@@ -301,6 +377,52 @@ pub(crate) fn atomic_bytes_replace(path: &Path, bytes: &[u8]) -> Result<(), Regi
         .map_err(RegistrationError::Io)?;
     let file = temporary
         .persist(path)
+        .map_err(|error| RegistrationError::Io(error.error))?;
+    file.sync_all().map_err(RegistrationError::Io)?;
+    sync_directory(parent)
+}
+
+fn install_or_update_json<T>(path: &Path, value: &T) -> Result<(), RegistrationError>
+where
+    T: Serialize + for<'de> Deserialize<'de> + PartialEq + ManagedFile,
+{
+    if path.exists() {
+        validate_regular_owned_file(path)?;
+        let existing: T = serde_json::from_slice(&fs::read(path).map_err(RegistrationError::Io)?)
+            .map_err(|_| RegistrationError::MalformedOwnedFile)?;
+        if !existing.is_recognized() {
+            return Err(RegistrationError::MalformedOwnedFile);
+        }
+        if &existing == value {
+            return Ok(());
+        }
+        return atomic_json_replace(path, value);
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(RegistrationError::UnsafePath(path.to_path_buf()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| RegistrationError::UnsafePath(path.to_path_buf()))?;
+    validate_existing_directory_if_present(parent)?;
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(RegistrationError::Json)?;
+    bytes.push(b'\n');
+    let mut temporary = Builder::new()
+        .prefix(".munshi-")
+        .tempfile_in(parent)
+        .map_err(RegistrationError::Io)?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(RegistrationError::Io)?;
+    temporary.write_all(&bytes).map_err(RegistrationError::Io)?;
+    temporary.flush().map_err(RegistrationError::Io)?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(RegistrationError::Io)?;
+    let file = temporary
+        .persist_noclobber(path)
         .map_err(|error| RegistrationError::Io(error.error))?;
     file.sync_all().map_err(RegistrationError::Io)?;
     sync_directory(parent)
@@ -369,7 +491,7 @@ fn utf8(path: &Path) -> Result<String, RegistrationError> {
         .ok_or(RegistrationError::NonUtf8Configuration)
 }
 
-fn ensure_directory(path: &Path) -> Result<PathBuf, RegistrationError> {
+pub(crate) fn ensure_directory(path: &Path) -> Result<PathBuf, RegistrationError> {
     if !path.is_absolute() {
         return Err(RegistrationError::RelativePath);
     }
@@ -428,13 +550,21 @@ pub(crate) fn validate_regular_owned_file(path: &Path) -> Result<(), Registratio
 
 fn validate_regular_file(path: &Path) -> Result<(), RegistrationError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.mode() & 0o111 != 0 =>
+        {
+            Ok(())
+        }
         Ok(_) => Err(RegistrationError::UnsafePath(path.to_path_buf())),
         Err(error) => Err(RegistrationError::Io(error)),
     }
 }
 
-fn validate_owned_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<(), RegistrationError> {
+fn validate_owned_file<T: for<'de> Deserialize<'de> + ManagedFile>(
+    path: &Path,
+) -> Result<(), RegistrationError> {
     if !path.exists() {
         if fs::symlink_metadata(path).is_ok() {
             return Err(RegistrationError::UnsafePath(path.to_path_buf()));
@@ -443,14 +573,13 @@ fn validate_owned_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<(), 
     }
     validate_regular_owned_file(path)?;
     let bytes = fs::read(path).map_err(RegistrationError::Io)?;
-    serde_json::from_slice::<T>(&bytes)
-        .map(|_| ())
-        .map_err(|_| RegistrationError::MalformedOwnedFile)
-}
-
-fn remove_owned_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<(), RegistrationError> {
-    validate_owned_file::<T>(path)?;
-    durable_remove(path)
+    let value =
+        serde_json::from_slice::<T>(&bytes).map_err(|_| RegistrationError::MalformedOwnedFile)?;
+    if value.is_recognized() {
+        Ok(())
+    } else {
+        Err(RegistrationError::MalformedOwnedFile)
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), RegistrationError> {
