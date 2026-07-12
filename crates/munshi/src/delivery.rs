@@ -221,12 +221,14 @@ pub struct NoteRef {
     pub hash: Option<String>,
 }
 
-/// A create request for a Munshi-owned note.
+/// A create request for a Munshi-owned note. `body` is the durable summary body only: Notesmith's
+/// create route assembles the note from a separate `frontmatter` map plus this body, so passing a
+/// document that already carried a frontmatter block would stack two blocks.
 #[derive(Debug, Clone)]
 pub struct CreateNote<'a> {
     pub title: &'a str,
     pub folder: &'a str,
-    pub content: &'a str,
+    pub body: &'a str,
     pub session_id: &'a str,
     pub source: &'a str,
     pub project_identity: &'a str,
@@ -300,6 +302,79 @@ fn note_route(
 fn note_path(folder: Option<&str>, component: &str, source: &str, session_id: &str) -> String {
     let (dir, title) = note_route(folder, component, source, session_id);
     format!("{dir}/{title}.md")
+}
+
+/// Splits a Munshi-owned archive Markdown document into its durable body, discarding the archive's
+/// own YAML frontmatter block. Delivered notes carry Munshi *identity* frontmatter instead, so the
+/// archive frontmatter must not be forwarded (it would otherwise stack a second block on create).
+fn archive_body(markdown: &str) -> &str {
+    if let Some(rest) = markdown.strip_prefix("---\n")
+        && let Some(end) = rest.find("\n---\n")
+    {
+        return rest[end + "\n---\n".len()..].trim_start_matches('\n');
+    }
+    markdown
+}
+
+/// The Munshi-owned identity frontmatter carried by every delivered note. These fields let a future
+/// versioned sink (issue #9) correlate revisions and let Munshi recognize notes it owns.
+fn identity_frontmatter(
+    source: &str,
+    session_id: &str,
+    project_identity: &str,
+    revision: u64,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("munshi_session".to_owned(), serde_json::json!(session_id));
+    map.insert("munshi_source".to_owned(), serde_json::json!(source));
+    map.insert(
+        "munshi_project".to_owned(),
+        serde_json::json!(project_identity),
+    );
+    map.insert("munshi_revision".to_owned(), serde_json::json!(revision));
+    map
+}
+
+/// Serializes a flat identity-frontmatter map to YAML with sorted keys. Values are limited to
+/// strings and integers, matching [`identity_frontmatter`].
+fn frontmatter_yaml(map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut yaml = String::new();
+    for key in keys {
+        match &map[key] {
+            serde_json::Value::Number(number) => {
+                yaml.push_str(&format!("{key}: {number}\n"));
+            }
+            value => {
+                let text = value.as_str().unwrap_or_default();
+                yaml.push_str(&format!("{key}: {}\n", yaml_quote(text)));
+            }
+        }
+    }
+    yaml
+}
+
+/// Double-quotes and escapes a YAML scalar string.
+fn yaml_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Builds a complete, valid Munshi-owned note document (one frontmatter block plus body) for a
+/// replace, which — unlike create — takes the full document rather than a separate frontmatter map.
+fn delivery_document(map: &serde_json::Map<String, serde_json::Value>, body: &str) -> String {
+    format!("---\n{}---\n{}\n", frontmatter_yaml(map), body.trim_end())
 }
 
 fn backoff_ms(attempts: u32) -> i64 {
@@ -382,8 +457,18 @@ pub(crate) fn deliver_one(
         });
     }
 
-    let content = fs::read_to_string(output_directory.join(relative)).map_err(DeliveryError::Io)?;
+    let archive_markdown =
+        fs::read_to_string(output_directory.join(relative)).map_err(DeliveryError::Io)?;
+    let body = archive_body(&archive_markdown);
     let source_selector = record.source.as_selector();
+    let identity = identity_frontmatter(
+        source_selector,
+        &record.session_id,
+        &project.identity,
+        record.current_revision,
+    );
+    // A complete, single-frontmatter-block document for replace (PUT takes the whole document).
+    let document = delivery_document(&identity, body);
     let deterministic_path = note_path(
         delivery.folder.as_deref(),
         &project.component,
@@ -396,37 +481,20 @@ pub(crate) fn deliver_one(
         source_selector,
         &record.session_id,
     );
+    let create = CreateNote {
+        title: &title,
+        folder: &dir,
+        body,
+        session_id: &record.session_id,
+        source: source_selector,
+        project_identity: &project.identity,
+        revision: record.current_revision,
+    };
 
     let result = if let Some(path) = existing.note_path.as_deref() {
-        replace_or_create(
-            sink,
-            path,
-            &content,
-            &CreateNote {
-                title: &title,
-                folder: &dir,
-                content: &content,
-                session_id: &record.session_id,
-                source: source_selector,
-                project_identity: &project.identity,
-                revision: record.current_revision,
-            },
-            &deterministic_path,
-        )
+        replace_or_create(sink, path, &document, &create, &deterministic_path)
     } else {
-        create_or_adopt(
-            sink,
-            &CreateNote {
-                title: &title,
-                folder: &dir,
-                content: &content,
-                session_id: &record.session_id,
-                source: source_selector,
-                project_identity: &project.identity,
-                revision: record.current_revision,
-            },
-            &deterministic_path,
-        )
+        create_or_adopt(sink, &create, &document, &deterministic_path)
     };
 
     match result {
@@ -472,33 +540,36 @@ pub(crate) fn deliver_one(
     }
 }
 
-/// Replaces an existing note, falling back to a create when the remote note has been deleted.
+/// Replaces an existing note with the complete `document`, falling back to a create when the remote
+/// note has been deleted.
 fn replace_or_create(
     sink: &dyn NotesmithSink,
     path: &str,
-    content: &str,
+    document: &str,
     create: &CreateNote<'_>,
     deterministic_path: &str,
 ) -> Result<(NoteRef, bool), SinkError> {
-    match sink.replace_note(path, content) {
+    match sink.replace_note(path, document) {
         Ok(note) => Ok((note, false)),
-        Err(SinkError::NotFound) => create_or_adopt(sink, create, deterministic_path),
+        Err(SinkError::NotFound) => create_or_adopt(sink, create, document, deterministic_path),
         Err(other) => Err(other),
     }
 }
 
-/// Creates a note, adopting the deterministic path when the note already exists (for example after
-/// a rebuilt operational database) by switching to a content replace.
+/// Creates a note from its body and identity frontmatter, adopting the deterministic path when the
+/// note already exists (for example after a rebuilt operational database) by replacing it with the
+/// complete `document`.
 fn create_or_adopt(
     sink: &dyn NotesmithSink,
     create: &CreateNote<'_>,
+    document: &str,
     deterministic_path: &str,
 ) -> Result<(NoteRef, bool), SinkError> {
     match sink.create_note(create) {
         Ok(note) => Ok((note, true)),
         Err(SinkError::AlreadyExists { path }) => {
             let adopt = path.unwrap_or_else(|| deterministic_path.to_owned());
-            let note = sink.replace_note(&adopt, create.content)?;
+            let note = sink.replace_note(&adopt, document)?;
             Ok((note, false))
         }
         Err(other) => Err(other),
@@ -589,16 +660,19 @@ impl HttpNotesmithSink {
 
 impl NotesmithSink for HttpNotesmithSink {
     fn create_note(&self, request: &CreateNote<'_>) -> Result<NoteRef, SinkError> {
+        // Notesmith assembles the note from `content` (body only) plus a separate `frontmatter`
+        // map, so the body must not carry its own frontmatter block.
+        let frontmatter = identity_frontmatter(
+            request.source,
+            request.session_id,
+            request.project_identity,
+            request.revision,
+        );
         let body = serde_json::json!({
             "title": request.title,
             "folder": request.folder,
-            "content": request.content,
-            "frontmatter": {
-                "munshi_session": request.session_id,
-                "munshi_source": request.source,
-                "munshi_project": request.project_identity,
-                "munshi_revision": request.revision,
-            },
+            "content": request.body,
+            "frontmatter": frontmatter,
         });
         let payload =
             serde_json::to_vec(&body).map_err(|error| SinkError::Protocol(error.to_string()))?;
@@ -732,7 +806,12 @@ fn http_request(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
     );
     if let Some(token) = token {
-        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        // Notesmith itself is unauthenticated and defers auth to a reverse proxy that expects
+        // a bearer token (notes-method docs/adr/0010, khata-handoff.md). The token is written
+        // on its own line with a trailing CRLF and is never placed in a format string or log.
+        request.push_str("Authorization: Bearer ");
+        request.push_str(token);
+        request.push_str("\r\n");
     }
     if let Some(body) = body {
         request.push_str("Content-Type: application/json\r\n");
@@ -1141,8 +1220,12 @@ fn select_candidates(
     selection: &Selection,
     force: bool,
 ) -> Result<Vec<SessionRecord>, DeliveryError> {
-    let state = StateStore::open(state_directory)?;
-    let sessions = state.list_sessions()?;
+    let sessions = StateStore::open(state_directory)?.list_sessions()?;
+    // Delivery rows are resolved through a session's own source scope, so a per-source store cache
+    // is used to look up each record's delivery — a Copilot-scoped store cannot see Claude/Codex
+    // delivery rows.
+    let mut stores: std::collections::BTreeMap<crate::source::SourceKind, StateStore> =
+        std::collections::BTreeMap::new();
     let deliverable = |record: &SessionRecord| -> bool {
         record.current_revision > 0
             && record.markdown_relative_path.is_some()
@@ -1157,7 +1240,13 @@ fn select_candidates(
         if !deliverable(&record) {
             continue;
         }
-        let existing = state.get_delivery(&record.session_id, endpoint, vault)?;
+        let store = match stores.entry(record.source) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(StateStore::open_for_source(state_directory, record.source)?)
+            }
+        };
+        let existing = store.get_delivery(&record.session_id, endpoint, vault)?;
         let include = match selection {
             Selection::Backfill => match existing {
                 Some(delivery) => !is_current_delivery(&delivery, &record),
@@ -1306,6 +1395,34 @@ mod tests {
     fn encode_path_preserves_slashes_and_escapes_spaces() {
         assert_eq!(encode_path("Munshi/a b.md"), "Munshi/a%20b.md");
         assert_eq!(encode_path("plain-note.md"), "plain-note.md");
+    }
+
+    #[test]
+    fn archive_body_strips_the_leading_frontmatter_block() {
+        let archive =
+            "---\nschema_version: 2\nid: \"copilot:abc\"\ntags: []\n---\n\n# Title\n\nBody.";
+        assert_eq!(archive_body(archive), "# Title\n\nBody.");
+        // Documents without frontmatter are returned unchanged.
+        assert_eq!(archive_body("# Just a body"), "# Just a body");
+    }
+
+    #[test]
+    fn delivery_document_has_exactly_one_frontmatter_block_with_identity() {
+        let map = identity_frontmatter("copilot", "sess-1", "github.com/o/r", 3);
+        let document = delivery_document(&map, "# Title\n\nBody.");
+        // Exactly one opening and one closing frontmatter delimiter.
+        assert_eq!(document.matches("\n---\n").count() + 1, 2);
+        assert!(document.starts_with("---\n"));
+        assert!(document.contains("munshi_session: \"sess-1\""));
+        assert!(document.contains("munshi_source: \"copilot\""));
+        assert!(document.contains("munshi_project: \"github.com/o/r\""));
+        assert!(document.contains("munshi_revision: 3"));
+        assert!(document.trim_end().ends_with("Body."));
+    }
+
+    #[test]
+    fn yaml_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(yaml_quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
     }
 
     #[test]

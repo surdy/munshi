@@ -917,11 +917,18 @@ impl StateStore {
         self.connection.execute(
             "UPDATE deliveries SET
                 delivery_state='pending',next_attempt_at_ms=NULL,
-                attempts=CASE WHEN ?4 THEN 0 ELSE attempts END,updated_at_ms=?5
+                attempts=CASE WHEN ?5 THEN 0 ELSE attempts END,updated_at_ms=?6
              WHERE session_id=(
                     SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
-                 ) AND endpoint=?3",
-            params![session_id, self.source_kind, endpoint, reset_attempts, now],
+                 ) AND endpoint=?3 AND vault=?4",
+            params![
+                session_id,
+                self.source_kind,
+                endpoint,
+                vault,
+                reset_attempts,
+                now
+            ],
         )?;
         self.get_delivery(session_id, endpoint, vault)
     }
