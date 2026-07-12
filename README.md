@@ -193,42 +193,37 @@ require changing every sink or renderer.
 
 ## Copilot session capture
 
-Copilot CLI exposes lifecycle hooks. Munshi should install user-level hooks under
-`~/.copilot/hooks` or `$COPILOT_HOME/hooks`. Copilot CLI 1.0.70 live testing confirmed this
-documented path; `~/.copilot/config/hooks` did not fire. Hook configuration is loaded at CLI
-startup.
+`munshi register` installs only `hooks/munshi.json` under `~/.copilot` or `$COPILOT_HOME`, after a
+prominent disclosure and explicit acceptance. It writes direct `exec`/`args` entries for
+`agentStop` and `sessionEnd` using the absolute current Munshi executable. Configuration and the
+temporary file handoff are stored below the selected Munshi state directory; unrelated hook and
+settings files are untouched. Restart Copilot CLI after registration because hooks are loaded at
+startup. See [automatic clean-session archival](docs/automatic-archive.md).
 
 Use these events:
 
-- `agentStop`: record the session ID, transcript path, working directory, and latest available
-  source position.
-- `sessionEnd`: finalize or revise the report.
+- `agentStop`: record the session ID, transcript path, and origin working directory.
+- `sessionEnd`: start clean-session archival.
 
 `sessionEnd` does not itself provide the transcript path, so Munshi persists the last path seen for
 each session during `agentStop`. This is the primary transcript lookup, but it is not sufficient:
 an early Ctrl-C can produce `sessionEnd` without `agentStop`, and SIGKILL can produce neither hook.
 
-The hook command must:
+The hook command:
 
-- Read one JSON payload from standard input.
-- Validate the event schema.
-- Acquire a short-lived per-session lock.
-- Record source metadata transactionally.
-- Queue or execute finalization.
-- Return quickly enough not to degrade Copilot CLI shutdown.
-- Never fail the originating Copilot session because archival failed.
-
-The compatibility spike must verify that command hooks fire during:
-
-- Normal interactive sessions.
-- Noninteractive `copilot -p` sessions.
-- Resumed sessions.
-- Interrupted and force-closed sessions.
+- Reads one JSON payload from standard input.
+- Validates the event schema.
+- Records the minimal `agentStop` metadata with an atomic durable file replacement.
+- Uses a per-session create-new worker marker to suppress duplicate clean-end workers.
+- Starts clean-session archival in a detached process with inherited standard streams closed.
+- Returns quickly enough not to degrade Copilot CLI shutdown.
+- Never fails the originating Copilot session because archival failed.
 
 A session becomes archive-worthy only after at least one user request and agent-produced content or
 tool activity. Empty or cancelled starts may be recorded diagnostically but do not create Markdown.
 
-Interrupted recovery uses this order:
+Issue #3 archives only sessions for which `agentStop` supplied metadata before `sessionEnd`.
+Interrupted recovery remains an issue #4 design:
 
 1. Use the latest hook-provided `transcriptPath`.
 2. For a supported, version-pinned Copilot adapter, derive the expected transcript path from
@@ -266,7 +261,7 @@ The first detected Git repository is the session's origin project and remains it
 association. Project identity uses a normalized canonical remote when available so clones and
 worktrees group together, with a locally assigned identity for repositories without a remote.
 
-State tracked per session:
+Planned issue #4 state tracked per session:
 
 ```text
 agent
@@ -284,7 +279,7 @@ last successful delivery
 last error
 ```
 
-When a session is resumed:
+The following resumed-session behavior remains deferred to issue #4:
 
 1. `agentStop` identifies new transcript material.
 2. Munshi loads only the content beyond the stored cursor.

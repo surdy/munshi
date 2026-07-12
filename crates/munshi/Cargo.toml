@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+libc.workspace = true
 munshi-runner = { path = "../munshi-runner" }
 serde.workspace = true
 serde_json.workspace = true

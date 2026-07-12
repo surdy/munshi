@@ -65,12 +65,14 @@ The manual record always has revision 1, a source-line cursor, and a SHA-256 sou
 These aliases are intentionally defensive compatibility assumptions, not a public Copilot schema.
 They must be reconciled with ongoing transcript-schema research before broad automatic ingestion.
 
-## Deferred to issues #3 and #4
+## Automatic archival and issue #4
 
-Issue #3 must add registration disclosure, idempotent user-hook installation/removal, fast
-fail-open hook ingestion, and automatic clean-session finalization through this same archive path.
+Issue #3 adds registration disclosure, idempotent user-hook installation/removal, fast fail-open
+hook ingestion, and automatic clean-session finalization through this same archive path. See
+[`automatic-archive.md`](automatic-archive.md).
 
-Issue #4 must add SQLite operational state, per-session locks, validated semantic cursors, resumed
+Issue #4 must replace the narrow file handoff with SQLite operational state, add robust locks,
+validated semantic cursors, resumed
 delta summaries with the prior summary, revision increments, transcript rewrite fallback, and
 interrupted/force-close recovery. Until then, rerunning the manual command replaces revision 1 and
 does not claim resumed-session semantics.

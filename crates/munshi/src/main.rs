@@ -1,10 +1,15 @@
+use std::error::Error;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use munshi::{ArchiveConfig, ArchiveOutcome, SessionReference, archive_session};
+use munshi::{
+    ArchiveConfig, ArchiveOutcome, HookEvent, HookResult, RegisterConfig, SessionReference,
+    accept_disclosure_from_terminal, archive_session, handle_hook, register, run_archive_worker,
+    unregister, wait_for_hook_result,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Archive coding-agent sessions as durable Markdown", version)]
@@ -49,17 +54,112 @@ enum Command {
         #[arg(long, default_value_t = 65_536)]
         max_stderr_bytes: usize,
     },
+    /// Disclose transcript processing, save configuration, and install user hooks.
+    Register {
+        /// Explicitly accept the displayed v1 transcript-processing disclosure.
+        #[arg(long)]
+        accept_disclosure: bool,
+        /// Copilot home whose hooks directory should contain Munshi's dedicated file.
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+        /// Durable Munshi operational state directory. Defaults below COPILOT_HOME.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Root directory for Munshi-owned Markdown archives.
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Explicit compatible summary executable.
+        #[arg(long)]
+        summarizer: PathBuf,
+        /// Argument forwarded to the summarizer; transcript content is sent only on stdin.
+        #[arg(long = "summarizer-arg", allow_hyphen_values = true)]
+        summarizer_args: Vec<OsString>,
+        #[arg(long, default_value_t = 300_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = 8_388_608)]
+        max_source_bytes: usize,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_input_bytes: usize,
+        #[arg(long, default_value_t = 262_144)]
+        max_stdout_bytes: usize,
+        #[arg(long, default_value_t = 65_536)]
+        max_stderr_bytes: usize,
+    },
+    /// Remove only Munshi's dedicated user hook and active configuration.
+    Unregister {
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    #[command(hide = true, subcommand)]
+    Hook(HookCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    AgentStop {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    SessionEnd {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    ArchiveWorker {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
+    },
+    Wait {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
+    },
+}
+
+enum Outcome {
+    Archive(ArchiveOutcome),
+    Registered { hook_path: PathBuf },
+    Unregistered,
+    Hook,
+    Worker,
+    Wait(HookResult),
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(ArchiveOutcome::Archived { id, relative_path }) => {
+        Ok(Outcome::Archive(ArchiveOutcome::Archived { id, relative_path })) => {
             println!("archived {id} -> {}", relative_path.display());
             ExitCode::SUCCESS
         }
-        Ok(ArchiveOutcome::NotArchiveWorthy { id }) => {
+        Ok(Outcome::Archive(ArchiveOutcome::NotArchiveWorthy { id })) => {
             eprintln!("not archived: {id} is not archive-worthy");
             ExitCode::from(2)
+        }
+        Ok(Outcome::Registered { hook_path }) => {
+            println!("registered Munshi hooks at {}", hook_path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::Unregistered) => {
+            println!("unregistered Munshi hooks");
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::Hook | Outcome::Worker) => ExitCode::SUCCESS,
+        Ok(Outcome::Wait(result)) => {
+            println!(
+                "{}",
+                serde_json::to_string(&result).expect("hook result serializes")
+            );
+            if matches!(result, HookResult::Failed { .. }) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => {
             eprintln!("error: {error}");
@@ -68,7 +168,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<ArchiveOutcome, munshi::ArchiveError> {
+fn run() -> Result<Outcome, Box<dyn Error>> {
     match Cli::parse().command {
         Command::Archive {
             session_id,
@@ -83,7 +183,7 @@ fn run() -> Result<ArchiveOutcome, munshi::ArchiveError> {
             max_input_bytes,
             max_stdout_bytes,
             max_stderr_bytes,
-        } => archive_session(&ArchiveConfig {
+        } => Ok(Outcome::Archive(archive_session(&ArchiveConfig {
             reference: SessionReference {
                 session_id,
                 events_path: events,
@@ -98,6 +198,84 @@ fn run() -> Result<ArchiveOutcome, munshi::ArchiveError> {
             max_input_bytes,
             max_stdout_bytes,
             max_stderr_bytes,
-        }),
+        })?)),
+        Command::Register {
+            accept_disclosure,
+            copilot_home,
+            state_dir,
+            output_dir,
+            summarizer,
+            summarizer_args,
+            timeout_ms,
+            max_source_bytes,
+            max_input_bytes,
+            max_stdout_bytes,
+            max_stderr_bytes,
+        } => {
+            accept_disclosure_from_terminal(accept_disclosure)?;
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = state_dir.unwrap_or_else(|| copilot_home.join("munshi"));
+            let executable = std::env::current_exe()?.canonicalize()?;
+            register(&RegisterConfig {
+                copilot_home: copilot_home.clone(),
+                state_directory,
+                output_directory: output_dir,
+                summarizer_binary: summarizer,
+                summarizer_args,
+                timeout: Duration::from_millis(timeout_ms),
+                max_source_bytes,
+                max_input_bytes,
+                max_stdout_bytes,
+                max_stderr_bytes,
+                executable,
+            })?;
+            Ok(Outcome::Registered {
+                hook_path: copilot_home.join("hooks/munshi.json"),
+            })
+        }
+        Command::Unregister {
+            copilot_home,
+            state_dir,
+        } => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = state_dir.unwrap_or_else(|| copilot_home.join("munshi"));
+            unregister(&copilot_home, &state_directory)?;
+            Ok(Outcome::Unregistered)
+        }
+        Command::Hook(HookCommand::AgentStop { state_dir }) => {
+            handle_hook(HookEvent::AgentStop, &state_dir, std::io::stdin().lock());
+            Ok(Outcome::Hook)
+        }
+        Command::Hook(HookCommand::SessionEnd { state_dir }) => {
+            handle_hook(HookEvent::SessionEnd, &state_dir, std::io::stdin().lock());
+            Ok(Outcome::Hook)
+        }
+        Command::Hook(HookCommand::ArchiveWorker {
+            state_dir,
+            session_id,
+        }) => {
+            let _ = run_archive_worker(&state_dir, &session_id)?;
+            Ok(Outcome::Worker)
+        }
+        Command::Hook(HookCommand::Wait {
+            state_dir,
+            session_id,
+            timeout_ms,
+        }) => Ok(Outcome::Wait(wait_for_hook_result(
+            &state_dir,
+            &session_id,
+            Duration::from_millis(timeout_ms),
+        )?)),
     }
+}
+
+fn resolve_copilot_home(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    if let Some(value) = std::env::var_os("COPILOT_HOME") {
+        return Ok(PathBuf::from(value));
+    }
+    let home = std::env::var_os("HOME").ok_or("COPILOT_HOME or HOME is required")?;
+    Ok(Path::new(&home).join(".copilot"))
 }
