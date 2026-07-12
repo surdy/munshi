@@ -23,8 +23,9 @@ use crate::source::{
     resolve_session_reference, validate_transcript_envelope,
 };
 use crate::state::{
-    Claim, CompletionReason, PersistedArchive, PlannedArchive, SessionRecord, StateError,
-    StateStore, WaitState, migrate_legacy_state, now_ms, try_acquire_session_lock,
+    BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlannedArchive,
+    SessionRecord, StateError, StateStore, WaitState, migrate_legacy_state, now_ms,
+    try_acquire_session_lock,
 };
 use crate::summary::{
     SummarizerConfig, SummaryError, build_revision_summary_input, build_summary_input, run_summary,
@@ -172,9 +173,18 @@ fn run_archive_worker_inner(
     }
 
     let lease = Duration::from_millis(stored.limits.timeout_ms.saturating_add(60_000));
-    let Some(claim) = state.claim_session(session_id, lease, false)? else {
-        return current_result(&state, session_id);
-    };
+    let claim =
+        match state.claim_session(session_id, lease, false, stored.policy.max_concurrency)? {
+            ClaimOutcome::NotClaimable => return current_result(&state, session_id),
+            ClaimOutcome::ConcurrencyExceeded => {
+                state.record_deferred(session_id, "concurrency-deferred")?;
+                state.clear_worker_reservation(session_id)?;
+                return Ok(HookResult::Failed {
+                    code: "concurrency-deferred".to_owned(),
+                });
+            }
+            ClaimOutcome::Claimed(claim) => claim,
+        };
     match process_claim(&mut state, state_directory, &stored, &claim) {
         Ok(result) => Ok(result),
         Err(error @ (HookWorkerError::PostPersist(_) | HookWorkerError::PostPersistWrite(_))) => {
@@ -536,19 +546,6 @@ fn process_claim(
                 .unwrap_or("project-disabled");
             return Err(HookWorkerError::Deferred(category));
         }
-        let now = now_ms();
-        let hour_ago = now.saturating_sub(60 * 60 * 1_000);
-        let day_ago = now.saturating_sub(24 * 60 * 60 * 1_000);
-        if state.summarizer_calls_since(&project.identity, hour_ago)?
-            >= policy.max_calls_per_hour as i64
-        {
-            return Err(HookWorkerError::Deferred("budget-hourly-exceeded"));
-        }
-        if state.summarizer_calls_since(&project.identity, day_ago)?
-            >= policy.max_calls_per_day as i64
-        {
-            return Err(HookWorkerError::Deferred("budget-daily-exceeded"));
-        }
         let max_input_bytes = policy
             .max_input_bytes
             .unwrap_or(stored.limits.max_input_bytes);
@@ -563,7 +560,25 @@ fn process_claim(
         } else {
             build_summary_input(&update.session, &project, max_input_bytes)?
         };
-        state.record_summarizer_call(&project.identity, now)?;
+        // Checking the budget and recording the call happen in one atomic transaction (see
+        // `reserve_summarizer_call`), so two processes racing on the same project's budget
+        // cannot both observe capacity and both proceed. This runs only once `input` has been
+        // built successfully, so a call that will never reach the summarizer (for example
+        // oversized input rejected above) is never charged against the budget.
+        match state.reserve_summarizer_call(
+            &project.identity,
+            now_ms(),
+            policy.max_calls_per_hour,
+            policy.max_calls_per_day,
+        )? {
+            BudgetOutcome::HourlyExceeded => {
+                return Err(HookWorkerError::Deferred("budget-hourly-exceeded"));
+            }
+            BudgetOutcome::DailyExceeded => {
+                return Err(HookWorkerError::Deferred("budget-daily-exceeded"));
+            }
+            BudgetOutcome::Reserved => {}
+        }
         run_summary(
             &SummarizerConfig {
                 binary: PathBuf::from(&stored.summarizer.executable),
@@ -807,11 +822,11 @@ fn policy_gate(
     stored: &crate::registration::StoredConfig,
     session_id: &str,
 ) -> Result<Option<HookResult>, HookWorkerError> {
-    if state.count_active_processing()? >= stored.policy.max_concurrency as i64 {
-        let _ = state.record_deferred(session_id, "concurrency-deferred");
-        state.clear_worker_reservation(session_id)?;
-        return Ok(Some(current_result(state, session_id)?));
-    }
+    // Concurrency is intentionally not checked here: it is enforced atomically inside
+    // `claim_session`'s own `BEGIN IMMEDIATE` transaction, so the count it decides on and the
+    // claim it allows or refuses always come from the same transaction. A separate advisory
+    // check at this point would race with other processes doing the same and could let more
+    // than `max_concurrency` sessions be claimed.
     let Some(session) = state.get_session(session_id)? else {
         return Ok(None);
     };

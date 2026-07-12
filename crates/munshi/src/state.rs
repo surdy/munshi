@@ -157,6 +157,24 @@ pub enum WaitState {
     Failed,
 }
 
+/// Result of [`StateStore::claim_session`]. `ConcurrencyExceeded` and a claimed session are
+/// decided by the same atomic transaction as the count they are based on, so no other process can
+/// observe stale capacity and also claim.
+#[derive(Debug)]
+pub enum ClaimOutcome {
+    Claimed(Box<Claim>),
+    ConcurrencyExceeded,
+    NotClaimable,
+}
+
+/// Result of [`StateStore::reserve_summarizer_call`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetOutcome {
+    Reserved,
+    HourlyExceeded,
+    DailyExceeded,
+}
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -948,8 +966,11 @@ impl StateStore {
         Ok(reserved)
     }
 
-    /// Counts sessions with a live (non-expired) processing lease, used to enforce the configured
-    /// global concurrency budget before claiming another session.
+    /// Counts sessions with a live (non-expired) processing lease. This is a non-authoritative
+    /// snapshot for reporting only; enforcement uses the atomic check inside [`claim_session`]
+    /// so a claim decision and the count it is based on always come from the same transaction.
+    ///
+    /// [`claim_session`]: StateStore::claim_session
     pub fn count_active_processing(&self) -> Result<i64, StateError> {
         let now = now_ms();
         self.connection
@@ -962,13 +983,22 @@ impl StateStore {
             .map_err(Into::into)
     }
 
-    /// Records one summarizer invocation for a project's hourly/daily cost budget and prunes
-    /// entries old enough that no configured window could still reference them.
-    pub fn record_summarizer_call(
+    /// Atomically checks a project's rolling hourly and daily summarizer-call budget and, only if
+    /// neither limit is currently met, records one call and returns [`BudgetOutcome::Reserved`].
+    /// The check and the reservation happen inside one `BEGIN IMMEDIATE` transaction, so two
+    /// processes racing for the same project's budget cannot both observe capacity and both
+    /// insert: SQLite serializes their write transactions, and the second to run always sees the
+    /// first's committed row. Callers should call this immediately before invoking the
+    /// summarizer, once they are certain a call will actually be made, so a call that never
+    /// reaches the summarizer (for example an unchanged or cursor-only revision, or oversized
+    /// input rejected before spawning it) is never charged.
+    pub fn reserve_summarizer_call(
         &mut self,
         project_identity: &str,
         now_ms: i64,
-    ) -> Result<(), StateError> {
+        max_calls_per_hour: u32,
+        max_calls_per_day: u32,
+    ) -> Result<BudgetOutcome, StateError> {
         const PRUNE_WINDOW_MS: i64 = 25 * 60 * 60 * 1_000;
         let transaction = self
             .connection
@@ -977,16 +1007,41 @@ impl StateStore {
             "DELETE FROM summarizer_calls WHERE called_at_ms < ?1",
             [now_ms.saturating_sub(PRUNE_WINDOW_MS)],
         )?;
+        let hour_ago = now_ms.saturating_sub(60 * 60 * 1_000);
+        let hourly_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM summarizer_calls
+             WHERE project_identity=?1 AND called_at_ms >= ?2",
+            params![project_identity, hour_ago],
+            |row| row.get(0),
+        )?;
+        if hourly_count >= max_calls_per_hour as i64 {
+            transaction.commit()?;
+            return Ok(BudgetOutcome::HourlyExceeded);
+        }
+        let day_ago = now_ms.saturating_sub(24 * 60 * 60 * 1_000);
+        let daily_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM summarizer_calls
+             WHERE project_identity=?1 AND called_at_ms >= ?2",
+            params![project_identity, day_ago],
+            |row| row.get(0),
+        )?;
+        if daily_count >= max_calls_per_day as i64 {
+            transaction.commit()?;
+            return Ok(BudgetOutcome::DailyExceeded);
+        }
         transaction.execute(
             "INSERT INTO summarizer_calls(project_identity, called_at_ms) VALUES (?1,?2)",
             params![project_identity, now_ms],
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(BudgetOutcome::Reserved)
     }
 
-    /// Counts a project's summarizer invocations since `since_ms`, used to evaluate its effective
-    /// hourly/daily budget.
+    /// Counts a project's summarizer invocations since `since_ms`. This is a read-only reporting
+    /// helper; enforcement uses [`reserve_summarizer_call`] so the check and reservation are
+    /// atomic.
+    ///
+    /// [`reserve_summarizer_call`]: StateStore::reserve_summarizer_call
     pub fn summarizer_calls_since(
         &self,
         project_identity: &str,
@@ -1110,7 +1165,8 @@ impl StateStore {
         session_id: &str,
         lease_duration: Duration,
         force: bool,
-    ) -> Result<Option<Claim>, StateError> {
+        max_concurrency: usize,
+    ) -> Result<ClaimOutcome, StateError> {
         validate_session_id(session_id)?;
         let now = now_ms();
         let transaction = self
@@ -1138,7 +1194,7 @@ impl StateStore {
             .optional()?;
         let Some(ref mut session) = session else {
             transaction.commit()?;
-            return Ok(None);
+            return Ok(ClaimOutcome::NotClaimable);
         };
         if session.active
             || !matches!(
@@ -1147,7 +1203,7 @@ impl StateStore {
             )
         {
             transaction.commit()?;
-            return Ok(None);
+            return Ok(ClaimOutcome::NotClaimable);
         }
         if session.lifecycle_state == "failed" && !force {
             let ready: bool = transaction.query_row(
@@ -1159,8 +1215,23 @@ impl StateStore {
             )?;
             if !ready {
                 transaction.commit()?;
-                return Ok(None);
+                return Ok(ClaimOutcome::NotClaimable);
             }
+        }
+        // Concurrency is checked inside this same BEGIN IMMEDIATE transaction as the claim
+        // itself: SQLite serializes writers, so a second process's claim_session call blocks
+        // here until this transaction commits or rolls back, and then re-reads a count that
+        // already reflects this decision. That makes "count active leases, then claim" atomic
+        // across processes rather than two separate races.
+        let active_processing: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM processing_attempts
+             WHERE outcome='processing' AND lease_expires_at_ms > ?1",
+            [now],
+            |row| row.get(0),
+        )?;
+        if active_processing >= max_concurrency as i64 {
+            transaction.commit()?;
+            return Ok(ClaimOutcome::ConcurrencyExceeded);
         }
         let retry_state = if session.lifecycle_state == "failed" {
             transaction
@@ -1210,13 +1281,13 @@ impl StateStore {
             params![session.database_id, retry_state, token, now],
         )?;
         transaction.commit()?;
-        Ok(Some(Claim {
+        Ok(ClaimOutcome::Claimed(Box::new(Claim {
             attempt_id,
             token,
             state_generation: session.state_generation,
             retry_state,
             session: session.clone(),
-        }))
+        })))
     }
 
     pub fn store_plan(&mut self, claim: &Claim, plan: &PlannedArchive) -> Result<(), StateError> {

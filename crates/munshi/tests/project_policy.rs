@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-use munshi::{CompletionReason, StateStore, parse_archive_markdown};
+use munshi::{BudgetOutcome, CompletionReason, StateStore, parse_archive_markdown};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -196,21 +196,38 @@ fn hourly_budget_defers_second_summarization_in_the_same_project() {
 }
 
 #[test]
-fn summarizer_call_budget_state_tracks_rolling_windows() {
+fn summarizer_call_budget_state_tracks_rolling_windows_and_enforces_the_limit() {
     let harness = Harness::new();
     let summarizer = harness.revision_summarizer("state-budget-count");
     assert_success(&harness.register(&summarizer));
     let mut state = StateStore::open(&harness.state).unwrap();
     let now = 1_000_000_000_i64;
-    state
-        .record_summarizer_call("example/project", now)
-        .unwrap();
-    state
-        .record_summarizer_call("example/project", now + 1_000)
-        .unwrap();
-    state
-        .record_summarizer_call("other/project", now + 1_000)
-        .unwrap();
+    assert_eq!(
+        state
+            .reserve_summarizer_call("example/project", now, 2, 1_000)
+            .unwrap(),
+        BudgetOutcome::Reserved
+    );
+    assert_eq!(
+        state
+            .reserve_summarizer_call("example/project", now + 1_000, 2, 1_000)
+            .unwrap(),
+        BudgetOutcome::Reserved
+    );
+    // A third call within the same rolling hour exceeds the limit of 2 and must be refused
+    // rather than silently recorded.
+    assert_eq!(
+        state
+            .reserve_summarizer_call("example/project", now + 2_000, 2, 1_000)
+            .unwrap(),
+        BudgetOutcome::HourlyExceeded
+    );
+    assert_eq!(
+        state
+            .reserve_summarizer_call("other/project", now + 1_000, 2, 1_000)
+            .unwrap(),
+        BudgetOutcome::Reserved
+    );
     assert_eq!(
         state
             .summarizer_calls_since("example/project", now - 1)
@@ -224,6 +241,102 @@ fn summarizer_call_budget_state_tracks_rolling_windows() {
         1
     );
     assert_eq!(state.count_active_processing().unwrap(), 0);
+}
+
+#[test]
+fn budget_reservation_never_oversubscribes_under_concurrent_racers() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("budget-race-count");
+    assert_success(&harness.register(&summarizer));
+
+    const MAX_PER_HOUR: u32 = 5;
+    const RACERS: usize = 16;
+    let now = 2_000_000_000_i64;
+    let handles: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let state_dir = harness.state.clone();
+            std::thread::spawn(move || {
+                // Each thread opens its own connection to the same database file, the same way
+                // each independent `munshi hook-worker` process would.
+                let mut state = StateStore::open(&state_dir).unwrap();
+                state
+                    .reserve_summarizer_call("race/project", now, MAX_PER_HOUR, 1_000)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    let reserved = outcomes
+        .iter()
+        .filter(|outcome| **outcome == BudgetOutcome::Reserved)
+        .count();
+    assert_eq!(reserved, MAX_PER_HOUR as usize);
+    assert_eq!(outcomes.len() - reserved, RACERS - MAX_PER_HOUR as usize);
+    let recorded = StateStore::open(&harness.state)
+        .unwrap()
+        .summarizer_calls_since("race/project", now - 1)
+        .unwrap();
+    assert_eq!(recorded, MAX_PER_HOUR as i64);
+}
+
+#[test]
+fn concurrency_limit_of_one_never_overlaps_summarizer_across_real_processes() {
+    let harness = Harness::new();
+    let (summarizer, lock_dir, violations) = harness.exclusive_sleeping_summarizer("excl-count", 1);
+    assert_success(&harness.register_with_budgets(&summarizer, 1_000, 1_000, 1));
+
+    let sessions = [
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444",
+        "55555555-5555-4555-8555-555555555555",
+    ];
+    for (index, session_id) in sessions.iter().enumerate() {
+        let transcript = harness.write_transcript(
+            session_id,
+            &format!("REQUEST_{index}"),
+            &format!("ANSWER_{index}"),
+        );
+        harness.queue_direct(
+            session_id,
+            &transcript,
+            10 + index as i64,
+            11 + index as i64,
+        );
+    }
+
+    // Spawn all three worker processes back to back with no synchronization between them: this
+    // is the real, deterministic cross-process race the atomic concurrency check must survive.
+    let mut children: Vec<_> = sessions.iter().map(|id| harness.spawn_worker(id)).collect();
+    for child in &mut children {
+        assert!(child.wait().unwrap().success());
+    }
+
+    // With max_concurrency=1 at most one of the three could have claimed and run immediately;
+    // the others deferred. Recover repeatedly so each deferred session gets a turn once the
+    // single slot frees up.
+    for _ in 0..(sessions.len() * 5) {
+        if sessions.iter().all(|id| harness.archive_exists(id)) {
+            break;
+        }
+        let _ = harness.recover(0, false, false);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    for session_id in sessions {
+        assert!(
+            harness.archive_exists(session_id),
+            "session {session_id} was never archived"
+        );
+    }
+    assert!(
+        !violations.exists(),
+        "summarizer ran concurrently with itself: {}",
+        fs::read_to_string(&violations).unwrap_or_default()
+    );
+    assert!(!lock_dir.exists(), "exclusive lock directory was left held");
 }
 
 struct Harness {
@@ -605,6 +718,33 @@ esac
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         script.canonicalize().unwrap()
+    }
+
+    /// A summarizer that proves mutual exclusion using an atomic `mkdir` as a lock: if a second
+    /// invocation ever runs while an earlier one still holds the directory, it records an
+    /// overlap violation instead of silently succeeding. This avoids relying on OS timestamp
+    /// resolution to detect a same-instant overlap.
+    fn exclusive_sleeping_summarizer(
+        &self,
+        count_name: &str,
+        seconds: u64,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let script = self.root().join(format!("{count_name}.sh"));
+        let lock_dir = self.root().join(format!("{count_name}.lock"));
+        let violations = self.root().join(format!("{count_name}.violations"));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\ncat >/dev/null\nif ! mkdir '{lock}' 2>/dev/null; then\n  printf 'overlap\\n' >> '{violations}'\n  exit 1\nfi\nsleep {seconds}\nrmdir '{lock}'\nprintf '%s' '{json}'\n",
+                lock = lock_dir.display(),
+                violations = violations.display(),
+                seconds = seconds,
+                json = r#"{"title":"Exclusive run","goal":"Prove mutual exclusion.","work_completed":["Ran alone."],"decisions":[],"files_changed":[],"commands_and_validation":[],"open_items":[],"tags":["concurrency"]}"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (script.canonicalize().unwrap(), lock_dir, violations)
     }
 }
 

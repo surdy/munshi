@@ -29,8 +29,8 @@ pub use source::{
     resolve_session_reference, validate_transcript_envelope,
 };
 pub use state::{
-    CompletionReason, Diagnostic, SessionRecord, StateError, StateStore, WaitState,
-    try_acquire_session_lock,
+    BudgetOutcome, ClaimOutcome, CompletionReason, Diagnostic, SessionRecord, StateError,
+    StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
     StructuredSummary, SummaryError, build_revision_summary_input, build_summary_input,

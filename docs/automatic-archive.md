@@ -169,6 +169,15 @@ of discarding it:
 - `max_input_bytes` and `timeout_ms` remain enforced per call; an oversized or slow attempt is a
   retryable summary failure rather than a silent drop.
 
+The concurrency check and the session claim happen inside one `BEGIN IMMEDIATE` SQLite
+transaction (`StateStore::claim_session`), and the hourly/daily budget check and its reservation
+happen inside another (`StateStore::reserve_summarizer_call`), invoked only once a real
+summarizer call is about to be made. SQLite serializes writers across processes, so two workers
+racing to claim a slot or a budget unit cannot both observe capacity and both proceed; the second
+always re-reads a count that already reflects the first's committed decision. A crashed worker's
+claim self-heals through its lease expiry (`count_active_processing` only counts live leases), so
+concurrency capacity is never permanently lost to a dead process.
+
 In every case the session is left retryable rather than failed permanently, so it is picked up
 opportunistically by a later hook (`agentStop`/`sessionEnd` trigger a recovery sweep automatically)
 or by `munshi hook recover`, once concurrency frees up, the budget window rolls over, or the project
