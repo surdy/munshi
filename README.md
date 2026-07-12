@@ -532,10 +532,11 @@ classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, 
 - delivery state (`disabled`, `delivery-related`, `unknown`),
 - archive Git-history configuration and repository health checks when enabled.
 
-Retry commands are idempotent and use the same session lock, claim path, and state machine as hook
-workers. By default they respect existing backoff and permanent-failure markers; `--force`
-overrides those markers only for selected retry targets. No query or retry command exposes raw
-transcript content.
+Retry commands are idempotent and reuse the same per-session lock, claim, and lifecycle transition
+logic as hook workers. They do not bypass the SQLite state machine. By default they respect retry
+backoff and permanent-failure markers; `--force` overrides those markers only for selected retry
+targets. `show` returns only current summary and operational metadata, never raw transcript
+content.
 
 ## Configuration
 
