@@ -17,6 +17,8 @@ use tempfile::TempDir;
 
 const SESSION_A: &str = "11111111-1111-4111-8111-111111111111";
 const SESSION_B: &str = "22222222-2222-4222-8222-222222222222";
+const SESSION_PREFIX_SHORT: &str = "session-1";
+const SESSION_PREFIX_LONG: &str = "session-10";
 
 #[test]
 fn registration_migrates_schema_idempotently_and_uses_wal() {
@@ -769,6 +771,148 @@ fn post_persist_recovery_skips_duplicate_git_commit() {
 }
 
 #[test]
+fn post_persist_recovery_uses_exact_commit_trailer_matching_for_prefix_session_ids() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("reconcile-prefix-collision-count");
+    assert_success(&harness.register_with_git_history(&summarizer, 10_000, true));
+
+    let transcript_long = harness.write_transcript(
+        SESSION_PREFIX_LONG,
+        "INITIAL_REQUEST",
+        "long initial answer",
+    );
+    harness.complete_lifecycle(SESSION_PREFIX_LONG, &transcript_long, 10, 11);
+    assert_success(&harness.wait(SESSION_PREFIX_LONG, 5_000));
+    harness.append_turn(&transcript_long, "DELTA_REQUEST", "long resumed answer");
+    harness.complete_lifecycle(SESSION_PREFIX_LONG, &transcript_long, 20, 21);
+    assert_success(&harness.wait(SESSION_PREFIX_LONG, 5_000));
+    let long_archive_path = harness.archive_path(SESSION_PREFIX_LONG);
+    let long_relative = long_archive_path
+        .strip_prefix(&harness.output)
+        .unwrap()
+        .to_path_buf();
+    assert_eq!(
+        harness.archive_commit_match_count(&long_relative, SESSION_PREFIX_LONG, 2),
+        1
+    );
+
+    let transcript_short = harness.write_transcript(
+        SESSION_PREFIX_SHORT,
+        "INITIAL_REQUEST",
+        "short initial answer",
+    );
+    harness.complete_lifecycle(SESSION_PREFIX_SHORT, &transcript_short, 30, 31);
+    assert_success(&harness.wait(SESSION_PREFIX_SHORT, 5_000));
+    harness.append_turn(&transcript_short, "DELTA_REQUEST", "short resumed answer");
+    harness.queue_direct(SESSION_PREFIX_SHORT, &transcript_short, 40, 41);
+
+    let resolved = resolve_session_reference(&SessionReference {
+        session_id: Some(SESSION_PREFIX_SHORT.to_owned()),
+        events_path: Some(transcript_short),
+        copilot_home: None,
+    })
+    .unwrap();
+    let session = load_session(&resolved, 1024 * 1024).unwrap();
+    let project = inspect_project(&harness.project).unwrap();
+    let summary = StructuredSummary {
+        title: "Recovered persisted revision".to_owned(),
+        goal: "Finalize a revision written before a worker crash.".to_owned(),
+        work_completed: vec!["Persisted Markdown before the simulated crash.".to_owned()],
+        decisions: Vec::new(),
+        files_changed: Vec::new(),
+        commands_and_validation: Vec::new(),
+        open_items: Vec::new(),
+        tags: vec!["recovery".to_owned()],
+    };
+    let markdown = render_revision_markdown(
+        &ArchiveMetadata {
+            session: &session,
+            project: &project,
+        },
+        &summary,
+        2,
+        "complete",
+        None,
+    );
+    atomic_replace(&long_archive_path, markdown.as_bytes()).unwrap();
+    let markdown_hash = content_hash(markdown.as_bytes());
+    assert_eq!(
+        harness.archive_commit_match_count(&long_relative, SESSION_PREFIX_SHORT, 2),
+        0
+    );
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let (database_id, generation): (i64, i64) = connection
+        .query_row(
+            "SELECT id,state_generation FROM sessions WHERE source_session_id=?1",
+            [SESSION_PREFIX_SHORT],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO processing_attempts(
+                session_id,state_generation,retry_state,lease_token,owner_pid,
+                started_at_ms,lease_expires_at_ms,outcome,
+                planned_revision,planned_record_count,planned_byte_offset,
+                planned_prefix_hash,planned_source_hash,planned_source_bytes,
+                planned_markdown_relative_path,planned_markdown_hash,
+                planned_archive_git_history,planned_completion_reason
+             ) VALUES (
+                ?1,?2,'revision-pending','post-persist-prefix-collision-token',999999,1,2,'processing',
+                2,?3,?4,?5,?6,?7,?8,?9,1,'complete'
+             )",
+            params![
+                database_id,
+                generation,
+                session.source_cursor as i64,
+                session.source_byte_cursor as i64,
+                session.source_prefix_hash,
+                session.source_hash,
+                session.source_bytes as i64,
+                long_relative.to_string_lossy(),
+                markdown_hash,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET lifecycle_state='processing',retry_state='revision-pending',
+                claim_token='post-persist-prefix-collision-token',claim_started_at_ms=1,
+                worker_generation=NULL,worker_spawned_at_ms=NULL
+             WHERE id=?1",
+            [database_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let commits_before = harness.archive_commit_count();
+    assert_success(&harness.recover(0, true, false));
+    assert_success(&harness.wait(SESSION_PREFIX_SHORT, 5_000));
+    assert_eq!(harness.archive_commit_count(), commits_before + 1);
+    assert_eq!(
+        harness.archive_commit_match_count(&long_relative, SESSION_PREFIX_LONG, 2),
+        1
+    );
+    assert_eq!(
+        harness.archive_commit_match_count(&long_relative, SESSION_PREFIX_SHORT, 2),
+        1
+    );
+
+    assert_success(&harness.recover(0, true, false));
+    assert_success(&harness.wait(SESSION_PREFIX_SHORT, 5_000));
+    assert_eq!(harness.archive_commit_count(), commits_before + 1);
+    assert_eq!(
+        harness.archive_commit_match_count(&long_relative, SESSION_PREFIX_LONG, 2),
+        1
+    );
+    assert_eq!(
+        harness.archive_commit_match_count(&long_relative, SESSION_PREFIX_SHORT, 2),
+        1
+    );
+}
+
+#[test]
 fn two_processes_same_session_produce_one_revision() {
     let harness = Harness::new();
     let summarizer = harness.sleeping_summarizer("same-count", 1);
@@ -1230,6 +1374,45 @@ impl Harness {
                 .unwrap()
                 .success()
         );
+    }
+
+    fn archive_commit_match_count(
+        &self,
+        relative_path: &Path,
+        session_id: &str,
+        summary_revision: u64,
+    ) -> usize {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["log", "--format=%B%x1e", "--"])
+            .arg(relative_path)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let expected_session_line = format!("session_id: {session_id}");
+        let expected_revision_line = format!("summary_revision: {summary_revision}");
+        output
+            .stdout
+            .split(|byte| *byte == 0x1e)
+            .filter(|message| {
+                let body = String::from_utf8_lossy(message);
+                let mut session_match = false;
+                let mut revision_match = false;
+                for line in body.lines() {
+                    let line = line.trim_end_matches('\r');
+                    if line == expected_session_line {
+                        session_match = true;
+                    } else if line == expected_revision_line {
+                        revision_match = true;
+                    }
+                    if session_match && revision_match {
+                        return true;
+                    }
+                }
+                false
+            })
+            .count()
     }
 
     fn git_status_porcelain(&self, repository: &Path) -> String {

@@ -150,26 +150,35 @@ fn archive_commit_exists(
     if !repository_has_commits(repository_root)? {
         return Ok(false);
     }
+    let expected_session_line = format!("session_id: {session_id}");
+    let expected_revision_line = format!("summary_revision: {summary_revision}");
     let bytes = run_git(
         repository_root,
         vec![
             OsString::from("log"),
-            OsString::from("--fixed-strings"),
-            OsString::from("--all-match"),
-            OsString::from("--grep"),
-            OsString::from(format!("session_id: {session_id}")),
-            OsString::from("--grep"),
-            OsString::from(format!("summary_revision: {summary_revision}")),
-            OsString::from("--format=%H"),
-            OsString::from("-n"),
-            OsString::from("1"),
+            OsString::from("--format=%B%x1e"),
             OsString::from("--"),
             markdown_relative_path.as_os_str().to_owned(),
         ],
         Vec::new(),
     )?;
-    let output = String::from_utf8(bytes).map_err(|_| ArchiveGitError::RepositoryNotDedicated)?;
-    Ok(!output.trim().is_empty())
+    for message in bytes.split(|byte| *byte == 0x1e) {
+        let body = String::from_utf8_lossy(message);
+        let mut session_match = false;
+        let mut revision_match = false;
+        for line in body.lines() {
+            let line = line.trim_end_matches('\r');
+            if line == expected_session_line {
+                session_match = true;
+            } else if line == expected_revision_line {
+                revision_match = true;
+            }
+            if session_match && revision_match {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn repository_has_commits(directory: &Path) -> Result<bool, ArchiveGitError> {
