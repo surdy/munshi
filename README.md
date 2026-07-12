@@ -16,8 +16,12 @@ recovery, per-project policy with bounded hourly/daily/input/timeout/concurrency
 defer rather than drop work, and optional dedicated archive Git history. Markdown remains the
 durable archive. Operational status/query/retry contracts are now available through
 `status`, `sessions`, `show`, `retry`, `retry-all`, `doctor`, and `configuration-check`.
-Remote delivery remains a later slice. See
-[`docs/automatic-archive.md`](docs/automatic-archive.md).
+Opt-in Notesmith delivery is now implemented (disabled by default) through the `munshi delivery`
+commands: latest-revision create/replace with bounded retry and a dead-letter state, confirmed
+backfill of existing summaries, and delivery state surfaced in `status`, `doctor`, and `show`.
+The mandatory remote revision-history capability remains a later slice. See
+[`docs/automatic-archive.md`](docs/automatic-archive.md) and
+[ADR 0006](docs/adr/0006-deliver-to-notesmith-downstream-of-local-archival.md).
 
 
 ## Goals
@@ -536,6 +540,18 @@ The following commands expose stable human-readable output and stable machine ou
 - `munshi retry-all [--limit N] [--force]`
 - `munshi doctor`
 - `munshi configuration-check`
+- `munshi delivery status`
+- `munshi delivery backfill [--confirm] [--limit N]`
+- `munshi delivery retry [<session-id>] [--all] [--force] [--limit N]`
+
+The delivery sink is managed with `munshi delivery configure --endpoint <url> --vault <name>
+[--folder <path>] [--credential-env <VAR> | --credential-keychain <service:account>]
+[--max-attempts N]`, `munshi delivery enable`, and `munshi delivery disable`. Delivery is disabled
+by default; the endpoint/vault/folder and the *source* of the credential are recorded in the
+Munshi-owned `config.json`, but the credential itself is only ever resolved at delivery time from
+an environment variable or the OS credential store. Enabling delivery reports the pending backfill
+as a dry run so existing summaries require an explicit `munshi delivery backfill --confirm` before
+publishing.
 
 Every JSON response emits `schema_version: 1` and a command discriminator. Session states are
 classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, `failed`,
@@ -546,7 +562,9 @@ classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, 
 
 - capture state (`enabled`, `disabled-project`, `unknown`) from real issue #5 policy state
   (`policy.disabled_projects`) rather than a local-archival approximation,
-- delivery state (`disabled`, `delivery-related`, `unknown`),
+- delivery state (`disabled`, `enabled`, `delivery-related`, `unknown`), where `enabled` means
+  delivery is on with an addressable sink and `delivery-related` means delivery is on but the sink
+  is not yet addressable,
 - archive Git-history configuration and repository health checks when enabled.
 
 Retry commands are idempotent and reuse the same per-session lock, claim, and lifecycle transition
@@ -628,25 +646,36 @@ Content-Type: application/json
 }
 ```
 
-An existing note can be replaced through the Notesmith note update endpoint using its returned path
-and `expected_hash`. Munshi should persist both values in SQLite.
+An existing note is replaced through the Notesmith note update endpoint using its returned path.
+Munshi persists the returned note path, the delivered summary revision, and the last summary hash
+in SQLite (schema-version 3 `deliveries` table). Because Munshi owns delivered notes, the replace
+is sent without `expected_hash` so a later revision overwrites any remote edits.
 
-Latest-only delivery requires no Notesmith server modification. Versioned delivery may require a
-capability check or integration work to ensure the target vault preserves a correlated Git history.
+Notes are routed by stable identity, not by the mutable summary title: a note is filed under
+`<folder>/<origin-project-component>/` with the stable filename `<source>-<session-id>.md`, so the
+persisted note identifier is idempotent across deliveries and even across an operational-database
+rebuild (a create that conflicts is adopted as a replace).
 
-Delivery behavior:
+Latest-revision delivery requires no Notesmith server modification. The mandatory versioned
+(revision-history-preserving) delivery is deferred to issue #9; this module is structured for it —
+the `NotesmithSink` trait isolates the wire protocol and delivered notes carry stable
+`munshi_session`/`munshi_revision` frontmatter a future versioned sink can use.
 
-- Create on the first successful summary.
-- Update on resumed-session revisions.
+Delivery behavior (implemented):
+
+- Create on the first successful summary, replace on later revisions.
 - Treat a matching existing Munshi ID as the same logical report.
 - Treat delivered notes as Munshi-owned and overwrite remote edits.
-- When Git history is enabled locally, require Notesmith revision history before delivering.
-- When delivery is first enabled, offer a count/dry run and require confirmation before backfilling
-  existing current summaries.
-- Retry timeouts and server errors with exponential backoff and jitter.
-- Do not retry validation or authentication errors indefinitely.
-- Place exhausted deliveries in a dead-letter state.
-- Keep local Markdown authoritative when Notesmith is unavailable.
+- When delivery is first enabled, report a count/dry run and require confirmation before
+  backfilling existing current summaries.
+- Retry transport and server errors with bounded exponential backoff.
+- Place exhausted deliveries in a dead-letter state (`munshi delivery retry --force` revives them).
+- A disabled project stops future delivery while retaining existing delivery history.
+- Keep local Markdown authoritative and untouched when Notesmith is unavailable; a delivery outage
+  never rolls back, invalidates, or blocks a local archive.
+
+Deferred to issue #9: when Git history is enabled locally, requiring Notesmith revision history
+before delivering.
 
 ## Generic webhook versus raw Markdown
 
