@@ -23,7 +23,7 @@ use crate::source::PreviousSource;
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 #[derive(Debug, Error)]
@@ -213,7 +213,7 @@ impl StateStore {
         if current > SCHEMA_VERSION {
             return Err(StateError::NewerSchema);
         }
-        if current == 0 {
+        if current < 1 {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -332,9 +332,29 @@ impl StateStore {
             )?;
             transaction.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
-                params![SCHEMA_VERSION, now_ms()],
+                params![1, now_ms()],
             )?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.pragma_update(None, "user_version", 1)?;
+            transaction.commit()?;
+        }
+        if current < 2 {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE summarizer_calls (
+                    id INTEGER PRIMARY KEY,
+                    project_identity TEXT NOT NULL,
+                    called_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX summarizer_calls_project_idx
+                    ON summarizer_calls(project_identity, called_at_ms);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![2, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 2)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -598,6 +618,21 @@ impl StateStore {
             params![database_id, operation, category, cause_category, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Records that a session was left pending by policy or a budget before any attempt was
+    /// claimed (a disabled project, exhausted concurrency, or an exhausted call budget). The
+    /// session's lifecycle state and retry schedule are left untouched so a later hook or
+    /// user-invoked command retries it opportunistically; only the visible diagnostic category is
+    /// updated.
+    pub fn record_deferred(&mut self, session_id: &str, category: &str) -> Result<(), StateError> {
+        let now = now_ms();
+        self.connection.execute(
+            "UPDATE sessions SET last_error_category=?2,updated_at_ms=?3
+             WHERE source_kind='copilot-cli' AND source_session_id=?1",
+            params![session_id, category, now],
+        )?;
+        self.record_diagnostic("archive-worker", category, None, Some(session_id))
     }
 
     pub fn latest_diagnostic(&self) -> Result<Option<Diagnostic>, StateError> {
@@ -911,6 +946,60 @@ impl StateStore {
         }
         transaction.commit()?;
         Ok(reserved)
+    }
+
+    /// Counts sessions with a live (non-expired) processing lease, used to enforce the configured
+    /// global concurrency budget before claiming another session.
+    pub fn count_active_processing(&self) -> Result<i64, StateError> {
+        let now = now_ms();
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM processing_attempts
+                 WHERE outcome='processing' AND lease_expires_at_ms > ?1",
+                [now],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Records one summarizer invocation for a project's hourly/daily cost budget and prunes
+    /// entries old enough that no configured window could still reference them.
+    pub fn record_summarizer_call(
+        &mut self,
+        project_identity: &str,
+        now_ms: i64,
+    ) -> Result<(), StateError> {
+        const PRUNE_WINDOW_MS: i64 = 25 * 60 * 60 * 1_000;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM summarizer_calls WHERE called_at_ms < ?1",
+            [now_ms.saturating_sub(PRUNE_WINDOW_MS)],
+        )?;
+        transaction.execute(
+            "INSERT INTO summarizer_calls(project_identity, called_at_ms) VALUES (?1,?2)",
+            params![project_identity, now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Counts a project's summarizer invocations since `since_ms`, used to evaluate its effective
+    /// hourly/daily budget.
+    pub fn summarizer_calls_since(
+        &self,
+        project_identity: &str,
+        since_ms: i64,
+    ) -> Result<i64, StateError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM summarizer_calls
+                 WHERE project_identity=?1 AND called_at_ms >= ?2",
+                params![project_identity, since_ms],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn clear_worker_reservation(&mut self, session_id: &str) -> Result<(), StateError> {

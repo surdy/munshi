@@ -117,5 +117,63 @@ Registration imports recognized stale issue #3 `sessions/latest.json` and pendin
 removing it. Fresh legacy workers are deferred, malformed or symlinked artifacts are left
 untouched, and a legacy result alone never proves archival without corresponding valid Markdown.
 
-Remote delivery, project policy/budgets, optional Git history, and broad status/retry commands
-remain out of scope.
+## Project policy and cost budgets
+
+Registration also stores a `policy` section in `$COPILOT_HOME/munshi/config.json`: global
+`max_calls_per_hour`, `max_calls_per_day`, and `max_concurrency` defaults (`--max-calls-per-hour`,
+`--max-calls-per-day`, and `--max-concurrency` at registration; 10/50/2 unless overridden), plus the
+explicit `disabled_projects` list written by:
+
+```bash
+munshi project disable /absolute/path/to/project
+munshi project enable /absolute/path/to/project
+munshi project status /absolute/path/to/project
+```
+
+Project identity is the same normalized canonical remote (or local fallback) used for archive
+routing, so disabling follows clones and worktrees. Disabling stops future processing and delivery
+only; it never deletes local archives or delivered notes, matching the disclosed registration
+behavior. Re-registering with the same or changed limits never silently re-enables a disabled
+project: `register` preserves the existing `disabled_projects` list.
+
+A project may also carry a nearest-parent override file, `.munshi.toml`, discovered by walking
+upward from the session's origin directory (the same directory Copilot reported at `agentStop`),
+analogous to how `.editorconfig` or `.git` are discovered:
+
+```toml
+[project]
+enabled = false
+max_calls_per_hour = 2
+max_calls_per_day = 10
+max_input_bytes = 500000
+timeout_ms = 120000
+```
+
+Every field is optional; an absent field falls back to global configuration. Precedence is nearest
+project override, then global configuration, then built-in defaults. A present but unparsable or
+oversized/symlinked override fails closed: rather than silently continuing with default-on
+processing, the project is treated as disabled (`project-override-invalid`) until the file is
+fixed. The explicit `disabled_projects` list always wins over an override's `enabled = true`.
+
+Hourly, daily, input-size, and timeout budgets, plus global worker concurrency, defer work instead
+of discarding it:
+
+- A disabled project (explicit or override) leaves its session in its current pending lifecycle
+  state with `last_error_category` set to `project-disabled`, `project-override-disabled`, or
+  `project-override-invalid`.
+- Reaching `max_concurrency` live processing leases defers a not-yet-claimed session
+  (`concurrency-deferred`) without claiming or penalizing it.
+- Reaching a project's effective hourly or daily summarizer-call budget defers the session
+  (`budget-hourly-exceeded` or `budget-daily-exceeded`) before invoking the summarizer, so the
+  budget check itself never spends a Copilot call.
+- `max_input_bytes` and `timeout_ms` remain enforced per call; an oversized or slow attempt is a
+  retryable summary failure rather than a silent drop.
+
+In every case the session is left retryable rather than failed permanently, so it is picked up
+opportunistically by a later hook (`agentStop`/`sessionEnd` trigger a recovery sweep automatically)
+or by `munshi hook recover`, once concurrency frees up, the budget window rolls over, or the project
+is re-enabled. No diagnostic category or log ever contains transcript content. See
+[ADR 0005](adr/0005-defer-project-policy-and-budgets-never-drop.md).
+
+Remote delivery, optional Git history, and broad status/retry/query commands remain out of scope.
+

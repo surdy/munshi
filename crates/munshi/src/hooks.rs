@@ -11,7 +11,8 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::project::{ProjectIdentityError, inspect_project};
+use crate::policy::resolve_policy;
+use crate::project::{ProjectIdentity, ProjectIdentityError, inspect_project};
 use crate::registration::{RegistrationError, load_stored_config};
 use crate::render::{
     ArchiveMetadata, RenderError, archive_path, atomic_replace, content_hash,
@@ -22,8 +23,8 @@ use crate::source::{
     resolve_session_reference, validate_transcript_envelope,
 };
 use crate::state::{
-    Claim, CompletionReason, PersistedArchive, PlannedArchive, StateError, StateStore, WaitState,
-    migrate_legacy_state, now_ms, try_acquire_session_lock,
+    Claim, CompletionReason, PersistedArchive, PlannedArchive, SessionRecord, StateError,
+    StateStore, WaitState, migrate_legacy_state, now_ms, try_acquire_session_lock,
 };
 use crate::summary::{
     SummarizerConfig, SummaryError, build_revision_summary_input, build_summary_input, run_summary,
@@ -81,6 +82,8 @@ pub enum HookWorkerError {
     Io(#[from] io::Error),
     #[error("hook worker JSON failed")]
     Json(#[from] serde_json::Error),
+    #[error("processing deferred by policy or budget ({0})")]
+    Deferred(&'static str),
 }
 
 #[derive(Deserialize)]
@@ -164,6 +167,9 @@ fn run_archive_worker_inner(
     {
         state.abandon_processing(session_id, "worker-interrupted")?;
     }
+    if let Some(result) = policy_gate(&mut state, &stored, session_id)? {
+        return Ok(result);
+    }
 
     let lease = Duration::from_millis(stored.limits.timeout_ms.saturating_add(60_000));
     let Some(claim) = state.claim_session(session_id, lease, false)? else {
@@ -173,6 +179,12 @@ fn run_archive_worker_inner(
         Ok(result) => Ok(result),
         Err(error @ (HookWorkerError::PostPersist(_) | HookWorkerError::PostPersistWrite(_))) => {
             Err(error)
+        }
+        Err(HookWorkerError::Deferred(category)) => {
+            state.abandon_processing(session_id, category)?;
+            Ok(HookResult::Failed {
+                code: category.to_owned(),
+            })
         }
         Err(error) => {
             let category = worker_error_code(&error);
@@ -511,21 +523,52 @@ fn process_claim(
     let summary = if cursor_only {
         prior_summary.cloned().ok_or(StateError::InvalidState)?
     } else {
+        let policy = resolve_policy(
+            &stored.policy.as_global(),
+            &stored.policy.disabled_projects,
+            &project.identity,
+            claim.session.origin_cwd.as_deref(),
+        );
+        if !policy.enabled {
+            let category = policy
+                .disabled_reason
+                .map(|reason| reason.as_category())
+                .unwrap_or("project-disabled");
+            return Err(HookWorkerError::Deferred(category));
+        }
+        let now = now_ms();
+        let hour_ago = now.saturating_sub(60 * 60 * 1_000);
+        let day_ago = now.saturating_sub(24 * 60 * 60 * 1_000);
+        if state.summarizer_calls_since(&project.identity, hour_ago)?
+            >= policy.max_calls_per_hour as i64
+        {
+            return Err(HookWorkerError::Deferred("budget-hourly-exceeded"));
+        }
+        if state.summarizer_calls_since(&project.identity, day_ago)?
+            >= policy.max_calls_per_day as i64
+        {
+            return Err(HookWorkerError::Deferred("budget-daily-exceeded"));
+        }
+        let max_input_bytes = policy
+            .max_input_bytes
+            .unwrap_or(stored.limits.max_input_bytes);
+        let timeout_ms = policy.timeout_ms.unwrap_or(stored.limits.timeout_ms);
         let input = if update.mode == TranscriptLoadMode::Delta {
             build_revision_summary_input(
                 &update.session,
                 &project,
                 prior_summary.ok_or(StateError::InvalidState)?,
-                stored.limits.max_input_bytes,
+                max_input_bytes,
             )?
         } else {
-            build_summary_input(&update.session, &project, stored.limits.max_input_bytes)?
+            build_summary_input(&update.session, &project, max_input_bytes)?
         };
+        state.record_summarizer_call(&project.identity, now)?;
         run_summary(
             &SummarizerConfig {
                 binary: PathBuf::from(&stored.summarizer.executable),
                 args: stored.summarizer.args.iter().map(Into::into).collect(),
-                timeout: Duration::from_millis(stored.limits.timeout_ms),
+                timeout: Duration::from_millis(timeout_ms),
                 stdout_limit: stored.limits.max_stdout_bytes,
                 stderr_limit: stored.limits.max_stderr_bytes,
             },
@@ -739,6 +782,58 @@ fn load_prior_archive(
         return Err(StateError::InvalidState.into());
     }
     Ok(Some((relative, markdown)))
+}
+
+/// Determines a session's project identity, preferring the cached identity from a prior
+/// successful summary and falling back to inspecting the session's recorded origin directory.
+fn resolve_session_project(session: &SessionRecord) -> Option<ProjectIdentity> {
+    if let Some(project) = session.project.clone() {
+        if !project.component.is_empty() {
+            return Some(project);
+        }
+    }
+    session
+        .origin_cwd
+        .as_deref()
+        .and_then(|cwd| inspect_project(cwd).ok())
+}
+
+/// Enforces global concurrency and per-project enable/disable policy before a session is claimed.
+/// Returns `Some` with a result the caller should return immediately when work must be deferred;
+/// deferred work is left in its current pending lifecycle state so a later hook or user-invoked
+/// command retries it opportunistically once concurrency frees up or the project is re-enabled.
+fn policy_gate(
+    state: &mut StateStore,
+    stored: &crate::registration::StoredConfig,
+    session_id: &str,
+) -> Result<Option<HookResult>, HookWorkerError> {
+    if state.count_active_processing()? >= stored.policy.max_concurrency as i64 {
+        let _ = state.record_deferred(session_id, "concurrency-deferred");
+        state.clear_worker_reservation(session_id)?;
+        return Ok(Some(current_result(state, session_id)?));
+    }
+    let Some(session) = state.get_session(session_id)? else {
+        return Ok(None);
+    };
+    let Some(project) = resolve_session_project(&session) else {
+        return Ok(None);
+    };
+    let policy = resolve_policy(
+        &stored.policy.as_global(),
+        &stored.policy.disabled_projects,
+        &project.identity,
+        session.origin_cwd.as_deref(),
+    );
+    if !policy.enabled {
+        let category = policy
+            .disabled_reason
+            .map(|reason| reason.as_category())
+            .unwrap_or("project-disabled");
+        let _ = state.record_deferred(session_id, category);
+        state.clear_worker_reservation(session_id)?;
+        return Ok(Some(current_result(state, session_id)?));
+    }
+    Ok(None)
 }
 
 fn current_result(state: &StateStore, session_id: &str) -> Result<HookResult, HookWorkerError> {
@@ -981,6 +1076,7 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
         HookWorkerError::Render(_) => "archive-write-failed",
         HookWorkerError::Io(_) => "io-failed",
         HookWorkerError::Json(_) => "json-failed",
+        HookWorkerError::Deferred(category) => category,
     }
 }
 

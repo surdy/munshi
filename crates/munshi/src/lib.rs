@@ -1,5 +1,6 @@
 mod archive;
 mod hooks;
+mod policy;
 mod project;
 mod registration;
 mod render;
@@ -12,10 +13,11 @@ pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook, read_last_failure,
     run_archive_worker, run_recovery, wait_for_hook_result,
 };
+pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
 pub use registration::{
-    DisclosureDecision, RegisterConfig, RegistrationError, accept_disclosure,
-    accept_disclosure_from_terminal, register, unregister,
+    DisclosureDecision, ProjectStatus, RegisterConfig, RegistrationError, accept_disclosure,
+    accept_disclosure_from_terminal, project_status, register, set_project_enabled, unregister,
 };
 pub use render::{
     ArchiveMetadata, ArchiveVersion, ArchivedCursor, ArchivedMarkdown, atomic_replace,

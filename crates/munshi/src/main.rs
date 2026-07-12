@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use munshi::{
-    ArchiveConfig, ArchiveOutcome, HookEvent, HookResult, RegisterConfig, SessionReference,
-    accept_disclosure_from_terminal, archive_session, handle_hook, register, run_archive_worker,
-    run_recovery, unregister, wait_for_hook_result,
+    ArchiveConfig, ArchiveOutcome, HookEvent, HookResult, ProjectStatus, RegisterConfig,
+    SessionReference, accept_disclosure_from_terminal, archive_session, handle_hook,
+    project_status, register, run_archive_worker, run_recovery, set_project_enabled, unregister,
+    wait_for_hook_result,
 };
 
 #[derive(Debug, Parser)]
@@ -84,12 +85,24 @@ enum Command {
         max_stdout_bytes: usize,
         #[arg(long, default_value_t = 65_536)]
         max_stderr_bytes: usize,
+        /// Maximum summarizer invocations allowed per project per rolling hour.
+        #[arg(long, default_value_t = 10)]
+        max_calls_per_hour: u32,
+        /// Maximum summarizer invocations allowed per project per rolling day.
+        #[arg(long, default_value_t = 50)]
+        max_calls_per_day: u32,
+        /// Maximum number of sessions summarized concurrently across all projects.
+        #[arg(long, default_value_t = 2)]
+        max_concurrency: usize,
     },
     /// Remove only Munshi's dedicated user hook and active configuration.
     Unregister {
         #[arg(long)]
         copilot_home: Option<PathBuf>,
     },
+    /// Enable, disable, or inspect future processing and delivery for one project.
+    #[command(subcommand)]
+    Project(ProjectCommand),
     #[command(hide = true, subcommand)]
     Hook(HookCommand),
     #[command(hide = true)]
@@ -98,6 +111,31 @@ enum Command {
         state_dir: PathBuf,
         #[arg(long)]
         session_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// Stop future processing and delivery for a project. Existing archives are left untouched.
+    Disable {
+        /// Project directory whose canonical identity should be disabled.
+        project_dir: PathBuf,
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+    },
+    /// Resume future processing and delivery for a previously disabled project.
+    Enable {
+        /// Project directory whose canonical identity should be re-enabled.
+        project_dir: PathBuf,
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
+    },
+    /// Print the effective enabled state and budgets for a project.
+    Status {
+        /// Project directory to inspect.
+        project_dir: PathBuf,
+        #[arg(long)]
+        copilot_home: Option<PathBuf>,
     },
 }
 
@@ -139,6 +177,7 @@ enum Outcome {
     Hook,
     Worker,
     Wait(HookResult),
+    Project(ProjectStatus),
 }
 
 fn main() -> ExitCode {
@@ -171,6 +210,17 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::SUCCESS
             }
+        }
+        Ok(Outcome::Project(status)) => {
+            println!(
+                "project {} enabled={} reason={} max_calls_per_hour={} max_calls_per_day={}",
+                status.identity,
+                status.enabled,
+                status.disabled_reason.unwrap_or("none"),
+                status.max_calls_per_hour,
+                status.max_calls_per_day
+            );
+            ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("error: {error}");
@@ -222,6 +272,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_input_bytes,
             max_stdout_bytes,
             max_stderr_bytes,
+            max_calls_per_hour,
+            max_calls_per_day,
+            max_concurrency,
         } => {
             eprintln!(
                 "Configured local output directory: {}",
@@ -250,6 +303,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 max_input_bytes,
                 max_stdout_bytes,
                 max_stderr_bytes,
+                max_calls_per_hour,
+                max_calls_per_day,
+                max_concurrency,
                 executable,
             })?;
             Ok(Outcome::Registered {
@@ -261,6 +317,43 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             let state_directory = copilot_home.join("munshi");
             unregister(&copilot_home, &state_directory)?;
             Ok(Outcome::Unregistered)
+        }
+        Command::Project(ProjectCommand::Disable {
+            project_dir,
+            copilot_home,
+        }) => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = copilot_home.join("munshi");
+            Ok(Outcome::Project(set_project_enabled(
+                &copilot_home,
+                &state_directory,
+                &project_dir,
+                false,
+            )?))
+        }
+        Command::Project(ProjectCommand::Enable {
+            project_dir,
+            copilot_home,
+        }) => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = copilot_home.join("munshi");
+            Ok(Outcome::Project(set_project_enabled(
+                &copilot_home,
+                &state_directory,
+                &project_dir,
+                true,
+            )?))
+        }
+        Command::Project(ProjectCommand::Status {
+            project_dir,
+            copilot_home,
+        }) => {
+            let copilot_home = resolve_copilot_home(copilot_home)?;
+            let state_directory = copilot_home.join("munshi");
+            Ok(Outcome::Project(project_status(
+                &state_directory,
+                &project_dir,
+            )?))
         }
         Command::Hook(HookCommand::AgentStop { state_dir }) => {
             if let Ok(state_dir) = resolve_state_directory(state_dir) {

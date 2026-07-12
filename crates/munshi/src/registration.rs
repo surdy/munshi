@@ -10,10 +10,15 @@ use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 use thiserror::Error;
 
+use crate::policy::{GlobalPolicy, ResolvedPolicy, resolve_policy};
+use crate::project::{ProjectIdentityError, inspect_project};
 use crate::state::{StateStore, migrate_legacy_state};
 
 const HOOK_FILE_NAME: &str = "munshi.json";
 const CONFIG_FILE_NAME: &str = "config.json";
+const DEFAULT_MAX_CALLS_PER_HOUR: u32 = 10;
+const DEFAULT_MAX_CALLS_PER_DAY: u32 = 50;
+const DEFAULT_MAX_CONCURRENCY: usize = 2;
 
 pub const DISCLOSURE: &str = "\
 IMPORTANT: MUNSHI TRANSCRIPT PROCESSING DISCLOSURE
@@ -38,6 +43,9 @@ pub struct RegisterConfig {
     pub max_input_bytes: usize,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    pub max_calls_per_hour: u32,
+    pub max_calls_per_day: u32,
+    pub max_concurrency: usize,
     pub executable: PathBuf,
 }
 
@@ -81,6 +89,8 @@ pub(crate) struct StoredConfig {
     pub project_origin: String,
     pub limits: StoredLimits,
     pub remote_delivery: bool,
+    #[serde(default = "StoredPolicy::defaults")]
+    pub policy: StoredPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +98,38 @@ pub(crate) struct StoredConfig {
 pub(crate) struct StoredCommand {
     pub executable: String,
     pub args: Vec<String>,
+}
+
+/// Global project-policy defaults: default-on processing, bounded summarization cost, and bounded
+/// worker concurrency. `disabled_projects` holds canonical project identities excluded from future
+/// processing and delivery by an explicit `munshi project disable`; existing archives are untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredPolicy {
+    pub max_calls_per_hour: u32,
+    pub max_calls_per_day: u32,
+    pub max_concurrency: usize,
+    #[serde(default)]
+    pub disabled_projects: Vec<String>,
+}
+
+impl StoredPolicy {
+    fn defaults() -> Self {
+        Self {
+            max_calls_per_hour: DEFAULT_MAX_CALLS_PER_HOUR,
+            max_calls_per_day: DEFAULT_MAX_CALLS_PER_DAY,
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            disabled_projects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn as_global(&self) -> GlobalPolicy {
+        GlobalPolicy {
+            max_calls_per_hour: self.max_calls_per_hour,
+            max_calls_per_day: self.max_calls_per_day,
+            max_concurrency: self.max_concurrency,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +220,6 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     }
     let copilot_home = ensure_directory(&config.copilot_home)?;
     let hooks_directory = ensure_child_directory(&copilot_home, "hooks")?;
-    let stored = StoredConfig::from_register(config)?;
     let hook = HookFile::new(config)?;
     let hook_path = hooks_directory.join(HOOK_FILE_NAME);
     let config_path = config.state_directory.join(CONFIG_FILE_NAME);
@@ -186,6 +227,9 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     let _lock = acquire_registration_lock(&lock_path)?;
     validate_owned_file::<StoredConfig>(&config_path)?;
     validate_owned_file::<HookFile>(&hook_path)?;
+    // Re-registration must not silently re-enable projects an explicit `project disable` excluded.
+    let disabled_projects = existing_disabled_projects(&config_path)?;
+    let stored = StoredConfig::from_register(config, disabled_projects)?;
     let state_directory = ensure_directory(&config.state_directory)?;
     ensure_child_directory(&state_directory, "locks")?;
     install_or_update_json(&config_path, &stored)?;
@@ -200,6 +244,16 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     )
     .map_err(state_registration_error)?;
     install_or_update_json(&hook_path, &hook)
+}
+
+fn existing_disabled_projects(config_path: &Path) -> Result<Vec<String>, RegistrationError> {
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(config_path).map_err(RegistrationError::Io)?;
+    let config: StoredConfig =
+        serde_json::from_slice(&bytes).map_err(|_| RegistrationError::MalformedOwnedFile)?;
+    Ok(config.policy.disabled_projects)
 }
 
 pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), RegistrationError> {
@@ -233,7 +287,10 @@ pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), Reg
 }
 
 impl StoredConfig {
-    fn from_register(config: &RegisterConfig) -> Result<Self, RegistrationError> {
+    fn from_register(
+        config: &RegisterConfig,
+        disabled_projects: Vec<String>,
+    ) -> Result<Self, RegistrationError> {
         Ok(Self {
             version: 1,
             summarizer: StoredCommand {
@@ -262,6 +319,12 @@ impl StoredConfig {
                 max_stderr_bytes: config.max_stderr_bytes,
             },
             remote_delivery: false,
+            policy: StoredPolicy {
+                max_calls_per_hour: config.max_calls_per_hour,
+                max_calls_per_day: config.max_calls_per_day,
+                max_concurrency: config.max_concurrency,
+                disabled_projects,
+            },
         })
     }
 }
@@ -277,6 +340,7 @@ impl ManagedFile for StoredConfig {
             && self.local_archival_enabled
             && self.transcript_processing_accepted
             && self.project_origin == "agent_stop_cwd"
+            && self.policy.max_concurrency >= 1
             && Path::new(&self.output_directory).is_absolute()
             && Path::new(&self.state_directory).is_absolute()
             && Path::new(&self.summarizer.executable).is_absolute()
@@ -329,11 +393,99 @@ pub(crate) fn load_stored_config(
         || !config.local_archival_enabled
         || !config.transcript_processing_accepted
         || config.project_origin != "agent_stop_cwd"
+        || config.policy.max_concurrency < 1
         || Path::new(&config.state_directory) != state_directory
     {
         return Err(RegistrationError::MalformedOwnedFile);
     }
     Ok(config)
+}
+
+/// The effective enable/disable state and budgets for one project directory, combining an explicit
+/// `munshi project disable` with any nearest-parent `.munshi.toml` override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStatus {
+    pub identity: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<&'static str>,
+    pub max_calls_per_hour: u32,
+    pub max_calls_per_day: u32,
+}
+
+/// Adds or removes `project_directory`'s canonical identity from the explicitly disabled-projects
+/// list in global configuration, using the registration lock to serialize with `register`.
+/// Disabling stops future processing and delivery for the project; it never touches archives
+/// already written locally or delivered remotely.
+pub fn set_project_enabled(
+    copilot_home: &Path,
+    state_directory: &Path,
+    project_directory: &Path,
+    enabled: bool,
+) -> Result<ProjectStatus, RegistrationError> {
+    let identity = inspect_project(project_directory)
+        .map_err(project_identity_error)?
+        .identity;
+    let hooks_directory = copilot_home.join("hooks");
+    validate_existing_directory_if_present(&hooks_directory)?;
+    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let _lock = acquire_registration_lock(&lock_path)?;
+    let config_path = state_directory.join(CONFIG_FILE_NAME);
+    let mut config = load_stored_config(state_directory)?;
+    if enabled {
+        config
+            .policy
+            .disabled_projects
+            .retain(|value| value != &identity);
+    } else if !config
+        .policy
+        .disabled_projects
+        .iter()
+        .any(|value| value == &identity)
+    {
+        config.policy.disabled_projects.push(identity.clone());
+    }
+    atomic_json_replace(&config_path, &config)?;
+    Ok(ProjectStatus {
+        identity,
+        enabled,
+        disabled_reason: (!enabled).then_some("project-disabled"),
+        max_calls_per_hour: config.policy.max_calls_per_hour,
+        max_calls_per_day: config.policy.max_calls_per_day,
+    })
+}
+
+/// Reports the effective policy for a project directory without changing anything, merging the
+/// explicit disabled-projects list and any nearest-parent `.munshi.toml` override over global
+/// configuration.
+pub fn project_status(
+    state_directory: &Path,
+    project_directory: &Path,
+) -> Result<ProjectStatus, RegistrationError> {
+    let identity_info = inspect_project(project_directory).map_err(project_identity_error)?;
+    let config = load_stored_config(state_directory)?;
+    let ResolvedPolicy {
+        enabled,
+        disabled_reason,
+        max_calls_per_hour,
+        max_calls_per_day,
+        ..
+    } = resolve_policy(
+        &config.policy.as_global(),
+        &config.policy.disabled_projects,
+        &identity_info.identity,
+        Some(project_directory),
+    );
+    Ok(ProjectStatus {
+        identity: identity_info.identity,
+        enabled,
+        disabled_reason: disabled_reason.map(|reason| reason.as_category()),
+        max_calls_per_hour,
+        max_calls_per_day,
+    })
+}
+
+fn project_identity_error(error: ProjectIdentityError) -> RegistrationError {
+    RegistrationError::Io(io::Error::other(error.to_string()))
 }
 
 pub(crate) fn atomic_json_replace(

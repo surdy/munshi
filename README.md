@@ -11,10 +11,12 @@ rendering, or delivery to one vendor.
 ## Status
 
 The workspace includes the Phase 0 `munshi-probe`, standalone `munshi archive`, user-level hook
-registration, and SQLite-backed automatic archival with resumed revisions and interrupted-session
-recovery. Markdown remains the durable archive; remote delivery, project policy/budgets, optional
-Git history, and broad status/query commands remain later slices. See
+registration, SQLite-backed automatic archival with resumed revisions and interrupted-session
+recovery, and per-project policy with bounded hourly/daily/input/timeout/concurrency budgets that
+defer rather than drop work. Markdown remains the durable archive; remote delivery, optional Git
+history, and broad status/query commands remain later slices. See
 [`docs/automatic-archive.md`](docs/automatic-archive.md).
+
 
 ## Goals
 
@@ -368,6 +370,13 @@ Munshi should include:
 - Project-level opt-out.
 - Opportunistic retry of deferred work on later hooks and Munshi commands.
 
+Implemented: global `--max-calls-per-hour`, `--max-calls-per-day`, and `--max-concurrency` at
+registration; a nearest-parent `.munshi.toml` project override for `enabled`, `max_calls_per_hour`,
+`max_calls_per_day`, `max_input_bytes`, and `timeout_ms`; `munshi project enable|disable|status`;
+and deferral (not failure) of work that exceeds a budget or an explicit or override-based
+disablement. See [`docs/automatic-archive.md`](docs/automatic-archive.md#project-policy-and-cost-budgets).
+A dry-run mode and aggregated status output remain later slices.
+
 ## Privacy and disclosure
 
 The MVP archives summaries only. Raw transcripts remain at their existing local source and are not
@@ -542,6 +551,13 @@ Configuration precedence:
 3. Nearest project configuration.
 4. User configuration.
 5. Built-in defaults.
+
+Implemented today: global configuration is written as `$COPILOT_HOME/munshi/config.json` from
+`munshi register` flags (including `--max-calls-per-hour`, `--max-calls-per-day`, and
+`--max-concurrency`) rather than a hand-edited global TOML file, and the nearest-parent project
+override is the `.munshi.toml` file described in
+[`docs/automatic-archive.md`](docs/automatic-archive.md#project-policy-and-cost-budgets). A
+full user-editable global TOML file and environment-variable overrides remain later work.
 
 ## Notesmith delivery
 
