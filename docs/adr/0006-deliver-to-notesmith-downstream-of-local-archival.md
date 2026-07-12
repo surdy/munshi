@@ -36,3 +36,12 @@ HTTP/1.1 client (Notesmith is a localhost daemon, so no async or TLS dependency 
 release implements only latest-revision create/replace. The mandatory versioned,
 revision-history-preserving delivery is deferred to issue #9; delivered notes already carry stable
 `munshi_session`/`munshi_revision` frontmatter that a future versioned sink can correlate against.
+
+**Update (issue #9):** versioned delivery is now implemented on the same `NotesmithSink` trait. When
+local archive Git history is enabled alongside delivery, Munshi verifies (or, when configured to
+provision, explicitly enables) the Notesmith vault's per-vault Git revision-history capability
+(`config.git.enabled`) and commits each delivered revision into the vault's own history with a
+message correlated to the local archive commit by source-scoped session identity and revision. If
+the capability is absent, versioned delivery is blocked with an actionable `remote-history-unavailable`
+status instead of degrading to latest-only storage, and the block never affects the already-durable
+local archive (consistent with ADR 0003).

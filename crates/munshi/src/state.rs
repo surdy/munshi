@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceKind};
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 #[derive(Debug, Error)]
@@ -169,6 +169,9 @@ pub struct DeliveryRecord {
     pub delivered_revision: Option<u64>,
     pub delivered_summary_hash: Option<String>,
     pub remote_hash: Option<String>,
+    /// The correlated Notesmith history commit (issue #9) that preserves this delivered revision,
+    /// when versioned delivery is active. `None` for latest-only (non-versioned) deliveries.
+    pub history_commit: Option<String>,
     pub delivery_state: String,
     pub attempts: u32,
     pub next_attempt_at_ms: Option<i64>,
@@ -183,6 +186,8 @@ pub struct DeliverySuccess {
     pub delivered_revision: u64,
     pub delivered_summary_hash: String,
     pub remote_hash: Option<String>,
+    /// The correlated remote history commit that preserved this revision, when versioned.
+    pub history_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +464,57 @@ impl StateStore {
                 params![3, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 3)?;
+            transaction.commit()?;
+        }
+        if current < 4 {
+            // Issue #9: versioned Notesmith delivery. A delivery may be `blocked` when the remote
+            // vault cannot preserve correlated revision history, and each delivered revision may
+            // record the correlated remote history commit (`history_commit`). SQLite cannot alter a
+            // CHECK constraint in place, so the table is rebuilt preserving every existing row.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE deliveries_new (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL,
+                    vault TEXT NOT NULL,
+                    note_path TEXT,
+                    delivered_revision INTEGER,
+                    delivered_summary_hash TEXT,
+                    remote_hash TEXT,
+                    history_commit TEXT,
+                    delivery_state TEXT NOT NULL CHECK (delivery_state IN (
+                        'pending','delivered','failed','dead-letter','blocked'
+                    )),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_ms INTEGER,
+                    last_error_category TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(session_id, endpoint, vault)
+                 );
+                 INSERT INTO deliveries_new (
+                    id,session_id,endpoint,vault,note_path,delivered_revision,
+                    delivered_summary_hash,remote_hash,history_commit,delivery_state,attempts,
+                    next_attempt_at_ms,last_error_category,created_at_ms,updated_at_ms
+                 )
+                 SELECT
+                    id,session_id,endpoint,vault,note_path,delivered_revision,
+                    delivered_summary_hash,remote_hash,NULL,delivery_state,attempts,
+                    next_attempt_at_ms,last_error_category,created_at_ms,updated_at_ms
+                 FROM deliveries;
+                 DROP TABLE deliveries;
+                 ALTER TABLE deliveries_new RENAME TO deliveries;
+                 CREATE INDEX deliveries_state_idx
+                    ON deliveries(delivery_state, next_attempt_at_ms);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![4, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 4)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -773,8 +829,8 @@ impl StateStore {
                 "SELECT
                     d.session_id,s.source_kind,s.source_session_id,d.endpoint,d.vault,
                     d.note_path,d.delivered_revision,d.delivered_summary_hash,d.remote_hash,
-                    d.delivery_state,d.attempts,d.next_attempt_at_ms,d.last_error_category,
-                    d.updated_at_ms
+                    d.history_commit,d.delivery_state,d.attempts,d.next_attempt_at_ms,
+                    d.last_error_category,d.updated_at_ms
                  FROM deliveries d JOIN sessions s ON s.id=d.session_id
                  WHERE d.session_id=?1 AND d.endpoint=?2 AND d.vault=?3",
                 params![database_id, endpoint, vault],
@@ -790,8 +846,8 @@ impl StateStore {
             "SELECT
                 d.session_id,s.source_kind,s.source_session_id,d.endpoint,d.vault,
                 d.note_path,d.delivered_revision,d.delivered_summary_hash,d.remote_hash,
-                d.delivery_state,d.attempts,d.next_attempt_at_ms,d.last_error_category,
-                d.updated_at_ms
+                d.history_commit,d.delivery_state,d.attempts,d.next_attempt_at_ms,
+                d.last_error_category,d.updated_at_ms
              FROM deliveries d JOIN sessions s ON s.id=d.session_id
              ORDER BY d.updated_at_ms DESC,d.id DESC",
         )?;
@@ -817,8 +873,8 @@ impl StateStore {
         self.connection.execute(
             "UPDATE deliveries SET
                 note_path=?4,delivered_revision=?5,delivered_summary_hash=?6,remote_hash=?7,
-                delivery_state='delivered',attempts=0,next_attempt_at_ms=NULL,
-                last_error_category=NULL,updated_at_ms=?8
+                history_commit=?8,delivery_state='delivered',attempts=0,next_attempt_at_ms=NULL,
+                last_error_category=NULL,updated_at_ms=?9
              WHERE session_id=?1 AND endpoint=?2 AND vault=?3",
             params![
                 database_id,
@@ -828,10 +884,40 @@ impl StateStore {
                 i64::try_from(success.delivered_revision).unwrap_or(i64::MAX),
                 success.delivered_summary_hash,
                 success.remote_hash,
+                success.history_commit,
                 now,
             ],
         )?;
         Ok(())
+    }
+
+    /// Records a delivery blocked by a missing remote revision-history capability (issue #9).
+    ///
+    /// Blocking is a configuration gate, not a transient failure: the attempt count is left
+    /// untouched (so a block never advances toward a dead letter), retry bookkeeping is cleared,
+    /// and the row is marked `blocked` with an actionable `category`. Local archival is never
+    /// affected. A blocked row becomes deliverable again once the capability is present and the
+    /// delivery is retried or a new revision is archived.
+    pub fn record_delivery_blocked(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        vault: &str,
+        category: &str,
+    ) -> Result<DeliveryRecord, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        let now = now_ms();
+        self.connection.execute(
+            "UPDATE deliveries SET
+                delivery_state='blocked',next_attempt_at_ms=NULL,
+                last_error_category=?4,updated_at_ms=?5
+             WHERE session_id=?1 AND endpoint=?2 AND vault=?3",
+            params![database_id, endpoint, vault, category, now],
+        )?;
+        self.get_delivery(session_id, endpoint, vault)?
+            .ok_or(StateError::InvalidState)
     }
 
     /// Records a failed delivery attempt. Increments the attempt count, and either schedules the
@@ -1188,11 +1274,12 @@ fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord
             .map(|value| u64::try_from(value).unwrap_or_default()),
         delivered_summary_hash: row.get(7)?,
         remote_hash: row.get(8)?,
-        delivery_state: row.get(9)?,
-        attempts: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
-        next_attempt_at_ms: row.get(11)?,
-        last_error_category: row.get(12)?,
-        updated_at_ms: row.get(13)?,
+        history_commit: row.get(9)?,
+        delivery_state: row.get(10)?,
+        attempts: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+        next_attempt_at_ms: row.get(12)?,
+        last_error_category: row.get(13)?,
+        updated_at_ms: row.get(14)?,
     })
 }
 

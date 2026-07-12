@@ -14,9 +14,11 @@ pub use archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, SessionReference,
 pub use delivery::{
     DeliveryCredentialSource, DeliveryError, DeliveryItem, DeliveryOutcome, DeliveryRunItem,
     DeliveryRunReport, DeliverySettings, DeliverySinkConfig, DeliveryStatusReport,
-    HttpNotesmithSink, NotesmithSink, backfill as delivery_backfill,
-    configure_sink as configure_delivery, load_settings as delivery_settings,
-    retry as delivery_retry, set_enabled as set_delivery_enabled, status as delivery_status,
+    HistoryCapability, HistoryReport, HttpNotesmithSink, NotesmithSink,
+    backfill as delivery_backfill, configure_sink as configure_delivery,
+    load_settings as delivery_settings, retry as delivery_retry,
+    set_enabled as set_delivery_enabled, status as delivery_status,
+    verify_history as delivery_verify_history,
 };
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook, read_last_failure,

@@ -90,6 +90,9 @@ pub struct DeliverySinkConfig {
     pub folder: Option<String>,
     pub credential: Option<DeliveryCredentialSource>,
     pub max_attempts: Option<u32>,
+    /// When `Some`, updates whether Munshi explicitly configures the remote history capability
+    /// (versus verify-only) for versioned delivery. `None` leaves the current setting unchanged.
+    pub provision_history: Option<bool>,
 }
 
 /// A safe, secret-free view of the resolved delivery configuration for reporting.
@@ -102,6 +105,12 @@ pub struct DeliverySettings {
     pub folder: Option<String>,
     pub credential_source: Option<String>,
     pub max_attempts: u32,
+    /// `true` when versioned delivery is required: local archive Git history is enabled alongside
+    /// delivery, so the remote must preserve correlated revision history (issue #9).
+    pub versioned: bool,
+    /// `true` when Munshi will explicitly configure the remote history capability if it is absent,
+    /// rather than only verifying it.
+    pub provision_history: bool,
 }
 
 impl DeliverySettings {
@@ -118,6 +127,8 @@ impl DeliverySettings {
                 .as_ref()
                 .map(DeliveryCredentialSource::describe),
             max_attempts: config.delivery.max_attempts,
+            versioned: config.archive_git_history && config.remote_delivery,
+            provision_history: config.delivery.provision_history,
         }
     }
 }
@@ -131,6 +142,8 @@ pub struct DeliveryItem {
     pub note_path: Option<String>,
     pub note_link: Option<String>,
     pub delivered_revision: Option<u64>,
+    /// The correlated remote history commit that preserved this revision (issue #9), when known.
+    pub history_commit: Option<String>,
     pub attempts: u32,
     pub next_attempt_at_ms: Option<i64>,
     pub last_error_category: Option<String>,
@@ -147,6 +160,7 @@ pub struct DeliveryStatusReport {
     pub pending: usize,
     pub failed: usize,
     pub dead_letter: usize,
+    pub blocked: usize,
     pub items: Vec<DeliveryItem>,
 }
 
@@ -169,6 +183,10 @@ pub enum DeliveryOutcome {
     Skipped {
         reason: String,
     },
+    Blocked {
+        reason: String,
+        detail: Option<String>,
+    },
     Failed {
         category: String,
         dead_letter: bool,
@@ -182,9 +200,26 @@ impl DeliveryOutcome {
             Self::Replaced { .. } => "replaced",
             Self::AlreadyDelivered { .. } => "already-delivered",
             Self::Skipped { .. } => "skipped",
+            Self::Blocked { .. } => "blocked",
             Self::Failed { .. } => "failed",
         }
     }
+}
+
+/// Whether versioned (revision-history-preserving) delivery is required for this run, and the
+/// resolved capability of the sink's vault. Versioned delivery is mandatory when local archive Git
+/// history is enabled alongside Notesmith delivery (issue #9); it must never silently degrade to
+/// latest-only storage when the remote cannot preserve correlated history.
+pub(crate) enum HistoryGate {
+    /// Local Git history is off, so latest-only delivery is the intended behavior (issue #8).
+    NotRequired,
+    /// Versioned delivery is required and the sink can preserve correlated history.
+    Available,
+    /// Versioned delivery is required but the sink cannot preserve history: block, don't degrade.
+    Blocked {
+        reason: String,
+        detail: Option<String>,
+    },
 }
 
 /// The `munshi delivery backfill` / `munshi delivery retry` contract.
@@ -199,6 +234,7 @@ pub struct DeliveryRunReport {
     pub replaced: usize,
     pub already_delivered: usize,
     pub skipped: usize,
+    pub blocked: usize,
     pub failed: usize,
     pub items: Vec<DeliveryRunItem>,
 }
@@ -252,6 +288,10 @@ pub enum SinkError {
     /// The sink response could not be understood.
     #[error("delivery sink protocol error: {0}")]
     Protocol(String),
+    /// The sink's vault cannot preserve correlated revision history (issue #9): the versioned
+    /// delivery contract requires it, so delivery is blocked rather than degraded to latest-only.
+    #[error("remote revision history is unavailable: {0}")]
+    HistoryUnavailable(String),
 }
 
 impl SinkError {
@@ -262,6 +302,48 @@ impl SinkError {
             Self::Transport(_) => "delivery-transport",
             Self::Server { .. } => "delivery-server",
             Self::Protocol(_) => "delivery-protocol",
+            Self::HistoryUnavailable(_) => "remote-history-unavailable",
+        }
+    }
+}
+
+/// The revision-history capability of a Notesmith vault (issue #9).
+///
+/// Notesmith preserves per-note revision history through per-vault Git: the vault's
+/// `git.enabled` config gates commits, and enabling it auto-initializes the repository
+/// (notes-method `routes/git.rs`, `routes/config.rs`). `available` is `true` only when a delivered
+/// revision can be preserved as a correlated commit.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryCapability {
+    pub available: bool,
+    /// The mechanism that preserves history; currently always `"git"`.
+    pub mechanism: &'static str,
+    /// A safe, secret-free human-readable detail for diagnostics.
+    pub detail: Option<String>,
+    /// `true` when Munshi configured the capability during this check (versus already present).
+    pub configured: bool,
+}
+
+impl HistoryCapability {
+    fn available(configured: bool) -> Self {
+        Self {
+            available: true,
+            mechanism: "git",
+            detail: Some(if configured {
+                "vault git history enabled".to_owned()
+            } else {
+                "vault git history already enabled".to_owned()
+            }),
+            configured,
+        }
+    }
+
+    fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            mechanism: "git",
+            detail: Some(detail.into()),
+            configured: false,
         }
     }
 }
@@ -272,6 +354,16 @@ pub trait NotesmithSink {
     fn create_note(&self, request: &CreateNote<'_>) -> Result<NoteRef, SinkError>;
     /// Replaces a note's content, overwriting any remote edits (Munshi owns delivered notes).
     fn replace_note(&self, path: &str, content: &str) -> Result<NoteRef, SinkError>;
+    /// Reports whether the sink's vault can preserve correlated revision history (issue #9),
+    /// without mutating the vault.
+    fn history_capability(&self) -> Result<HistoryCapability, SinkError>;
+    /// Verifies the revision-history capability and explicitly configures it when absent, so
+    /// versioned delivery has a place to preserve correlated history.
+    fn ensure_history_capability(&self) -> Result<HistoryCapability, SinkError>;
+    /// Commits the just-delivered note revision into the vault's history with a message that
+    /// correlates it to the local archive commit, returning the created commit id (or `None` when
+    /// there was nothing to commit). Requires an available history capability.
+    fn commit_revision(&self, message: &str) -> Result<Option<String>, SinkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +492,7 @@ pub(crate) fn deliver_one(
     disabled_projects: &[String],
     output_directory: &Path,
     record: &SessionRecord,
+    gate: &HistoryGate,
 ) -> Result<DeliveryOutcome, DeliveryError> {
     let (Some(endpoint), Some(vault)) = (delivery.endpoint.as_deref(), delivery.vault.as_deref())
     else {
@@ -457,6 +550,18 @@ pub(crate) fn deliver_one(
         });
     }
 
+    // Issue #9: when versioned delivery is required but the sink cannot preserve correlated
+    // revision history, block instead of silently degrading to latest-only. The block never
+    // contacts the create/replace routes and never advances retry bookkeeping, and it leaves the
+    // already-successful local archive untouched.
+    if let HistoryGate::Blocked { reason, detail } = gate {
+        state.record_delivery_blocked(&record.session_id, endpoint, vault, reason)?;
+        return Ok(DeliveryOutcome::Blocked {
+            reason: reason.clone(),
+            detail: detail.clone(),
+        });
+    }
+
     let archive_markdown =
         fs::read_to_string(output_directory.join(relative)).map_err(DeliveryError::Io)?;
     let body = archive_body(&archive_markdown);
@@ -499,6 +604,38 @@ pub(crate) fn deliver_one(
 
     match result {
         Ok((note, created)) => {
+            // In versioned mode, preserve this revision as a correlated commit in the vault's own
+            // history before recording success. The commit message carries the same source-scoped
+            // session identity and revision as the local archive commit, so the two histories
+            // correlate. A commit failure is treated as a delivery failure (bounded retry) rather
+            // than a silent latest-only success.
+            let history_commit = if matches!(gate, HistoryGate::Available) {
+                let message = format!(
+                    "munshi: {source_selector}:{} revision {}",
+                    record.session_id, record.current_revision
+                );
+                match sink.commit_revision(&message) {
+                    Ok(sha) => sha,
+                    Err(error) => {
+                        let category = error.category();
+                        let updated = state.record_delivery_failure(
+                            &record.session_id,
+                            endpoint,
+                            vault,
+                            category,
+                            delivery.max_attempts.max(1),
+                            now_ms()
+                                .saturating_add(backoff_ms(existing.attempts.saturating_add(1))),
+                        )?;
+                        return Ok(DeliveryOutcome::Failed {
+                            category: category.to_owned(),
+                            dead_letter: updated.delivery_state == "dead-letter",
+                        });
+                    }
+                }
+            } else {
+                None
+            };
             state.record_delivery_success(
                 &record.session_id,
                 endpoint,
@@ -508,6 +645,7 @@ pub(crate) fn deliver_one(
                     delivered_revision: record.current_revision,
                     delivered_summary_hash: summary_hash.unwrap_or_default(),
                     remote_hash: note.hash,
+                    history_commit,
                 },
             )?;
             if created {
@@ -654,6 +792,7 @@ impl HttpNotesmithSink {
             path,
             self.token.as_deref(),
             body,
+            None,
         )
     }
 }
@@ -714,6 +853,150 @@ impl NotesmithSink for HttpNotesmithSink {
             }),
         }
     }
+
+    fn history_capability(&self) -> Result<HistoryCapability, SinkError> {
+        let enabled = self.vault_git_enabled()?;
+        Ok(if enabled {
+            HistoryCapability::available(false)
+        } else {
+            HistoryCapability::unavailable(
+                "vault git history is disabled; enable [git] in the Notesmith vault config",
+            )
+        })
+    }
+
+    fn ensure_history_capability(&self) -> Result<HistoryCapability, SinkError> {
+        let (config, hash) = self.vault_config()?;
+        if git_enabled_in_config(&config) {
+            return Ok(HistoryCapability::available(false));
+        }
+        // Explicitly configure the capability: flip `git.enabled` in the vault config and PUT it
+        // back with the ETag Notesmith returned. Enabling git auto-initializes the repository
+        // (notes-method routes/config.rs), so commits become possible without further setup.
+        let mut updated = config;
+        set_git_enabled(&mut updated, true)?;
+        let payload =
+            serde_json::to_vec(&updated).map_err(|error| SinkError::Protocol(error.to_string()))?;
+        let response = http_request(
+            &self.host,
+            self.port,
+            self.timeout,
+            "PUT",
+            &format!("/api/v/{}/config", encode_path(&self.vault)),
+            self.token.as_deref(),
+            Some(&payload),
+            Some(&hash),
+        )?;
+        match response.status {
+            200 => {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .map_err(|error| SinkError::Protocol(error.to_string()))?;
+                if value
+                    .get("config")
+                    .is_some_and(git_enabled_in_config)
+                {
+                    Ok(HistoryCapability::available(true))
+                } else {
+                    Err(SinkError::HistoryUnavailable(
+                        "vault config was saved but git history is still disabled".to_owned(),
+                    ))
+                }
+            }
+            status => Err(SinkError::HistoryUnavailable(format!(
+                "could not enable vault git history (status {status})"
+            ))),
+        }
+    }
+
+    fn commit_revision(&self, message: &str) -> Result<Option<String>, SinkError> {
+        let body = serde_json::json!({ "message": message });
+        let payload =
+            serde_json::to_vec(&body).map_err(|error| SinkError::Protocol(error.to_string()))?;
+        let response = self.request(
+            "POST",
+            &format!("/api/v/{}/git/commit", encode_path(&self.vault)),
+            Some(&payload),
+        )?;
+        match response.status {
+            200 => {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .map_err(|error| SinkError::Protocol(error.to_string()))?;
+                let sha = value
+                    .get("sha")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned);
+                Ok(sha)
+            }
+            // Notesmith returns 400 when git is not enabled or the vault is not a repository.
+            400 => Err(SinkError::HistoryUnavailable(
+                "vault git history is not enabled".to_owned(),
+            )),
+            status => Err(SinkError::Server {
+                status,
+                body: response.body_text(),
+            }),
+        }
+    }
+}
+
+impl HttpNotesmithSink {
+    /// Reads the vault's `git.enabled` flag from its Notesmith config.
+    fn vault_git_enabled(&self) -> Result<bool, SinkError> {
+        let (config, _hash) = self.vault_config()?;
+        Ok(git_enabled_in_config(&config))
+    }
+
+    /// Fetches the vault config document and its ETag hash for conflict-safe updates.
+    fn vault_config(&self) -> Result<(serde_json::Value, String), SinkError> {
+        let response = self.request(
+            "GET",
+            &format!("/api/v/{}/config", encode_path(&self.vault)),
+            None,
+        )?;
+        match response.status {
+            200 => {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .map_err(|error| SinkError::Protocol(error.to_string()))?;
+                let config = value.get("config").cloned().ok_or_else(|| {
+                    SinkError::Protocol("config response missing config".to_owned())
+                })?;
+                let hash = value
+                    .get("hash")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        SinkError::Protocol("config response missing hash".to_owned())
+                    })?;
+                Ok((config, hash))
+            }
+            status => Err(SinkError::Server {
+                status,
+                body: response.body_text(),
+            }),
+        }
+    }
+}
+
+/// Reads `config.git.enabled` from a Notesmith vault config document.
+fn git_enabled_in_config(config: &serde_json::Value) -> bool {
+    config
+        .get("git")
+        .and_then(|git| git.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Sets `config.git.enabled`, creating the `git` object when the config omits it.
+fn set_git_enabled(config: &mut serde_json::Value, enabled: bool) -> Result<(), SinkError> {
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| SinkError::Protocol("vault config is not a JSON object".to_owned()))?;
+    let git = object.entry("git").or_insert_with(|| serde_json::json!({}));
+    let git = git.as_object_mut().ok_or_else(|| {
+        SinkError::Protocol("vault config git section is not an object".to_owned())
+    })?;
+    git.insert("enabled".to_owned(), serde_json::json!(enabled));
+    Ok(())
 }
 
 fn parse_note_ref(body: &[u8]) -> Result<NoteRef, SinkError> {
@@ -779,6 +1062,9 @@ impl HttpResponse {
     }
 }
 
+// A minimal hand-rolled HTTP/1.1 client: host/port/timeout plus optional bearer and If-Match
+// headers are all independent request inputs, so they are passed positionally.
+#[allow(clippy::too_many_arguments)]
 fn http_request(
     host: &str,
     port: u16,
@@ -787,6 +1073,7 @@ fn http_request(
     path: &str,
     token: Option<&str>,
     body: Option<&[u8]>,
+    if_match: Option<&str>,
 ) -> Result<HttpResponse, SinkError> {
     let address = (host, port)
         .to_socket_addrs()
@@ -812,6 +1099,10 @@ fn http_request(
         request.push_str("Authorization: Bearer ");
         request.push_str(token);
         request.push_str("\r\n");
+    }
+    if let Some(if_match) = if_match {
+        // Notesmith's config PUT requires an If-Match ETag for conflict detection.
+        request.push_str(&format!("If-Match: \"{if_match}\"\r\n"));
     }
     if let Some(body) = body {
         request.push_str("Content-Type: application/json\r\n");
@@ -925,6 +1216,44 @@ fn sink_from_config(config: &StoredConfig) -> Result<HttpNotesmithSink, Delivery
 /// `Ok(None)` when delivery is disabled or unconfigured, records network/sink failures as a bounded
 /// retry inside operational state, and never mutates the session's archival lifecycle. Credential
 /// or connection errors surface to the caller so it can record a safe diagnostic.
+/// Resolves the versioned-delivery [`HistoryGate`] for a sink.
+///
+/// When local archive Git history is enabled alongside delivery, versioned delivery is mandatory
+/// (issue #9). This verifies the sink vault's revision-history capability, or explicitly configures
+/// it when `provision` is set. If the capability is absent or cannot be verified, the gate blocks
+/// delivery with an actionable reason rather than degrading to latest-only storage.
+pub(crate) fn resolve_history_gate(
+    sink: &dyn NotesmithSink,
+    required: bool,
+    provision: bool,
+) -> HistoryGate {
+    if !required {
+        return HistoryGate::NotRequired;
+    }
+    let capability = if provision {
+        sink.ensure_history_capability()
+    } else {
+        sink.history_capability()
+    };
+    match capability {
+        Ok(capability) if capability.available => HistoryGate::Available,
+        Ok(capability) => HistoryGate::Blocked {
+            reason: "remote-history-unavailable".to_owned(),
+            detail: capability.detail,
+        },
+        Err(error) => HistoryGate::Blocked {
+            reason: error.category().to_owned(),
+            detail: Some(error.to_string()),
+        },
+    }
+}
+
+/// Whether versioned delivery is required: local archive Git history is enabled *and* delivery is
+/// enabled. In that mode the remote must preserve correlated revision history (issue #9).
+fn history_required(config: &StoredConfig) -> bool {
+    config.archive_git_history && config.remote_delivery
+}
+
 pub(crate) fn deliver_after_archive(
     state: &mut StateStore,
     config: &StoredConfig,
@@ -937,6 +1266,11 @@ pub(crate) fn deliver_after_archive(
         return Ok(None);
     };
     let sink = sink_from_config(config)?;
+    let gate = resolve_history_gate(
+        &sink,
+        history_required(config),
+        config.delivery.provision_history,
+    );
     let output_directory = PathBuf::from(&config.output_directory);
     let outcome = deliver_one(
         state,
@@ -945,6 +1279,7 @@ pub(crate) fn deliver_after_archive(
         &config.policy.disabled_projects,
         &output_directory,
         &record,
+        &gate,
     )?;
     Ok(Some(outcome))
 }
@@ -953,6 +1288,95 @@ pub(crate) fn deliver_after_archive(
 pub fn load_settings(state_directory: &Path) -> Result<DeliverySettings, DeliveryError> {
     let config = load_stored_config(state_directory)?;
     Ok(DeliverySettings::from_config(&config))
+}
+
+/// The `munshi delivery history` contract: reports the remote revision-history capability and,
+/// with `configure`, explicitly enables it when absent.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryReport {
+    pub schema_version: u32,
+    pub command: &'static str,
+    pub settings: DeliverySettings,
+    /// Whether versioned delivery is currently required (local Git history + delivery enabled).
+    pub required: bool,
+    /// Whether this invocation asked Munshi to explicitly configure the capability.
+    pub configure_requested: bool,
+    /// The probed capability, when the sink was reachable.
+    pub capability: Option<HistoryCapability>,
+    /// A stable status token: `available`, `configured`, `unavailable`, or `unreachable`.
+    pub status: String,
+    /// A safe, secret-free human-readable summary.
+    pub message: String,
+}
+
+impl HistoryReport {
+    /// `true` when versioned delivery would proceed (capability present); `false` when it would be
+    /// blocked. Callers use this to choose an exit code.
+    pub fn ok(&self) -> bool {
+        matches!(self.status.as_str(), "available" | "configured")
+    }
+
+    pub fn print_human(&self) {
+        print_settings(&self.settings);
+        println!(
+            "remote history: {} (required={}, configure={})",
+            self.status, self.required, self.configure_requested
+        );
+        println!("{}", self.message);
+    }
+}
+
+/// Verifies (or, with `configure`, explicitly configures) the Notesmith vault's revision-history
+/// capability that versioned delivery depends on (issue #9). Never mutates local archival state.
+pub fn verify_history(
+    state_directory: &Path,
+    configure: bool,
+) -> Result<HistoryReport, DeliveryError> {
+    let config = load_stored_config(state_directory)?;
+    let settings = DeliverySettings::from_config(&config);
+    if !config.delivery.is_addressable() {
+        return Err(DeliveryError::NotConfigured);
+    }
+    let required = history_required(&config);
+    let provision = configure || config.delivery.provision_history;
+    let sink = sink_from_config(&config)?;
+    let probe = if provision {
+        sink.ensure_history_capability()
+    } else {
+        sink.history_capability()
+    };
+    let (capability, status, message) = match probe {
+        Ok(capability) if capability.available => {
+            let status = if capability.configured {
+                "configured"
+            } else {
+                "available"
+            };
+            let message = format!(
+                "remote revision history is {status} via {} — versioned delivery can preserve correlated history",
+                capability.mechanism
+            );
+            (Some(capability), status.to_owned(), message)
+        }
+        Ok(capability) => {
+            let message = capability.detail.clone().unwrap_or_else(|| {
+                "remote revision history is unavailable; versioned delivery will be blocked"
+                    .to_owned()
+            });
+            (Some(capability), "unavailable".to_owned(), message)
+        }
+        Err(error) => (None, "unreachable".to_owned(), error.to_string()),
+    };
+    Ok(HistoryReport {
+        schema_version: 1,
+        command: "delivery-history",
+        settings,
+        required,
+        configure_requested: configure,
+        capability,
+        status,
+        message,
+    })
 }
 
 /// Configures the Notesmith sink without enabling delivery. The credential source is recorded, but
@@ -976,6 +1400,9 @@ pub fn configure_sink(
             .max_attempts
             .filter(|value| *value >= 1)
             .unwrap_or(DEFAULT_MAX_DELIVERY_ATTEMPTS);
+        if let Some(provision) = sink.provision_history {
+            config.delivery.provision_history = provision;
+        }
         Ok(())
     })?;
     Ok(DeliverySettings::from_config(&config))
@@ -1018,6 +1445,7 @@ pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryEr
     let mut pending = 0;
     let mut failed = 0;
     let mut dead_letter = 0;
+    let mut blocked = 0;
     let items = deliveries
         .iter()
         .map(|record| {
@@ -1026,6 +1454,7 @@ pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryEr
                 "pending" => pending += 1,
                 "failed" => failed += 1,
                 "dead-letter" => dead_letter += 1,
+                "blocked" => blocked += 1,
                 _ => {}
             }
             delivery_item(record)
@@ -1041,6 +1470,7 @@ pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryEr
         pending,
         failed,
         dead_letter,
+        blocked,
         items,
     })
 }
@@ -1060,6 +1490,7 @@ fn delivery_item(record: &DeliveryRecord) -> DeliveryItem {
         note_path: record.note_path.clone(),
         note_link,
         delivered_revision: record.delivered_revision,
+        history_commit: record.history_commit.clone(),
         attempts: record.attempts,
         next_attempt_at_ms: record.next_attempt_at_ms,
         last_error_category: record.last_error_category.clone(),
@@ -1166,6 +1597,7 @@ fn run(
         replaced: 0,
         already_delivered: 0,
         skipped: 0,
+        blocked: 0,
         failed: 0,
         items: Vec::new(),
     };
@@ -1180,6 +1612,14 @@ fn run(
         None => None,
     };
     let sink = HttpNotesmithSink::connect(&endpoint, &vault, token)?;
+    // Resolve the versioned-delivery capability once for the whole run so every candidate is
+    // gated consistently (issue #9): either all versioned deliveries are preserved as correlated
+    // history, or they are all blocked with an actionable status — never silently latest-only.
+    let gate = resolve_history_gate(
+        &sink,
+        history_required(&config),
+        config.delivery.provision_history,
+    );
 
     for record in candidates {
         let mut state = StateStore::open_for_source(state_directory, record.source)?;
@@ -1193,12 +1633,14 @@ fn run(
             &config.policy.disabled_projects,
             &output_directory,
             &record,
+            &gate,
         )?;
         match &outcome {
             DeliveryOutcome::Created { .. } => report.created += 1,
             DeliveryOutcome::Replaced { .. } => report.replaced += 1,
             DeliveryOutcome::AlreadyDelivered { .. } => report.already_delivered += 1,
             DeliveryOutcome::Skipped { .. } => report.skipped += 1,
+            DeliveryOutcome::Blocked { .. } => report.blocked += 1,
             DeliveryOutcome::Failed { .. } => report.failed += 1,
         }
         let _ = outcome.as_kind();
@@ -1254,6 +1696,7 @@ fn select_candidates(
             },
             Selection::Failed => existing.as_ref().is_some_and(|delivery| {
                 delivery.delivery_state == "failed"
+                    || delivery.delivery_state == "blocked"
                     || (delivery.delivery_state == "dead-letter" && force)
             }),
             Selection::One { source, session_id } => {
@@ -1279,8 +1722,8 @@ impl DeliveryStatusReport {
     pub fn print_human(&self) {
         print_settings(&self.settings);
         println!(
-            "deliveries total={} delivered={} pending={} failed={} dead-letter={}",
-            self.total, self.delivered, self.pending, self.failed, self.dead_letter
+            "deliveries total={} delivered={} pending={} failed={} dead-letter={} blocked={}",
+            self.total, self.delivered, self.pending, self.failed, self.dead_letter, self.blocked
         );
         for item in &self.items {
             println!(
@@ -1305,12 +1748,13 @@ impl DeliveryRunReport {
         print_settings(&self.settings);
         if self.confirmed {
             println!(
-                "delivery run candidates={} created={} replaced={} already-delivered={} skipped={} failed={}",
+                "delivery run candidates={} created={} replaced={} already-delivered={} skipped={} blocked={} failed={}",
                 self.candidates,
                 self.created,
                 self.replaced,
                 self.already_delivered,
                 self.skipped,
+                self.blocked,
                 self.failed
             );
         } else {
@@ -1328,7 +1772,7 @@ impl DeliveryRunReport {
 
 fn print_settings(settings: &DeliverySettings) {
     println!(
-        "delivery {} (endpoint {}, vault {}, folder {}, credential {}, max-attempts {})",
+        "delivery {} (endpoint {}, vault {}, folder {}, credential {}, max-attempts {}, versioned {}, provision-history {})",
         if settings.enabled {
             "enabled"
         } else {
@@ -1339,6 +1783,8 @@ fn print_settings(settings: &DeliverySettings) {
         settings.folder.as_deref().unwrap_or("<none>"),
         settings.credential_source.as_deref().unwrap_or("<none>"),
         settings.max_attempts,
+        settings.versioned,
+        settings.provision_history,
     );
 }
 
@@ -1423,6 +1869,31 @@ mod tests {
     #[test]
     fn yaml_quote_escapes_quotes_and_backslashes() {
         assert_eq!(yaml_quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn reads_and_sets_vault_git_enabled_in_config() {
+        let mut config = serde_json::json!({ "name": "work", "git": { "enabled": false } });
+        assert!(!git_enabled_in_config(&config));
+        set_git_enabled(&mut config, true).unwrap();
+        assert!(git_enabled_in_config(&config));
+        // A config that omits the git section defaults to disabled and gains one when set.
+        let mut bare = serde_json::json!({ "name": "work" });
+        assert!(!git_enabled_in_config(&bare));
+        set_git_enabled(&mut bare, true).unwrap();
+        assert_eq!(bare["git"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn history_capability_helpers_report_mechanism_and_configured_flag() {
+        let available = HistoryCapability::available(true);
+        assert!(available.available);
+        assert!(available.configured);
+        assert_eq!(available.mechanism, "git");
+        let unavailable = HistoryCapability::unavailable("disabled");
+        assert!(!unavailable.available);
+        assert!(!unavailable.configured);
+        assert_eq!(unavailable.detail.as_deref(), Some("disabled"));
     }
 
     #[test]

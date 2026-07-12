@@ -416,6 +416,212 @@ fn reset_delivery_for_retry_is_scoped_to_endpoint_and_vault() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #9: versioned delivery with correlated remote revision history
+// ---------------------------------------------------------------------------
+
+#[test]
+fn local_git_history_is_independent_when_delivery_is_disabled() {
+    // Acceptance: local Git history keeps working when Notesmith is absent / delivery is disabled.
+    let harness = Harness::new();
+    harness.register_versioned();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+
+    let subjects = harness.archive_git_log();
+    assert!(
+        subjects
+            .iter()
+            .any(|subject| subject.contains(&format!("copilot:{SESSION_A} revision 1"))),
+        "local archive must commit the revision independently; log={subjects:?}"
+    );
+    // No sink was configured, so no delivery row exists.
+    assert_eq!(harness.delivery_status_json()["total"], 0);
+}
+
+#[test]
+fn versioned_delivery_blocks_when_remote_history_is_unavailable() {
+    // Acceptance: versioned delivery blocks (never degrades to latest-only) when the remote cannot
+    // preserve correlated history, and the local archive is untouched.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start(); // git.enabled = false
+    harness.register_versioned();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+
+    harness.configure(&server.endpoint());
+    harness.enable();
+
+    let run = harness.delivery_backfill_json(true);
+    assert_eq!(run["blocked"], 1, "run={run}");
+    assert_eq!(run["created"], 0);
+    assert_eq!(
+        server.note_count(),
+        0,
+        "a blocked versioned delivery must never write a latest-only note"
+    );
+    assert!(server.commits().is_empty());
+
+    let status = harness.delivery_status_json();
+    assert_eq!(status["blocked"], 1);
+    let item = &status["items"][0];
+    assert_eq!(item["state"], "blocked");
+    assert_eq!(item["last_error_category"], "remote-history-unavailable");
+
+    // The local archive committed the revision regardless of the delivery block.
+    assert!(
+        harness
+            .archive_git_log()
+            .iter()
+            .any(|subject| subject.contains(&format!("copilot:{SESSION_A} revision 1")))
+    );
+
+    // `delivery history` reports the capability as unavailable with a non-zero exit.
+    let (report, ok) = harness.delivery_history(false);
+    assert_eq!(report["status"], "unavailable");
+    assert_eq!(report["required"], true);
+    assert!(
+        !ok,
+        "history verify must fail when the capability is absent"
+    );
+}
+
+#[test]
+fn versioned_delivery_commits_correlated_revision_when_capability_present() {
+    // Acceptance: delivered revisions carry stable identifiers that correlate local and remote
+    // histories, and each revision is preserved as its own remote commit.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start_with_history(); // git.enabled = true
+    harness.register_versioned();
+    harness.configure(&server.endpoint());
+    harness.enable();
+    let transcript = harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivered_revision(SESSION_A, 1);
+
+    assert_eq!(server.note_count(), 1);
+    let commits = server.commits();
+    assert_eq!(commits.len(), 1, "one correlated commit per revision");
+    assert!(
+        commits[0].contains(&format!("copilot:{SESSION_A} revision 1")),
+        "remote commit must correlate to the local session/revision; commit={:?}",
+        commits[0]
+    );
+
+    // The delivery row records the correlated remote history commit.
+    let status = harness.delivery_status_json();
+    let item = &status["items"][0];
+    assert_eq!(item["state"], "delivered");
+    assert!(item["history_commit"].is_string());
+
+    // A second revision preserves a second correlated commit.
+    harness.revise_session(SESSION_A, &transcript, "GOAL_TWO", "answer two");
+    harness.wait_for_delivered_revision(SESSION_A, 2);
+    let commits = server.commits();
+    assert_eq!(commits.len(), 2);
+    assert!(commits[1].contains(&format!("copilot:{SESSION_A} revision 2")));
+
+    // Local and remote histories share the same source-scoped session/revision identity.
+    let local = harness.archive_git_log();
+    assert!(
+        local
+            .iter()
+            .any(|subject| subject.contains(&format!("copilot:{SESSION_A} revision 2")))
+    );
+}
+
+#[test]
+fn configuring_remote_history_unblocks_versioned_delivery() {
+    // Acceptance: Munshi can explicitly configure the capability; a blocked delivery recovers once
+    // the capability is present. Exercises the disabled -> enabled configuration transition.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start(); // git.enabled = false
+    harness.register_versioned();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.configure(&server.endpoint());
+    harness.enable();
+
+    // First backfill blocks because remote history is unavailable.
+    assert_eq!(harness.delivery_backfill_json(true)["blocked"], 1);
+    assert!(!server.git_enabled());
+
+    // Explicitly configure the capability via Munshi; the vault git history is now enabled.
+    let (report, ok) = harness.delivery_history(true);
+    assert!(ok, "configure should succeed: {report}");
+    assert_eq!(report["status"], "configured");
+    assert!(server.git_enabled(), "Munshi must have enabled vault git");
+
+    // Retrying the blocked delivery now succeeds and preserves a correlated commit.
+    let retry = harness.delivery_retry_all_json(false);
+    let created = retry["created"].as_u64().unwrap_or(0);
+    let replaced = retry["replaced"].as_u64().unwrap_or(0);
+    assert_eq!(created + replaced, 1, "retry={retry}");
+    assert_eq!(server.note_count(), 1);
+    assert!(
+        server.commits()[0].contains(&format!("copilot:{SESSION_A} revision 1")),
+        "commits={:?}",
+        server.commits()
+    );
+    let status = harness.delivery_status_json();
+    assert_eq!(status["blocked"], 0);
+    assert_eq!(status["delivered"], 1);
+}
+
+#[test]
+fn provisioning_auto_configures_capability_during_delivery() {
+    // Acceptance: with provisioning enabled, versioned delivery configures the missing capability
+    // itself rather than blocking. Exercises the capability-success path end to end.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start(); // git.enabled = false initially
+    harness.register_versioned();
+    harness.configure_with_provision(&server.endpoint());
+    harness.enable();
+    harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivered_revision(SESSION_A, 1);
+
+    assert!(
+        server.git_enabled(),
+        "provisioning must enable the vault git history"
+    );
+    assert_eq!(server.note_count(), 1);
+    assert!(server.commits()[0].contains(&format!("copilot:{SESSION_A} revision 1")));
+}
+
+#[test]
+fn later_revision_blocks_without_overwriting_the_delivered_note() {
+    // When the remote capability regresses, a new revision is blocked and the previously delivered
+    // note is never overwritten with a latest-only copy.
+    let harness = Harness::new();
+    let server = FakeNotesmith::start_with_history();
+    harness.register_versioned();
+    harness.configure(&server.endpoint());
+    harness.enable();
+    let transcript = harness.archive_session(SESSION_A, "GOAL_ONE", "answer one");
+    harness.wait_for_delivered_revision(SESSION_A, 1);
+    assert_eq!(server.commits().len(), 1);
+    let note_path = harness.delivery_status_json()["items"][0]["note_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let delivered_body = server.note_body(&note_path).unwrap();
+
+    // Regress the capability, then archive a second revision.
+    server.set_git_enabled(false);
+    harness.revise_session(SESSION_A, &transcript, "GOAL_TWO", "answer two");
+    harness.wait_for_delivery_blocked(SESSION_A);
+
+    let item = harness.delivery_status_json()["items"][0].clone();
+    assert_eq!(item["state"], "blocked");
+    assert_eq!(item["last_error_category"], "remote-history-unavailable");
+    assert_eq!(
+        item["delivered_revision"], 1,
+        "a blocked revision must not advance the delivered revision"
+    );
+    assert_eq!(
+        server.note_body(&note_path).as_deref(),
+        Some(delivered_body.as_str()),
+        "the delivered note must not be overwritten with a latest-only copy"
+    );
+    assert_eq!(server.commits().len(), 1, "no new commit while blocked");
+}
+
 /// Counts the number of complete YAML frontmatter blocks in a note document.
 fn frontmatter_block_count(document: &str) -> usize {
     document
@@ -435,6 +641,12 @@ struct FakeState {
     unauthorized: usize,
     required_token: Option<String>,
     last_auth: Option<String>,
+    /// Whether the vault's per-vault Git revision history is enabled (issue #9 capability).
+    git_enabled: bool,
+    /// Commit messages recorded by `git/commit`, newest last — the vault's correlated history.
+    commits: Vec<String>,
+    /// Bumped on every config write so the ETag changes, mirroring Notesmith's hash-based ETag.
+    config_generation: u64,
 }
 
 struct FakeNotesmith {
@@ -445,14 +657,19 @@ struct FakeNotesmith {
 
 impl FakeNotesmith {
     fn start() -> Self {
-        Self::start_inner(None)
+        Self::start_inner(None, false)
     }
 
     fn start_requiring_token(token: &str) -> Self {
-        Self::start_inner(Some(token.to_owned()))
+        Self::start_inner(Some(token.to_owned()), false)
     }
 
-    fn start_inner(required_token: Option<String>) -> Self {
+    /// Starts a fake with the vault's revision-history capability already enabled.
+    fn start_with_history() -> Self {
+        Self::start_inner(None, true)
+    }
+
+    fn start_inner(required_token: Option<String>, git_enabled: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(FakeState {
@@ -461,6 +678,9 @@ impl FakeNotesmith {
             unauthorized: 0,
             required_token,
             last_auth: None,
+            git_enabled,
+            commits: Vec::new(),
+            config_generation: 0,
         }));
         let outage = Arc::new(AtomicBool::new(false));
         let thread_state = Arc::clone(&state);
@@ -513,6 +733,19 @@ impl FakeNotesmith {
             .notes
             .insert(path.to_owned(), body.to_owned());
     }
+
+    fn git_enabled(&self) -> bool {
+        self.state.lock().unwrap().git_enabled
+    }
+
+    fn set_git_enabled(&self, enabled: bool) {
+        self.state.lock().unwrap().git_enabled = enabled;
+    }
+
+    /// The commit messages recorded by `git/commit`, in order — the vault's correlated history.
+    fn commits(&self) -> Vec<String> {
+        self.state.lock().unwrap().commits.clone()
+    }
 }
 
 fn handle_connection(
@@ -545,7 +778,13 @@ fn handle_connection(
         }
     }
     guard.requests += 1;
-    let response = route(&request.method, &request.target, &request.body, &mut guard);
+    let response = route(
+        &request.method,
+        &request.target,
+        &request.body,
+        request.if_match.as_deref(),
+        &mut guard,
+    );
     drop(guard);
     let _ = stream.write_all(response.as_bytes());
 }
@@ -567,7 +806,82 @@ fn build_note_document(frontmatter: &Value, content: &str) -> String {
     format!("---\n{yaml}---\n{content}\n")
 }
 
-fn route(method: &str, target: &str, body: &str, state: &mut FakeState) -> String {
+fn route(
+    method: &str,
+    target: &str,
+    body: &str,
+    if_match: Option<&str>,
+    state: &mut FakeState,
+) -> String {
+    // Vault config: exposes and updates the per-vault `git.enabled` revision-history capability.
+    let config_target = format!("/api/v/{VAULT}/config");
+    if target == config_target {
+        let config_value =
+            |state: &FakeState| json!({ "name": VAULT, "git": { "enabled": state.git_enabled } });
+        if method == "GET" {
+            let hash = format!("cfg-{}", state.config_generation);
+            return json_response(
+                200,
+                &json!({
+                    "config": config_value(state),
+                    "hash": hash,
+                    "path": ".notesmith/vault.toml",
+                    "warnings": {},
+                }),
+            );
+        }
+        if method == "PUT" {
+            let current = format!("cfg-{}", state.config_generation);
+            match if_match {
+                Some(value) if value == current => {}
+                Some(_) | None => {
+                    return json_response(
+                        if if_match.is_none() { 428 } else { 409 },
+                        &json!({ "error": "conflict" }),
+                    );
+                }
+            }
+            // Notesmith's PUT takes the full config object as the body (not wrapped).
+            let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let enabled = payload["git"]["enabled"].as_bool().unwrap_or(false);
+            // Enabling git auto-initializes the repository (notes-method routes/config.rs).
+            let did_init = enabled && !state.git_enabled;
+            state.git_enabled = enabled;
+            state.config_generation += 1;
+            let hash = format!("cfg-{}", state.config_generation);
+            let git_init = if did_init {
+                json!({ "initialized": true, "alreadyRepo": false, "sha": "init0000" })
+            } else {
+                Value::Null
+            };
+            return json_response(
+                200,
+                &json!({
+                    "config": config_value(state),
+                    "hash": hash,
+                    "path": ".notesmith/vault.toml",
+                    "warnings": {},
+                    "gitInit": git_init,
+                }),
+            );
+        }
+    }
+
+    // Git commit: preserves a delivered revision as a correlated commit. Requires git.enabled.
+    if method == "POST" && target == format!("/api/v/{VAULT}/git/commit") {
+        if !state.git_enabled {
+            return json_response(
+                400,
+                &json!({ "error": "git integration is not enabled for this vault" }),
+            );
+        }
+        let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let message = payload["message"].as_str().unwrap_or("").to_owned();
+        state.commits.push(message);
+        let sha = format!("commit{:04}", state.commits.len());
+        return json_response(200, &json!({ "committed": true, "sha": sha, "files": [] }));
+    }
+
     // target: /api/v/{vault}/notes  or  /api/v/{vault}/notes/{path...}
     let prefix = format!("/api/v/{VAULT}/notes");
     if method == "POST" && target == prefix {
@@ -614,6 +928,7 @@ fn json_response(status: u16, value: &Value) -> String {
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        428 => "Precondition Required",
         _ => "Status",
     };
     format!(
@@ -627,6 +942,7 @@ struct FakeRequest {
     target: String,
     body: String,
     auth: Option<String>,
+    if_match: Option<String>,
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
@@ -653,6 +969,7 @@ fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
     let target = parts.next()?.to_owned();
     let mut content_length = 0usize;
     let mut auth = None;
+    let mut if_match = None;
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(value) = lower.strip_prefix("content-length:") {
@@ -661,6 +978,10 @@ fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
             auth = line
                 .split_once(':')
                 .map(|(_, value)| value.trim().to_owned());
+        } else if lower.starts_with("if-match:") {
+            if_match = line
+                .split_once(':')
+                .map(|(_, value)| value.trim().trim_matches('"').to_owned());
         }
     }
     let mut body = buffer[header_end + 4..].to_vec();
@@ -677,6 +998,7 @@ fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
         target,
         body: String::from_utf8_lossy(&body).into_owned(),
         auth,
+        if_match,
     })
 }
 
@@ -806,6 +1128,27 @@ impl Harness {
         assert_success(&output);
     }
 
+    /// Registers with local archive Git history enabled, so delivery must be versioned (issue #9).
+    fn register_versioned(&self) {
+        let output = self
+            .munshi()
+            .arg("register")
+            .arg("--accept-transcript-processing")
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .arg("--output-dir")
+            .arg(&self.output)
+            .arg("--archive-git-history")
+            .arg("--summarizer")
+            .arg(fake("status-contract.sh"))
+            .arg("--timeout-ms")
+            .arg("5000")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+
     fn configure(&self, endpoint: &str) {
         self.configure_with_folder(endpoint, "Munshi");
     }
@@ -841,6 +1184,57 @@ impl Harness {
             .output()
             .unwrap();
         assert_success(&output);
+    }
+
+    /// Configures the sink and opts into Munshi explicitly configuring the remote history
+    /// capability when it is absent (issue #9 provisioning).
+    fn configure_with_provision(&self, endpoint: &str) {
+        let output = self
+            .munshi()
+            .args(["delivery", "configure", "--endpoint"])
+            .arg(endpoint)
+            .args([
+                "--vault",
+                VAULT,
+                "--folder",
+                "Munshi",
+                "--provision-history",
+            ])
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+
+    /// Runs `delivery history`, optionally configuring the capability, returning the JSON contract
+    /// and whether the command reported success (exit code zero).
+    fn delivery_history(&self, configure: bool) -> (Value, bool) {
+        let mut command = self.munshi();
+        command.args(["delivery", "history", "--state-dir"]);
+        command.arg(self.state_str());
+        command.arg("--json");
+        if configure {
+            command.arg("--configure");
+        }
+        let output = command.output().unwrap();
+        let value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        (value, output.status.success())
+    }
+
+    /// Reads the local archive repository's commit subjects (newest first).
+    fn archive_git_log(&self) -> Vec<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.output)
+            .args(["log", "--format=%s"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     fn enable(&self) {
@@ -1039,6 +1433,10 @@ impl Harness {
     /// delivery outcome deterministically.
     fn wait_for_delivery_failed(&self, session_id: &str) {
         self.wait_for_delivery(session_id, |item| item["state"] == "failed");
+    }
+
+    fn wait_for_delivery_blocked(&self, session_id: &str) {
+        self.wait_for_delivery(session_id, |item| item["state"] == "blocked");
     }
 
     fn wait_for_delivered_revision(&self, session_id: &str, revision: u64) {

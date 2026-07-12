@@ -132,6 +132,11 @@ pub(crate) struct StoredDelivery {
     /// Bounded number of delivery attempts before a session is parked as a dead letter.
     #[serde(default = "default_max_delivery_attempts")]
     pub max_attempts: u32,
+    /// Issue #9: when versioned delivery is required but the remote revision-history capability is
+    /// absent, whether Munshi should explicitly configure it (`true`) or only verify it (`false`,
+    /// the default). Configuring mutates the Notesmith vault config to enable per-vault Git.
+    #[serde(default)]
+    pub provision_history: bool,
 }
 
 fn default_max_delivery_attempts() -> u32 {
@@ -146,6 +151,7 @@ impl Default for StoredDelivery {
             folder: None,
             credential: None,
             max_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
+            provision_history: false,
         }
     }
 }

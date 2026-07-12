@@ -543,15 +543,25 @@ The following commands expose stable human-readable output and stable machine ou
 - `munshi delivery status`
 - `munshi delivery backfill [--confirm] [--limit N]`
 - `munshi delivery retry [<session-id>] [--all] [--force] [--limit N]`
+- `munshi delivery history [--configure]`
 
 The delivery sink is managed with `munshi delivery configure --endpoint <url> --vault <name>
 [--folder <path>] [--credential-env <VAR> | --credential-keychain <service:account>]
-[--max-attempts N]`, `munshi delivery enable`, and `munshi delivery disable`. Delivery is disabled
-by default; the endpoint/vault/folder and the *source* of the credential are recorded in the
-Munshi-owned `config.json`, but the credential itself is only ever resolved at delivery time from
-an environment variable or the OS credential store. Enabling delivery reports the pending backfill
-as a dry run so existing summaries require an explicit `munshi delivery backfill --confirm` before
-publishing.
+[--max-attempts N] [--provision-history]`, `munshi delivery enable`, and `munshi delivery disable`.
+Delivery is disabled by default; the endpoint/vault/folder and the *source* of the credential are
+recorded in the Munshi-owned `config.json`, but the credential itself is only ever resolved at
+delivery time from an environment variable or the OS credential store. Enabling delivery reports
+the pending backfill as a dry run so existing summaries require an explicit `munshi delivery
+backfill --confirm` before publishing.
+
+When local archive Git history is enabled (`--archive-git-history`) alongside delivery, delivery is
+**versioned** (issue #9): each delivered revision is preserved as a correlated commit in the
+Notesmith vault's own per-vault Git history, keyed by the same source-scoped session identity and
+revision as the local archive commit. Munshi verifies the vault's revision-history capability
+(`config.git.enabled`); if it is unavailable, versioned delivery is **blocked** with an actionable
+status rather than degrading to latest-only storage. `munshi delivery history` reports the live
+capability, `--configure` (or `--provision-history` at configure time) explicitly enables it, and
+blocked deliveries recover via `munshi delivery retry` once the capability is present.
 
 Every JSON response emits `schema_version: 1` and a command discriminator. Session states are
 classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, `failed`,
@@ -668,10 +678,11 @@ Notes are routed by stable identity, not by the mutable summary title: a note is
 persisted note identifier is idempotent across deliveries and even across an operational-database
 rebuild (a create that conflicts is adopted as a replace).
 
-Latest-revision delivery requires no Notesmith server modification. The mandatory versioned
-(revision-history-preserving) delivery is deferred to issue #9; this module is structured for it —
-the `NotesmithSink` trait isolates the wire protocol and delivered notes carry stable
-`munshi_session`/`munshi_revision` frontmatter a future versioned sink can use.
+Latest-revision delivery requires no Notesmith server modification. Versioned
+(revision-history-preserving) delivery (issue #9) reuses the same wire protocol: the `NotesmithSink`
+trait also verifies/configures the vault's per-vault Git capability and commits each delivered
+revision, and delivered notes carry stable `munshi_session`/`munshi_revision` frontmatter that
+correlates with the vault's Git history.
 
 Delivery behavior (implemented):
 
@@ -686,8 +697,14 @@ Delivery behavior (implemented):
 - Keep local Markdown authoritative and untouched when Notesmith is unavailable; a delivery outage
   never rolls back, invalidates, or blocks a local archive.
 
-Deferred to issue #9: when Git history is enabled locally, requiring Notesmith revision history
-before delivering.
+Versioned delivery (issue #9): when local archive Git history is enabled alongside delivery, Munshi
+verifies (or, with `--provision-history`/`munshi delivery history --configure`, explicitly enables)
+the Notesmith vault's revision-history capability. Each delivered revision is committed into the
+vault's own Git history with a message correlated to the local archive commit by source-scoped
+session identity and revision. If the capability is absent, versioned delivery is blocked with an
+actionable `remote-history-unavailable` status and never degrades to latest-only storage; the block
+never affects the already-successful local archive, and recovers on retry once the capability is
+present.
 
 ## Generic webhook versus raw Markdown
 

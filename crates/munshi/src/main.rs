@@ -9,12 +9,12 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, DeliveryCredentialSource, DeliveryRunReport, DeliverySinkConfig,
-    DeliveryStatusReport, HookEvent, HookFailure, HookResult, ProjectStatus, RegisterConfig,
-    SessionRecord, SessionReference, SourceKind, StateStore, StructuredSummary,
+    DeliveryStatusReport, HistoryReport, HookEvent, HookFailure, HookResult, ProjectStatus,
+    RegisterConfig, SessionRecord, SessionReference, SourceKind, StateStore, StructuredSummary,
     accept_disclosure_from_terminal, archive_session, configure_delivery, delivery_backfill,
-    delivery_retry, delivery_status, handle_hook, parse_archive_markdown, project_status,
-    read_last_failure, register, run_archive_worker_for_source, run_recovery, set_delivery_enabled,
-    set_project_enabled, unregister, wait_for_hook_result,
+    delivery_retry, delivery_status, delivery_verify_history, handle_hook, parse_archive_markdown,
+    project_status, read_last_failure, register, run_archive_worker_for_source, run_recovery,
+    set_delivery_enabled, set_project_enabled, unregister, wait_for_hook_result,
 };
 use serde::{Deserialize, Serialize};
 
@@ -272,6 +272,13 @@ enum DeliveryCommand {
         /// Bounded number of delivery attempts before a session is parked as a dead letter.
         #[arg(long)]
         max_attempts: Option<u32>,
+        /// For versioned delivery (issue #9), explicitly configure the Notesmith vault's revision
+        /// history capability when absent instead of only verifying it. Use `--no-provision-history`
+        /// to return to verify-only.
+        #[arg(long, overrides_with = "no_provision_history")]
+        provision_history: bool,
+        #[arg(long, overrides_with = "provision_history", hide = true)]
+        no_provision_history: bool,
         #[arg(long)]
         copilot_home: Option<PathBuf>,
     },
@@ -284,6 +291,18 @@ enum DeliveryCommand {
     Disable {
         #[arg(long)]
         copilot_home: Option<PathBuf>,
+    },
+    /// Verify (or, with `--configure`, explicitly enable) the Notesmith vault's revision-history
+    /// capability required for versioned delivery.
+    History {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Explicitly enable the remote history capability if it is absent.
+        #[arg(long)]
+        configure: bool,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
     },
     /// Show delivery configuration and per-session delivery state.
     Status {
@@ -386,6 +405,10 @@ enum Outcome {
     },
     DeliveryRun {
         report: Box<DeliveryRunReport>,
+        json: bool,
+    },
+    DeliveryHistory {
+        report: Box<HistoryReport>,
         json: bool,
     },
     Status {
@@ -504,6 +527,10 @@ struct ConfigurationAssessment {
     capture_state: CaptureState,
     delivery_state: DeliveryState,
     archive_git_history: Option<bool>,
+    /// Whether versioned delivery is required (local Git history + delivery enabled) — issue #9.
+    versioned_delivery: Option<bool>,
+    /// Whether Munshi will explicitly configure the remote history capability (versus verify-only).
+    provision_remote_history: Option<bool>,
     disabled_projects: usize,
     config_path: String,
     hook_path: String,
@@ -592,6 +619,7 @@ struct DeliveryView {
     note_path: Option<String>,
     note_link: Option<String>,
     delivered_revision: Option<u64>,
+    history_commit: Option<String>,
     attempts: u32,
     last_error_code: Option<String>,
 }
@@ -698,6 +726,8 @@ struct RawStoredConfig {
 struct RawDelivery {
     endpoint: Option<String>,
     vault: Option<String>,
+    #[serde(default)]
+    provision_history: Option<bool>,
 }
 
 impl RawDelivery {
@@ -826,10 +856,22 @@ fn main() -> ExitCode {
             } else {
                 report.print_human();
             }
-            if report.failed > 0 {
+            if report.failed > 0 || report.blocked > 0 {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
+            }
+        }
+        Ok(Outcome::DeliveryHistory { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            if report.ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
         }
         Ok(Outcome::Status { report, json }) => {
@@ -1183,11 +1225,20 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
             credential_env,
             credential_keychain,
             max_attempts,
+            provision_history,
+            no_provision_history,
             copilot_home,
         } => {
             let copilot_home = resolve_copilot_home(copilot_home)?;
             let state_directory = copilot_home.join("munshi");
             let credential = resolve_credential_source(credential_env, credential_keychain)?;
+            let provision = if provision_history {
+                Some(true)
+            } else if no_provision_history {
+                Some(false)
+            } else {
+                None
+            };
             let settings = configure_delivery(
                 &copilot_home,
                 &state_directory,
@@ -1197,6 +1248,7 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                     folder,
                     credential,
                     max_attempts,
+                    provision_history: provision,
                 },
             )?;
             Ok(Outcome::DeliveryConfigured {
@@ -1222,6 +1274,17 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
             let settings = set_delivery_enabled(&copilot_home, &state_directory, false)?;
             Ok(Outcome::DeliveryDisabled {
                 settings: Box::new(settings),
+            })
+        }
+        DeliveryCommand::History {
+            state_dir,
+            configure,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::DeliveryHistory {
+                report: Box::new(delivery_verify_history(&state_directory, configure)?),
+                json,
             })
         }
         DeliveryCommand::Status { state_dir, json } => {
@@ -1803,6 +1866,8 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
     let mut summarizer_executable = None;
     let mut output_directory = None;
     let mut archive_git_history = None;
+    let mut versioned_delivery = None;
+    let mut provision_remote_history = None;
     let mut disabled_projects = 0usize;
 
     let mut config_recognized = false;
@@ -2027,6 +2092,40 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         ),
                     }
 
+                    // Issue #9: when local Git history is enabled alongside delivery, versioned
+                    // delivery is required and the Notesmith vault must preserve correlated revision
+                    // history. Doctor reports this statically; `munshi delivery history` probes the
+                    // live capability.
+                    let versioned =
+                        archive_git_history == Some(true) && config.remote_delivery == Some(true);
+                    let provision = config
+                        .delivery
+                        .as_ref()
+                        .and_then(|delivery| delivery.provision_history)
+                        .unwrap_or(false);
+                    versioned_delivery = Some(versioned);
+                    provision_remote_history = Some(provision);
+                    if versioned {
+                        let hint = if provision {
+                            "versioned delivery: Munshi will configure the Notesmith vault's revision history; verify with `munshi delivery history --configure`"
+                        } else {
+                            "versioned delivery requires remote revision history; verify with `munshi delivery history` (add `--configure` to enable it)"
+                        };
+                        push_check(
+                            &mut checks,
+                            "delivery-remote-history",
+                            CheckStatus::Warning,
+                            hint.to_owned(),
+                        );
+                    } else if config.remote_delivery == Some(true) {
+                        push_check(
+                            &mut checks,
+                            "delivery-remote-history",
+                            CheckStatus::Ok,
+                            "latest-only delivery (local Git history disabled)".to_owned(),
+                        );
+                    }
+
                     let summarizer_absolute = summarizer_executable
                         .as_deref()
                         .is_some_and(|path| Path::new(path).is_absolute());
@@ -2168,6 +2267,8 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
         capture_state,
         delivery_state,
         archive_git_history,
+        versioned_delivery,
+        provision_remote_history,
         disabled_projects,
         config_path: config_path.display().to_string(),
         hook_path: hook_path.display().to_string(),
@@ -2381,6 +2482,7 @@ fn lookup_delivery_view(
         note_path: record.note_path,
         note_link,
         delivered_revision: record.delivered_revision,
+        history_commit: record.history_commit,
         attempts: record.attempts,
         last_error_code: record.last_error_category,
     })
