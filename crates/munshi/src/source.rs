@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -10,6 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_EVENT_TEXT_BYTES: usize = 128 * 1024;
+pub const NORMALIZER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SessionReference {
@@ -39,7 +41,10 @@ pub struct NormalizedSession {
     pub tool_activities: usize,
     pub ignored_events: usize,
     pub source_cursor: u64,
+    pub source_byte_cursor: u64,
+    pub source_prefix_hash: String,
     pub source_hash: String,
+    pub source_bytes: u64,
     pub started_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -48,6 +53,78 @@ impl NormalizedSession {
     pub fn is_archive_worthy(&self) -> bool {
         self.user_requests > 0 && (self.assistant_messages > 0 || self.tool_activities > 0)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousSource {
+    pub normalizer_version: u32,
+    pub record_count: u64,
+    pub byte_offset: u64,
+    pub prefix_hash: String,
+    pub source_hash: String,
+    pub source_bytes: u64,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub user_requests: usize,
+    pub assistant_messages: usize,
+    pub tool_activities: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorFallbackReason {
+    CursorMismatch,
+    NormalizerChanged,
+    SourceTruncated,
+}
+
+impl CursorFallbackReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CursorMismatch => "cursor-mismatch",
+            Self::NormalizerChanged => "normalizer-changed",
+            Self::SourceTruncated => "source-truncated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptLoadMode {
+    Full,
+    Delta,
+    Unchanged,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceSnapshot {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl SourceSnapshot {
+    pub fn verify_unchanged(&self) -> Result<(), SourceError> {
+        let metadata = fs::metadata(&self.path).map_err(SourceError::Io)?;
+        if metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.len() != self.length
+            || metadata.mtime() != self.modified_seconds
+            || metadata.mtime_nsec() != self.modified_nanoseconds
+        {
+            return Err(SourceError::ChangedDuringRead);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptUpdate {
+    pub session: NormalizedSession,
+    pub mode: TranscriptLoadMode,
+    pub fallback_reason: Option<CursorFallbackReason>,
+    pub snapshot: SourceSnapshot,
 }
 
 #[derive(Debug, Error)]
@@ -74,6 +151,10 @@ pub enum SourceError {
     MalformedJson { line: u64 },
     #[error("normalized event content exceeds the per-event safety limit")]
     EventContentLimit,
+    #[error("transcript changed while it was being read")]
+    ChangedDuringRead,
+    #[error("transcript does not match the version-pinned Copilot event envelope")]
+    UnsupportedEnvelope,
 }
 
 pub fn resolve_session_reference(
@@ -153,10 +234,206 @@ pub fn load_session(
     resolved: &ResolvedSession,
     max_source_bytes: usize,
 ) -> Result<NormalizedSession, SourceError> {
+    Ok(load_session_update(resolved, max_source_bytes, None)?.session)
+}
+
+pub fn load_session_update(
+    resolved: &ResolvedSession,
+    max_source_bytes: usize,
+    previous: Option<&PreviousSource>,
+) -> Result<TranscriptUpdate, SourceError> {
+    let (bytes, snapshot) = read_stable_source(&resolved.events_path, max_source_bytes)?;
+    let source_hash = sha256(&bytes);
+
+    let (mode, fallback_reason, normalized, total_records) = match previous {
+        None => {
+            let normalized = normalize_records(&bytes, 0)?;
+            (
+                TranscriptLoadMode::Full,
+                None,
+                normalized,
+                count_records(&bytes),
+            )
+        }
+        Some(previous) if previous.normalizer_version != NORMALIZER_VERSION => {
+            let normalized = normalize_records(&bytes, 0)?;
+            (
+                TranscriptLoadMode::Full,
+                Some(CursorFallbackReason::NormalizerChanged),
+                normalized,
+                count_records(&bytes),
+            )
+        }
+        Some(previous) if bytes.len() < previous.byte_offset as usize => {
+            let normalized = normalize_records(&bytes, 0)?;
+            (
+                TranscriptLoadMode::Full,
+                Some(CursorFallbackReason::SourceTruncated),
+                normalized,
+                count_records(&bytes),
+            )
+        }
+        Some(previous) => {
+            let offset = previous.byte_offset as usize;
+            let prefix = &bytes[..offset];
+            let prefix_valid = sha256(prefix) == previous.prefix_hash
+                && count_records(prefix) == previous.record_count;
+            if !prefix_valid {
+                let normalized = normalize_records(&bytes, 0)?;
+                (
+                    TranscriptLoadMode::Full,
+                    Some(CursorFallbackReason::CursorMismatch),
+                    normalized,
+                    count_records(&bytes),
+                )
+            } else {
+                let delta = &bytes[offset..];
+                if !delta.is_empty()
+                    && offset > 0
+                    && bytes[offset - 1] != b'\n'
+                    && delta[0] != b'\n'
+                {
+                    let normalized = normalize_records(&bytes, 0)?;
+                    (
+                        TranscriptLoadMode::Full,
+                        Some(CursorFallbackReason::CursorMismatch),
+                        normalized,
+                        count_records(&bytes),
+                    )
+                } else if count_records(delta) == 0 {
+                    (
+                        TranscriptLoadMode::Unchanged,
+                        None,
+                        NormalizedRecords::default(),
+                        previous.record_count,
+                    )
+                } else {
+                    let normalized = normalize_records(delta, previous.record_count)?;
+                    (
+                        TranscriptLoadMode::Delta,
+                        None,
+                        normalized,
+                        previous.record_count + count_records(delta),
+                    )
+                }
+            }
+        }
+    };
+
+    let (user_requests, assistant_messages, tool_activities, started_at, updated_at) =
+        if mode == TranscriptLoadMode::Delta {
+            let previous = previous.expect("delta loads have a previous cursor");
+            (
+                previous.user_requests + normalized.user_requests,
+                previous.assistant_messages + normalized.assistant_messages,
+                previous.tool_activities + normalized.tool_activities,
+                previous
+                    .started_at
+                    .clone()
+                    .or_else(|| normalized.first_timestamp.map(format_timestamp)),
+                normalized
+                    .last_timestamp
+                    .map(format_timestamp)
+                    .or_else(|| previous.updated_at.clone()),
+            )
+        } else if mode == TranscriptLoadMode::Unchanged {
+            let previous = previous.expect("unchanged loads have a previous cursor");
+            (
+                previous.user_requests,
+                previous.assistant_messages,
+                previous.tool_activities,
+                previous.started_at.clone(),
+                previous.updated_at.clone(),
+            )
+        } else {
+            (
+                normalized.user_requests,
+                normalized.assistant_messages,
+                normalized.tool_activities,
+                normalized.first_timestamp.map(format_timestamp),
+                normalized.last_timestamp.map(format_timestamp),
+            )
+        };
+
+    let source_prefix_hash = sha256(&bytes);
+    Ok(TranscriptUpdate {
+        session: NormalizedSession {
+            session_id: resolved.session_id.clone(),
+            events: normalized.events,
+            user_requests,
+            assistant_messages,
+            tool_activities,
+            ignored_events: normalized.ignored_events,
+            source_cursor: total_records,
+            source_byte_cursor: bytes.len() as u64,
+            source_prefix_hash,
+            source_hash,
+            source_bytes: bytes.len() as u64,
+            started_at,
+            updated_at,
+        },
+        mode,
+        fallback_reason,
+        snapshot,
+    })
+}
+
+pub fn validate_transcript_envelope(
+    path: &Path,
+    max_source_bytes: usize,
+) -> Result<(), SourceError> {
+    let metadata = fs::symlink_metadata(path).map_err(SourceError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SourceError::UnsupportedTranscriptPath);
+    }
+    let mut reader = BufReader::new(File::open(path).map_err(SourceError::Io)?);
+    let mut line = Vec::new();
+    let limit = max_source_bytes.min(256 * 1024);
+    loop {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(limit.saturating_add(1) as u64)
+            .read_until(b'\n', &mut line)
+            .map_err(SourceError::Io)?;
+        if read == 0 {
+            return Err(SourceError::UnsupportedEnvelope);
+        }
+        if line.len() > limit {
+            return Err(SourceError::UnsupportedEnvelope);
+        }
+        while line
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value =
+            serde_json::from_slice(&line).map_err(|_| SourceError::UnsupportedEnvelope)?;
+        let object = value.as_object().ok_or(SourceError::UnsupportedEnvelope)?;
+        if !object.get("id").is_some_and(Value::is_string)
+            || !object.contains_key("timestamp")
+            || !object.contains_key("parentId")
+            || !object.get("type").is_some_and(Value::is_string)
+            || !object.get("data").is_some_and(Value::is_object)
+        {
+            return Err(SourceError::UnsupportedEnvelope);
+        }
+        return Ok(());
+    }
+}
+
+fn read_stable_source(
+    path: &Path,
+    max_source_bytes: usize,
+) -> Result<(Vec<u8>, SourceSnapshot), SourceError> {
     let mut bytes = Vec::new();
-    File::open(&resolved.events_path)
-        .map_err(SourceError::Io)?
-        .take(max_source_bytes.saturating_add(1) as u64)
+    let file = File::open(path).map_err(SourceError::Io)?;
+    let before = file.metadata().map_err(SourceError::Io)?;
+    file.take(max_source_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(SourceError::Io)?;
     if bytes.len() > max_source_bytes {
@@ -164,51 +441,85 @@ pub fn load_session(
             limit: max_source_bytes,
         });
     }
+    let after = fs::metadata(path).map_err(SourceError::Io)?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || after.len() != bytes.len() as u64
+    {
+        return Err(SourceError::ChangedDuringRead);
+    }
+    let snapshot = SourceSnapshot {
+        path: path.to_path_buf(),
+        device: after.dev(),
+        inode: after.ino(),
+        length: after.len(),
+        modified_seconds: after.mtime(),
+        modified_nanoseconds: after.mtime_nsec(),
+    };
+    Ok((bytes, snapshot))
+}
 
-    let source_hash = format!("sha256:{:x}", Sha256::digest(&bytes));
-    let mut events = Vec::new();
-    let mut user_requests = 0;
-    let mut assistant_messages = 0;
-    let mut tool_activities = 0;
-    let mut ignored_events = 0;
-    let mut line_count = 0_u64;
-    let mut first_timestamp: Option<DateTime<Utc>> = None;
-    let mut last_timestamp: Option<DateTime<Utc>> = None;
+#[derive(Default)]
+struct NormalizedRecords {
+    events: Vec<NormalizedEvent>,
+    user_requests: usize,
+    assistant_messages: usize,
+    tool_activities: usize,
+    ignored_events: usize,
+    line_count: u64,
+    first_timestamp: Option<DateTime<Utc>>,
+    last_timestamp: Option<DateTime<Utc>>,
+}
 
+fn normalize_records(bytes: &[u8], prior_records: u64) -> Result<NormalizedRecords, SourceError> {
+    let mut normalized = NormalizedRecords::default();
     for raw_line in bytes.split(|byte| *byte == b'\n') {
         if raw_line.is_empty() {
             continue;
         }
-        line_count += 1;
-        let value: Value = serde_json::from_slice(raw_line)
-            .map_err(|_| SourceError::MalformedJson { line: line_count })?;
+        normalized.line_count += 1;
+        let value: Value =
+            serde_json::from_slice(raw_line).map_err(|_| SourceError::MalformedJson {
+                line: prior_records + normalized.line_count,
+            })?;
         let Some(object) = value.as_object() else {
-            ignored_events += 1;
+            normalized.ignored_events += 1;
             continue;
         };
 
         if let Some(timestamp) = object.get("timestamp").and_then(parse_timestamp) {
-            first_timestamp = Some(first_timestamp.map_or(timestamp, |old| old.min(timestamp)));
-            last_timestamp = Some(last_timestamp.map_or(timestamp, |old| old.max(timestamp)));
+            normalized.first_timestamp = Some(
+                normalized
+                    .first_timestamp
+                    .map_or(timestamp, |old| old.min(timestamp)),
+            );
+            normalized.last_timestamp = Some(
+                normalized
+                    .last_timestamp
+                    .map_or(timestamp, |old| old.max(timestamp)),
+            );
         }
 
         let Some(event_type) = object.get("type").and_then(Value::as_str) else {
-            ignored_events += 1;
+            normalized.ignored_events += 1;
             continue;
         };
         match event_type {
             "user.message" => {
                 let Some(data) = event_data(object) else {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 };
                 let Some(content) = data.get("content").and_then(Value::as_str) else {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 };
                 if let Some(content) = nonempty(content) {
-                    user_requests += 1;
-                    events.push(NormalizedEvent {
+                    normalized.user_requests += 1;
+                    normalized.events.push(NormalizedEvent {
                         kind: "user",
                         content: validate_content(content)?,
                     });
@@ -216,20 +527,20 @@ pub fn load_session(
             }
             "assistant.message" => {
                 let Some(data) = event_data(object) else {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 };
                 if !data.get("messageId").is_some_and(Value::is_string) {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 }
                 let Some(content) = data.get("content").and_then(Value::as_str) else {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 };
                 if let Some(content) = nonempty(content) {
-                    assistant_messages += 1;
-                    events.push(NormalizedEvent {
+                    normalized.assistant_messages += 1;
+                    normalized.events.push(NormalizedEvent {
                         kind: "assistant",
                         content: validate_content(content)?,
                     });
@@ -237,42 +548,41 @@ pub fn load_session(
             }
             "tool.execution_start" => {
                 let Some(data) = event_data(object).filter(|data| valid_tool_start(data)) else {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 };
-                tool_activities += 1;
-                events.push(NormalizedEvent {
+                normalized.tool_activities += 1;
+                normalized.events.push(NormalizedEvent {
                     kind: "tool",
                     content: extract_tool_start(data)?,
                 });
             }
             "tool.execution_complete" => {
                 let Some(data) = event_data(object).filter(|data| valid_tool_complete(data)) else {
-                    ignored_events += 1;
+                    normalized.ignored_events += 1;
                     continue;
                 };
-                tool_activities += 1;
-                events.push(NormalizedEvent {
+                normalized.tool_activities += 1;
+                normalized.events.push(NormalizedEvent {
                     kind: "tool",
                     content: extract_tool_complete(data)?,
                 });
             }
-            _ => ignored_events += 1,
+            _ => normalized.ignored_events += 1,
         }
     }
+    Ok(normalized)
+}
 
-    Ok(NormalizedSession {
-        session_id: resolved.session_id.clone(),
-        events,
-        user_requests,
-        assistant_messages,
-        tool_activities,
-        ignored_events,
-        source_cursor: line_count,
-        source_hash,
-        started_at: first_timestamp.map(format_timestamp),
-        updated_at: last_timestamp.map(format_timestamp),
-    })
+fn count_records(bytes: &[u8]) -> u64 {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .count() as u64
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn event_data(object: &Map<String, Value>) -> Option<&Map<String, Value>> {

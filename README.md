@@ -10,10 +10,11 @@ rendering, or delivery to one vendor.
 
 ## Status
 
-The workspace includes the Phase 0 `munshi-probe` compatibility tool and a production-facing
-`munshi archive` manual path for one Copilot session. Hook registration, SQLite-backed revisions,
-recovery, and remote delivery remain later slices. See
-[`docs/manual-archive.md`](docs/manual-archive.md) for safe usage and current boundaries.
+The workspace includes the Phase 0 `munshi-probe`, standalone `munshi archive`, user-level hook
+registration, and SQLite-backed automatic archival with resumed revisions and interrupted-session
+recovery. Markdown remains the durable archive; remote delivery, project policy/budgets, optional
+Git history, and broad status/query commands remain later slices. See
+[`docs/automatic-archive.md`](docs/automatic-archive.md).
 
 ## Goals
 
@@ -195,26 +196,27 @@ require changing every sink or renderer.
 
 `munshi register` installs only `hooks/munshi.json` under `~/.copilot` or `$COPILOT_HOME`, after a
 prominent disclosure and explicit acceptance. It writes direct `exec`/`args` entries for
-`agentStop` and `sessionEnd` using the absolute current Munshi executable. Configuration and the
-temporary file handoff are stored below the selected Munshi state directory; unrelated hook and
-settings files are untouched. Restart Copilot CLI after registration because hooks are loaded at
-startup. See [automatic clean-session archival](docs/automatic-archive.md).
+`agentStop` and `sessionEnd` using the absolute current Munshi executable. Configuration and
+rebuildable SQLite operational state are stored below the selected Munshi state directory;
+unrelated hook and settings files are untouched. Restart Copilot CLI after registration because
+hooks are loaded at startup. See
+[automatic session archival](docs/automatic-archive.md).
 
 Use these events:
 
 - `agentStop`: record the session ID, transcript path, and origin working directory.
-- `sessionEnd`: start clean-session archival.
+- `sessionEnd`: record completion and queue clean or interrupted archival.
 
 `sessionEnd` does not itself provide the transcript path, so Munshi persists the last path seen for
 each session during `agentStop`. This is the primary transcript lookup, but it is not sufficient:
 an early Ctrl-C can produce `sessionEnd` without `agentStop`, and SIGKILL can produce neither hook.
 
-The hook command:
+Each hook command:
 
 - Reads one JSON payload from standard input.
 - Validates the event schema.
-- Records the minimal `agentStop` metadata with an atomic durable file replacement.
-- Uses a per-session create-new worker marker to suppress duplicate clean-end workers.
+- Commits one short idempotent SQLite transaction while preserving the first origin directory.
+- Reserves at most one detached worker for the session state generation.
 - Starts clean-session archival in a detached process with inherited standard streams closed.
 - Returns quickly enough not to degrade Copilot CLI shutdown.
 - Never fails the originating Copilot session because archival failed.
@@ -222,16 +224,17 @@ The hook command:
 A session becomes archive-worthy only after at least one user request and agent-produced content or
 tool activity. Empty or cancelled starts may be recorded diagnostically but do not create Markdown.
 
-Issue #3 archives only sessions for which `agentStop` supplied metadata before `sessionEnd`.
-Interrupted recovery remains an issue #4 design:
+Interrupted and force-close recovery follows these rules:
 
 1. Use the latest hook-provided `transcriptPath`.
 2. For a supported, version-pinned Copilot adapter, derive the expected transcript path from
    `sessionId`, require that it exists, and validate its expected envelope before use.
 3. If neither lookup succeeds, leave the session pending rather than guessing or marking it
    archived.
-4. Opportunistically scan source session state after later hooks or user-invoked recovery commands
-   to discover sessions for which force-close delivered no lifecycle event.
+4. Later hooks and the internal recovery command revisit retryable failures and stale known
+   sessions after a quiet period.
+5. A discovered session without a safely known origin is retained as unresolved operational state
+   and is not summarized into a guessed project.
 
 The recovered summary records the interrupted completion reason when known. A force-killed process
 may provide no reason at all.
@@ -261,36 +264,34 @@ The first detected Git repository is the session's origin project and remains it
 association. Project identity uses a normalized canonical remote when available so clones and
 worktrees group together, with a locally assigned identity for repositories without a remote.
 
-Planned issue #4 state tracked per session:
+The SQLite store tracks current operational state per session:
 
 ```text
 agent
 session_id
-project identity
-transcript reference
-source cursor
-source content hash
-summary revision
-summary content hash
-local Markdown path
-Notesmith note path
-Notesmith expected hash
-last successful delivery
-last error
+first origin and project identity
+latest transcript reference
+record and byte cursor
+prefix and full source hashes
+lifecycle and completion reason
+current structured-summary cache
+current revision, Markdown hash, and relative path
+processing attempts, leases, and safe failure category
 ```
 
-The following resumed-session behavior remains deferred to issue #4:
+For a resumed session:
 
 1. `agentStop` identifies new transcript material.
-2. Munshi loads only the content beyond the stored cursor.
-3. The previous summary and new transcript delta are sent to the summarizer.
-4. The summarizer returns a complete revised summary, not an append-only fragment.
-5. The local Markdown file is replaced atomically.
-6. `summary_revision` is incremented.
-7. Notesmith replaces its Munshi-managed copy when delivery is enabled.
+2. Munshi validates the exact previously processed byte prefix.
+3. Only records beyond the validated cursor are normalized.
+4. The previous complete structured summary and new delta are sent to the summarizer.
+5. The summarizer returns a complete revised summary, not an append-only fragment.
+6. The local Markdown file is replaced atomically.
+7. `summary_revision` is incremented.
 
 If cursor validation fails because the transcript was truncated or rewritten, Munshi falls back to
-a complete re-read and records the reason.
+a complete re-read, omits the previous-summary delta context, and records a content-free fallback
+reason. Revision and cursor state advance only after the new Markdown has been durably replaced.
 
 ## Summarization with Copilot CLI
 
@@ -474,37 +475,27 @@ Git history is optional. When disabled, Munshi retains only the current summary 
 
 ## State and concurrency
 
-SQLite should store session state, cursors, and delivery attempts. Markdown, with optional Git
-history, remains the durable record; SQLite is rebuildable operational state rather than the
-authority for an existing archive.
+`$COPILOT_HOME/munshi/munshi.db` stores session state, current cursors, worker claims, attempts, and
+safe diagnostics. It uses forward migrations, foreign keys, WAL, short writer transactions, and a
+brief migration advisory lock. Markdown, with optional future Git history, remains the durable
+record; SQLite is rebuildable operational state rather than the authority for an existing archive.
+See [ADR 0004](docs/adr/0004-use-rebuildable-sqlite-operational-state.md).
 
-Requirements:
+Implemented guarantees:
 
 - One writer transaction per state transition.
-- A per-session advisory lock around summarization.
+- A persistent owner-only per-session advisory lock around source loading, summarization, Markdown
+  persistence, and final state transition.
 - Atomic Markdown replacement using write, flush, and rename.
-- A content hash for rendered output.
-- Idempotent sink delivery.
+- Current structured-summary and rendered-content hashes.
 - No cursor advancement until rendering and required local persistence succeed.
-- Failed remote delivery must not roll back successful local persistence.
+- Post-rename/pre-transaction crash reconciliation from the planned hash and Markdown front matter.
+- Backoff plus opportunistic retries for failed pending work.
+- Safe import of stale issue #3 metadata/jobs and rebuild from current owned Markdown.
 - Concurrent terminal sessions must not block unrelated session IDs.
 
-Useful commands:
-
-```text
-munshi install
-munshi uninstall
-munshi status
-munshi sessions
-munshi summarize <session-id>
-munshi retry <session-id>
-munshi retry --all
-munshi show <session-id>
-munshi config check
-munshi doctor
-```
-
-All query commands should support `--json` for Madari and other integrations.
+`munshi hook recover` is an internal recovery/testing path used by later hooks and explicit repair
+work. Broad status, retry, query, and doctor commands remain issue #7 scope.
 
 ## Configuration
 
@@ -907,17 +898,12 @@ round-trip backup.
 
 ## Open implementation questions
 
-These should be resolved during Phase 0 rather than guessed:
+Remaining questions for later slices:
 
 - Which observed Copilot transcript event variants are stable enough to normalize across versions.
-- Whether hooks execute synchronously enough to require detached finalization.
 - Reliability of the validated title/summary prompt across available Copilot models and larger
   inputs.
-- Reliable mapping from transcript offsets to semantic event cursors.
-- Safe discovery bounds for recovering force-closed sessions from private, version-pinned source
-  state.
-- Whether the first release should keep state in one SQLite file or separate operational and
-  delivery databases.
+- Safe default quiet periods for force-close discovery across future Copilot versions.
 - Notesmith authentication as deployed behind the current reverse proxy.
 - How Notesmith exposes or verifies per-note Git revision history for versioned delivery.
 - Naming and routing rules for Notesmith folders.

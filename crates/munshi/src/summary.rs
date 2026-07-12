@@ -42,6 +42,8 @@ struct SummaryRequest<'a> {
     instruction: &'static str,
     required_schema: RequiredSchema,
     session: SummarySession<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_summary: Option<&'a StructuredSummary>,
     events: &'a [crate::source::NormalizedEvent],
     ignored_unknown_event_count: usize,
 }
@@ -90,14 +92,43 @@ pub fn build_summary_input(
     project: &ProjectIdentity,
     input_limit: usize,
 ) -> Result<Vec<u8>, SummaryError> {
+    build_summary_input_inner(session, project, None, input_limit)
+}
+
+pub fn build_revision_summary_input(
+    session: &NormalizedSession,
+    project: &ProjectIdentity,
+    previous_summary: &StructuredSummary,
+    input_limit: usize,
+) -> Result<Vec<u8>, SummaryError> {
+    build_summary_input_inner(session, project, Some(previous_summary), input_limit)
+}
+
+fn build_summary_input_inner(
+    session: &NormalizedSession,
+    project: &ProjectIdentity,
+    previous_summary: Option<&StructuredSummary>,
+    input_limit: usize,
+) -> Result<Vec<u8>, SummaryError> {
     let request = SummaryRequest {
-        instruction: concat!(
-            "Summarize this coding session as exactly one JSON object matching required_schema. ",
-            "Return every required field. Capture goals, meaningful completed work, decisions, ",
-            "files changed, commands and validation, and open items. Do not quote prompts, raw ",
-            "tool output, secrets, or substantial code. Use concise strings and arrays of strings. ",
-            "Return JSON only, with no Markdown fence or commentary."
-        ),
+        instruction: if previous_summary.is_some() {
+            concat!(
+                "Revise previous_summary using only the new normalized events. Return a complete ",
+                "replacement summary as exactly one JSON object matching required_schema, not a ",
+                "patch or append-only fragment. Preserve still-correct prior work and incorporate ",
+                "new goals, meaningful completed work, decisions, files changed, commands and ",
+                "validation, and open items. Do not quote prompts, raw tool output, secrets, or ",
+                "substantial code. Return JSON only, with no Markdown fence or commentary."
+            )
+        } else {
+            concat!(
+                "Summarize this coding session as exactly one JSON object matching required_schema. ",
+                "Return every required field. Capture goals, meaningful completed work, decisions, ",
+                "files changed, commands and validation, and open items. Do not quote prompts, raw ",
+                "tool output, secrets, or substantial code. Use concise strings and arrays of strings. ",
+                "Return JSON only, with no Markdown fence or commentary."
+            )
+        },
         required_schema: RequiredSchema {
             title: "non-empty string",
             goal: "non-empty string",
@@ -115,6 +146,7 @@ pub fn build_summary_input(
             project_identity: &project.identity,
             repository: project.repository.as_deref(),
         },
+        previous_summary,
         events: &session.events,
         ignored_unknown_event_count: session.ignored_events,
     };
@@ -141,10 +173,12 @@ pub fn run_summary(
     )?;
     let summary: StructuredSummary =
         serde_json::from_slice(&stdout).map_err(SummaryError::MalformedJson)?;
-    validate_summary(summary)
+    validate_structured_summary(summary)
 }
 
-fn validate_summary(mut summary: StructuredSummary) -> Result<StructuredSummary, SummaryError> {
+pub fn validate_structured_summary(
+    mut summary: StructuredSummary,
+) -> Result<StructuredSummary, SummaryError> {
     summary.title = validate_text("title", summary.title, TITLE_LIMIT, true)?;
     summary.goal = validate_text("goal", summary.goal, GOAL_LIMIT, false)?;
     summary.work_completed = validate_list("work_completed", summary.work_completed, ITEM_LIMIT)?;
@@ -193,7 +227,12 @@ fn validate_text(
         .chars()
         .all(|character| !character.is_control() || matches!(character, '\n' | '\t'));
     let length = value.chars().count();
-    if length == 0 || length > max || !valid_controls || (single_line && value.contains('\n')) {
+    if length == 0
+        || length > max
+        || !valid_controls
+        || (single_line && value.contains('\n'))
+        || (!single_line && value.contains("\n## "))
+    {
         Err(SummaryError::InvalidText { field, max })
     } else {
         Ok(value)

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 use thiserror::Error;
 
+use crate::state::{StateStore, migrate_legacy_state};
+
 const HOOK_FILE_NAME: &str = "munshi.json";
 const CONFIG_FILE_NAME: &str = "config.json";
 
@@ -185,12 +187,18 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     validate_owned_file::<StoredConfig>(&config_path)?;
     validate_owned_file::<HookFile>(&hook_path)?;
     let state_directory = ensure_directory(&config.state_directory)?;
-    ensure_child_directory(&state_directory, "sessions")?;
-    ensure_child_directory(&state_directory, "pending")?;
-    ensure_child_directory(&state_directory, "workers")?;
-    ensure_child_directory(&state_directory, "results")?;
-    ensure_child_directory(&state_directory, "failures")?;
+    ensure_child_directory(&state_directory, "locks")?;
     install_or_update_json(&config_path, &stored)?;
+    let mut state = StateStore::open(&state_directory).map_err(state_registration_error)?;
+    state
+        .rebuild_from_archives(&config.output_directory)
+        .map_err(state_registration_error)?;
+    migrate_legacy_state(
+        &mut state,
+        &state_directory,
+        config.timeout.saturating_add(Duration::from_secs(60)),
+    )
+    .map_err(state_registration_error)?;
     install_or_update_json(&hook_path, &hook)
 }
 
@@ -430,30 +438,6 @@ pub(crate) fn durable_remove(path: &Path) -> Result<(), RegistrationError> {
     )
 }
 
-pub(crate) fn create_owned_lock(path: &Path) -> Result<Option<File>, RegistrationError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| RegistrationError::UnsafePath(path.to_path_buf()))?;
-    validate_existing_directory_if_present(parent)?;
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(file) => {
-            file.sync_all().map_err(RegistrationError::Io)?;
-            sync_directory(parent)?;
-            Ok(Some(file))
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            validate_regular_owned_file(path)?;
-            Ok(None)
-        }
-        Err(error) => Err(RegistrationError::Io(error)),
-    }
-}
-
 struct RegistrationLock {
     _file: File,
 }
@@ -671,4 +655,8 @@ fn sync_directory(path: &Path) -> Result<(), RegistrationError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(RegistrationError::Io)
+}
+
+fn state_registration_error(error: crate::state::StateError) -> RegistrationError {
+    RegistrationError::Io(io::Error::other(error.to_string()))
 }

@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use munshi::{DisclosureDecision, accept_disclosure};
+use munshi::{DisclosureDecision, accept_disclosure, parse_archive_markdown, read_last_failure};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -304,9 +305,8 @@ fn hook_payload_errors_fail_open_without_echoing_private_content() {
     assert_success(&output);
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
-    let failure = fs::read_to_string(paths.state.join("failures/last.json")).unwrap();
-    assert!(failure.contains("payload-not-single-object"));
-    assert!(!failure.contains(private));
+    let failure = read_last_failure(&paths.state).unwrap().unwrap();
+    assert_eq!(failure.code, "payload-not-single-object");
     assert!(
         !paths
             .state
@@ -316,7 +316,7 @@ fn hook_payload_errors_fail_open_without_echoing_private_content() {
 }
 
 #[test]
-fn missing_agent_stop_and_nonclean_session_end_are_harmless_noops() {
+fn unresolved_session_end_stays_pending_and_later_interruption_archives() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
     assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
@@ -326,12 +326,24 @@ fn missing_agent_stop_and_nonclean_session_end_are_harmless_noops() {
         "session-end",
         session_end_payload(&project).to_string().as_bytes(),
     ));
-    assert!(
-        !paths
-            .state
-            .join(format!("pending/{SESSION_ID}.json"))
-            .exists()
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let pending: (String, Option<String>, String) = connection
+        .query_row(
+            "SELECT lifecycle_state,transcript_path,last_error_category
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        pending,
+        (
+            "summary-pending".to_owned(),
+            None,
+            "transcript-unresolved".to_owned()
+        )
     );
+    drop(connection);
 
     assert_success(&hook_command(
         &paths,
@@ -347,12 +359,10 @@ fn missing_agent_stop_and_nonclean_session_end_are_harmless_noops() {
         "session-end",
         interrupted.to_string().as_bytes(),
     ));
-    assert!(
-        !paths
-            .state
-            .join(format!("pending/{SESSION_ID}.json"))
-            .exists()
-    );
+    assert_success(&wait_command(&paths, 5_000));
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(find_archive(&paths.output)).unwrap()).unwrap();
+    assert_eq!(archived.completion_reason, "interrupted");
 }
 
 #[test]
@@ -377,31 +387,30 @@ fn agent_stop_uses_an_atomic_minimal_metadata_handoff() {
             .as_bytes(),
     ));
 
-    let pending_path = paths
-        .state
-        .join(format!("sessions/{SESSION_ID}/latest.json"));
-    let pending: Value = serde_json::from_slice(&fs::read(pending_path).unwrap()).unwrap();
-    assert_eq!(
-        pending,
-        json!({
-            "version": 1,
-            "session_id": SESSION_ID,
-            "transcript_path": transcript,
-            "origin_cwd": project,
-            "agent_stop_timestamp": 1783817107011_u64,
-        })
-    );
-    assert!(
-        fs::read_dir(paths.state.join(format!("sessions/{SESSION_ID}")))
-            .unwrap()
-            .all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".munshi-")
-            })
-    );
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let row: (String, String, i64, String, i64) = connection
+        .query_row(
+            "SELECT transcript_path,origin_cwd,last_agent_stop_ms,lifecycle_state,
+                    current_summary_revision
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_ID],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(PathBuf::from(row.0), transcript);
+    assert_eq!(PathBuf::from(row.1), project);
+    assert_eq!(row.2, 1_783_817_107_011);
+    assert_eq!(row.3, "observed");
+    assert_eq!(row.4, 0);
+    assert!(!paths.state.join("sessions").exists());
 }
 
 #[test]
@@ -433,28 +442,21 @@ fn session_end_returns_quickly_and_reports_detached_failure_deterministically() 
     let waited = wait_command(&paths, 5_000);
     assert!(!waited.status.success());
     assert!(String::from_utf8_lossy(&waited.stdout).contains("\"status\":\"failed\""));
-    let failure = fs::read_to_string(paths.state.join("failures/last.json")).unwrap();
-    assert!(failure.contains("summary-failed"));
-    assert!(!failure.contains(project.to_string_lossy().as_ref()));
-    assert!(
-        !paths
-            .state
-            .join(format!("pending/{SESSION_ID}.json"))
-            .exists()
-    );
-    assert!(
-        !paths
-            .state
-            .join(format!("workers/{SESSION_ID}.lock"))
-            .exists()
-    );
-    assert!(paths.state.join("failures/last.json").is_file());
-    assert!(
-        paths
-            .state
-            .join(format!("results/{SESSION_ID}.json"))
-            .is_file()
-    );
+    let failure = read_last_failure(&paths.state).unwrap().unwrap();
+    assert_eq!(failure.code, "summary-failed");
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let row: (String, i64, String) = connection
+        .query_row(
+            "SELECT lifecycle_state,current_summary_revision,last_error_category
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("failed".to_owned(), 0, "summary-failed".to_owned()));
+    for legacy in ["pending", "workers", "results", "failures"] {
+        assert!(!paths.state.join(legacy).exists());
+    }
 }
 
 #[test]
@@ -496,10 +498,13 @@ fn duplicate_clean_hooks_start_one_worker_and_full_lifecycle_matches_manual_arch
     assert_eq!(fs::read_to_string(count).unwrap(), "x");
 
     let archive = find_archive(&paths.output);
-    assert_eq!(
-        fs::read_to_string(archive).unwrap(),
-        include_str!("../../../fixtures/manual/expected/normal.md")
-    );
+    let markdown = fs::read_to_string(archive).unwrap();
+    let parsed = parse_archive_markdown(&markdown).unwrap();
+    assert_eq!(parsed.schema_version, 2);
+    assert_eq!(parsed.summary_revision, 1);
+    assert_eq!(parsed.session_id, SESSION_ID);
+    assert_eq!(parsed.summary.title, "Implement manual archival");
+    assert_eq!(parsed.completion_reason, "complete");
     assert!(
         !paths
             .state

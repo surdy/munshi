@@ -65,14 +65,20 @@ The manual record always has revision 1, a source-line cursor, and a SHA-256 sou
 These aliases are intentionally defensive compatibility assumptions, not a public Copilot schema.
 They must be reconciled with ongoing transcript-schema research before broad automatic ingestion.
 
-## Automatic archival and issue #4
+## Automatic archival and resumed revisions
 
 Issue #3 adds registration disclosure, idempotent user-hook installation/removal, fast fail-open
 hook ingestion, and automatic clean-session finalization through this same archive path. See
 [`automatic-archive.md`](automatic-archive.md).
 
-Issue #4 must replace the narrow file handoff with SQLite operational state, add robust locks,
-validated semantic cursors, resumed
-delta summaries with the prior summary, revision increments, transcript rewrite fallback, and
-interrupted/force-close recovery. Until then, rerunning the manual command replaces revision 1 and
-does not claim resumed-session semantics.
+Issue #4 replaces the hook file handoff with SQLite operational state, per-session advisory locks,
+validated record/byte cursors, resumed delta summaries with the previous complete structured
+summary, revision increments, rewrite/truncation fallback, retries, and interrupted/force-close
+recovery.
+
+The standalone manual command intentionally remains a full single-shot archive at revision 1. It
+does not open the registered hook database or claim incremental resume semantics. Automatic
+workers write archive front matter schema 2; the state rebuilder accepts both manual schema 1
+records and automatic schema 2 records. A schema 1 record remains valid durable Markdown but lacks
+prefix evidence, so its next automatic update performs one complete reread before establishing a
+schema 2 cursor.

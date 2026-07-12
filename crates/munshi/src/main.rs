@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, HookEvent, HookResult, RegisterConfig, SessionReference,
     accept_disclosure_from_terminal, archive_session, handle_hook, register, run_archive_worker,
-    unregister, wait_for_hook_result,
+    run_recovery, unregister, wait_for_hook_result,
 };
 
 #[derive(Debug, Parser)]
@@ -95,7 +95,9 @@ enum Command {
     #[command(hide = true)]
     HookWorker {
         #[arg(long)]
-        job: PathBuf,
+        state_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
     },
 }
 
@@ -116,6 +118,16 @@ enum HookCommand {
         session_id: String,
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
+    },
+    Recover {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long, default_value_t = 1_800_000)]
+        stale_after_ms: u64,
+        #[arg(long)]
+        force_retry: bool,
+        #[arg(long)]
+        rebuild_state: bool,
     },
 }
 
@@ -262,8 +274,11 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             }
             Ok(Outcome::Hook)
         }
-        Command::HookWorker { job } => {
-            let _ = run_archive_worker(&job)?;
+        Command::HookWorker {
+            state_dir,
+            session_id,
+        } => {
+            let _ = run_archive_worker(&state_dir, &session_id)?;
             Ok(Outcome::Worker)
         }
         Command::Hook(HookCommand::Wait {
@@ -275,6 +290,20 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             &session_id,
             Duration::from_millis(timeout_ms),
         )?)),
+        Command::Hook(HookCommand::Recover {
+            state_dir,
+            stale_after_ms,
+            force_retry,
+            rebuild_state,
+        }) => {
+            run_recovery(
+                &state_dir,
+                Duration::from_millis(stale_after_ms),
+                force_retry,
+                rebuild_state,
+            )?;
+            Ok(Outcome::Worker)
+        }
     }
 }
 

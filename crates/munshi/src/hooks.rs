@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,15 +9,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-use crate::archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, archive_session};
-use crate::registration::{
-    RegistrationError, atomic_json_replace, create_owned_lock, durable_remove, ensure_directory,
-    load_stored_config, validate_regular_owned_file,
+use crate::project::{ProjectIdentityError, inspect_project};
+use crate::registration::{RegistrationError, load_stored_config};
+use crate::render::{
+    ArchiveMetadata, RenderError, archive_path, atomic_replace, content_hash,
+    parse_archive_markdown, render_revision_markdown,
 };
-use crate::source::SessionReference;
+use crate::source::{
+    PreviousSource, SessionReference, SourceError, TranscriptLoadMode, load_session_update,
+    resolve_session_reference, validate_transcript_envelope,
+};
+use crate::state::{
+    Claim, CompletionReason, PersistedArchive, PlannedArchive, StateError, StateStore, WaitState,
+    migrate_legacy_state, now_ms, try_acquire_session_lock,
+};
+use crate::summary::{
+    SummarizerConfig, SummaryError, build_revision_summary_input, build_summary_input, run_summary,
+};
 
 const MAX_HOOK_PAYLOAD_BYTES: u64 = 64 * 1024;
+const DEFAULT_RECOVERY_STALE_MS: u64 = 30 * 60 * 1_000;
+const RECOVERY_SCAN_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -40,6 +55,30 @@ pub struct HookFailure {
     pub cause_code: Option<String>,
     pub session_id: Option<String>,
     pub recorded_at_unix_ms: u128,
+}
+
+#[derive(Debug, Error)]
+pub enum HookWorkerError {
+    #[error(transparent)]
+    State(#[from] StateError),
+    #[error("archive persisted but final state commit failed")]
+    PostPersist(#[source] StateError),
+    #[error("archive replacement reached its target but durability confirmation failed")]
+    PostPersistWrite(#[source] RenderError),
+    #[error(transparent)]
+    Registration(#[from] RegistrationError),
+    #[error(transparent)]
+    Source(#[from] SourceError),
+    #[error(transparent)]
+    Project(#[from] ProjectIdentityError),
+    #[error(transparent)]
+    Summary(#[from] SummaryError),
+    #[error(transparent)]
+    Render(#[from] RenderError),
+    #[error("hook worker I/O failed")]
+    Io(#[from] io::Error),
+    #[error("hook worker JSON failed")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Deserialize)]
@@ -67,27 +106,6 @@ struct SessionEndPayload {
     error: Option<IgnoredAny>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SessionMetadata {
-    version: u32,
-    session_id: String,
-    transcript_path: String,
-    origin_cwd: String,
-    agent_stop_timestamp: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArchiveJob {
-    version: u32,
-    session_id: String,
-    transcript_path: String,
-    origin_cwd: String,
-    agent_stop_timestamp: u64,
-    session_end_timestamp: u64,
-}
-
 pub fn handle_hook(event: HookEvent, state_directory: &Path, input: impl Read) {
     let result = match event {
         HookEvent::AgentStop => handle_agent_stop(state_directory, input),
@@ -96,125 +114,180 @@ pub fn handle_hook(event: HookEvent, state_directory: &Path, input: impl Read) {
     if let Err(failure) = result {
         record_failure(state_directory, failure);
     }
+    let _ = spawn_recovery_sweep(state_directory);
 }
 
-pub fn run_archive_worker(job_path: &Path) -> Result<HookResult, RegistrationError> {
-    validate_regular_owned_file(job_path)?;
-    let job: ArchiveJob =
-        serde_json::from_slice(&fs::read(job_path).map_err(RegistrationError::Io)?)
-            .map_err(RegistrationError::Json)?;
-    validate_session_id(&job.session_id)?;
-    if job_path.file_name().and_then(|name| name.to_str())
-        != Some(&format!("{}.json", job.session_id))
-    {
-        return Err(RegistrationError::MalformedOwnedFile);
-    }
-    let state_directory = job_path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| RegistrationError::UnsafePath(job_path.to_path_buf()))?;
-    let lock_path = worker_lock_path(state_directory, &job.session_id);
-    let (result, archive_failure) = match run_archive_worker_inner(state_directory, &job) {
-        Ok(result) => (result, None),
-        Err(archive_failure) => (
-            HookResult::Failed {
-                code: archive_failure.code.clone(),
-            },
-            Some(archive_failure),
-        ),
-    };
-    finalize_worker(
-        &job.session_id,
-        result,
-        archive_failure,
-        || durable_remove(job_path),
-        || durable_remove(&lock_path),
-        |result| atomic_json_replace(&result_path(state_directory, &job.session_id), result),
-        |diagnostic| record_failure(state_directory, diagnostic),
-    )
-}
-
-fn finalize_worker<RemoveJob, RemoveLock, Publish, Record>(
+pub fn run_archive_worker(
+    state_directory: &Path,
     session_id: &str,
-    result: HookResult,
-    archive_failure: Option<HookFailure>,
-    mut remove_job: RemoveJob,
-    mut remove_lock: RemoveLock,
-    mut publish: Publish,
-    mut record: Record,
-) -> Result<HookResult, RegistrationError>
-where
-    RemoveJob: FnMut() -> Result<(), RegistrationError>,
-    RemoveLock: FnMut() -> Result<(), RegistrationError>,
-    Publish: FnMut(&HookResult) -> Result<(), RegistrationError>,
-    Record: FnMut(HookFailure),
-{
-    if let Some(archive_failure) = archive_failure.as_ref() {
-        record(archive_failure.clone());
+) -> Result<HookResult, HookWorkerError> {
+    let result = run_archive_worker_inner(state_directory, session_id);
+    if let Err(error) = &result {
+        if let Ok(mut state) = StateStore::open(state_directory) {
+            let category = worker_error_code(error);
+            let _ = state.clear_worker_reservation(session_id);
+            let _ = state.record_diagnostic("archive-worker", category, None, Some(session_id));
+        }
+    }
+    result
+}
+
+fn run_archive_worker_inner(
+    state_directory: &Path,
+    session_id: &str,
+) -> Result<HookResult, HookWorkerError> {
+    validate_session_id(session_id).map_err(|_| StateError::InvalidState)?;
+    let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
+        return Ok(HookResult::Failed {
+            code: "worker-busy".to_owned(),
+        });
+    };
+
+    let stored = load_stored_config(state_directory)?;
+    let output_directory = PathBuf::from(&stored.output_directory);
+    let mut state = StateStore::open(state_directory)?;
+    let session = state.get_session(session_id)?;
+    if session
+        .as_ref()
+        .is_none_or(|session| session.current_revision == 0)
+    {
+        let _ = state.hydrate_session_from_archives(&output_directory, session_id)?;
+    }
+    if let Some(result) = reconcile_persisted_attempt(&mut state, &output_directory, session_id)? {
+        return Ok(result);
+    }
+    if state
+        .get_session(session_id)?
+        .is_some_and(|session| session.lifecycle_state == "processing")
+    {
+        state.abandon_processing(session_id, "worker-interrupted")?;
     }
 
-    let job_error = remove_job().err();
-    let lock_error = remove_lock().err();
-    let publish_error = publish(&result).err();
-
-    if job_error.is_some() || lock_error.is_some() || publish_error.is_some() {
-        let mut diagnostic = failure(
-            "archive-worker",
-            finalization_failure_code(
-                publish_error.is_some(),
-                job_error.is_some(),
-                lock_error.is_some(),
-            ),
-            Some(session_id.to_owned()),
-        );
-        diagnostic.cause_code = archive_failure.map(|failure| failure.code);
-        record(diagnostic);
-    }
-
-    if let Some(error) = publish_error {
-        Err(error)
-    } else if let Some(error) = job_error {
-        Err(error)
-    } else if let Some(error) = lock_error {
-        Err(error)
-    } else {
-        Ok(result)
+    let lease = Duration::from_millis(stored.limits.timeout_ms.saturating_add(60_000));
+    let Some(claim) = state.claim_session(session_id, lease, false)? else {
+        return current_result(&state, session_id);
+    };
+    match process_claim(&mut state, state_directory, &stored, &claim) {
+        Ok(result) => Ok(result),
+        Err(error @ (HookWorkerError::PostPersist(_) | HookWorkerError::PostPersistWrite(_))) => {
+            Err(error)
+        }
+        Err(error) => {
+            let category = worker_error_code(&error);
+            let retryable = worker_error_retryable(&error);
+            state.fail_attempt(&claim, category, retryable)?;
+            Ok(HookResult::Failed {
+                code: category.to_owned(),
+            })
+        }
     }
 }
 
-fn finalization_failure_code(
-    publish_failed: bool,
-    job_failed: bool,
-    lock_failed: bool,
-) -> &'static str {
-    match (publish_failed, job_failed, lock_failed) {
-        (false, true, false) => "job-remove-failed",
-        (false, false, true) => "worker-lock-remove-failed",
-        (false, true, true) => "job-and-worker-lock-remove-failed",
-        (true, false, false) => "result-write-failed",
-        (true, true, false) => "result-write-and-job-remove-failed",
-        (true, false, true) => "result-write-and-worker-lock-remove-failed",
-        (true, true, true) => "result-write-job-and-worker-lock-remove-failed",
-        (false, false, false) => unreachable!("called only when finalization failed"),
+pub fn run_recovery(
+    state_directory: &Path,
+    stale_after: Duration,
+    force_retry: bool,
+    rebuild: bool,
+) -> Result<(), HookWorkerError> {
+    let Some(_recovery_lock) = try_acquire_session_lock(state_directory, "_recovery")? else {
+        return Err(StateError::LockBusy.into());
+    };
+    let stored = load_stored_config(state_directory)?;
+    if rebuild {
+        crate::state::rebuild_database(state_directory, Path::new(&stored.output_directory))?;
     }
+    let mut state = StateStore::open(state_directory)?;
+    migrate_legacy_state(
+        &mut state,
+        state_directory,
+        Duration::from_millis(stored.limits.timeout_ms).saturating_add(Duration::from_secs(60)),
+    )?;
+    let cutoff = now_ms().saturating_sub(stale_after.as_millis().try_into().unwrap_or(i64::MAX));
+    let mut reserved_sessions = Vec::new();
+    for session in state.unresolved_sessions()? {
+        let Ok(path) = resolve_fallback_transcript(state_directory, &session.session_id) else {
+            continue;
+        };
+        let metadata = fs::metadata(&path)?;
+        let evidence = format!(
+            "{}:{}:{}",
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        );
+        if state.attach_recovered_transcript(&session.session_id, &path, &evidence)? {
+            reserved_sessions.push(session.session_id);
+        }
+    }
+    for session in state.stale_known_sessions(cutoff)? {
+        let Some(path) = session.transcript_path.as_deref() else {
+            continue;
+        };
+        let Some(origin) = session.origin_cwd.as_deref() else {
+            continue;
+        };
+        if !source_is_stale_and_supported(path, cutoff, stored.limits.max_source_bytes) {
+            continue;
+        }
+        let metadata = fs::metadata(path)?;
+        let evidence = format!(
+            "{}:{}:{}",
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        );
+        if state.mark_recovery_interrupted(&session.session_id, path, Some(origin), &evidence)? {
+            reserved_sessions.push(session.session_id);
+        }
+    }
+    discover_unknown_sessions(
+        &mut state,
+        state_directory,
+        cutoff,
+        stored.limits.max_source_bytes,
+    )?;
+    reserved_sessions.extend(state.reserve_eligible_workers(force_retry, RECOVERY_SCAN_LIMIT)?);
+    reserved_sessions.sort();
+    reserved_sessions.dedup();
+    for session_id in reserved_sessions {
+        if spawn_worker(state_directory, &session_id).is_err() {
+            let _ = state.clear_worker_reservation(&session_id);
+            let _ =
+                state.record_diagnostic("recovery", "worker-spawn-failed", None, Some(&session_id));
+        }
+    }
+    Ok(())
 }
 
 pub fn wait_for_hook_result(
     state_directory: &Path,
     session_id: &str,
     timeout: Duration,
-) -> Result<HookResult, RegistrationError> {
-    validate_session_id(session_id)?;
-    let path = result_path(state_directory, session_id);
+) -> Result<HookResult, HookWorkerError> {
+    validate_session_id(session_id).map_err(|_| StateError::InvalidState)?;
     let deadline = Instant::now() + timeout;
+    let state = StateStore::open(state_directory)?;
     loop {
-        if path.exists() {
-            validate_regular_owned_file(&path)?;
-            let bytes = fs::read(&path).map_err(RegistrationError::Io)?;
-            return serde_json::from_slice(&bytes).map_err(RegistrationError::Json);
+        let (status, relative_path, error) = state.wait_state(session_id)?;
+        match status {
+            WaitState::Archived => {
+                return Ok(HookResult::Archived {
+                    relative_path: relative_path
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                });
+            }
+            WaitState::NotArchiveWorthy => return Ok(HookResult::NotArchiveWorthy),
+            WaitState::Failed => {
+                return Ok(HookResult::Failed {
+                    code: error.unwrap_or_else(|| "archive-failed".to_owned()),
+                });
+            }
+            WaitState::Pending => {}
         }
         if Instant::now() >= deadline {
-            return Err(RegistrationError::Io(io::Error::new(
+            return Err(HookWorkerError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out waiting for hook worker",
             )));
@@ -223,16 +296,15 @@ pub fn wait_for_hook_result(
     }
 }
 
-pub fn read_last_failure(state_directory: &Path) -> Result<Option<HookFailure>, RegistrationError> {
-    let path = state_directory.join("failures/last.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    validate_regular_owned_file(&path)?;
-    let bytes = fs::read(path).map_err(RegistrationError::Io)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(RegistrationError::Json)
+pub fn read_last_failure(state_directory: &Path) -> Result<Option<HookFailure>, HookWorkerError> {
+    let state = StateStore::open(state_directory)?;
+    Ok(state.latest_diagnostic()?.map(|diagnostic| HookFailure {
+        operation: diagnostic.operation,
+        code: diagnostic.category,
+        cause_code: diagnostic.cause_category,
+        session_id: diagnostic.session_id,
+        recorded_at_unix_ms: diagnostic.recorded_at_ms.try_into().unwrap_or_default(),
+    }))
 }
 
 fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), HookFailure> {
@@ -253,64 +325,20 @@ fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), Hoo
             Some(payload.session_id),
         ));
     }
-    durable_remove(&result_path(state_directory, &payload.session_id)).map_err(|_| {
+    let mut state = StateStore::open(state_directory).map_err(|_| {
         failure(
             "agent-stop",
-            "state-remove-failed",
+            "state-open-failed",
             Some(payload.session_id.clone()),
         )
     })?;
-    let directory = ensure_directory(&state_directory.join("sessions").join(&payload.session_id))
-        .map_err(|_| {
-        failure(
-            "agent-stop",
-            "state-directory-failed",
-            Some(payload.session_id.clone()),
+    state
+        .ingest_agent_stop(
+            &payload.session_id,
+            payload.timestamp.try_into().unwrap_or(i64::MAX),
+            Path::new(&payload.cwd),
+            Path::new(&payload.transcript_path),
         )
-    })?;
-    let metadata_path = directory.join("latest.json");
-    let origin_cwd = if metadata_path.exists() {
-        validate_regular_owned_file(&metadata_path).map_err(|_| {
-            failure(
-                "agent-stop",
-                "state-invalid",
-                Some(payload.session_id.clone()),
-            )
-        })?;
-        let previous: SessionMetadata =
-            serde_json::from_slice(&fs::read(&metadata_path).map_err(|_| {
-                failure(
-                    "agent-stop",
-                    "state-read-failed",
-                    Some(payload.session_id.clone()),
-                )
-            })?)
-            .map_err(|_| {
-                failure(
-                    "agent-stop",
-                    "state-malformed",
-                    Some(payload.session_id.clone()),
-                )
-            })?;
-        if previous.version != 1 || previous.session_id != payload.session_id {
-            return Err(failure(
-                "agent-stop",
-                "state-mismatch",
-                Some(payload.session_id),
-            ));
-        }
-        previous.origin_cwd
-    } else {
-        payload.cwd
-    };
-    let metadata = SessionMetadata {
-        version: 1,
-        session_id: payload.session_id.clone(),
-        transcript_path: payload.transcript_path,
-        origin_cwd,
-        agent_stop_timestamp: payload.timestamp,
-    };
-    atomic_json_replace(&metadata_path, &metadata)
         .map_err(|_| failure("agent-stop", "state-write-failed", Some(payload.session_id)))
 }
 
@@ -331,89 +359,500 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
         ));
     }
     let _ = payload.error;
-    if payload.reason != "complete" {
-        return Ok(());
-    }
-
-    let metadata_path = session_metadata_path(state_directory, &payload.session_id);
-    if !metadata_path.exists() {
-        return Ok(());
-    }
-    validate_regular_owned_file(&metadata_path).map_err(|_| {
+    let completion = match payload.reason.as_str() {
+        "complete" => CompletionReason::Complete,
+        "user_exit" => CompletionReason::Interrupted,
+        _ => CompletionReason::Unknown,
+    };
+    let mut state = StateStore::open(state_directory).map_err(|_| {
         failure(
             "session-end",
-            "session-state-invalid",
+            "state-open-failed",
             Some(payload.session_id.clone()),
         )
     })?;
-    let metadata: SessionMetadata =
-        serde_json::from_slice(&fs::read(&metadata_path).map_err(|_| {
-            failure(
-                "session-end",
-                "session-state-read-failed",
-                Some(payload.session_id.clone()),
-            )
-        })?)
+    let needs_fallback = state
+        .get_session(&payload.session_id)
+        .ok()
+        .flatten()
+        .is_none_or(|session| session.transcript_path.is_none());
+    let fallback = needs_fallback
+        .then(|| resolve_fallback_transcript(state_directory, &payload.session_id))
+        .transpose()
+        .ok()
+        .flatten();
+    let reserved = state
+        .ingest_session_end(
+            &payload.session_id,
+            payload.timestamp.try_into().unwrap_or(i64::MAX),
+            Path::new(&payload.cwd),
+            &payload.reason,
+            completion,
+            fallback.as_deref(),
+        )
         .map_err(|_| {
             failure(
                 "session-end",
-                "session-state-malformed",
+                "state-write-failed",
                 Some(payload.session_id.clone()),
             )
         })?;
-    if metadata.version != 1 || metadata.session_id != payload.session_id {
+    if reserved && spawn_worker(state_directory, &payload.session_id).is_err() {
+        let _ = state.clear_worker_reservation(&payload.session_id);
         return Err(failure(
             "session-end",
-            "session-state-mismatch",
+            "worker-spawn-failed",
             Some(payload.session_id),
         ));
     }
-    let job = ArchiveJob {
-        version: 1,
-        session_id: metadata.session_id,
-        transcript_path: metadata.transcript_path,
-        origin_cwd: metadata.origin_cwd,
-        agent_stop_timestamp: metadata.agent_stop_timestamp,
-        session_end_timestamp: payload.timestamp,
-    };
-    let job_path = pending_path(state_directory, &job.session_id);
-    atomic_json_replace(&job_path, &job).map_err(|_| {
-        failure(
-            "session-end",
-            "job-write-failed",
-            Some(job.session_id.clone()),
-        )
+    Ok(())
+}
+
+fn process_claim(
+    state: &mut StateStore,
+    state_directory: &Path,
+    stored: &crate::registration::StoredConfig,
+    claim: &Claim,
+) -> Result<HookResult, HookWorkerError> {
+    let transcript_path = claim
+        .session
+        .transcript_path
+        .clone()
+        .or_else(|| resolve_fallback_transcript(state_directory, &claim.session.session_id).ok())
+        .ok_or(SourceError::TranscriptNotFound)?;
+    let resolved = resolve_session_reference(&SessionReference {
+        session_id: Some(claim.session.session_id.clone()),
+        events_path: Some(transcript_path),
+        copilot_home: None,
     })?;
-    let lock_path = worker_lock_path(state_directory, &job.session_id);
-    let Some(lock) = create_owned_lock(&lock_path).map_err(|_| {
-        failure(
-            "session-end",
-            "worker-lock-failed",
-            Some(job.session_id.clone()),
-        )
-    })?
-    else {
-        return Ok(());
-    };
-    drop(lock);
-    if result_path(state_directory, &job.session_id).exists() {
-        let _ = durable_remove(&job_path);
-        let _ = durable_remove(&lock_path);
-        return Ok(());
+    let output_directory = PathBuf::from(&stored.output_directory);
+    let prior = load_prior_archive(&output_directory, claim)?;
+    let previous_source = prior.as_ref().map(|(_, archive)| {
+        let cursor = archive.cursor.as_ref();
+        PreviousSource {
+            normalizer_version: cursor.map_or(0, |cursor| cursor.normalizer_version),
+            record_count: cursor.map_or(archive.source_cursor, |cursor| cursor.record_count),
+            byte_offset: cursor.map_or(0, |cursor| cursor.byte_offset),
+            prefix_hash: cursor
+                .map(|cursor| cursor.prefix_hash.clone())
+                .unwrap_or_default(),
+            source_hash: archive.source_hash.clone(),
+            source_bytes: cursor.map_or(0, |cursor| cursor.source_bytes),
+            started_at: archive.started_at.clone(),
+            updated_at: archive.updated_at.clone(),
+            user_requests: claim
+                .session
+                .previous_source
+                .as_ref()
+                .map_or(0, |source| source.user_requests),
+            assistant_messages: claim
+                .session
+                .previous_source
+                .as_ref()
+                .map_or(0, |source| source.assistant_messages),
+            tool_activities: claim
+                .session
+                .previous_source
+                .as_ref()
+                .map_or(0, |source| source.tool_activities),
+        }
+    });
+    let update = load_session_update(
+        &resolved,
+        stored.limits.max_source_bytes,
+        previous_source.as_ref(),
+    )?;
+    if update.mode == TranscriptLoadMode::Unchanged {
+        state.complete_no_change(claim)?;
+        return Ok(HookResult::Archived {
+            relative_path: claim
+                .session
+                .markdown_relative_path
+                .clone()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        });
+    }
+    if claim.session.current_revision == 0 && !update.session.is_archive_worthy() {
+        state.complete_not_archive_worthy(claim)?;
+        return Ok(HookResult::NotArchiveWorthy);
+    }
+    if claim.session.current_revision > 0
+        && update.mode == TranscriptLoadMode::Full
+        && !update.session.is_archive_worthy()
+    {
+        return Err(SourceError::UnsupportedEnvelope.into());
     }
 
-    let executable = std::env::current_exe().map_err(|_| {
-        failure(
-            "session-end",
-            "current-executable-failed",
-            Some(job.session_id.clone()),
+    let project = match claim.session.project.clone() {
+        Some(project) if !project.component.is_empty() => project,
+        _ => inspect_project(
+            claim
+                .session
+                .origin_cwd
+                .as_deref()
+                .ok_or(StateError::InvalidState)?,
+        )?,
+    };
+    let prior_summary = prior.as_ref().map(|(_, archive)| &archive.summary);
+    let cursor_only = claim.session.current_revision > 0
+        && update.mode == TranscriptLoadMode::Delta
+        && update.session.events.is_empty();
+    let summary = if cursor_only {
+        prior_summary.cloned().ok_or(StateError::InvalidState)?
+    } else {
+        let input = if update.mode == TranscriptLoadMode::Delta {
+            build_revision_summary_input(
+                &update.session,
+                &project,
+                prior_summary.ok_or(StateError::InvalidState)?,
+                stored.limits.max_input_bytes,
+            )?
+        } else {
+            build_summary_input(&update.session, &project, stored.limits.max_input_bytes)?
+        };
+        run_summary(
+            &SummarizerConfig {
+                binary: PathBuf::from(&stored.summarizer.executable),
+                args: stored.summarizer.args.iter().map(Into::into).collect(),
+                timeout: Duration::from_millis(stored.limits.timeout_ms),
+                stdout_limit: stored.limits.max_stdout_bytes,
+                stderr_limit: stored.limits.max_stderr_bytes,
+            },
+            input,
+        )?
+    };
+    update.snapshot.verify_unchanged()?;
+
+    let revision = if cursor_only {
+        claim.session.current_revision
+    } else {
+        claim.session.current_revision.saturating_add(1)
+    };
+    let completion = claim
+        .session
+        .completion_reason
+        .as_deref()
+        .unwrap_or("unknown");
+    let fallback_reason = update.fallback_reason.map(|reason| reason.code());
+    let metadata = ArchiveMetadata {
+        session: &update.session,
+        project: &project,
+    };
+    let markdown =
+        render_revision_markdown(&metadata, &summary, revision, completion, fallback_reason);
+    let output = if let Some(relative) = claim.session.markdown_relative_path.as_ref() {
+        validate_relative_archive_path(relative)?;
+        output_directory.join(relative)
+    } else {
+        archive_path(&output_directory, &metadata)
+    };
+    let relative_path = output
+        .strip_prefix(&output_directory)
+        .map_err(|_| StateError::InvalidState)?
+        .to_path_buf();
+    let markdown_hash = content_hash(markdown.as_bytes());
+    let plan = PlannedArchive {
+        revision,
+        record_count: update.session.source_cursor,
+        byte_offset: update.session.source_byte_cursor,
+        prefix_hash: update.session.source_prefix_hash.clone(),
+        source_hash: update.session.source_hash.clone(),
+        source_bytes: update.session.source_bytes,
+        markdown_relative_path: relative_path.clone(),
+        markdown_hash: markdown_hash.clone(),
+        completion_reason: completion.to_owned(),
+        fallback_reason: fallback_reason.map(ToOwned::to_owned),
+    };
+    state.store_plan(claim, &plan)?;
+    if let Err(error) = atomic_replace(&output, markdown.as_bytes()) {
+        if fs::read(&output)
+            .ok()
+            .is_some_and(|bytes| content_hash(&bytes) == markdown_hash)
+        {
+            return Err(HookWorkerError::PostPersistWrite(error));
+        }
+        return Err(error.into());
+    }
+    let summary_json = serde_json::to_vec(&summary)?;
+    state
+        .complete_attempt(
+            claim,
+            &PersistedArchive {
+                revision,
+                summary,
+                summary_hash: content_hash(&summary_json),
+                markdown_relative_path: relative_path.clone(),
+                markdown_hash,
+                project,
+                normalizer_version: crate::source::NORMALIZER_VERSION,
+                record_count: update.session.source_cursor,
+                byte_offset: update.session.source_byte_cursor,
+                prefix_hash: update.session.source_prefix_hash,
+                source_hash: update.session.source_hash,
+                source_bytes: update.session.source_bytes,
+                started_at: update.session.started_at,
+                updated_at: update.session.updated_at,
+                user_requests: update.session.user_requests,
+                assistant_messages: update.session.assistant_messages,
+                tool_activities: update.session.tool_activities,
+                completion_reason: completion.to_owned(),
+                fallback_reason: fallback_reason.map(ToOwned::to_owned),
+            },
+            false,
         )
+        .map_err(HookWorkerError::PostPersist)?;
+    Ok(HookResult::Archived {
+        relative_path: relative_path.to_string_lossy().into_owned(),
+    })
+}
+
+fn reconcile_persisted_attempt(
+    state: &mut StateStore,
+    output_directory: &Path,
+    session_id: &str,
+) -> Result<Option<HookResult>, HookWorkerError> {
+    let Some(plan) = state.pending_plan(session_id)? else {
+        return Ok(None);
+    };
+    validate_relative_archive_path(&plan.plan.markdown_relative_path)?;
+    let output = output_directory.join(&plan.plan.markdown_relative_path);
+    let bytes = match fs::read(&output) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    if content_hash(&bytes) != plan.plan.markdown_hash {
+        return Ok(None);
+    }
+    fs::File::open(&output)?.sync_all()?;
+    fs::File::open(output.parent().ok_or(StateError::InvalidState)?)?.sync_all()?;
+    let markdown = std::str::from_utf8(&bytes)
+        .map_err(|_| RenderError::InvalidArchive)
+        .and_then(parse_archive_markdown)?;
+    let Some(cursor) = markdown.cursor.as_ref() else {
+        return Ok(None);
+    };
+    if markdown.session_id != session_id
+        || markdown.summary_revision != plan.plan.revision
+        || cursor.record_count != plan.plan.record_count
+        || cursor.byte_offset != plan.plan.byte_offset
+        || cursor.prefix_hash != plan.plan.prefix_hash
+        || cursor.source_hash != plan.plan.source_hash
+    {
+        return Ok(None);
+    }
+    let session = state
+        .get_session(session_id)?
+        .ok_or(StateError::InvalidState)?;
+    let claim = Claim {
+        attempt_id: plan.attempt_id,
+        token: plan.token,
+        state_generation: plan.state_generation,
+        retry_state: plan.retry_state,
+        session,
+    };
+    let summary_json = serde_json::to_vec(&markdown.summary)?;
+    state.complete_attempt(
+        &claim,
+        &PersistedArchive {
+            revision: markdown.summary_revision,
+            summary: markdown.summary,
+            summary_hash: content_hash(&summary_json),
+            markdown_relative_path: plan.plan.markdown_relative_path.clone(),
+            markdown_hash: plan.plan.markdown_hash.clone(),
+            project: markdown.project,
+            normalizer_version: cursor.normalizer_version,
+            record_count: cursor.record_count,
+            byte_offset: cursor.byte_offset,
+            prefix_hash: cursor.prefix_hash.clone(),
+            source_hash: cursor.source_hash.clone(),
+            source_bytes: cursor.source_bytes,
+            started_at: markdown.started_at,
+            updated_at: markdown.updated_at,
+            user_requests: claim
+                .session
+                .previous_source
+                .as_ref()
+                .map_or(0, |source| source.user_requests),
+            assistant_messages: claim
+                .session
+                .previous_source
+                .as_ref()
+                .map_or(0, |source| source.assistant_messages),
+            tool_activities: claim
+                .session
+                .previous_source
+                .as_ref()
+                .map_or(0, |source| source.tool_activities),
+            completion_reason: markdown.completion_reason,
+            fallback_reason: markdown.cursor_fallback_reason,
+        },
+        true,
+    )?;
+    Ok(Some(HookResult::Archived {
+        relative_path: plan
+            .plan
+            .markdown_relative_path
+            .to_string_lossy()
+            .into_owned(),
+    }))
+}
+
+fn load_prior_archive(
+    output_directory: &Path,
+    claim: &Claim,
+) -> Result<Option<(PathBuf, crate::render::ArchivedMarkdown)>, HookWorkerError> {
+    if claim.session.current_revision == 0 {
+        return Ok(None);
+    }
+    let relative = claim
+        .session
+        .markdown_relative_path
+        .clone()
+        .ok_or(StateError::InvalidState)?;
+    validate_relative_archive_path(&relative)?;
+    let bytes = fs::read(output_directory.join(&relative))?;
+    if claim
+        .session
+        .markdown_hash
+        .as_deref()
+        .is_some_and(|hash| hash != content_hash(&bytes))
+    {
+        return Err(StateError::InvalidState.into());
+    }
+    let markdown = std::str::from_utf8(&bytes)
+        .map_err(|_| RenderError::InvalidArchive)
+        .and_then(parse_archive_markdown)?;
+    if markdown.session_id != claim.session.session_id
+        || markdown.summary_revision != claim.session.current_revision
+    {
+        return Err(StateError::InvalidState.into());
+    }
+    Ok(Some((relative, markdown)))
+}
+
+fn current_result(state: &StateStore, session_id: &str) -> Result<HookResult, HookWorkerError> {
+    let (wait, path, error) = state.wait_state(session_id)?;
+    Ok(match wait {
+        WaitState::Archived => HookResult::Archived {
+            relative_path: path.unwrap_or_default().to_string_lossy().into_owned(),
+        },
+        WaitState::NotArchiveWorthy => HookResult::NotArchiveWorthy,
+        WaitState::Failed | WaitState::Pending => HookResult::Failed {
+            code: error.unwrap_or_else(|| "work-not-claimable".to_owned()),
+        },
+    })
+}
+
+fn resolve_fallback_transcript(
+    state_directory: &Path,
+    session_id: &str,
+) -> Result<PathBuf, SourceError> {
+    let copilot_home = state_directory
+        .parent()
+        .ok_or(SourceError::MissingCopilotHome)?
+        .to_path_buf();
+    let resolved = resolve_session_reference(&SessionReference {
+        session_id: Some(session_id.to_owned()),
+        events_path: None,
+        copilot_home: Some(copilot_home),
     })?;
-    let mut command = Command::new(executable);
+    validate_transcript_envelope(&resolved.events_path, 8 * 1024 * 1024)?;
+    Ok(resolved.events_path)
+}
+
+fn discover_unknown_sessions(
+    state: &mut StateStore,
+    state_directory: &Path,
+    cutoff_ms: i64,
+    max_source_bytes: usize,
+) -> Result<(), HookWorkerError> {
+    let Some(copilot_home) = state_directory.parent() else {
+        return Ok(());
+    };
+    let session_state = copilot_home.join("session-state");
+    if !session_state.is_dir() {
+        return Ok(());
+    }
+    let mut inspected = 0;
+    for entry in fs::read_dir(session_state)? {
+        if inspected >= RECOVERY_SCAN_LIMIT {
+            break;
+        }
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() || !entry.metadata()?.is_dir() {
+            continue;
+        }
+        let Some(session_id) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if validate_session_id(&session_id).is_err() || state.get_session(&session_id)?.is_some() {
+            continue;
+        }
+        let resolved = match resolve_session_reference(&SessionReference {
+            session_id: Some(session_id.clone()),
+            events_path: None,
+            copilot_home: Some(copilot_home.to_path_buf()),
+        }) {
+            Ok(resolved) => resolved,
+            Err(_) => continue,
+        };
+        if !source_is_stale_and_supported(&resolved.events_path, cutoff_ms, max_source_bytes) {
+            continue;
+        }
+        let metadata = fs::metadata(&resolved.events_path)?;
+        let evidence = format!(
+            "{}:{}:{}",
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        );
+        let _ =
+            state.mark_recovery_interrupted(&session_id, &resolved.events_path, None, &evidence)?;
+        inspected += 1;
+    }
+    Ok(())
+}
+
+fn source_is_stale_and_supported(path: &Path, cutoff_ms: i64, max_source_bytes: usize) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let modified_ms = metadata
+        .mtime()
+        .saturating_mul(1_000)
+        .saturating_add(metadata.mtime_nsec() / 1_000_000);
+    modified_ms <= cutoff_ms && validate_transcript_envelope(path, max_source_bytes).is_ok()
+}
+
+fn spawn_worker(state_directory: &Path, session_id: &str) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    spawn_detached(
+        Command::new(executable)
+            .arg("hook-worker")
+            .arg("--state-dir")
+            .arg(state_directory)
+            .arg("--session-id")
+            .arg(session_id),
+    )
+}
+
+fn spawn_recovery_sweep(state_directory: &Path) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    spawn_detached(
+        Command::new(executable)
+            .arg("hook")
+            .arg("recover")
+            .arg("--state-dir")
+            .arg(state_directory)
+            .arg("--stale-after-ms")
+            .arg(DEFAULT_RECOVERY_STALE_MS.to_string()),
+    )
+}
+
+fn spawn_detached(command: &mut Command) -> io::Result<()> {
     command
-        .arg("hook-worker")
-        .arg("--job")
-        .arg(&job_path)
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -426,68 +865,7 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
             Ok(())
         });
     }
-    if command.spawn().is_err() {
-        let _ = durable_remove(&lock_path);
-        return Err(failure(
-            "session-end",
-            "worker-spawn-failed",
-            Some(job.session_id),
-        ));
-    }
-    Ok(())
-}
-
-fn run_archive_worker_inner(
-    state_directory: &Path,
-    job: &ArchiveJob,
-) -> Result<HookResult, HookFailure> {
-    if job.version != 1 {
-        return Err(failure(
-            "archive-worker",
-            "job-version-unsupported",
-            Some(job.session_id.clone()),
-        ));
-    }
-    validate_absolute_string(&job.transcript_path)
-        .map_err(|code| failure("archive-worker", code, Some(job.session_id.clone())))?;
-    validate_absolute_string(&job.origin_cwd)
-        .map_err(|code| failure("archive-worker", code, Some(job.session_id.clone())))?;
-    let stored = load_stored_config(state_directory).map_err(|_| {
-        failure(
-            "archive-worker",
-            "config-invalid",
-            Some(job.session_id.clone()),
-        )
-    })?;
-    let outcome = archive_session(&ArchiveConfig {
-        reference: SessionReference {
-            session_id: Some(job.session_id.clone()),
-            events_path: Some(PathBuf::from(&job.transcript_path)),
-            copilot_home: None,
-        },
-        project_directory: PathBuf::from(&job.origin_cwd),
-        output_directory: PathBuf::from(stored.output_directory),
-        summarizer_binary: PathBuf::from(stored.summarizer.executable),
-        summarizer_args: stored.summarizer.args.into_iter().map(Into::into).collect(),
-        timeout: Duration::from_millis(stored.limits.timeout_ms),
-        max_source_bytes: stored.limits.max_source_bytes,
-        max_input_bytes: stored.limits.max_input_bytes,
-        max_stdout_bytes: stored.limits.max_stdout_bytes,
-        max_stderr_bytes: stored.limits.max_stderr_bytes,
-    })
-    .map_err(|error| {
-        failure(
-            "archive-worker",
-            archive_error_code(&error),
-            Some(job.session_id.clone()),
-        )
-    })?;
-    Ok(match outcome {
-        ArchiveOutcome::Archived { relative_path, .. } => HookResult::Archived {
-            relative_path: relative_path.to_string_lossy().into_owned(),
-        },
-        ArchiveOutcome::NotArchiveWorthy { .. } => HookResult::NotArchiveWorthy,
-    })
+    command.spawn().map(|_| ())
 }
 
 fn read_one_json<T: for<'de> Deserialize<'de>>(input: impl Read) -> Result<T, &'static str> {
@@ -541,29 +919,17 @@ fn validate_session_id(value: &str) -> Result<(), RegistrationError> {
     }
 }
 
-fn session_metadata_path(state_directory: &Path, session_id: &str) -> PathBuf {
-    state_directory
-        .join("sessions")
-        .join(session_id)
-        .join("latest.json")
-}
-
-fn pending_path(state_directory: &Path, session_id: &str) -> PathBuf {
-    state_directory
-        .join("pending")
-        .join(format!("{session_id}.json"))
-}
-
-fn worker_lock_path(state_directory: &Path, session_id: &str) -> PathBuf {
-    state_directory
-        .join("workers")
-        .join(format!("{session_id}.lock"))
-}
-
-fn result_path(state_directory: &Path, session_id: &str) -> PathBuf {
-    state_directory
-        .join("results")
-        .join(format!("{session_id}.json"))
+fn validate_relative_archive_path(path: &Path) -> Result<(), StateError> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+    {
+        Err(StateError::InvalidState)
+    } else {
+        Ok(())
+    }
 }
 
 fn failure(operation: &str, code: &str, session_id: Option<String>) -> HookFailure {
@@ -580,193 +946,41 @@ fn failure(operation: &str, code: &str, session_id: Option<String>) -> HookFailu
 }
 
 fn record_failure(state_directory: &Path, failure: HookFailure) {
-    let _ = atomic_json_replace(&state_directory.join("failures/last.json"), &failure);
+    if let Ok(mut state) = StateStore::open(state_directory) {
+        let _ = state.record_diagnostic(
+            &failure.operation,
+            &failure.code,
+            failure.cause_code.as_deref(),
+            failure.session_id.as_deref(),
+        );
+    }
 }
 
-fn archive_error_code(error: &ArchiveError) -> &'static str {
+fn worker_error_code(error: &HookWorkerError) -> &'static str {
     match error {
-        ArchiveError::Source(_) => "source-failed",
-        ArchiveError::Project(_) => "project-failed",
-        ArchiveError::Summary(_) => "summary-failed",
-        ArchiveError::Render(_) => "archive-write-failed",
+        HookWorkerError::State(_) => "state-failed",
+        HookWorkerError::PostPersist(_) => "state-finalize-failed",
+        HookWorkerError::PostPersistWrite(_) => "archive-finalize-failed",
+        HookWorkerError::Registration(_) => "config-invalid",
+        HookWorkerError::Source(SourceError::ChangedDuringRead) => "source-changed",
+        HookWorkerError::Source(SourceError::TranscriptNotFound) => "transcript-unresolved",
+        HookWorkerError::Source(_) => "source-failed",
+        HookWorkerError::Project(_) => "project-failed",
+        HookWorkerError::Summary(_) => "summary-failed",
+        HookWorkerError::Render(_) => "archive-write-failed",
+        HookWorkerError::Io(_) => "io-failed",
+        HookWorkerError::Json(_) => "json-failed",
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::cell::{Cell, RefCell};
-
-    use super::*;
-
-    #[test]
-    fn successful_result_is_published_when_job_removal_fails() {
-        let lock_attempted = Cell::new(false);
-        let published = RefCell::new(None);
-        let diagnostics = RefCell::new(Vec::new());
-        let outcome = HookResult::Archived {
-            relative_path: "project/session.md".to_owned(),
-        };
-
-        let finalized = finalize_worker(
-            "session",
-            outcome.clone(),
-            None,
-            || Err(injected_error()),
-            || {
-                lock_attempted.set(true);
-                Ok(())
-            },
-            |result| {
-                published.replace(Some(result.clone()));
-                Ok(())
-            },
-            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
-        );
-
-        assert!(finalized.is_err());
-        assert!(lock_attempted.get());
-        assert_eq!(published.into_inner(), Some(outcome));
-        let diagnostics = diagnostics.into_inner();
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "job-remove-failed");
-    }
-
-    #[test]
-    fn successful_result_is_published_when_lock_removal_fails() {
-        let job_attempted = Cell::new(false);
-        let published = RefCell::new(None);
-        let diagnostics = RefCell::new(Vec::new());
-        let outcome = HookResult::NotArchiveWorthy;
-
-        let finalized = finalize_worker(
-            "session",
-            outcome.clone(),
-            None,
-            || {
-                job_attempted.set(true);
-                Ok(())
-            },
-            || Err(injected_error()),
-            |result| {
-                published.replace(Some(result.clone()));
-                Ok(())
-            },
-            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
-        );
-
-        assert!(finalized.is_err());
-        assert!(job_attempted.get());
-        assert_eq!(published.into_inner(), Some(outcome));
-        let diagnostics = diagnostics.into_inner();
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "worker-lock-remove-failed");
-    }
-
-    #[test]
-    fn result_write_failure_still_attempts_both_cleanups() {
-        let job_attempted = Cell::new(false);
-        let lock_attempted = Cell::new(false);
-        let publish_attempted = Cell::new(false);
-        let diagnostics = RefCell::new(Vec::new());
-
-        let finalized = finalize_worker(
-            "session",
-            HookResult::NotArchiveWorthy,
-            None,
-            || {
-                job_attempted.set(true);
-                Ok(())
-            },
-            || {
-                lock_attempted.set(true);
-                Ok(())
-            },
-            |_| {
-                publish_attempted.set(true);
-                Err(injected_error())
-            },
-            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
-        );
-
-        assert!(finalized.is_err());
-        assert!(job_attempted.get());
-        assert!(lock_attempted.get());
-        assert!(publish_attempted.get());
-        let diagnostics = diagnostics.into_inner();
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "result-write-failed");
-    }
-
-    #[test]
-    fn combined_finalization_failure_attempts_every_operation() {
-        let job_attempted = Cell::new(false);
-        let lock_attempted = Cell::new(false);
-        let publish_attempted = Cell::new(false);
-        let diagnostics = RefCell::new(Vec::new());
-
-        let finalized = finalize_worker(
-            "session",
-            HookResult::Archived {
-                relative_path: "project/session.md".to_owned(),
-            },
-            None,
-            || {
-                job_attempted.set(true);
-                Err(injected_error())
-            },
-            || {
-                lock_attempted.set(true);
-                Err(injected_error())
-            },
-            |_| {
-                publish_attempted.set(true);
-                Err(injected_error())
-            },
-            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
-        );
-
-        assert!(finalized.is_err());
-        assert!(job_attempted.get());
-        assert!(lock_attempted.get());
-        assert!(publish_attempted.get());
-        let diagnostics = diagnostics.into_inner();
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0].code,
-            "result-write-job-and-worker-lock-remove-failed"
-        );
-    }
-
-    #[test]
-    fn cleanup_failure_preserves_original_archive_failure_cause() {
-        let diagnostics = RefCell::new(Vec::new());
-        let archive_failure = failure(
-            "archive-worker",
-            "summary-failed",
-            Some("session".to_owned()),
-        );
-
-        let finalized = finalize_worker(
-            "session",
-            HookResult::Failed {
-                code: "summary-failed".to_owned(),
-            },
-            Some(archive_failure),
-            || Err(injected_error()),
-            || Ok(()),
-            |_| Ok(()),
-            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
-        );
-
-        assert!(finalized.is_err());
-        let diagnostics = diagnostics.into_inner();
-        assert_eq!(diagnostics.len(), 2);
-        assert_eq!(diagnostics[0].code, "summary-failed");
-        assert_eq!(diagnostics[1].code, "job-remove-failed");
-        assert_eq!(diagnostics[1].cause_code.as_deref(), Some("summary-failed"));
-    }
-
-    fn injected_error() -> RegistrationError {
-        RegistrationError::Io(io::Error::other("injected finalization failure"))
-    }
+fn worker_error_retryable(error: &HookWorkerError) -> bool {
+    matches!(
+        error,
+        HookWorkerError::Source(SourceError::ChangedDuringRead | SourceError::TranscriptNotFound)
+            | HookWorkerError::Summary(_)
+            | HookWorkerError::Io(_)
+            | HookWorkerError::State(_)
+            | HookWorkerError::PostPersist(_)
+            | HookWorkerError::PostPersistWrite(_)
+    )
 }

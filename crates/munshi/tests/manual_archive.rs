@@ -383,7 +383,10 @@ fn renderer_is_deterministic_and_atomic_replace_replaces_existing_file() {
         tool_activities: 0,
         ignored_events: 0,
         source_cursor: 9,
+        source_byte_cursor: 128,
+        source_prefix_hash: "sha256:abc".to_owned(),
         source_hash: "sha256:abc".to_owned(),
+        source_bytes: 128,
         started_at: Some("2026-07-12T00:00:00.000Z".to_owned()),
         updated_at: Some("2026-07-12T00:01:00.000Z".to_owned()),
     };
