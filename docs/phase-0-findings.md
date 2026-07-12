@@ -62,10 +62,10 @@ Only aggregate structural results are recorded. No raw JSONL is committed.
 `fixtures/copilot-1.0.70/transcript/synthetic-envelope.jsonl` is sanitized synthetic content, not a
 copy or transformation of a personal transcript. Its envelope and event categories are shaped only
 from the aggregate observations above and the installed 1.0.70 schema. It contains one record for
-each of `session.start`, `user.message`, `assistant.turn_start`, `assistant.message`,
-`assistant.turn_end`, `hook.start`, `hook.end`, `session.resume`, and `session.shutdown`, plus one
-optional `agentId` example. Minimal `data` objects intentionally make no claim about private
-semantic schemas.
+each of `session.start`, `session.model_change`, `system.message`, `user.message`,
+`assistant.turn_start`, `assistant.message`, `assistant.turn_end`, `hook.start`, `hook.end`,
+`session.resume`, and `session.shutdown`, plus one optional `agentId` example. Minimal `data`
+objects intentionally make no claim about private semantic schemas.
 
 | Scenario | Bytes | Valid lines | Top-level keys | `type` counts | Status |
 | --- | ---: | ---: | --- | --- | --- |

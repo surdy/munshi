@@ -117,19 +117,19 @@ fn committed_transcript_fixture_has_expected_envelope_and_discriminators() {
 
     let report = inspect_transcript(&transcript, &BTreeSet::from(["type".to_owned()])).unwrap();
 
-    assert_eq!(report.bytes, 986);
+    assert_eq!(report.bytes, 1_210);
     assert_eq!(report.bytes, fs::metadata(&transcript).unwrap().len());
-    assert_eq!(report.lines, 9);
-    assert_eq!(report.json_valid_lines, 9);
+    assert_eq!(report.lines, 11);
+    assert_eq!(report.json_valid_lines, 11);
     assert_eq!(
         report.top_level_key_frequency,
         BTreeMap::from([
             ("agentId".to_owned(), 1),
-            ("data".to_owned(), 9),
-            ("id".to_owned(), 9),
-            ("parentId".to_owned(), 9),
-            ("timestamp".to_owned(), 9),
-            ("type".to_owned(), 9),
+            ("data".to_owned(), 11),
+            ("id".to_owned(), 11),
+            ("parentId".to_owned(), 11),
+            ("timestamp".to_owned(), 11),
+            ("type".to_owned(), 11),
         ])
     );
     assert_eq!(
@@ -140,9 +140,11 @@ fn committed_transcript_fixture_has_expected_envelope_and_discriminators() {
             ("\"assistant.turn_start\"".to_owned(), 1),
             ("\"hook.end\"".to_owned(), 1),
             ("\"hook.start\"".to_owned(), 1),
+            ("\"session.model_change\"".to_owned(), 1),
             ("\"session.resume\"".to_owned(), 1),
             ("\"session.shutdown\"".to_owned(), 1),
             ("\"session.start\"".to_owned(), 1),
+            ("\"system.message\"".to_owned(), 1),
             ("\"user.message\"".to_owned(), 1),
         ])
     );
@@ -380,6 +382,8 @@ fn assert_sanitized_strings(value: &serde_json::Value) {
                     | "<event-07>"
                     | "<event-08>"
                     | "<event-09>"
+                    | "<event-10>"
+                    | "<event-11>"
                     | "assistant.message"
                     | "assistant.turn_end"
                     | "assistant.turn_start"
@@ -387,9 +391,11 @@ fn assert_sanitized_strings(value: &serde_json::Value) {
                     | "end_turn"
                     | "hook.end"
                     | "hook.start"
+                    | "session.model_change"
                     | "session.resume"
                     | "session.shutdown"
                     | "session.start"
+                    | "system.message"
                     | "user.message"
                     | "user_exit"
             ),
