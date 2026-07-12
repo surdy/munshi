@@ -472,6 +472,7 @@ fn post_persist_worker_crash_is_reconciled_without_second_summary_call() {
     harness.queue_direct(SESSION_A, &transcript, 20, 21);
 
     let resolved = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: Some(SESSION_A.to_owned()),
         events_path: Some(transcript),
         copilot_home: None,
@@ -580,6 +581,7 @@ fn post_persist_recovery_creates_missing_git_commit() {
     harness.queue_direct(SESSION_A, &transcript, 20, 21);
 
     let resolved = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: Some(SESSION_A.to_owned()),
         events_path: Some(transcript),
         copilot_home: None,
@@ -682,6 +684,7 @@ fn post_persist_recovery_skips_duplicate_git_commit() {
     harness.queue_direct(SESSION_A, &transcript, 20, 21);
 
     let resolved = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: Some(SESSION_A.to_owned()),
         events_path: Some(transcript),
         copilot_home: None,
@@ -807,6 +810,7 @@ fn post_persist_recovery_uses_exact_commit_trailer_matching_for_prefix_session_i
     harness.queue_direct(SESSION_PREFIX_SHORT, &transcript_short, 40, 41);
 
     let resolved = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: Some(SESSION_PREFIX_SHORT.to_owned()),
         events_path: Some(transcript_short),
         copilot_home: None,
@@ -1047,6 +1051,7 @@ fn schema_one_markdown_rebuild_forces_a_full_cursor_upgrade() {
     let harness = Harness::new();
     let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
     let resolved = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: Some(SESSION_A.to_owned()),
         events_path: Some(transcript.clone()),
         copilot_home: None,

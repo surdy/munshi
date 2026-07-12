@@ -19,7 +19,7 @@ use crate::registration::{
     RegistrationError, durable_remove, ensure_directory, validate_regular_owned_file,
 };
 use crate::render::{ArchivedMarkdown, content_hash, parse_archive_markdown};
-use crate::source::PreviousSource;
+use crate::source::{PreviousSource, SourceKind};
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
@@ -64,6 +64,7 @@ impl CompletionReason {
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub database_id: i64,
+    pub source: SourceKind,
     pub session_id: String,
     pub origin_cwd: Option<PathBuf>,
     pub project: Option<ProjectIdentity>,
@@ -179,10 +180,22 @@ pub enum BudgetOutcome {
 
 pub struct StateStore {
     connection: Connection,
+    source_kind: String,
 }
 
 impl StateStore {
     pub fn open(state_directory: &Path) -> Result<Self, StateError> {
+        Self::open_for_source(state_directory, SourceKind::Copilot)
+    }
+
+    /// Open the shared operational state store scoped to a specific capturing harness.
+    ///
+    /// The SQLite schema is source-neutral: sessions are keyed by
+    /// `(source_kind, source_session_id)`, so multiple harnesses can share one database.
+    /// Session-scoped queries are bound to this store's `source_kind`, keeping Copilot's
+    /// hook-driven behavior byte-for-byte identical while letting other adapters drive the
+    /// same lifecycle state machine.
+    pub fn open_for_source(state_directory: &Path, source: SourceKind) -> Result<Self, StateError> {
         ensure_directory(state_directory)?;
         ensure_directory(&state_directory.join("locks"))?;
         let _migration_lock = acquire_named_lock_with_timeout(
@@ -209,7 +222,10 @@ impl StateStore {
              PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;",
         )?;
-        let mut store = Self { connection };
+        let mut store = Self {
+            connection,
+            source_kind: source.agent_label().to_owned(),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -419,6 +435,7 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let database_id = upsert_session(
             &transaction,
+            &self.source_kind,
             session_id,
             Some(origin_cwd),
             None,
@@ -497,6 +514,7 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let database_id = upsert_session(
             &transaction,
+            &self.source_kind,
             session_id,
             Some(origin_cwd),
             fallback_transcript_path,
@@ -603,10 +621,10 @@ impl StateStore {
                     source_started_at,source_updated_at,source_user_requests,
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                    last_error_category
+                    last_error_category,source_kind
                  FROM sessions
-                 WHERE source_kind='copilot-cli' AND source_session_id=?1",
-                [session_id],
+                 WHERE source_kind=?2 AND source_session_id=?1",
+                params![session_id, self.source_kind],
                 session_from_row,
             )
             .optional()
@@ -626,9 +644,8 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category
+                last_error_category,source_kind
              FROM sessions
-             WHERE source_kind='copilot-cli'
              ORDER BY updated_at_ms DESC,id DESC",
         )?;
         statement
@@ -649,8 +666,8 @@ impl StateStore {
                 self.connection
                     .query_row(
                         "SELECT id FROM sessions
-                         WHERE source_kind='copilot-cli' AND source_session_id=?1",
-                        [session_id],
+                         WHERE source_kind=?2 AND source_session_id=?1",
+                        params![session_id, self.source_kind],
                         |row| row.get::<_, i64>(0),
                     )
                     .optional()
@@ -675,8 +692,8 @@ impl StateStore {
         let now = now_ms();
         self.connection.execute(
             "UPDATE sessions SET last_error_category=?2,updated_at_ms=?3
-             WHERE source_kind='copilot-cli' AND source_session_id=?1",
-            params![session_id, category, now],
+             WHERE source_kind=?4 AND source_session_id=?1",
+            params![session_id, category, now, self.source_kind],
         )?;
         self.record_diagnostic("archive-worker", category, None, Some(session_id))
     }
@@ -707,6 +724,7 @@ impl StateStore {
 
 fn upsert_session(
     transaction: &Transaction<'_>,
+    source_kind: &str,
     session_id: &str,
     origin_cwd: Option<&Path>,
     transcript_path: Option<&Path>,
@@ -717,7 +735,7 @@ fn upsert_session(
         "INSERT INTO sessions(
             source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
             lifecycle_state,created_at_ms,updated_at_ms
-         ) VALUES ('copilot-cli',?1,?2,?3,?4,'observed',?5,?5)
+         ) VALUES (?6,?1,?2,?3,?4,'observed',?5,?5)
          ON CONFLICT(source_kind,source_session_id) DO UPDATE SET
             origin_cwd=COALESCE(sessions.origin_cwd,excluded.origin_cwd),
             transcript_path=COALESCE(excluded.transcript_path,sessions.transcript_path),
@@ -729,14 +747,15 @@ fn upsert_session(
             origin_cwd.map(path_text).transpose()?,
             transcript_path.map(path_text).transpose()?,
             transcript_source,
-            now
+            now,
+            source_kind
         ],
     )?;
     transaction
         .query_row(
             "SELECT id FROM sessions
-             WHERE source_kind='copilot-cli' AND source_session_id=?1",
-            [session_id],
+             WHERE source_kind=?2 AND source_session_id=?1",
+            params![session_id, source_kind],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -842,6 +861,13 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
     };
     Ok(SessionRecord {
         database_id: row.get(0)?,
+        source: SourceKind::from_agent_label(&row.get::<_, String>(34)?).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                34,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other("unknown source kind")),
+            )
+        })?,
         session_id: row.get(1)?,
         origin_cwd: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
         project,
@@ -947,8 +973,8 @@ impl StateStore {
         let database_id = transaction
             .query_row(
                 "SELECT id FROM sessions
-                 WHERE source_kind='copilot-cli' AND source_session_id=?1",
-                [session_id],
+                 WHERE source_kind=?2 AND source_session_id=?1",
+                params![session_id, self.source_kind],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
@@ -977,13 +1003,13 @@ impl StateStore {
         &mut self,
         force: bool,
         limit: usize,
-    ) -> Result<Vec<String>, StateError> {
+    ) -> Result<Vec<(SourceKind, String)>, StateError> {
         let now = now_ms();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare(
-            "SELECT id,source_session_id
+            "SELECT id,source_session_id,source_kind
              FROM sessions
              WHERE active=0
                AND lifecycle_state IN (
@@ -1007,12 +1033,22 @@ impl StateStore {
         let rows = statement
             .query_map(
                 params![now - WORKER_RESERVATION_STALE_MS, now, force, limit as i64],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut reserved = Vec::new();
-        for (database_id, session_id) in rows {
+        for (database_id, session_id, source_kind) in rows {
+            // Skip any row with an unrecognized source label rather than mis-routing it.
+            let Some(source) = SourceKind::from_agent_label(&source_kind) else {
+                continue;
+            };
             if reserve_worker_in_transaction(&transaction, database_id, now, force)? {
                 if force {
                     transaction.execute(
@@ -1021,7 +1057,7 @@ impl StateStore {
                         [database_id],
                     )?;
                 }
-                reserved.push(session_id);
+                reserved.push((source, session_id));
             }
         }
         transaction.commit()?;
@@ -1122,8 +1158,8 @@ impl StateStore {
     pub fn clear_worker_reservation(&mut self, session_id: &str) -> Result<(), StateError> {
         self.connection.execute(
             "UPDATE sessions SET worker_generation=NULL,worker_spawned_at_ms=NULL
-             WHERE source_kind='copilot-cli' AND source_session_id=?1",
-            [session_id],
+             WHERE source_kind=?2 AND source_session_id=?1",
+            params![session_id, self.source_kind],
         )?;
         Ok(())
     }
@@ -1139,11 +1175,11 @@ impl StateStore {
                         a.planned_completion_reason,a.planned_fallback_reason
                  FROM processing_attempts a
                  JOIN sessions s ON s.id=a.session_id
-                 WHERE s.source_kind='copilot-cli' AND s.source_session_id=?1
+                 WHERE s.source_kind=?2 AND s.source_session_id=?1
                    AND a.outcome='processing'
                    AND a.planned_revision IS NOT NULL
                  ORDER BY a.id DESC LIMIT 1",
-                [session_id],
+                params![session_id, self.source_kind],
                 |row| {
                     Ok(PendingPlan {
                         attempt_id: row.get(0)?,
@@ -1184,10 +1220,10 @@ impl StateStore {
                 "SELECT s.id,a.id,a.retry_state
                  FROM sessions s
                  JOIN processing_attempts a ON a.session_id=s.id
-                 WHERE s.source_kind='copilot-cli' AND s.source_session_id=?1
+                 WHERE s.source_kind=?2 AND s.source_session_id=?1
                    AND a.outcome='processing'
                  ORDER BY a.id DESC LIMIT 1",
-                [session_id],
+                params![session_id, self.source_kind],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -1249,10 +1285,10 @@ impl StateStore {
                     source_started_at,source_updated_at,source_user_requests,
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                    last_error_category
+                    last_error_category,source_kind
                  FROM sessions
-                 WHERE source_kind='copilot-cli' AND source_session_id=?1",
-                [session_id],
+                 WHERE source_kind=?2 AND source_session_id=?1",
+                params![session_id, self.source_kind],
                 session_from_row,
             )
             .optional()?;
@@ -1704,6 +1740,7 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let database_id = upsert_session(
             &transaction,
+            record.archive.source.agent_label(),
             &record.archive.session_id,
             None,
             None,
@@ -1797,7 +1834,7 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category
+                last_error_category,source_kind
              FROM sessions
              WHERE active=1
                AND last_agent_stop_ms IS NOT NULL
@@ -1825,7 +1862,7 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category
+                last_error_category,source_kind
              FROM sessions
              WHERE transcript_path IS NULL
                AND lifecycle_state IN (
@@ -1853,8 +1890,8 @@ impl StateStore {
             .query_row(
                 "SELECT id,completion_reason,current_summary_revision
                  FROM sessions
-                 WHERE source_kind='copilot-cli' AND source_session_id=?1",
-                [session_id],
+                 WHERE source_kind=?2 AND source_session_id=?1",
+                params![session_id, self.source_kind],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -1928,6 +1965,7 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let database_id = upsert_session(
             &transaction,
+            &self.source_kind,
             session_id,
             origin_cwd,
             Some(transcript_path),
@@ -2448,6 +2486,7 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let database_id = upsert_session(
             &transaction,
+            &self.source_kind,
             &metadata.session_id,
             Some(Path::new(&metadata.origin_cwd)),
             Some(Path::new(&metadata.transcript_path)),
@@ -2497,6 +2536,7 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let database_id = upsert_session(
             &transaction,
+            &self.source_kind,
             &job.session_id,
             Some(Path::new(&job.origin_cwd)),
             Some(Path::new(&job.transcript_path)),

@@ -252,14 +252,31 @@ continue to prefer the documented hook-provided `transcriptPath`.
 Other private files such as Copilot's internal session SQLite database may be inspected by a future
 best-effort adapter, but the MVP must not depend on their schema.
 
+## Additional harness adapters
+
+Munshi captures Claude Code and Codex sessions through the same vendor-neutral
+[`SourceKind`](crates/munshi/src/source.rs) adapter boundary that Copilot uses. Selecting a source
+is independent from selecting a summarizer: use `munshi archive --source claude-code|codex`, or
+`StateStore::open_for_source` / `run_archive_worker_for_source` to drive the shared archive/state
+worker pipeline for those harnesses. Claude Code normal/resumed/interrupted and Codex
+normal/resumed transcripts normalize to the same model and archive through the shared summarizer,
+renderer, state, and delivery paths. Existing Copilot behavior, identity (`copilot:<session-id>`),
+and archive format are unchanged.
+
+The version-pinned transcript schemas, normalized-record mapping, supported lifecycles, and
+private-format assumptions are documented in
+[harness source adapters](docs/harness-adapters.md). Synthetic/sanitized conformance fixtures live
+under `fixtures/claude-code-2.1.44/` and `fixtures/codex-rollout-0.x/`.
+
 ## Session identity and revisions
 
 The stable report identity is:
 
 ```text
-copilot:<session-id>
+<source>:<session-id>
 ```
 
+where `<source>` is `copilot`, `claude-code`, or `codex`. Copilot identities remain `copilot:<id>`.
 The identity does not include the end timestamp because resumed sessions must update the same
 report. It also does not include a repository: one source session remains one logical session even
 when it changes working directories or touches multiple repositories.

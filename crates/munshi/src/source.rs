@@ -13,8 +13,83 @@ use thiserror::Error;
 const MAX_EVENT_TEXT_BYTES: usize = 128 * 1024;
 pub const NORMALIZER_VERSION: u32 = 2;
 
+/// Vendor-neutral identity of the coding-agent harness that produced a session.
+///
+/// The variants form the adapter boundary: each maps a source-specific transcript
+/// envelope to the same [`NormalizedSession`] model so that summarizer, renderer,
+/// state, and delivery paths remain independent from the capturing harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceKind {
+    /// GitHub Copilot CLI (`events.jsonl`), the version-pinned default adapter.
+    #[default]
+    Copilot,
+    /// Anthropic Claude Code session transcripts (`<uuid>.jsonl`).
+    ClaudeCode,
+    /// OpenAI Codex CLI rollout files (`rollout-*.jsonl`).
+    Codex,
+}
+
+impl SourceKind {
+    /// Stable identity prefix used in the durable archive `id` (`<prefix>:<session>`).
+    pub fn id_prefix(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot",
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Human- and machine-readable agent label recorded in archive frontmatter,
+    /// summarizer input, and the SQLite `source_kind` column.
+    pub fn agent_label(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot-cli",
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex-cli",
+        }
+    }
+
+    /// Selector accepted on the command line and in configuration.
+    pub fn as_selector(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot",
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Parse a user- or config-provided selector into a source kind.
+    pub fn parse_selector(value: &str) -> Option<Self> {
+        match value {
+            "copilot" | "copilot-cli" => Some(Self::Copilot),
+            "claude-code" | "claude" => Some(Self::ClaudeCode),
+            "codex" | "codex-cli" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// Recover the source kind from a persisted agent label.
+    pub fn from_agent_label(label: &str) -> Option<Self> {
+        match label {
+            "copilot-cli" => Some(Self::Copilot),
+            "claude-code" => Some(Self::ClaudeCode),
+            "codex-cli" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// Whether the source supports resolving a transcript from a session ID alone.
+    /// Only the version-pinned Copilot session-state fallback is supported; other
+    /// harnesses require an explicit transcript path.
+    fn supports_session_id_lookup(self) -> bool {
+        matches!(self, Self::Copilot)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionReference {
+    pub source: SourceKind,
     pub session_id: Option<String>,
     pub events_path: Option<PathBuf>,
     pub copilot_home: Option<PathBuf>,
@@ -22,6 +97,7 @@ pub struct SessionReference {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedSession {
+    pub source: SourceKind,
     pub session_id: String,
     pub events_path: PathBuf,
 }
@@ -34,6 +110,7 @@ pub struct NormalizedEvent {
 
 #[derive(Debug, Clone)]
 pub struct NormalizedSession {
+    pub source: SourceKind,
     pub session_id: String,
     pub events: Vec<NormalizedEvent>,
     pub user_requests: usize,
@@ -166,6 +243,7 @@ pub fn resolve_session_reference(
         return Err(SourceError::MissingReference);
     }
 
+    let source = reference.source;
     let supplied_id = reference
         .session_id
         .as_deref()
@@ -173,30 +251,28 @@ pub fn resolve_session_reference(
         .transpose()?;
 
     if let Some(path) = &reference.events_path {
-        if path.file_name().and_then(|name| name.to_str()) != Some("events.jsonl") {
-            return Err(SourceError::UnsupportedTranscriptPath);
-        }
         let metadata = std::fs::symlink_metadata(path).map_err(SourceError::Io)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(SourceError::UnsupportedTranscriptPath);
         }
         let canonical = path.canonicalize().map_err(SourceError::Io)?;
-        let derived_id = canonical
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .ok_or(SourceError::InvalidSessionId)
-            .and_then(validate_session_id)?;
+        let derived_id = derive_session_id_from_path(source, &canonical)?;
         if supplied_id.is_some_and(|session_id| session_id != derived_id) {
             return Err(SourceError::SessionIdMismatch);
         }
         return Ok(ResolvedSession {
-            session_id: supplied_id.unwrap_or(derived_id).to_owned(),
+            source,
+            session_id: supplied_id.unwrap_or(&derived_id).to_owned(),
             events_path: canonical,
         });
     }
 
     let session_id = supplied_id.expect("a session ID is present when no path was supplied");
+    if !source.supports_session_id_lookup() {
+        // Only the version-pinned Copilot session-state directory is a supported
+        // session-ID fallback; other harnesses require an explicit transcript path.
+        return Err(SourceError::TranscriptNotFound);
+    }
     let home = reference
         .copilot_home
         .clone()
@@ -227,9 +303,50 @@ pub fn resolve_session_reference(
     }
 
     Ok(ResolvedSession {
+        source,
         session_id: session_id.to_owned(),
         events_path: canonical,
     })
+}
+
+/// Derive a stable session ID from an explicit transcript path for the given source.
+///
+/// Copilot keeps its version-pinned `session-state/<id>/events.jsonl` layout where the
+/// parent directory is the session ID. Claude Code and Codex name the transcript file
+/// itself after the session, so the sanitized file stem is used.
+fn derive_session_id_from_path(
+    source: SourceKind,
+    canonical: &Path,
+) -> Result<String, SourceError> {
+    match source {
+        SourceKind::Copilot => {
+            if canonical.file_name().and_then(|name| name.to_str()) != Some("events.jsonl") {
+                return Err(SourceError::UnsupportedTranscriptPath);
+            }
+            canonical
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .ok_or(SourceError::InvalidSessionId)
+                .and_then(validate_session_id)
+                .map(ToOwned::to_owned)
+        }
+        SourceKind::ClaudeCode | SourceKind::Codex => {
+            if canonical
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("jsonl")
+            {
+                return Err(SourceError::UnsupportedTranscriptPath);
+            }
+            canonical
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or(SourceError::InvalidSessionId)
+                .and_then(validate_session_id)
+                .map(ToOwned::to_owned)
+        }
+    }
 }
 
 pub fn load_session(
@@ -250,7 +367,7 @@ pub fn load_session_update(
 
     let (mode, fallback_reason, normalized, total_records) = match previous {
         None => {
-            let normalized = normalize_records(&bytes, 0)?;
+            let normalized = normalize_records(&bytes, 0, resolved.source)?;
             (
                 TranscriptLoadMode::Full,
                 None,
@@ -259,7 +376,7 @@ pub fn load_session_update(
             )
         }
         Some(previous) if previous.normalizer_version != NORMALIZER_VERSION => {
-            let normalized = normalize_records(&bytes, 0)?;
+            let normalized = normalize_records(&bytes, 0, resolved.source)?;
             (
                 TranscriptLoadMode::Full,
                 Some(CursorFallbackReason::NormalizerChanged),
@@ -268,7 +385,7 @@ pub fn load_session_update(
             )
         }
         Some(previous) if bytes.len() < previous.byte_offset as usize => {
-            let normalized = normalize_records(&bytes, 0)?;
+            let normalized = normalize_records(&bytes, 0, resolved.source)?;
             (
                 TranscriptLoadMode::Full,
                 Some(CursorFallbackReason::SourceTruncated),
@@ -282,7 +399,7 @@ pub fn load_session_update(
             let prefix_valid = sha256(prefix) == previous.prefix_hash
                 && count_records(prefix) == previous.record_count;
             if !prefix_valid {
-                let normalized = normalize_records(&bytes, 0)?;
+                let normalized = normalize_records(&bytes, 0, resolved.source)?;
                 (
                     TranscriptLoadMode::Full,
                     Some(CursorFallbackReason::CursorMismatch),
@@ -296,7 +413,7 @@ pub fn load_session_update(
                     && bytes[offset - 1] != b'\n'
                     && delta[0] != b'\n'
                 {
-                    let normalized = normalize_records(&bytes, 0)?;
+                    let normalized = normalize_records(&bytes, 0, resolved.source)?;
                     (
                         TranscriptLoadMode::Full,
                         Some(CursorFallbackReason::CursorMismatch),
@@ -311,7 +428,8 @@ pub fn load_session_update(
                         previous.record_count,
                     )
                 } else {
-                    let normalized = normalize_records(delta, previous.record_count)?;
+                    let normalized =
+                        normalize_records(delta, previous.record_count, resolved.source)?;
                     (
                         TranscriptLoadMode::Delta,
                         None,
@@ -361,6 +479,7 @@ pub fn load_session_update(
     let source_prefix_hash = sha256(&bytes);
     Ok(TranscriptUpdate {
         session: NormalizedSession {
+            source: resolved.source,
             session_id: resolved.session_id.clone(),
             events: normalized.events,
             user_requests,
@@ -382,6 +501,7 @@ pub fn load_session_update(
 }
 
 pub fn validate_transcript_envelope(
+    source: SourceKind,
     path: &Path,
     max_source_bytes: usize,
 ) -> Result<(), SourceError> {
@@ -417,15 +537,40 @@ pub fn validate_transcript_envelope(
         let value: Value =
             serde_json::from_slice(&line).map_err(|_| SourceError::UnsupportedEnvelope)?;
         let object = value.as_object().ok_or(SourceError::UnsupportedEnvelope)?;
-        if !object.get("id").is_some_and(Value::is_string)
-            || !object.contains_key("timestamp")
-            || !object.contains_key("parentId")
-            || !object.get("type").is_some_and(Value::is_string)
-            || !object.get("data").is_some_and(Value::is_object)
-        {
+        if !envelope_matches(source, object) {
             return Err(SourceError::UnsupportedEnvelope);
         }
         return Ok(());
+    }
+}
+
+/// Structural envelope recognition for the first meaningful transcript record.
+///
+/// Each check is intentionally shallow and privacy-safe: it inspects only the
+/// version-pinned discriminator keys, never record content, so a different
+/// harness's transcript is rejected before any normalization occurs.
+fn envelope_matches(source: SourceKind, object: &Map<String, Value>) -> bool {
+    match source {
+        SourceKind::Copilot => {
+            object.get("id").is_some_and(Value::is_string)
+                && object.contains_key("timestamp")
+                && object.contains_key("parentId")
+                && object.get("type").is_some_and(Value::is_string)
+                && object.get("data").is_some_and(Value::is_object)
+        }
+        SourceKind::ClaudeCode => {
+            let has_type = object.get("type").is_some_and(Value::is_string);
+            let claude_shaped = object.get("message").is_some_and(Value::is_object)
+                || object.contains_key("leafUuid")
+                || object.contains_key("sessionId")
+                || object.contains_key("uuid");
+            has_type && claude_shaped && !object.contains_key("payload")
+        }
+        SourceKind::Codex => {
+            object.get("type").is_some_and(Value::is_string)
+                && object.contains_key("timestamp")
+                && object.contains_key("payload")
+        }
     }
 }
 
@@ -477,7 +622,40 @@ struct NormalizedRecords {
     last_timestamp: Option<DateTime<Utc>>,
 }
 
-fn normalize_records(bytes: &[u8], prior_records: u64) -> Result<NormalizedRecords, SourceError> {
+/// Outcome of classifying one raw transcript record for a source adapter.
+struct RecordClass {
+    events: Vec<NormalizedEvent>,
+    ignored: usize,
+}
+
+impl RecordClass {
+    fn ignored() -> Self {
+        Self {
+            events: Vec::new(),
+            ignored: 1,
+        }
+    }
+
+    fn skipped() -> Self {
+        Self {
+            events: Vec::new(),
+            ignored: 0,
+        }
+    }
+
+    fn event(kind: &'static str, content: String) -> Self {
+        Self {
+            events: vec![NormalizedEvent { kind, content }],
+            ignored: 0,
+        }
+    }
+}
+
+fn normalize_records(
+    bytes: &[u8],
+    prior_records: u64,
+    source: SourceKind,
+) -> Result<NormalizedRecords, SourceError> {
     let mut normalized = NormalizedRecords::default();
     for raw_line in bytes.split(|byte| *byte == b'\n') {
         if raw_line.is_empty() {
@@ -506,75 +684,419 @@ fn normalize_records(bytes: &[u8], prior_records: u64) -> Result<NormalizedRecor
             );
         }
 
-        let Some(event_type) = object.get("type").and_then(Value::as_str) else {
-            normalized.ignored_events += 1;
-            continue;
-        };
-        match event_type {
-            "user.message" => {
-                let Some(data) = event_data(object) else {
-                    normalized.ignored_events += 1;
-                    continue;
-                };
-                let Some(content) = data.get("content").and_then(Value::as_str) else {
-                    normalized.ignored_events += 1;
-                    continue;
-                };
-                if let Some(content) = nonempty(content) {
-                    normalized.user_requests += 1;
-                    normalized.events.push(NormalizedEvent {
-                        kind: "user",
-                        content: validate_content(content)?,
-                    });
-                }
+        let class = classify_record(source, object)?;
+        normalized.ignored_events += class.ignored;
+        for event in class.events {
+            match event.kind {
+                "user" => normalized.user_requests += 1,
+                "assistant" => normalized.assistant_messages += 1,
+                "tool" => normalized.tool_activities += 1,
+                _ => {}
             }
-            "assistant.message" => {
-                let Some(data) = event_data(object) else {
-                    normalized.ignored_events += 1;
-                    continue;
-                };
-                if !data.get("messageId").is_some_and(Value::is_string) {
-                    normalized.ignored_events += 1;
-                    continue;
-                }
-                let Some(content) = data.get("content").and_then(Value::as_str) else {
-                    normalized.ignored_events += 1;
-                    continue;
-                };
-                if let Some(content) = nonempty(content) {
-                    normalized.assistant_messages += 1;
-                    normalized.events.push(NormalizedEvent {
-                        kind: "assistant",
-                        content: validate_content(content)?,
-                    });
-                }
-            }
-            "tool.execution_start" => {
-                let Some(data) = event_data(object).filter(|data| valid_tool_start(data)) else {
-                    normalized.ignored_events += 1;
-                    continue;
-                };
-                normalized.tool_activities += 1;
-                normalized.events.push(NormalizedEvent {
-                    kind: "tool",
-                    content: extract_tool_start(data)?,
-                });
-            }
-            "tool.execution_complete" => {
-                let Some(data) = event_data(object).filter(|data| valid_tool_complete(data)) else {
-                    normalized.ignored_events += 1;
-                    continue;
-                };
-                normalized.tool_activities += 1;
-                normalized.events.push(NormalizedEvent {
-                    kind: "tool",
-                    content: extract_tool_complete(data)?,
-                });
-            }
-            _ => normalized.ignored_events += 1,
+            normalized.events.push(event);
         }
     }
     Ok(normalized)
+}
+
+fn classify_record(
+    source: SourceKind,
+    object: &Map<String, Value>,
+) -> Result<RecordClass, SourceError> {
+    match source {
+        SourceKind::Copilot => classify_copilot(object),
+        SourceKind::ClaudeCode => classify_claude(object),
+        SourceKind::Codex => classify_codex(object),
+    }
+}
+
+fn classify_copilot(object: &Map<String, Value>) -> Result<RecordClass, SourceError> {
+    let Some(event_type) = object.get("type").and_then(Value::as_str) else {
+        return Ok(RecordClass::ignored());
+    };
+    match event_type {
+        "user.message" => {
+            let Some(data) = event_data(object) else {
+                return Ok(RecordClass::ignored());
+            };
+            let Some(content) = data.get("content").and_then(Value::as_str) else {
+                return Ok(RecordClass::ignored());
+            };
+            match nonempty(content) {
+                Some(content) => Ok(RecordClass::event("user", validate_content(content)?)),
+                None => Ok(RecordClass::skipped()),
+            }
+        }
+        "assistant.message" => {
+            let Some(data) = event_data(object) else {
+                return Ok(RecordClass::ignored());
+            };
+            if !data.get("messageId").is_some_and(Value::is_string) {
+                return Ok(RecordClass::ignored());
+            }
+            let Some(content) = data.get("content").and_then(Value::as_str) else {
+                return Ok(RecordClass::ignored());
+            };
+            match nonempty(content) {
+                Some(content) => Ok(RecordClass::event("assistant", validate_content(content)?)),
+                None => Ok(RecordClass::skipped()),
+            }
+        }
+        "tool.execution_start" => {
+            let Some(data) = event_data(object).filter(|data| valid_tool_start(data)) else {
+                return Ok(RecordClass::ignored());
+            };
+            Ok(RecordClass::event("tool", extract_tool_start(data)?))
+        }
+        "tool.execution_complete" => {
+            let Some(data) = event_data(object).filter(|data| valid_tool_complete(data)) else {
+                return Ok(RecordClass::ignored());
+            };
+            Ok(RecordClass::event("tool", extract_tool_complete(data)?))
+        }
+        _ => Ok(RecordClass::ignored()),
+    }
+}
+
+/// Classify one Anthropic Claude Code transcript record.
+///
+/// Version-pinned assumption (documented in `docs/harness-adapters.md`): each line is a
+/// JSON object with a string `type`. Genuine user prompts and assistant replies live under
+/// `message.content` (a string or an array of typed blocks). `tool_use` blocks on assistant
+/// messages and `tool_result` blocks on user messages are normalized as tool activity, while
+/// `summary`, `system`, and queue/bookkeeping records are treated as ignored metadata.
+fn classify_claude(object: &Map<String, Value>) -> Result<RecordClass, SourceError> {
+    let Some(record_type) = object.get("type").and_then(Value::as_str) else {
+        return Ok(RecordClass::ignored());
+    };
+    match record_type {
+        "user" | "assistant" => {
+            let Some(message) = object.get("message").and_then(Value::as_object) else {
+                return Ok(RecordClass::ignored());
+            };
+            let assistant = record_type == "assistant";
+            let Some(content) = message.get("content") else {
+                return Ok(RecordClass::ignored());
+            };
+            classify_claude_content(content, assistant)
+        }
+        // Compaction summaries, system notices, and queue bookkeeping carry no
+        // archive-worthy user or agent content.
+        _ => Ok(RecordClass::ignored()),
+    }
+}
+
+fn classify_claude_content(content: &Value, assistant: bool) -> Result<RecordClass, SourceError> {
+    match content {
+        Value::String(text) => match nonempty(text) {
+            Some(text) => Ok(RecordClass::event(
+                if assistant { "assistant" } else { "user" },
+                validate_content(text)?,
+            )),
+            None => Ok(RecordClass::skipped()),
+        },
+        Value::Array(blocks) => {
+            let mut events = Vec::new();
+            let mut recognized = false;
+            for block in blocks {
+                let Some(block) = block.as_object() else {
+                    continue;
+                };
+                let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                recognized = true;
+                match block_type {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            if let Some(text) = nonempty(text) {
+                                events.push(NormalizedEvent {
+                                    kind: if assistant { "assistant" } else { "user" },
+                                    content: validate_content(text)?,
+                                });
+                            }
+                        }
+                    }
+                    "tool_use" if assistant => {
+                        if let Some(event) = extract_claude_tool_use(block)? {
+                            events.push(event);
+                        }
+                    }
+                    "tool_result" if !assistant => {
+                        if let Some(event) = extract_claude_tool_result(block)? {
+                            events.push(event);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if events.is_empty() && !recognized {
+                Ok(RecordClass::ignored())
+            } else {
+                Ok(RecordClass { events, ignored: 0 })
+            }
+        }
+        _ => Ok(RecordClass::ignored()),
+    }
+}
+
+fn extract_claude_tool_use(
+    block: &Map<String, Value>,
+) -> Result<Option<NormalizedEvent>, SourceError> {
+    let Some(name) = block.get("name").and_then(Value::as_str).and_then(nonempty) else {
+        return Ok(None);
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("event", "tool_use".to_owned());
+    if let Some(id) = block.get("id").and_then(Value::as_str).and_then(nonempty) {
+        fields.insert("tool_use_id", id);
+    }
+    fields.insert("name", name);
+    if let Some(input) = block.get("input").and_then(compact_value) {
+        fields.insert("input", input);
+    }
+    Ok(Some(NormalizedEvent {
+        kind: "tool",
+        content: render_tool_fields(fields)?,
+    }))
+}
+
+fn extract_claude_tool_result(
+    block: &Map<String, Value>,
+) -> Result<Option<NormalizedEvent>, SourceError> {
+    let mut fields = BTreeMap::new();
+    fields.insert("event", "tool_result".to_owned());
+    if let Some(id) = block
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    {
+        fields.insert("tool_use_id", id);
+    }
+    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+        fields.insert("is_error", "true".to_owned());
+    }
+    if let Some(output) = block.get("content").and_then(extract_claude_result_text) {
+        fields.insert("output", output);
+    }
+    if fields.len() == 1 {
+        return Ok(None);
+    }
+    Ok(Some(NormalizedEvent {
+        kind: "tool",
+        content: render_tool_fields(fields)?,
+    }))
+}
+
+fn extract_claude_result_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => nonempty(text),
+        Value::Array(items) => {
+            let parts: Vec<_> = items
+                .iter()
+                .filter_map(extract_claude_result_text)
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text") => object
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(nonempty),
+            _ => None,
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
+}
+
+/// Classify one OpenAI Codex CLI rollout record.
+///
+/// Version-pinned assumption (documented in `docs/harness-adapters.md`): each line is a
+/// `RolloutLine` wrapping a tagged `RolloutItem` as `{"type": <kind>, "payload": {..}}`.
+/// Only `response_item` payloads carry conversation content; `session_meta`, `turn_context`,
+/// `compacted`, `event_msg`, and world-state records are ignored metadata. Within a
+/// `response_item`, user/assistant messages, function/custom tool calls, and their outputs
+/// are normalized; model reasoning is deliberately dropped.
+fn classify_codex(object: &Map<String, Value>) -> Result<RecordClass, SourceError> {
+    let Some(record_type) = object.get("type").and_then(Value::as_str) else {
+        return Ok(RecordClass::ignored());
+    };
+    if record_type != "response_item" {
+        return Ok(RecordClass::ignored());
+    }
+    let Some(payload) = object.get("payload").and_then(Value::as_object) else {
+        return Ok(RecordClass::ignored());
+    };
+    let Some(item_type) = payload.get("type").and_then(Value::as_str) else {
+        return Ok(RecordClass::ignored());
+    };
+    match item_type {
+        "message" => {
+            let Some(role) = payload.get("role").and_then(Value::as_str) else {
+                return Ok(RecordClass::ignored());
+            };
+            let text = payload
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|blocks| extract_codex_message_text(blocks))
+                .unwrap_or_default();
+            match nonempty(&text) {
+                Some(text) => match role {
+                    "user" => Ok(RecordClass::event("user", validate_content(text)?)),
+                    "assistant" => Ok(RecordClass::event("assistant", validate_content(text)?)),
+                    _ => Ok(RecordClass::ignored()),
+                },
+                None => Ok(RecordClass::skipped()),
+            }
+        }
+        "function_call" | "custom_tool_call" => Ok(codex_tool_call(payload, item_type)?
+            .map_or_else(RecordClass::ignored, |event| RecordClass {
+                events: vec![event],
+                ignored: 0,
+            })),
+        "function_call_output" | "custom_tool_call_output" => Ok(codex_tool_output(payload)?
+            .map_or_else(RecordClass::ignored, |event| RecordClass {
+                events: vec![event],
+                ignored: 0,
+            })),
+        "local_shell_call" => Ok(codex_local_shell_call(payload)?.map_or_else(
+            RecordClass::ignored,
+            |event| RecordClass {
+                events: vec![event],
+                ignored: 0,
+            },
+        )),
+        // Reasoning is internal model output and is intentionally not archived.
+        _ => Ok(RecordClass::ignored()),
+    }
+}
+
+fn extract_codex_message_text(blocks: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for block in blocks {
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        if let Some("input_text" | "output_text" | "text") =
+            block.get("type").and_then(Value::as_str)
+        {
+            if let Some(text) = block.get("text").and_then(Value::as_str).and_then(nonempty) {
+                parts.push(text);
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn codex_tool_call(
+    payload: &Map<String, Value>,
+    item_type: &str,
+) -> Result<Option<NormalizedEvent>, SourceError> {
+    let Some(call_id) = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    else {
+        return Ok(None);
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("event", item_type.to_owned());
+    fields.insert("call_id", call_id);
+    if let Some(name) = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    {
+        fields.insert("name", name);
+    }
+    if let Some(arguments) = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    {
+        fields.insert("arguments", arguments);
+    } else if let Some(input) = payload
+        .get("input")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    {
+        fields.insert("input", input);
+    }
+    Ok(Some(NormalizedEvent {
+        kind: "tool",
+        content: render_tool_fields(fields)?,
+    }))
+}
+
+fn codex_tool_output(payload: &Map<String, Value>) -> Result<Option<NormalizedEvent>, SourceError> {
+    let Some(call_id) = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    else {
+        return Ok(None);
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("event", "function_call_output".to_owned());
+    fields.insert("call_id", call_id);
+    if let Some(output) = payload.get("output").and_then(extract_codex_output_text) {
+        fields.insert("output", output);
+    }
+    Ok(Some(NormalizedEvent {
+        kind: "tool",
+        content: render_tool_fields(fields)?,
+    }))
+}
+
+fn extract_codex_output_text(value: &Value) -> Option<String> {
+    match value {
+        // `function_call_output.output` is either a plain string or an array of
+        // structured content items on the wire.
+        Value::String(text) => nonempty(text),
+        Value::Array(items) => {
+            let parts: Vec<_> = items.iter().filter_map(extract_codex_output_text).collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        Value::Object(object) => object
+            .get("content")
+            .and_then(extract_codex_output_text)
+            .or_else(|| {
+                object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(nonempty)
+            }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
+}
+
+fn codex_local_shell_call(
+    payload: &Map<String, Value>,
+) -> Result<Option<NormalizedEvent>, SourceError> {
+    let mut fields = BTreeMap::new();
+    fields.insert("event", "local_shell_call".to_owned());
+    if let Some(call_id) = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    {
+        fields.insert("call_id", call_id);
+    }
+    if let Some(command) = payload
+        .get("action")
+        .and_then(Value::as_object)
+        .and_then(|action| action.get("command"))
+        .and_then(compact_value)
+    {
+        fields.insert("command", command);
+    }
+    if fields.len() == 1 {
+        return Ok(None);
+    }
+    Ok(Some(NormalizedEvent {
+        kind: "tool",
+        content: render_tool_fields(fields)?,
+    }))
 }
 
 fn count_records(bytes: &[u8]) -> u64 {

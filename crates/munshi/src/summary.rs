@@ -140,8 +140,8 @@ fn build_summary_input_inner(
             tags: "array of strings",
         },
         session: SummarySession {
-            id: format!("copilot:{}", session.session_id),
-            source_agent: "copilot-cli",
+            id: format!("{}:{}", session.source.id_prefix(), session.session_id),
+            source_agent: session.source.agent_label(),
             session_id: &session.session_id,
             project_identity: &project.identity,
             repository: project.repository.as_deref(),

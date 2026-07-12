@@ -12,7 +12,7 @@ mod summary;
 pub use archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, SessionReference, archive_session};
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook, read_last_failure,
-    run_archive_worker, run_recovery, wait_for_hook_result,
+    run_archive_worker, run_archive_worker_for_source, run_recovery, wait_for_hook_result,
 };
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
@@ -26,7 +26,7 @@ pub use render::{
 };
 pub use source::{
     CursorFallbackReason, NormalizedEvent, NormalizedSession, PreviousSource, SourceError,
-    TranscriptLoadMode, TranscriptUpdate, load_session, load_session_update,
+    SourceKind, TranscriptLoadMode, TranscriptUpdate, load_session, load_session_update,
     resolve_session_reference, validate_transcript_envelope,
 };
 pub use state::{

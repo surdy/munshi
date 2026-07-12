@@ -8,7 +8,7 @@ use tempfile::Builder;
 use thiserror::Error;
 
 use crate::project::ProjectIdentity;
-use crate::source::NormalizedSession;
+use crate::source::{NormalizedSession, SourceKind};
 use crate::summary::{StructuredSummary, validate_structured_summary};
 
 #[derive(Debug)]
@@ -63,6 +63,7 @@ pub struct ArchivedCursor {
 #[derive(Debug, Clone)]
 pub struct ArchivedMarkdown {
     pub schema_version: u32,
+    pub source: SourceKind,
     pub session_id: String,
     pub project: ProjectIdentity,
     pub summary_revision: u64,
@@ -106,9 +107,13 @@ fn render_markdown_version(
     line_string(
         &mut output,
         "id",
-        &format!("copilot:{}", metadata.session.session_id),
+        &format!(
+            "{}:{}",
+            metadata.session.source.id_prefix(),
+            metadata.session.session_id
+        ),
     );
-    line_string(&mut output, "agent", "copilot-cli");
+    line_string(&mut output, "agent", metadata.session.source.agent_label());
     line_string(&mut output, "session_id", &metadata.session.session_id);
     line_string(&mut output, "project", &metadata.project.project);
     line_string(&mut output, "project_identity", &metadata.project.identity);
@@ -205,9 +210,9 @@ pub fn parse_archive_markdown(markdown: &str) -> Result<ArchivedMarkdown, Render
         return Err(RenderError::InvalidArchive);
     }
     let session_id = parse_string(field(&fields, "session_id")?)?;
-    if parse_string(field(&fields, "id")?)? != format!("copilot:{session_id}")
-        || parse_string(field(&fields, "agent")?)? != "copilot-cli"
-    {
+    let source = SourceKind::from_agent_label(&parse_string(field(&fields, "agent")?)?)
+        .ok_or(RenderError::InvalidArchive)?;
+    if parse_string(field(&fields, "id")?)? != format!("{}:{session_id}", source.id_prefix()) {
         return Err(RenderError::InvalidArchive);
     }
     let project_name = parse_string(field(&fields, "project")?)?;
@@ -297,6 +302,7 @@ pub fn parse_archive_markdown(markdown: &str) -> Result<ArchivedMarkdown, Render
     })?;
     Ok(ArchivedMarkdown {
         schema_version,
+        source,
         session_id,
         project: ProjectIdentity {
             identity: project_identity,

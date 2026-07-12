@@ -352,6 +352,7 @@ fn session_id_fallback_is_confined_to_copilot_session_state() {
     fs::copy(fixture_events(NORMAL_ID), &events).unwrap();
 
     let resolved = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: Some(NORMAL_ID.to_owned()),
         events_path: None,
         copilot_home: Some(home),
@@ -362,6 +363,7 @@ fn session_id_fallback_is_confined_to_copilot_session_state() {
     assert_eq!(resolved.events_path, events.canonicalize().unwrap());
 
     let explicit_only = resolve_session_reference(&SessionReference {
+        source: munshi::SourceKind::Copilot,
         session_id: None,
         events_path: Some(fixture_events(NORMAL_ID)),
         copilot_home: None,
@@ -373,6 +375,7 @@ fn session_id_fallback_is_confined_to_copilot_session_state() {
 #[test]
 fn renderer_is_deterministic_and_atomic_replace_replaces_existing_file() {
     let session = NormalizedSession {
+        source: munshi::SourceKind::Copilot,
         session_id: "stable-session".to_owned(),
         events: vec![NormalizedEvent {
             kind: "user",
@@ -465,6 +468,7 @@ fn config(
 ) -> ArchiveConfig {
     ArchiveConfig {
         reference: SessionReference {
+            source: munshi::SourceKind::Copilot,
             session_id: Some(session_id.to_owned()),
             events_path: Some(events_path),
             copilot_home: None,

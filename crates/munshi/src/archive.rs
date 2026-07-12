@@ -45,7 +45,7 @@ pub enum ArchiveError {
 pub fn archive_session(config: &ArchiveConfig) -> Result<ArchiveOutcome, ArchiveError> {
     let resolved = resolve_session_reference(&config.reference)?;
     let session = load_session(&resolved, config.max_source_bytes)?;
-    let id = format!("copilot:{}", session.session_id);
+    let id = format!("{}:{}", session.source.id_prefix(), session.session_id);
     if !session.is_archive_worthy() {
         return Ok(ArchiveOutcome::NotArchiveWorthy { id });
     }

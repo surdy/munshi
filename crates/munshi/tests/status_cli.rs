@@ -152,6 +152,10 @@ fn status_sessions_and_show_json_contracts_cover_required_states() {
     }
     for item in items {
         assert!(item.get("transcript_path").is_none());
+        assert_eq!(
+            item["source"], "copilot",
+            "session list items must expose their source kind"
+        );
     }
 
     let failed_only = harness.sessions_json(Some("failed"));
@@ -170,6 +174,7 @@ fn status_sessions_and_show_json_contracts_cover_required_states() {
     assert_eq!(show["command"], "show");
     assert_eq!(show["found"], true);
     assert_eq!(show["session"]["state"], "archived");
+    assert_eq!(show["session"]["source_kind"], "copilot");
     assert_eq!(
         show["session"]["summary"]["title"],
         "Contract summary title"

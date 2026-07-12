@@ -9,9 +9,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, HookEvent, HookFailure, HookResult, ProjectStatus,
-    RegisterConfig, SessionRecord, SessionReference, StateStore, StructuredSummary,
+    RegisterConfig, SessionRecord, SessionReference, SourceKind, StateStore, StructuredSummary,
     accept_disclosure_from_terminal, archive_session, handle_hook, parse_archive_markdown,
-    project_status, read_last_failure, register, run_archive_worker, run_recovery,
+    project_status, read_last_failure, register, run_archive_worker_for_source, run_recovery,
     set_project_enabled, unregister, wait_for_hook_result,
 };
 use serde::{Deserialize, Serialize};
@@ -25,12 +25,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Manually summarize and archive one Copilot CLI session.
+    /// Manually summarize and archive one coding-agent session.
     #[command(visible_alias = "summarize")]
     Archive {
-        /// Copilot's stable source session ID.
+        /// The source harness's stable session ID.
         session_id: Option<String>,
-        /// Explicit transcript path. It must be a regular events.jsonl file.
+        /// Capturing harness. Source selection is independent of the summarizer.
+        #[arg(long, default_value = "copilot")]
+        source: String,
+        /// Explicit transcript path. Copilot expects an `events.jsonl` file; Claude Code and
+        /// Codex expect the harness's `<session>.jsonl` transcript or rollout file.
         #[arg(long)]
         events: Option<PathBuf>,
         /// Copilot home used for the version-pinned session-state fallback.
@@ -133,6 +137,9 @@ enum Command {
     /// Show one session and its current summary.
     Show {
         session_id: String,
+        /// Disambiguate when the same session ID exists under multiple sources.
+        #[arg(long)]
+        source: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Emit a stable machine-readable contract.
@@ -142,6 +149,9 @@ enum Command {
     /// Retry one pending/failed session using the normal worker state machine.
     Retry {
         session_id: String,
+        /// Disambiguate when the same session ID exists under multiple sources.
+        #[arg(long)]
+        source: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Force failed sessions past backoff/permanent retry markers.
@@ -186,6 +196,9 @@ enum Command {
     HookWorker {
         #[arg(long)]
         state_dir: PathBuf,
+        /// Capturing harness whose state machine and source adapter drive this worker.
+        #[arg(long, default_value = "copilot")]
+        source: String,
         #[arg(long)]
         session_id: String,
     },
@@ -433,6 +446,7 @@ struct SessionsReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct SessionListItem {
+    source: String,
     session_id: String,
     state: String,
     lifecycle_state: String,
@@ -453,6 +467,7 @@ struct ShowReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct ShowSessionView {
+    source_kind: String,
     session_id: String,
     state: String,
     lifecycle_state: String,
@@ -495,6 +510,7 @@ struct SourceProgressView {
 struct RetryReport {
     schema_version: u32,
     command: &'static str,
+    source: Option<String>,
     session_id: String,
     force: bool,
     result: String,
@@ -520,6 +536,7 @@ struct RetryAllReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct RetryItem {
+    source: String,
     session_id: String,
     result: String,
     code: Option<String>,
@@ -726,6 +743,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
     match Cli::parse().command {
         Command::Archive {
             session_id,
+            source,
             events,
             copilot_home,
             project_dir,
@@ -737,22 +755,27 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_input_bytes,
             max_stdout_bytes,
             max_stderr_bytes,
-        } => Ok(Outcome::Archive(archive_session(&ArchiveConfig {
-            reference: SessionReference {
-                session_id,
-                events_path: events,
-                copilot_home,
-            },
-            project_directory: project_dir,
-            output_directory: output_dir,
-            summarizer_binary: summarizer,
-            summarizer_args,
-            timeout: Duration::from_millis(timeout_ms),
-            max_source_bytes,
-            max_input_bytes,
-            max_stdout_bytes,
-            max_stderr_bytes,
-        })?)),
+        } => {
+            let source = SourceKind::parse_selector(&source)
+                .ok_or_else(|| format!("unsupported source: {source}"))?;
+            Ok(Outcome::Archive(archive_session(&ArchiveConfig {
+                reference: SessionReference {
+                    source,
+                    session_id,
+                    events_path: events,
+                    copilot_home,
+                },
+                project_directory: project_dir,
+                output_directory: output_dir,
+                summarizer_binary: summarizer,
+                summarizer_args,
+                timeout: Duration::from_millis(timeout_ms),
+                max_source_bytes,
+                max_input_bytes,
+                max_stdout_bytes,
+                max_stderr_bytes,
+            })?))
+        }
         Command::Register {
             accept_transcript_processing,
             dry_run,
@@ -871,24 +894,33 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         }
         Command::Show {
             session_id,
+            source,
             state_dir,
             json,
         } => {
             let state_directory = resolve_state_directory(state_dir)?;
+            let source = source.as_deref().map(parse_source_selector).transpose()?;
             Ok(Outcome::Show {
-                report: Box::new(build_show_report(&state_directory, &session_id)?),
+                report: Box::new(build_show_report(&state_directory, source, &session_id)?),
                 json,
             })
         }
         Command::Retry {
             session_id,
+            source,
             state_dir,
             force,
             json,
         } => {
             let state_directory = resolve_state_directory(state_dir)?;
+            let source = source.as_deref().map(parse_source_selector).transpose()?;
             Ok(Outcome::Retry {
-                report: Box::new(build_retry_report(&state_directory, &session_id, force)?),
+                report: Box::new(build_retry_report(
+                    &state_directory,
+                    source,
+                    &session_id,
+                    force,
+                )?),
                 json,
             })
         }
@@ -932,9 +964,11 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         }
         Command::HookWorker {
             state_dir,
+            source,
             session_id,
         } => {
-            let _ = run_archive_worker(&state_dir, &session_id)?;
+            let source = parse_source_selector(&source)?;
+            let _ = run_archive_worker_for_source(&state_dir, source, &session_id)?;
             Ok(Outcome::Worker)
         }
         Command::Hook(HookCommand::Wait {
@@ -1004,15 +1038,22 @@ fn build_sessions_report(
 
 fn build_show_report(
     state_directory: &Path,
+    source: Option<SourceKind>,
     session_id: &str,
 ) -> Result<ShowReport, Box<dyn Error>> {
-    let Some(record) = load_session_record(state_directory, session_id)? else {
-        return Ok(ShowReport {
-            schema_version: 1,
-            command: "show",
-            found: false,
-            session: None,
-        });
+    let record = match resolve_session_target(state_directory, source, session_id)? {
+        SessionTarget::One(record) => *record,
+        SessionTarget::NotFound => {
+            return Ok(ShowReport {
+                schema_version: 1,
+                command: "show",
+                found: false,
+                session: None,
+            });
+        }
+        SessionTarget::Ambiguous(sources) => {
+            return Err(ambiguous_source_error(session_id, &sources));
+        }
     };
 
     let configuration = inspect_configuration(state_directory);
@@ -1066,6 +1107,7 @@ fn build_show_report(
 
     let state = operational_state(&record).to_owned();
     let view = ShowSessionView {
+        source_kind: record.source.as_selector().to_owned(),
         session_id: record.session_id.clone(),
         state,
         lifecycle_state: record.lifecycle_state.clone(),
@@ -1091,28 +1133,38 @@ fn build_show_report(
 
 fn build_retry_report(
     state_directory: &Path,
+    source: Option<SourceKind>,
     session_id: &str,
     force: bool,
 ) -> Result<RetryReport, Box<dyn Error>> {
-    let Some(before) = load_session_record(state_directory, session_id)? else {
-        return Ok(RetryReport {
-            schema_version: 1,
-            command: "retry",
-            session_id: session_id.to_owned(),
-            force,
-            result: "not-found".to_owned(),
-            code: None,
-            state_before: None,
-            state_after: None,
-            archive_path: None,
-        });
+    let before = match resolve_session_target(state_directory, source, session_id)? {
+        SessionTarget::One(record) => *record,
+        SessionTarget::NotFound => {
+            return Ok(RetryReport {
+                schema_version: 1,
+                command: "retry",
+                source: source.map(|source| source.as_selector().to_owned()),
+                session_id: session_id.to_owned(),
+                force,
+                result: "not-found".to_owned(),
+                code: None,
+                state_before: None,
+                state_after: None,
+                archive_path: None,
+            });
+        }
+        SessionTarget::Ambiguous(sources) => {
+            return Err(ambiguous_source_error(session_id, &sources));
+        }
     };
+    let target_source = before.source;
     let before_state = operational_state(&before).to_owned();
 
     if !is_retryable_lifecycle(&before.lifecycle_state) {
         return Ok(RetryReport {
             schema_version: 1,
             command: "retry",
+            source: Some(target_source.as_selector().to_owned()),
             session_id: session_id.to_owned(),
             force,
             result: "not-eligible".to_owned(),
@@ -1124,21 +1176,22 @@ fn build_retry_report(
     }
 
     if state_database_exists(state_directory) {
-        let mut state = StateStore::open(state_directory)?;
+        let mut state = StateStore::open_for_source(state_directory, target_source)?;
         let _ = state.reserve_worker(session_id, force)?;
     }
 
-    let hook = run_archive_worker(state_directory, session_id).unwrap_or(HookResult::Failed {
-        code: "worker-error".to_owned(),
-    });
+    let hook = run_archive_worker_for_source(state_directory, target_source, session_id)
+        .unwrap_or(HookResult::Failed {
+            code: "worker-error".to_owned(),
+        });
     let (result, code, archive_path) = retry_fields_from_hook(hook);
-    let state_after = load_session_record(state_directory, session_id)?
-        .map(|record| operational_state(&record).to_owned())
+    let state_after = resolved_operational_state(state_directory, target_source, session_id)?
         .or(Some(before_state.clone()));
 
     Ok(RetryReport {
         schema_version: 1,
         command: "retry",
+        source: Some(target_source.as_selector().to_owned()),
         session_id: session_id.to_owned(),
         force,
         result,
@@ -1147,6 +1200,22 @@ fn build_retry_report(
         state_after,
         archive_path,
     })
+}
+
+/// Reads the current operational state of a specific source's session, scoping the state
+/// store to that source so the lookup can never observe a different source's same-ID row.
+fn resolved_operational_state(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if !state_database_exists(state_directory) {
+        return Ok(None);
+    }
+    let state = StateStore::open_for_source(state_directory, source)?;
+    Ok(state
+        .get_session(session_id)?
+        .map(|record| operational_state(&record).to_owned()))
 }
 
 fn build_retry_all_report(
@@ -1170,7 +1239,7 @@ fn build_retry_all_report(
     }
 
     let mut state = StateStore::open(state_directory)?;
-    let session_ids = state.reserve_eligible_workers(force, limit)?;
+    let reserved = state.reserve_eligible_workers(force, limit)?;
     drop(state);
 
     let mut items = Vec::new();
@@ -1179,10 +1248,12 @@ fn build_retry_all_report(
     let mut not_eligible = 0;
     let mut failed = 0;
 
-    for session_id in session_ids {
-        let hook = run_archive_worker(state_directory, &session_id).unwrap_or(HookResult::Failed {
-            code: "worker-error".to_owned(),
-        });
+    for (source, session_id) in reserved {
+        let hook = run_archive_worker_for_source(state_directory, source, &session_id).unwrap_or(
+            HookResult::Failed {
+                code: "worker-error".to_owned(),
+            },
+        );
         let (result, code, archive_path) = retry_fields_from_hook(hook);
         match result.as_str() {
             "archived" => archived += 1,
@@ -1191,6 +1262,7 @@ fn build_retry_all_report(
             _ => failed += 1,
         }
         items.push(RetryItem {
+            source: source.as_selector().to_owned(),
             session_id,
             result,
             code,
@@ -1835,6 +1907,7 @@ fn overall_status(checks: &[CheckResult]) -> CheckStatus {
 
 fn build_session_item(record: &SessionRecord) -> SessionListItem {
     SessionListItem {
+        source: record.source.as_selector().to_owned(),
         session_id: record.session_id.clone(),
         state: operational_state(record).to_owned(),
         lifecycle_state: record.lifecycle_state.clone(),
@@ -1962,15 +2035,52 @@ fn load_sessions(state_directory: &Path) -> Result<Vec<SessionRecord>, Box<dyn E
     Ok(state.list_sessions()?)
 }
 
-fn load_session_record(
+/// Result of resolving a session ID that may exist under more than one source.
+enum SessionTarget {
+    NotFound,
+    One(Box<SessionRecord>),
+    Ambiguous(Vec<String>),
+}
+
+fn parse_source_selector(value: &str) -> Result<SourceKind, Box<dyn Error>> {
+    SourceKind::parse_selector(value)
+        .ok_or_else(|| -> Box<dyn Error> { format!("unsupported source: {value}").into() })
+}
+
+/// Resolve a session ID to a single record. An explicit source selector narrows the
+/// match; without one, a session ID shared across sources is reported as ambiguous so a
+/// retry can never silently target the wrong source's session.
+fn resolve_session_target(
     state_directory: &Path,
+    source: Option<SourceKind>,
     session_id: &str,
-) -> Result<Option<SessionRecord>, Box<dyn Error>> {
-    if !state_database_exists(state_directory) {
-        return Ok(None);
+) -> Result<SessionTarget, Box<dyn Error>> {
+    let mut matches: Vec<SessionRecord> = load_sessions(state_directory)?
+        .into_iter()
+        .filter(|record| record.session_id == session_id)
+        .filter(|record| source.is_none_or(|wanted| record.source == wanted))
+        .collect();
+    match matches.len() {
+        0 => Ok(SessionTarget::NotFound),
+        1 => Ok(SessionTarget::One(Box::new(matches.pop().expect("one match")))),
+        _ => {
+            let mut sources: Vec<String> = matches
+                .iter()
+                .map(|record| record.source.as_selector().to_owned())
+                .collect();
+            sources.sort_unstable();
+            sources.dedup();
+            Ok(SessionTarget::Ambiguous(sources))
+        }
     }
-    let state = StateStore::open(state_directory)?;
-    Ok(state.get_session(session_id)?)
+}
+
+fn ambiguous_source_error(session_id: &str, sources: &[String]) -> Box<dyn Error> {
+    format!(
+        "session {session_id} exists under multiple sources ({}); pass --source to disambiguate",
+        sources.join(", ")
+    )
+    .into()
 }
 
 fn read_last_failure_if_available(state_directory: &Path) -> Option<HookFailure> {

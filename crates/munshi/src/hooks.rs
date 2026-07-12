@@ -20,8 +20,8 @@ use crate::render::{
     parse_archive_markdown, render_revision_markdown,
 };
 use crate::source::{
-    PreviousSource, SessionReference, SourceError, TranscriptLoadMode, load_session_update,
-    resolve_session_reference, validate_transcript_envelope,
+    PreviousSource, SessionReference, SourceError, SourceKind, TranscriptLoadMode,
+    load_session_update, resolve_session_reference, validate_transcript_envelope,
 };
 use crate::state::{
     BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlannedArchive,
@@ -130,9 +130,23 @@ pub fn run_archive_worker(
     state_directory: &Path,
     session_id: &str,
 ) -> Result<HookResult, HookWorkerError> {
-    let result = run_archive_worker_inner(state_directory, session_id);
+    run_archive_worker_for_source(state_directory, SourceKind::Copilot, session_id)
+}
+
+/// Run the shared archive worker for a specific capturing harness.
+///
+/// This is the same summarize/render/persist state machine that Copilot's hooks drive;
+/// only the source adapter and the store's `source_kind` scoping differ. It lets Claude
+/// Code and Codex sessions archive normal, resumed, and interrupted lifecycles through the
+/// identical pipeline once their observations have been ingested into the state store.
+pub fn run_archive_worker_for_source(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+) -> Result<HookResult, HookWorkerError> {
+    let result = run_archive_worker_inner(state_directory, source, session_id);
     if let Err(error) = &result {
-        if let Ok(mut state) = StateStore::open(state_directory) {
+        if let Ok(mut state) = StateStore::open_for_source(state_directory, source) {
             let category = worker_error_code(error);
             let _ = state.clear_worker_reservation(session_id);
             let _ = state.record_diagnostic("archive-worker", category, None, Some(session_id));
@@ -143,6 +157,7 @@ pub fn run_archive_worker(
 
 fn run_archive_worker_inner(
     state_directory: &Path,
+    source: SourceKind,
     session_id: &str,
 ) -> Result<HookResult, HookWorkerError> {
     validate_session_id(session_id).map_err(|_| StateError::InvalidState)?;
@@ -154,7 +169,7 @@ fn run_archive_worker_inner(
 
     let stored = load_stored_config(state_directory)?;
     let output_directory = PathBuf::from(&stored.output_directory);
-    let mut state = StateStore::open(state_directory)?;
+    let mut state = StateStore::open_for_source(state_directory, source)?;
     let session = state.get_session(session_id)?;
     if session
         .as_ref()
@@ -190,7 +205,7 @@ fn run_archive_worker_inner(
             }
             ClaimOutcome::Claimed(claim) => claim,
         };
-    match process_claim(&mut state, state_directory, &stored, &claim) {
+    match process_claim(&mut state, state_directory, source, &stored, &claim) {
         Ok(result) => Ok(result),
         Err(error @ (HookWorkerError::PostPersist(_) | HookWorkerError::PostPersistWrite(_))) => {
             Err(error)
@@ -239,7 +254,7 @@ pub fn run_recovery(
         Duration::from_millis(stored.limits.timeout_ms).saturating_add(Duration::from_secs(60)),
     )?;
     let cutoff = now_ms().saturating_sub(stale_after.as_millis().try_into().unwrap_or(i64::MAX));
-    let mut reserved_sessions = Vec::new();
+    let mut reserved_sessions: Vec<(SourceKind, String)> = Vec::new();
     for session in state.unresolved_sessions()? {
         let Ok(path) = resolve_fallback_transcript(state_directory, &session.session_id) else {
             continue;
@@ -252,7 +267,7 @@ pub fn run_recovery(
             metadata.mtime_nsec()
         );
         if state.attach_recovered_transcript(&session.session_id, &path, &evidence)? {
-            reserved_sessions.push(session.session_id);
+            reserved_sessions.push((session.source, session.session_id));
         }
     }
     for session in state.stale_known_sessions(cutoff)? {
@@ -273,7 +288,7 @@ pub fn run_recovery(
             metadata.mtime_nsec()
         );
         if state.mark_recovery_interrupted(&session.session_id, path, Some(origin), &evidence)? {
-            reserved_sessions.push(session.session_id);
+            reserved_sessions.push((session.source, session.session_id));
         }
     }
     discover_unknown_sessions(
@@ -285,8 +300,8 @@ pub fn run_recovery(
     reserved_sessions.extend(state.reserve_eligible_workers(force_retry, RECOVERY_SCAN_LIMIT)?);
     reserved_sessions.sort();
     reserved_sessions.dedup();
-    for session_id in reserved_sessions {
-        if spawn_worker(state_directory, &session_id).is_err() {
+    for (source, session_id) in reserved_sessions {
+        if spawn_worker(state_directory, source, &session_id).is_err() {
             let _ = state.clear_worker_reservation(&session_id);
             let _ =
                 state.record_diagnostic("recovery", "worker-spawn-failed", None, Some(&session_id));
@@ -433,7 +448,7 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
                 Some(payload.session_id.clone()),
             )
         })?;
-    if reserved && spawn_worker(state_directory, &payload.session_id).is_err() {
+    if reserved && spawn_worker(state_directory, SourceKind::Copilot, &payload.session_id).is_err() {
         let _ = state.clear_worker_reservation(&payload.session_id);
         return Err(failure(
             "session-end",
@@ -447,6 +462,7 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
 fn process_claim(
     state: &mut StateStore,
     state_directory: &Path,
+    source: SourceKind,
     stored: &crate::registration::StoredConfig,
     claim: &Claim,
 ) -> Result<HookResult, HookWorkerError> {
@@ -457,6 +473,7 @@ fn process_claim(
         .or_else(|| resolve_fallback_transcript(state_directory, &claim.session.session_id).ok())
         .ok_or(SourceError::TranscriptNotFound)?;
     let resolved = resolve_session_reference(&SessionReference {
+        source,
         session_id: Some(claim.session.session_id.clone()),
         events_path: Some(transcript_path),
         copilot_home: None,
@@ -929,11 +946,12 @@ fn resolve_fallback_transcript(
         .ok_or(SourceError::MissingCopilotHome)?
         .to_path_buf();
     let resolved = resolve_session_reference(&SessionReference {
+        source: SourceKind::Copilot,
         session_id: Some(session_id.to_owned()),
         events_path: None,
         copilot_home: Some(copilot_home),
     })?;
-    validate_transcript_envelope(&resolved.events_path, 8 * 1024 * 1024)?;
+    validate_transcript_envelope(SourceKind::Copilot, &resolved.events_path, 8 * 1024 * 1024)?;
     Ok(resolved.events_path)
 }
 
@@ -966,6 +984,7 @@ fn discover_unknown_sessions(
             continue;
         }
         let resolved = match resolve_session_reference(&SessionReference {
+            source: SourceKind::Copilot,
             session_id: Some(session_id.clone()),
             events_path: None,
             copilot_home: Some(copilot_home.to_path_buf()),
@@ -998,16 +1017,19 @@ fn source_is_stale_and_supported(path: &Path, cutoff_ms: i64, max_source_bytes: 
         .mtime()
         .saturating_mul(1_000)
         .saturating_add(metadata.mtime_nsec() / 1_000_000);
-    modified_ms <= cutoff_ms && validate_transcript_envelope(path, max_source_bytes).is_ok()
+    modified_ms <= cutoff_ms
+        && validate_transcript_envelope(SourceKind::Copilot, path, max_source_bytes).is_ok()
 }
 
-fn spawn_worker(state_directory: &Path, session_id: &str) -> io::Result<()> {
+fn spawn_worker(state_directory: &Path, source: SourceKind, session_id: &str) -> io::Result<()> {
     let executable = std::env::current_exe()?;
     spawn_detached(
         Command::new(executable)
             .arg("hook-worker")
             .arg("--state-dir")
             .arg(state_directory)
+            .arg("--source")
+            .arg(source.as_selector())
             .arg("--session-id")
             .arg(session_id),
     )
