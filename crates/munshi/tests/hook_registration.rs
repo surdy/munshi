@@ -66,15 +66,11 @@ fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema(
     for (event, command) in [("agentStop", "agent-stop"), ("sessionEnd", "session-end")] {
         let entry = &hook["hooks"][event][0];
         assert_eq!(entry["type"], "command");
-        assert_eq!(
-            entry["command"]["exec"],
-            executable.to_string_lossy().as_ref()
-        );
-        assert_eq!(entry["command"]["args"], json!(["hook", command]));
+        assert_eq!(entry["exec"], executable.to_string_lossy().as_ref());
+        assert_eq!(entry["args"], json!(["hook", command]));
         assert_eq!(entry["timeoutSec"], 2);
-        assert!(entry.get("exec").is_none());
-        assert!(entry.get("args").is_none());
         assert!(entry.get("bash").is_none());
+        assert!(entry.get("command").is_none());
     }
     let config: Value =
         serde_json::from_slice(&fs::read(paths.state.join("config.json")).unwrap()).unwrap();
@@ -126,6 +122,20 @@ fn registration_rejects_symlinked_or_malformed_owned_paths() {
 
     fs::remove_file(paths.copilot_home.join("hooks")).unwrap();
     fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
+    let target = elsewhere.join("target.json");
+    fs::write(&target, b"target-bytes").unwrap();
+    symlink(&target, paths.copilot_home.join("hooks/munshi.json")).unwrap();
+    let output = register_command(&paths, fake("success.sh"), 2_000, true);
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&target).unwrap(), b"target-bytes");
+    assert!(
+        fs::symlink_metadata(paths.copilot_home.join("hooks/munshi.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    fs::remove_file(paths.copilot_home.join("hooks/munshi.json")).unwrap();
+
     fs::write(paths.copilot_home.join("hooks/munshi.json"), b"{not-json").unwrap();
     let output = register_command(&paths, fake("success.sh"), 2_000, true);
     assert!(!output.status.success());
@@ -231,11 +241,10 @@ fn agent_stop_uses_an_atomic_minimal_metadata_handoff() {
     let transcript = fixture_events();
     let project = git_project(directory.path());
     let payload = agent_stop_payload(&project, &transcript);
-    assert_success(&hook_command(
-        &paths,
-        "agent-stop",
-        payload.to_string().as_bytes(),
-    ));
+    let output = hook_command(&paths, "agent-stop", payload.to_string().as_bytes());
+    assert_success(&output);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     let later_project = directory.path().join("later-project");
     fs::create_dir_all(&later_project).unwrap();
     assert_success(&hook_command(
@@ -417,7 +426,7 @@ fn dry_run_writes_nothing_and_direct_exec_preserves_spaces() {
         serde_json::from_slice(&fs::read(paths.copilot_home.join("hooks/munshi.json")).unwrap())
             .unwrap();
     assert_eq!(
-        hook["hooks"]["agentStop"][0]["command"]["exec"],
+        hook["hooks"]["agentStop"][0]["exec"],
         copied_binary
             .canonicalize()
             .unwrap()

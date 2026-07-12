@@ -116,16 +116,10 @@ struct HookEvents {
 struct HookCommand {
     #[serde(rename = "type")]
     kind: String,
-    command: DirectCommand,
-    #[serde(rename = "timeoutSec")]
-    timeout_seconds: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DirectCommand {
     exec: String,
     args: Vec<String>,
+    #[serde(rename = "timeoutSec")]
+    timeout_seconds: u64,
 }
 
 pub fn accept_disclosure(
@@ -291,10 +285,8 @@ impl HookFile {
         let executable = utf8(&config.executable)?;
         let command = |event: &str| HookCommand {
             kind: "command".to_owned(),
-            command: DirectCommand {
-                exec: executable.clone(),
-                args: vec!["hook".to_owned(), event.to_owned()],
-            },
+            exec: executable.clone(),
+            args: vec!["hook".to_owned(), event.to_owned()],
             timeout_seconds: 2,
         };
         Ok(Self {
@@ -313,8 +305,8 @@ impl ManagedFile for HookFile {
             commands.len() == 1
                 && commands[0].kind == "command"
                 && commands[0].timeout_seconds == 2
-                && Path::new(&commands[0].command.exec).is_absolute()
-                && commands[0].command.args == ["hook", event]
+                && Path::new(&commands[0].exec).is_absolute()
+                && commands[0].args == ["hook", event]
         };
         self.version == 1
             && valid(&self.hooks.agent_stop, "agent-stop")
