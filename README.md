@@ -190,8 +190,10 @@ require changing every sink or renderer.
 
 ## Copilot session capture
 
-Copilot CLI exposes lifecycle hooks. Munshi should install user-level hooks under the Copilot
-configuration directory.
+Copilot CLI exposes lifecycle hooks. Munshi should install user-level hooks under
+`~/.copilot/hooks` or `$COPILOT_HOME/hooks`. Copilot CLI 1.0.70 live testing confirmed this
+documented path; `~/.copilot/config/hooks` did not fire. Hook configuration is loaded at CLI
+startup.
 
 Use these events:
 
@@ -199,8 +201,9 @@ Use these events:
   source position.
 - `sessionEnd`: finalize or revise the report.
 
-`sessionEnd` does not itself provide the transcript path, so Munshi must persist the last path seen
-for each session during `agentStop`.
+`sessionEnd` does not itself provide the transcript path, so Munshi persists the last path seen for
+each session during `agentStop`. This is the primary transcript lookup, but it is not sufficient:
+an early Ctrl-C can produce `sessionEnd` without `agentStop`, and SIGKILL can produce neither hook.
 
 The hook command must:
 
@@ -222,11 +225,26 @@ The compatibility spike must verify that command hooks fire during:
 A session becomes archive-worthy only after at least one user request and agent-produced content or
 tool activity. Empty or cancelled starts may be recorded diagnostically but do not create Markdown.
 
-If a session has activity but no clean `sessionEnd`, Munshi marks it interrupted and recovers it
-opportunistically on a later hook or user-invoked command. The recovered summary records the
-interrupted completion reason.
+Interrupted recovery uses this order:
 
-Private files such as Copilot's internal session SQLite database may be inspected by a future
+1. Use the latest hook-provided `transcriptPath`.
+2. For a supported, version-pinned Copilot adapter, derive the expected transcript path from
+   `sessionId`, require that it exists, and validate its expected envelope before use.
+3. If neither lookup succeeds, leave the session pending rather than guessing or marking it
+   archived.
+4. Opportunistically scan source session state after later hooks or user-invoked recovery commands
+   to discover sessions for which force-close delivered no lifecycle event.
+
+The recovered summary records the interrupted completion reason when known. A force-killed process
+may provide no reason at all.
+
+Source note: privacy-safe inspection of installed Copilot CLI 1.0.70 maps
+`$COPILOT_HOME/session-state/<sessionId>/events.jsonl` deterministically. No documented CLI resolver
+exists; an experimental RPC is not a production contract. The derived path is therefore a private,
+version-pinned, existence-validated fallback, never a stable public contract. Normal capture must
+continue to prefer the documented hook-provided `transcriptPath`.
+
+Other private files such as Copilot's internal session SQLite database may be inspected by a future
 best-effort adapter, but the MVP must not depend on their schema.
 
 ## Session identity and revisions
@@ -893,10 +911,13 @@ round-trip backup.
 
 These should be resolved during Phase 0 rather than guessed:
 
-- Exact Copilot transcript event schema exposed by `transcriptPath`.
+- Which observed Copilot transcript event variants are stable enough to normalize across versions.
 - Whether hooks execute synchronously enough to require detached finalization.
-- Best structured-output prompt and validation strategy for available Copilot models.
+- Reliability of the validated title/summary prompt across available Copilot models and larger
+  inputs.
 - Reliable mapping from transcript offsets to semantic event cursors.
+- Safe discovery bounds for recovering force-closed sessions from private, version-pinned source
+  state.
 - Whether the first release should keep state in one SQLite file or separate operational and
   delivery databases.
 - Notesmith authentication as deployed behind the current reverse proxy.

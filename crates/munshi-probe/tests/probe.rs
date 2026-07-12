@@ -257,6 +257,43 @@ sleep 5
     assert!(!marker.exists());
 }
 
+#[test]
+fn committed_live_fixtures_contain_only_allowlisted_sanitized_values() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/copilot-1.0.70");
+    let mut files = Vec::new();
+    collect_files(&root, &mut files);
+    files.sort();
+
+    let expected = [
+        "interactive/agent-stop.json",
+        "interactive/session-end.json",
+        "interrupted/session-end.json",
+        "noninteractive/agent-stop.json",
+        "noninteractive/session-end.json",
+        "resumed/agent-stop.json",
+        "resumed/session-end.json",
+    ];
+    let relative: Vec<_> = files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(relative, expected);
+
+    for path in files {
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("/Users/"));
+        assert!(!contents.contains("/home/"));
+        assert!(!contents.contains("surdy"));
+        let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_sanitized_strings(&value);
+    }
+}
+
 fn config(binary: PathBuf) -> SummaryProbeConfig {
     SummaryProbeConfig {
         binary,
@@ -264,6 +301,40 @@ fn config(binary: PathBuf) -> SummaryProbeConfig {
         timeout: Duration::from_secs(2),
         stdout_limit: 4 * 1024,
         stderr_limit: 4 * 1024,
+    }
+}
+
+fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_files(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
+}
+
+fn assert_sanitized_strings(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => assert!(
+            matches!(
+                value.as_str(),
+                "<redacted>" | "end_turn" | "complete" | "user_exit"
+            ),
+            "unexpected fixture string value"
+        ),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                assert_sanitized_strings(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                assert_sanitized_strings(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
