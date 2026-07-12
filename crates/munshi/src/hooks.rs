@@ -662,6 +662,110 @@ mod tests {
         assert_eq!(diagnostics[0].code, "worker-lock-remove-failed");
     }
 
+    #[test]
+    fn result_write_failure_still_attempts_both_cleanups() {
+        let job_attempted = Cell::new(false);
+        let lock_attempted = Cell::new(false);
+        let publish_attempted = Cell::new(false);
+        let diagnostics = RefCell::new(Vec::new());
+
+        let finalized = finalize_worker(
+            "session",
+            HookResult::NotArchiveWorthy,
+            None,
+            || {
+                job_attempted.set(true);
+                Ok(())
+            },
+            || {
+                lock_attempted.set(true);
+                Ok(())
+            },
+            |_| {
+                publish_attempted.set(true);
+                Err(injected_error())
+            },
+            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
+        );
+
+        assert!(finalized.is_err());
+        assert!(job_attempted.get());
+        assert!(lock_attempted.get());
+        assert!(publish_attempted.get());
+        let diagnostics = diagnostics.into_inner();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "result-write-failed");
+    }
+
+    #[test]
+    fn combined_finalization_failure_attempts_every_operation() {
+        let job_attempted = Cell::new(false);
+        let lock_attempted = Cell::new(false);
+        let publish_attempted = Cell::new(false);
+        let diagnostics = RefCell::new(Vec::new());
+
+        let finalized = finalize_worker(
+            "session",
+            HookResult::Archived {
+                relative_path: "project/session.md".to_owned(),
+            },
+            None,
+            || {
+                job_attempted.set(true);
+                Err(injected_error())
+            },
+            || {
+                lock_attempted.set(true);
+                Err(injected_error())
+            },
+            |_| {
+                publish_attempted.set(true);
+                Err(injected_error())
+            },
+            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
+        );
+
+        assert!(finalized.is_err());
+        assert!(job_attempted.get());
+        assert!(lock_attempted.get());
+        assert!(publish_attempted.get());
+        let diagnostics = diagnostics.into_inner();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            "result-write-job-and-worker-lock-remove-failed"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_original_archive_failure_cause() {
+        let diagnostics = RefCell::new(Vec::new());
+        let archive_failure = failure(
+            "archive-worker",
+            "summary-failed",
+            Some("session".to_owned()),
+        );
+
+        let finalized = finalize_worker(
+            "session",
+            HookResult::Failed {
+                code: "summary-failed".to_owned(),
+            },
+            Some(archive_failure),
+            || Err(injected_error()),
+            || Ok(()),
+            |_| Ok(()),
+            |diagnostic| diagnostics.borrow_mut().push(diagnostic),
+        );
+
+        assert!(finalized.is_err());
+        let diagnostics = diagnostics.into_inner();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].code, "summary-failed");
+        assert_eq!(diagnostics[1].code, "job-remove-failed");
+        assert_eq!(diagnostics[1].cause_code.as_deref(), Some("summary-failed"));
+    }
+
     fn injected_error() -> RegistrationError {
         RegistrationError::Io(io::Error::other("injected finalization failure"))
     }
