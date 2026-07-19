@@ -21,7 +21,7 @@ A useful product phrase is: **Munshi writes the record; Khata keeps the ledger.*
 
 ## Current Munshi direction
 
-The full Munshi plan is in [`README.md`](../README.md). Important decisions already made:
+The full Munshi plan is in the [design and product specification](design.md). Important decisions already made:
 
 | Area | Decision |
 | --- | --- |
