@@ -1,0 +1,8 @@
+{
+  "cwd": "<redacted>",
+  "hook_event_name": "SessionEnd",
+  "prompt_id": "<redacted>",
+  "reason": "other",
+  "session_id": "<redacted>",
+  "transcript_path": "<redacted>"
+}

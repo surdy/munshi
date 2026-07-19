@@ -22,6 +22,7 @@ const CLAUDE_INTERRUPTED: &str = "0c1a0de0-0000-4000-8000-000000000003";
 const CLAUDE_MISSING: &str = "0c1a0de0-0000-4000-8000-000000000004";
 const CLAUDE_TRUNCATED: &str = "0c1a0de0-0000-4000-8000-000000000005";
 const CLAUDE_CONCURRENT_A: &str = "0c1a0de0-0000-4000-8000-000000000006";
+const CLAUDE_BOOKKEEPING: &str = "0c1a0de0-0000-4000-8000-000000000205";
 
 const CODEX_NORMAL: &str = "c0de0000-0000-4000-8000-000000000001";
 const CODEX_RESUMED: &str = "c0de0000-0000-4000-8000-000000000002";
@@ -49,6 +50,26 @@ fn claude_normal_normalizes_to_the_shared_model() {
     assert!(session.started_at.is_some() && session.updated_at.is_some());
     let kinds: Vec<_> = session.events.iter().map(|event| event.kind).collect();
     assert_eq!(kinds, ["user", "assistant", "tool", "tool", "assistant"]);
+}
+
+#[test]
+fn claude_2_1_205_bookkeeping_records_stay_ignored_metadata() {
+    // Claude Code 2.1.205 interleaves ai-title, attachment, last-prompt, mode,
+    // and queue-operation records between messages. The pinned 2.1.44 envelope
+    // is unchanged for user/assistant records; the new bookkeeping types must
+    // degrade to ignored metadata (docs/phase-0-claude-code-findings.md).
+    let session = load_fixture(
+        SourceKind::ClaudeCode,
+        "claude-code-2.1.205",
+        "transcript",
+        CLAUDE_BOOKKEEPING,
+    );
+    assert_eq!(session.user_requests, 1);
+    assert_eq!(session.assistant_messages, 1);
+    assert!(session.is_archive_worthy());
+    assert_eq!(session.ignored_events, 6);
+    let kinds: Vec<_> = session.events.iter().map(|event| event.kind).collect();
+    assert_eq!(kinds, ["user", "assistant"]);
 }
 
 #[test]

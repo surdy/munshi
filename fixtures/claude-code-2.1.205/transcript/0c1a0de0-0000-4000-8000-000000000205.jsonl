@@ -1,0 +1,8 @@
+{"type":"queue-operation","operation":"enqueue","content":"Add a hello function to greet.py","sessionId":"0c1a0de0-0000-4000-8000-000000000205","timestamp":"2026-07-18T20:00:00.000Z"}
+{"type":"queue-operation","operation":"dequeue","sessionId":"0c1a0de0-0000-4000-8000-000000000205","timestamp":"2026-07-18T20:00:01.000Z"}
+{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"0c1a0de0-0000-4000-8000-000000000205","timestamp":"2026-07-18T20:00:02.000Z","cwd":"/work/demo","version":"2.1.205","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli","message":{"role":"user","content":"Add a hello function to greet.py"}}
+{"type":"attachment","uuid":"at1","parentUuid":"u1","sessionId":"0c1a0de0-0000-4000-8000-000000000205","timestamp":"2026-07-18T20:00:03.000Z","cwd":"/work/demo","version":"2.1.205","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli","attachment":{"type":"queued_command","prompt":"synthetic attachment"}}
+{"type":"assistant","uuid":"a1","parentUuid":"at1","sessionId":"0c1a0de0-0000-4000-8000-000000000205","timestamp":"2026-07-18T20:00:04.000Z","cwd":"/work/demo","version":"2.1.205","gitBranch":"main","isSidechain":false,"userType":"external","entrypoint":"cli","message":{"role":"assistant","id":"msg_a1","model":"claude-synthetic","content":[{"type":"text","text":"Done. Added hello()."}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}}
+{"type":"ai-title","aiTitle":"Add hello function","sessionId":"0c1a0de0-0000-4000-8000-000000000205"}
+{"type":"last-prompt","lastPrompt":"Add a hello function to greet.py","leafUuid":"a1","sessionId":"0c1a0de0-0000-4000-8000-000000000205"}
+{"type":"mode","mode":"default","sessionId":"0c1a0de0-0000-4000-8000-000000000205"}

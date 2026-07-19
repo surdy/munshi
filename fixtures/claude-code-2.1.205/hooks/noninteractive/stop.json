@@ -1,0 +1,12 @@
+{
+  "background_tasks": [],
+  "cwd": "<redacted>",
+  "hook_event_name": "Stop",
+  "last_assistant_message": "<redacted>",
+  "permission_mode": "default",
+  "prompt_id": "<redacted>",
+  "session_crons": [],
+  "session_id": "<redacted>",
+  "stop_hook_active": false,
+  "transcript_path": "<redacted>"
+}

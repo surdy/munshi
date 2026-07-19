@@ -43,8 +43,52 @@ pub fn capture_hook(
 ) -> Result<CaptureReport, CaptureError> {
     let mut input_bytes = Vec::new();
     input.read_to_end(&mut input_bytes)?;
+    let value: Value = serde_json::from_slice(&input_bytes)?;
+    write_capture(output, value, input_bytes, mode)
+}
 
-    let mut value: Value = serde_json::from_slice(&input_bytes)?;
+/// Capture into `directory` under a self-naming fixture file derived from the
+/// payload's `hook_event_name`, so repeating hooks (Claude Code fires `Stop`
+/// once per assistant turn) never collide with a fixed `--output` path.
+pub fn capture_hook_in_directory(
+    mut input: impl Read,
+    directory: &Path,
+    mode: CaptureMode,
+) -> Result<CaptureReport, CaptureError> {
+    let mut input_bytes = Vec::new();
+    input.read_to_end(&mut input_bytes)?;
+    let value: Value = serde_json::from_slice(&input_bytes)?;
+    let output = directory.join(fixture_file_name(&value));
+    write_capture(&output, value, input_bytes, mode)
+}
+
+fn fixture_file_name(value: &Value) -> String {
+    let event: String = value
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("hook")
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(64)
+        .collect();
+    let event = if event.is_empty() {
+        "hook".to_owned()
+    } else {
+        event
+    };
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    format!("{event}-{unix_ms}-{}.json", std::process::id())
+}
+
+fn write_capture(
+    output: &Path,
+    mut value: Value,
+    input_bytes: Vec<u8>,
+    mode: CaptureMode,
+) -> Result<CaptureReport, CaptureError> {
     let sanitized = matches!(mode, CaptureMode::Sanitized { .. });
     let output_bytes = match mode {
         CaptureMode::Raw => input_bytes,

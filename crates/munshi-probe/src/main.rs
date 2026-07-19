@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use munshi_probe::capture::{CaptureMode, capture_hook};
+use munshi_probe::capture::{CaptureMode, capture_hook, capture_hook_in_directory};
 use munshi_probe::inspect::inspect_transcript;
 use munshi_probe::summary::{SummaryProbeConfig, run_summary_probe};
 
@@ -23,8 +23,11 @@ struct Cli {
 enum Command {
     /// Validate and atomically capture one hook JSON payload from stdin.
     CaptureHook {
-        #[arg(long)]
-        output: PathBuf,
+        #[arg(long, required_unless_present = "output_dir", conflicts_with = "output_dir")]
+        output: Option<PathBuf>,
+        /// Capture into this directory as `<hook_event_name>-<unix-ms>-<pid>.json`.
+        #[arg(long = "output-dir")]
+        output_dir: Option<PathBuf>,
         #[arg(long)]
         sanitize: bool,
         #[arg(long = "preserve-value", requires = "sanitize")]
@@ -70,6 +73,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::CaptureHook {
             output,
+            output_dir,
             sanitize,
             preserved_values,
             replacement,
@@ -82,7 +86,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 CaptureMode::Raw
             };
-            let report = capture_hook(io::stdin().lock(), &output, mode)?;
+            let report = match (output, output_dir) {
+                (Some(output), None) => capture_hook(io::stdin().lock(), &output, mode)?,
+                (None, Some(directory)) => {
+                    capture_hook_in_directory(io::stdin().lock(), &directory, mode)?
+                }
+                _ => unreachable!("clap enforces exactly one destination"),
+            };
             print_json(&report)?;
         }
         Command::InspectTranscript {
