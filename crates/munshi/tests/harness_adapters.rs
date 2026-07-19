@@ -73,6 +73,26 @@ fn claude_2_1_205_bookkeeping_records_stay_ignored_metadata() {
 }
 
 #[test]
+fn claude_transcript_origin_skips_leading_bookkeeping_records() {
+    // The 2.1.205 fixture opens with queue-operation records that carry no cwd; the origin
+    // reader must scan past them to the first record with an absolute top-level cwd.
+    let path = fixture(
+        "claude-code-2.1.205",
+        "transcript",
+        &format!("{CLAUDE_BOOKKEEPING}.jsonl"),
+    );
+    assert_eq!(
+        munshi::claude_transcript_origin(&path),
+        Some(PathBuf::from("/work/demo"))
+    );
+    // A transcript with no cwd anywhere yields no origin rather than a guess.
+    let directory = test_directory();
+    let no_cwd = directory.path().join("no-cwd.jsonl");
+    fs::write(&no_cwd, "{\"type\":\"ai-title\",\"aiTitle\":\"x\"}\n").unwrap();
+    assert_eq!(munshi::claude_transcript_origin(&no_cwd), None);
+}
+
+#[test]
 fn codex_normal_normalizes_to_the_shared_model() {
     let session = load_fixture(
         SourceKind::Codex,

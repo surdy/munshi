@@ -59,7 +59,13 @@ sources but performs each per-session mutation against a store scoped to that se
 non-Copilot session from being skipped, mis-routed to the Copilot adapter, or given a duplicate
 Copilot row. Session-ID-only transcript discovery remains intentionally Copilot-only, because only
 Copilot has a safe, version-pinned `session-state/<id>/events.jsonl` fallback; other sources are
-left pending rather than guessed.
+left pending rather than guessed. Path-yielding directory sweeps are a different, permitted
+mechanism: recovery also sweeps the registered Claude Code home's `projects/*/` directories for
+stale regular `<session-id>.jsonl` files whose hooks never fired (force-kill emits none). Each
+swept file provides its own explicit transcript path — no ID-to-path guessing occurs — and its
+origin project is read from the transcript's pinned top-level `cwd` key. Sibling `<uuid>/`
+directories, `memory/`, and foreign-envelope files are skipped by file-type, extension, and
+envelope checks.
 
 When optional archive Git history is enabled, each commit subject carries the durable archive
 identity `<source-prefix>:<session_id>` (matching the Markdown frontmatter `id`), and the commit
