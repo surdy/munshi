@@ -23,7 +23,11 @@ struct Cli {
 enum Command {
     /// Validate and atomically capture one hook JSON payload from stdin.
     CaptureHook {
-        #[arg(long, required_unless_present = "output_dir", conflicts_with = "output_dir")]
+        #[arg(
+            long,
+            required_unless_present = "output_dir",
+            conflicts_with = "output_dir"
+        )]
         output: Option<PathBuf>,
         /// Capture into this directory as `<hook_event_name>-<unix-ms>-<pid>.json`.
         #[arg(long = "output-dir")]

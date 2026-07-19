@@ -71,8 +71,8 @@ fn directory_capture_names_fixture_after_hook_event_and_never_collides() {
         },
     )
     .unwrap();
-    let second = capture_hook_in_directory(input.as_slice(), directory.path(), CaptureMode::Raw)
-        .unwrap();
+    let second =
+        capture_hook_in_directory(input.as_slice(), directory.path(), CaptureMode::Raw).unwrap();
 
     assert_ne!(first.path, second.path);
     for report in [&first, &second] {
@@ -110,7 +110,10 @@ fn directory_capture_degrades_missing_event_name_to_generic_stem() {
     )
     .unwrap();
     let hostile_name = hostile.path.file_name().unwrap().to_str().unwrap();
-    assert!(hostile_name.starts_with("escape-"), "unexpected name {hostile_name}");
+    assert!(
+        hostile_name.starts_with("escape-"),
+        "unexpected name {hostile_name}"
+    );
     assert_eq!(hostile.path.parent().unwrap(), directory.path());
 }
 

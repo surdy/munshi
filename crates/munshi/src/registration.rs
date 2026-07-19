@@ -29,7 +29,7 @@ pub const DISCLOSURE: &str = "\
 IMPORTANT: MUNSHI TRANSCRIPT PROCESSING DISCLOSURE
 
 After registration, local transcript summarization is ON by default for all projects.
-The full Copilot transcript is sent again to the configured summarizer and may consume credits or incur cost.
+The full session transcript from each registered harness (Copilot CLI, Claude Code) is sent again to the configured summarizer and may consume credits or incur cost.
 Munshi v1 has NO secret redaction or granular transcript filtering.
 Summaries are written as local Markdown files in the configured output directory.
 Remote delivery remains DISABLED.
@@ -42,10 +42,18 @@ pub struct CopilotTarget {
     pub home: PathBuf,
 }
 
+/// A Claude Code installation whose `settings.json` receives Munshi's managed hook entries.
+#[derive(Debug, Clone)]
+pub struct ClaudeTarget {
+    pub home: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct RegisterConfig {
     /// Install lifecycle hooks into this Copilot home, when targeting Copilot.
     pub copilot: Option<CopilotTarget>,
+    /// Merge lifecycle hook entries into this Claude Code home's `settings.json`.
+    pub claude: Option<ClaudeTarget>,
     pub state_directory: PathBuf,
     pub output_directory: PathBuf,
     pub archive_git_history: bool,
@@ -64,7 +72,7 @@ pub struct RegisterConfig {
 
 impl RegisterConfig {
     fn harnesses_selected(&self) -> bool {
-        self.copilot.is_some()
+        self.copilot.is_some() || self.claude.is_some()
     }
 }
 
@@ -88,6 +96,8 @@ pub enum RegistrationError {
     UnsafePath(PathBuf),
     #[error("the existing Munshi-owned file is malformed or was not created by this version")]
     MalformedOwnedFile,
+    #[error("the harness settings file at {0} is not a JSON settings object Munshi can merge into")]
+    ForeignSettingsUnrecognized(PathBuf),
     #[error("another Munshi registration operation is active")]
     RegistrationBusy,
     #[error("configuration contains a non-UTF-8 argument or path")]
@@ -145,7 +155,6 @@ impl StoredHarnesses {
                 .as_deref()
                 .is_none_or(|home| Path::new(home).is_absolute())
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +364,16 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
             Ok::<_, RegistrationError>((hook_path, HookFile::new(config)?))
         })
         .transpose()?;
+    let claude_settings = config
+        .claude
+        .as_ref()
+        .map(|target| {
+            let home = ensure_directory(&target.home)?;
+            let settings_path = home.join("settings.json");
+            crate::claude_settings::validate_claude_settings(&settings_path)?;
+            Ok::<_, RegistrationError>(settings_path)
+        })
+        .transpose()?;
     // Re-registration must not silently re-enable projects an explicit `project disable` excluded.
     let disabled_projects = existing_disabled_projects(&config_path)?;
     let stored = StoredConfig::from_register(config, disabled_projects)?;
@@ -375,6 +394,9 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     .map_err(state_registration_error)?;
     if let Some((hook_path, hook)) = &copilot_hook {
         install_or_update_json(hook_path, hook)?;
+    }
+    if let Some(settings_path) = &claude_settings {
+        crate::claude_settings::install_claude_hooks(settings_path, &config.executable)?;
     }
     Ok(())
 }
@@ -403,11 +425,14 @@ pub fn unregister(
     validate_existing_directory_if_present(copilot_home_fallback)?;
     let config_path = state_directory.join(CONFIG_FILE_NAME);
     let config_exists = recognized_owned_file_exists::<StoredConfig>(&config_path)?;
-    let copilot_home = if config_exists {
+    let (copilot_home, claude_home) = if config_exists {
         let config = load_stored_config(state_directory)?;
-        config.harnesses.copilot_home.map(PathBuf::from)
+        (
+            config.harnesses.copilot_home.map(PathBuf::from),
+            config.harnesses.claude_home.map(PathBuf::from),
+        )
     } else {
-        Some(copilot_home_fallback.to_path_buf())
+        (Some(copilot_home_fallback.to_path_buf()), None)
     };
     let hook_path = copilot_home.map(|home| home.join("hooks").join(HOOK_FILE_NAME));
     let hook_exists = match hook_path.as_deref() {
@@ -434,6 +459,9 @@ pub fn unregister(
         let hook_path = hook_path.expect("hook existence implies a path");
         validate_owned_file::<HookFile>(&hook_path)?;
         durable_remove(&hook_path)?;
+    }
+    if let Some(home) = claude_home {
+        crate::claude_settings::remove_claude_hooks(&home.join("settings.json"))?;
     }
     if config_exists {
         validate_owned_file::<StoredConfig>(&config_path)?;
@@ -489,7 +517,11 @@ impl StoredConfig {
                     .as_ref()
                     .map(|target| utf8(&target.home))
                     .transpose()?,
-                claude_home: None,
+                claude_home: config
+                    .claude
+                    .as_ref()
+                    .map(|target| utf8(&target.home))
+                    .transpose()?,
             },
         })
     }
@@ -883,6 +915,9 @@ fn validate_absolute_paths(config: &RegisterConfig) -> Result<(), RegistrationEr
     if let Some(copilot) = &config.copilot {
         paths.push(&copilot.home);
     }
+    if let Some(claude) = &config.claude {
+        paths.push(&claude.home);
+    }
     for path in paths {
         if !path.is_absolute() {
             return Err(RegistrationError::RelativePath);
@@ -894,7 +929,7 @@ fn validate_absolute_paths(config: &RegisterConfig) -> Result<(), RegistrationEr
     Ok(())
 }
 
-fn utf8(path: &Path) -> Result<String, RegistrationError> {
+pub(crate) fn utf8(path: &Path) -> Result<String, RegistrationError> {
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or(RegistrationError::NonUtf8Configuration)
@@ -926,7 +961,7 @@ fn ensure_child_directory(parent: &Path, child: &str) -> Result<PathBuf, Registr
     ensure_directory(&parent.join(child))
 }
 
-fn validate_existing_directory_if_present(path: &Path) -> Result<(), RegistrationError> {
+pub(crate) fn validate_existing_directory_if_present(path: &Path) -> Result<(), RegistrationError> {
     match fs::symlink_metadata(path) {
         Ok(metadata)
             if metadata.is_dir()

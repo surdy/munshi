@@ -116,13 +116,45 @@ struct SessionEndPayload {
     error: Option<IgnoredAny>,
 }
 
-pub fn handle_hook(event: HookEvent, state_directory: &Path, input: impl Read) {
-    let result = match event {
-        HookEvent::AgentStop => handle_agent_stop(state_directory, input),
-        HookEvent::SessionEnd => handle_session_end(state_directory, input),
+/// Claude Code `Stop` payload (phase-0 pinned at 2.1.205). Deliberately tolerant — Claude adds
+/// fields across versions (`prompt_id`, `permission_mode`, `last_assistant_message`, ...) and an
+/// unknown field must never drop an observation. The extra fields are never read, so payload
+/// content (which includes conversation text) cannot leak into state or diagnostics.
+#[derive(Deserialize)]
+struct ClaudeStopPayload {
+    session_id: String,
+    transcript_path: String,
+    cwd: String,
+    hook_event_name: String,
+}
+
+/// Claude Code `SessionEnd` payload (phase-0 pinned at 2.1.205). Tolerant, like `Stop`. Every
+/// observed `SessionEnd` carried `transcript_path`, but it stays optional so its absence degrades
+/// to an unresolved session instead of a dropped one.
+#[derive(Deserialize)]
+struct ClaudeSessionEndPayload {
+    session_id: String,
+    #[serde(default)]
+    transcript_path: Option<String>,
+    cwd: String,
+    hook_event_name: String,
+    reason: String,
+}
+
+pub fn handle_hook(event: HookEvent, source: SourceKind, state_directory: &Path, input: impl Read) {
+    let result = match (source, event) {
+        (SourceKind::Copilot, HookEvent::AgentStop) => handle_agent_stop(state_directory, input),
+        (SourceKind::Copilot, HookEvent::SessionEnd) => handle_session_end(state_directory, input),
+        (SourceKind::ClaudeCode, HookEvent::AgentStop) => {
+            handle_claude_agent_stop(state_directory, input)
+        }
+        (SourceKind::ClaudeCode, HookEvent::SessionEnd) => {
+            handle_claude_session_end(state_directory, input)
+        }
+        (SourceKind::Codex, _) => Err(failure("hook", "unsupported-hook-source", None)),
     };
     if let Err(failure) = result {
-        record_failure(state_directory, failure);
+        record_failure(state_directory, source, failure);
     }
     let _ = spawn_recovery_sweep(state_directory);
 }
@@ -365,9 +397,18 @@ pub fn wait_for_hook_result(
     session_id: &str,
     timeout: Duration,
 ) -> Result<HookResult, HookWorkerError> {
+    wait_for_hook_result_for_source(state_directory, SourceKind::Copilot, session_id, timeout)
+}
+
+pub fn wait_for_hook_result_for_source(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<HookResult, HookWorkerError> {
     validate_session_id(session_id).map_err(|_| StateError::InvalidState)?;
     let deadline = Instant::now() + timeout;
-    let state = StateStore::open(state_directory)?;
+    let state = StateStore::open_for_source(state_directory, source)?;
     loop {
         let (status, relative_path, error) = state.wait_state(session_id)?;
         match status {
@@ -500,6 +541,115 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
             )
         })?;
     if reserved && spawn_worker(state_directory, SourceKind::Copilot, &payload.session_id).is_err()
+    {
+        let _ = state.clear_worker_reservation(&payload.session_id);
+        return Err(failure(
+            "session-end",
+            "worker-spawn-failed",
+            Some(payload.session_id),
+        ));
+    }
+    Ok(())
+}
+
+/// Claude Code fires `Stop` once per completed assistant turn — the analog of Copilot's
+/// `agentStop`. There is no stop-reason contract to gate on, no payload timestamp (receipt time is
+/// stamped locally), and the hook always carries an explicit `transcript_path`, so the ID-only
+/// transcript lookup rule for Claude Code is never exercised.
+fn handle_claude_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), HookFailure> {
+    let payload: ClaudeStopPayload =
+        read_one_json(input).map_err(|code| failure("agent-stop", code, None))?;
+    validate_session_id(&payload.session_id)
+        .map_err(|_| failure("agent-stop", "invalid-session-id", None))?;
+    validate_absolute_string(&payload.cwd)
+        .map_err(|code| failure("agent-stop", code, Some(payload.session_id.clone())))?;
+    validate_absolute_string(&payload.transcript_path)
+        .map_err(|code| failure("agent-stop", code, Some(payload.session_id.clone())))?;
+    if payload.hook_event_name != "Stop" {
+        return Err(failure(
+            "agent-stop",
+            "unexpected-hook-event",
+            Some(payload.session_id),
+        ));
+    }
+    let mut state =
+        StateStore::open_for_source(state_directory, SourceKind::ClaudeCode).map_err(|_| {
+            failure(
+                "agent-stop",
+                "state-open-failed",
+                Some(payload.session_id.clone()),
+            )
+        })?;
+    state
+        .ingest_agent_stop(
+            &payload.session_id,
+            now_ms(),
+            Path::new(&payload.cwd),
+            Path::new(&payload.transcript_path),
+        )
+        .map_err(|_| failure("agent-stop", "state-write-failed", Some(payload.session_id)))
+}
+
+fn handle_claude_session_end(state_directory: &Path, input: impl Read) -> Result<(), HookFailure> {
+    let payload: ClaudeSessionEndPayload =
+        read_one_json(input).map_err(|code| failure("session-end", code, None))?;
+    validate_session_id(&payload.session_id)
+        .map_err(|_| failure("session-end", "invalid-session-id", None))?;
+    validate_absolute_string(&payload.cwd)
+        .map_err(|code| failure("session-end", code, Some(payload.session_id.clone())))?;
+    if payload.reason.trim().is_empty() || payload.reason.len() > 128 {
+        return Err(failure(
+            "session-end",
+            "invalid-reason",
+            Some(payload.session_id),
+        ));
+    }
+    if payload.hook_event_name != "SessionEnd" {
+        return Err(failure(
+            "session-end",
+            "unexpected-hook-event",
+            Some(payload.session_id),
+        ));
+    }
+    // Phase-0 finding: `reason` cannot distinguish a clean end from an interruption — clean
+    // noninteractive runs and SIGINT both report "other". Affirmative user-driven ends map to
+    // Complete; everything else (including future unknown reasons) degrades to Unknown and is
+    // still archived, with a previously recorded `Stop` marking the turn as completed.
+    let completion = match payload.reason.as_str() {
+        "clear" | "logout" | "prompt_input_exit" => CompletionReason::Complete,
+        _ => CompletionReason::Unknown,
+    };
+    let fallback = payload
+        .transcript_path
+        .as_deref()
+        .filter(|path| validate_absolute_string(path).is_ok())
+        .map(PathBuf::from);
+    let mut state =
+        StateStore::open_for_source(state_directory, SourceKind::ClaudeCode).map_err(|_| {
+            failure(
+                "session-end",
+                "state-open-failed",
+                Some(payload.session_id.clone()),
+            )
+        })?;
+    let reserved = state
+        .ingest_session_end(
+            &payload.session_id,
+            now_ms(),
+            Path::new(&payload.cwd),
+            &payload.reason,
+            completion,
+            fallback.as_deref(),
+        )
+        .map_err(|_| {
+            failure(
+                "session-end",
+                "state-write-failed",
+                Some(payload.session_id.clone()),
+            )
+        })?;
+    if reserved
+        && spawn_worker(state_directory, SourceKind::ClaudeCode, &payload.session_id).is_err()
     {
         let _ = state.clear_worker_reservation(&payload.session_id);
         return Err(failure(
@@ -1229,8 +1379,8 @@ fn failure(operation: &str, code: &str, session_id: Option<String>) -> HookFailu
     }
 }
 
-fn record_failure(state_directory: &Path, failure: HookFailure) {
-    if let Ok(mut state) = StateStore::open(state_directory) {
+fn record_failure(state_directory: &Path, source: SourceKind, failure: HookFailure) {
+    if let Ok(mut state) = StateStore::open_for_source(state_directory, source) {
         let _ = state.record_diagnostic(
             &failure.operation,
             &failure.code,
