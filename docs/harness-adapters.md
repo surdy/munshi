@@ -80,13 +80,16 @@ JSONL under `$COPILOT_HOME/session-state/<sessionId>/events.jsonl`. Event types
 [phase-0 findings](phase-0-findings.md). The session-state path remains a private,
 existence-validated fallback, not a public contract.
 
-## Claude Code (version-pinned to 2.1.44)
+## Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 
 **Source of truth.** Claude Code stores each session as JSONL at
 `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`. The transcript file is named after the
 session, so the adapter uses the file stem as the session identifier when resolving an explicit
 path. These files are a private, undocumented store; the mapping is treated as version-pinned
-evidence, not a stable contract.
+evidence, not a stable contract. A 2.1.205 live probe
+([phase-0 Claude Code findings](phase-0-claude-code-findings.md)) confirmed the `user`/`assistant`
+envelope is unchanged and that the record types added since 2.1.44 (`ai-title`, `attachment`,
+`last-prompt`, `mode`, `queue-operation`) degrade to ignored metadata.
 
 **Envelope.** Each line is a JSON object with a string `type` and (for turns) a `message` object,
 plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `cwd`, `version`,

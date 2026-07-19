@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use munshi_probe::capture::{CaptureError, CaptureMode, capture_hook};
+use munshi_probe::capture::{CaptureError, CaptureMode, capture_hook, capture_hook_in_directory};
 use munshi_probe::inspect::inspect_transcript;
 use munshi_probe::summary::{
     Phase0Summary, SummaryProbeConfig, SummaryProbeError, run_summary_probe,
@@ -55,6 +55,63 @@ fn sanitized_capture_is_recursive_and_atomically_created() {
         captured,
         serde_json::from_slice::<serde_json::Value>(&fs::read(&output).unwrap()).unwrap()
     );
+}
+
+#[test]
+fn directory_capture_names_fixture_after_hook_event_and_never_collides() {
+    let directory = test_directory();
+    let input = br#"{"hook_event_name": "SessionEnd", "session_id": "private-id"}"#;
+
+    let first = capture_hook_in_directory(
+        input.as_slice(),
+        directory.path(),
+        CaptureMode::Sanitized {
+            replacement: "<redacted>".to_owned(),
+            preserved_values: BTreeSet::from(["SessionEnd".to_owned()]),
+        },
+    )
+    .unwrap();
+    let second = capture_hook_in_directory(input.as_slice(), directory.path(), CaptureMode::Raw)
+        .unwrap();
+
+    assert_ne!(first.path, second.path);
+    for report in [&first, &second] {
+        let name = report.path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("SessionEnd-"), "unexpected name {name}");
+        assert!(name.ends_with(".json"));
+        assert!(report.path.exists());
+    }
+    let sanitized: serde_json::Value =
+        serde_json::from_slice(&fs::read(&first.path).unwrap()).unwrap();
+    assert_eq!(
+        sanitized,
+        serde_json::json!({"hook_event_name": "SessionEnd", "session_id": "<redacted>"})
+    );
+}
+
+#[test]
+fn directory_capture_degrades_missing_event_name_to_generic_stem() {
+    let directory = test_directory();
+
+    let report = capture_hook_in_directory(
+        br#"{"session_id": "private-id"}"#.as_slice(),
+        directory.path(),
+        CaptureMode::Raw,
+    )
+    .unwrap();
+
+    let name = report.path.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("hook-"), "unexpected name {name}");
+
+    let hostile = capture_hook_in_directory(
+        br#"{"hook_event_name": "../../escape"}"#.as_slice(),
+        directory.path(),
+        CaptureMode::Raw,
+    )
+    .unwrap();
+    let hostile_name = hostile.path.file_name().unwrap().to_str().unwrap();
+    assert!(hostile_name.starts_with("escape-"), "unexpected name {hostile_name}");
+    assert_eq!(hostile.path.parent().unwrap(), directory.path());
 }
 
 #[test]
@@ -342,6 +399,70 @@ fn committed_live_fixtures_contain_only_allowlisted_sanitized_values() {
             let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
             assert_sanitized_strings(&value);
         }
+    }
+}
+
+#[test]
+fn committed_claude_hook_fixtures_contain_only_allowlisted_sanitized_values() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-code-2.1.205");
+    let mut files = Vec::new();
+    collect_files(&root, &mut files);
+    files.sort();
+
+    let expected = [
+        "hooks/interrupted/session-end.json",
+        "hooks/noninteractive/session-end.json",
+        "hooks/noninteractive/stop.json",
+        "hooks/resumed/session-end.json",
+        "hooks/resumed/stop.json",
+        "transcript/0c1a0de0-0000-4000-8000-000000000205.jsonl",
+    ];
+    let relative: Vec<_> = files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(relative, expected);
+
+    for path in files {
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("/Users/"));
+        assert!(!contents.contains("/home/"));
+        assert!(!contents.contains("surdy"));
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert_claude_hook_sanitized_strings(&value);
+        }
+    }
+}
+
+fn assert_claude_hook_sanitized_strings(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => assert!(
+            matches!(
+                value.as_str(),
+                "<redacted>" | "Stop" | "SessionEnd" | "other" | "default"
+            ),
+            "unexpected fixture string value"
+        ),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                assert_claude_hook_sanitized_strings(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                assert_claude_hook_sanitized_strings(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
