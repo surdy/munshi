@@ -11,6 +11,11 @@ munshi register --accept-transcript-processing \
   --output-dir /absolute/path/to/munshi-summaries
 ```
 
+With no `--harness` (or explicit home) flag, registration targets every harness whose home
+directory exists. `--harness copilot` and `--harness claude-code` (repeatable) select explicitly;
+passing `--copilot-home` or `--claude-home` selects exactly that harness. Both harnesses share the
+same state store, summarizer configuration, and archive tree.
+
 Without `--accept-transcript-processing`, a terminal prompts for the exact text `I ACCEPT`;
 noninteractive registration fails. `--dry-run` prints the managed paths without writing. The
 disclosure states that transcript summarization becomes default-on for all projects, the full
@@ -23,13 +28,21 @@ successful non-cursor summary revision in the configured output directory's dedi
 
 The default locations are:
 
-- hooks: `$COPILOT_HOME/hooks/munshi.json`, or `~/.copilot/hooks/munshi.json`
+- Copilot hooks: `$COPILOT_HOME/hooks/munshi.json`, or `~/.copilot/hooks/munshi.json`
+- Claude Code hooks: managed entries inside `$CLAUDE_CONFIG_DIR/settings.json`, or
+  `~/.claude/settings.json`
 - state/config: `$MUNSHI_HOME`, or `~/.munshi` (harness-neutral; ADR 0008)
 
-`--copilot-home` overrides the Copilot hooks root and `--state-dir` the Munshi home. Registration writes only Munshi's dedicated hook and config
-files, rejects symlinked or wrongly owned managed paths, and does not rewrite equivalent files.
-`munshi unregister` removes only those two positively recognized files; archives and pending
-diagnostic state remain.
+`--copilot-home` overrides the Copilot hooks root, `--claude-home` the Claude Code home, and
+`--state-dir` the Munshi home. Registration writes only Munshi's dedicated hook and config files,
+rejects symlinked or wrongly owned managed paths, and does not rewrite equivalent files. Claude
+Code's `settings.json` is a foreign file Munshi merges into: registration appends one strictly
+shaped matcher group per managed event (`Stop`, `SessionEnd`) and preserves every other key,
+event, entry, the user's key order, and the file's mode; a file that is not a JSON settings
+object is refused before configuration is written. `munshi unregister` removes only positively
+recognized Munshi-owned files and managed entries; archives and pending diagnostic state remain.
+Register with no active Claude Code session: Claude Code itself rewrites `settings.json` and hook
+configuration is read at session startup.
 
 Register and unregister serialize changes with a persistent owner-only
 `<state>/locks/.munshi-registration.lock` file and a nonblocking OS advisory lock held for the
@@ -56,6 +69,25 @@ Tests can use the hidden `munshi hook wait` command to await terminal state dete
 That hook shape is intentionally guarded as a version-pinned Copilot CLI 1.0.70 compatibility
 contract from Phase 0. Generic web documentation or a different locally installed Copilot version
 is not treated as evidence that the schema changed.
+
+## Claude Code hooks
+
+Claude Code's `Stop` event (once per completed assistant turn) maps to the agent-stop ingestion
+path and `SessionEnd` to session-end, via `munshi hook <event> --source claude-code` shell
+commands with the same two-second timeout. The payload contract is version-pinned at 2.1.205
+([phase-0 Claude Code findings](phase-0-claude-code-findings.md)): snake_case fields, no
+timestamp (receipt time is stamped locally), `transcript_path` present on both events (persisted
+as the transcript reference, so Claude Code never needs session-ID-only resolution), and extra
+undocumented fields that tolerant deserialization ignores — hook payloads carry conversation
+text and are never logged or persisted. `SessionEnd` reasons `clear`, `logout`, and
+`prompt_input_exit` record an affirmative completion; every other value — including `other`,
+which clean noninteractive runs also report — degrades to the unknown completion category and
+still archives. Failures fail open toward Claude Code exactly as they do toward Copilot.
+
+Because a force-killed Claude Code process emits no hooks at all, recovery additionally sweeps
+the registered Claude home's `projects/*/` directories for stale, unknown `<session-id>.jsonl`
+transcripts and archives them as interrupted (see
+[harness adapters](harness-adapters.md)).
 
 ## SQLite state, locking, and revisions
 

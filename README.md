@@ -48,7 +48,8 @@ above; see [ADR 0007](docs/adr/0007-madari-status-and-actions-over-cli-json-only
 - Calling model APIs directly.
 - Providing a central archive server.
 - Building a web dashboard.
-- Supporting Claude Code or Codex in the initial implementation.
+- Supporting Codex in the initial implementation. (Claude Code capture has since landed: the
+  adapter, hook registration, and recovery sweep are implemented; Codex remains adapter-only.)
 
 ## Product decisions
 
@@ -264,7 +265,25 @@ Munshi captures Claude Code and Codex sessions through the same vendor-neutral
 [`SourceKind`](crates/munshi/src/source.rs) adapter boundary that Copilot uses. Selecting a source
 is independent from selecting a summarizer: use `munshi archive --source claude-code|codex`, or
 `StateStore::open_for_source` / `run_archive_worker_for_source` to drive the shared archive/state
-worker pipeline for those harnesses. Claude Code normal/resumed/interrupted and Codex
+worker pipeline for those harnesses.
+
+Claude Code capture is fully automatic once registered:
+
+```bash
+munshi register --accept-transcript-processing \
+  --harness claude-code \
+  --summarizer /absolute/path/to/summarizer \
+  --output-dir /absolute/path/to/munshi-summaries
+```
+
+Registration merges managed `Stop`/`SessionEnd` entries into `~/.claude/settings.json`
+(preserving all foreign settings; see
+[automatic session archival](docs/automatic-archive.md#claude-code-hooks)), hook payloads are
+version-pinned at Claude Code 2.1.205
+([phase-0 findings](docs/phase-0-claude-code-findings.md)), and recovery sweeps
+`~/.claude/projects` for sessions whose hooks never fired. `--harness` is repeatable, so one
+registration can manage Copilot and Claude Code together against the shared state store and
+archive tree. Codex remains manual-archive only. Claude Code normal/resumed/interrupted and Codex
 normal/resumed transcripts normalize to the same model and archive through the shared summarizer,
 renderer, state, and delivery paths. Existing Copilot behavior, identity (`copilot:<session-id>`),
 and archive format are unchanged.
@@ -1013,7 +1032,8 @@ without Munshi becoming dependent on Madari.
 
 ### Phase 4: Additional harnesses
 
-- Claude Code hook adapter.
+- Claude Code hook adapter. (Done: registration into `settings.json`, `--source claude-code`
+  hook ingestion, and the `~/.claude/projects` recovery sweep.)
 - Codex rollout-file adapter and watcher.
 - Adapter conformance suite.
 - Optional alternative CLI summarizers.
