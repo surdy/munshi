@@ -1,0 +1,244 @@
+# Summarizers
+
+Munshi never calls a model API directly. Every summary is produced by an external
+**summarizer executable** that you choose and configure with `munshi register --summarizer
+...` (or `munshi archive --summarizer ...` for one-off runs). This document describes the
+contract Munshi and your summarizer must agree on, gives two working examples, and covers
+what to know before writing your own.
+
+## 1. How Munshi invokes your summarizer
+
+For each session Munshi decides to summarize, it:
+
+1. Builds one JSON object (the *request*) describing the session.
+2. Spawns your summarizer binary with any `--summarizer-arg` values as arguments, and writes
+   the request JSON to its **stdin**, then closes stdin.
+3. Waits up to `--timeout-ms` (default 300000) for the process to exit, then kills the whole
+   process group if it's still running.
+4. Reads stdout, capped at `--max-stdout-bytes` (default 262144), and stderr, capped at
+   `--max-stderr-bytes` (default 65536).
+5. Requires **exactly one JSON object** on stdout (the *response*) matching the schema in
+   [section 3](#3-the-required-output), and nothing else — no leading/trailing text, no
+   Markdown fences, no NDJSON stream.
+6. If the process exits nonzero, stdout isn't valid JSON, the JSON doesn't validate, or the
+   timeout fires, the summary attempt fails. Munshi does not retry immediately; the session is
+   left pending and picked up again later via the normal `munshi retry` / worker cycle.
+
+Munshi itself makes no network calls to summarize a session — whatever your summarizer does
+(call an API, run a local model, shell out to another CLI) is entirely up to it. Session
+content is **only ever sent on stdin**; it is never passed as a command-line argument, so it
+never appears in `ps` output or shell history. `--summarizer-arg` is for fixed flags (model
+name, output format, `--no-ask-user`, etc.), not content.
+
+## 2. The input request
+
+Munshi writes one JSON object like this to your summarizer's stdin:
+
+```json
+{
+  "instruction": "Summarize this coding session as exactly one JSON object matching required_schema. Return every required field. Capture goals, meaningful completed work, decisions, files changed, commands and validation, and open items. Do not quote prompts, raw tool output, secrets, or substantial code. Use concise strings and arrays of strings. Return JSON only, with no Markdown fence or commentary.",
+  "required_schema": {
+    "title": "non-empty string",
+    "goal": "non-empty string",
+    "work_completed": "array of strings",
+    "decisions": "array of strings",
+    "files_changed": "array of strings",
+    "commands_and_validation": "array of strings",
+    "open_items": "array of strings",
+    "tags": "array of strings"
+  },
+  "session": {
+    "id": "claude-code:a1b2c3d4-...",
+    "source_agent": "claude-code",
+    "session_id": "a1b2c3d4-...",
+    "project_identity": "github.com/you/your-repo",
+    "repository": "you/your-repo"
+  },
+  "events": [
+    { "kind": "user", "content": "Add a retry command for failed deliveries." },
+    { "kind": "assistant", "content": "I'll add a `munshi delivery retry` subcommand..." },
+    { "kind": "tool", "content": "cargo test -p munshi delivery::retry ... ok" }
+  ],
+  "ignored_unknown_event_count": 0
+}
+```
+
+Field reference:
+
+| Field | Meaning |
+|---|---|
+| `instruction` | Fixed natural-language instruction for the model. Wording differs slightly for fresh vs. revision requests, but the field is always present. |
+| `required_schema` | Output field names and expected shape, spelled out for the model. Mirrors `StructuredSummary` exactly — use it, don't hardcode a copy that could drift. |
+| `session.id` | Munshi's globally unique ID, `<source>:<session_id>`. |
+| `session.source_agent` | Harness that captured the session: `copilot-cli`, `claude-code`, or `codex-cli`. |
+| `session.session_id` | The harness's own session ID. |
+| `session.project_identity` | Canonical project identity Munshi resolved the session to: the normalized Git remote (for example `github.com/you/your-repo`) or `local:sha256:<digest>` for repositories without one. |
+| `session.repository` | Best-effort repository name, or `null` if none was resolved. |
+| `previous_summary` | Present only when revising an already-archived summary (a resumed/updated session): the last accepted `StructuredSummary`, same shape as the required output. Field is omitted entirely on a first-time summary. |
+| `events` | Normalized transcript: an ordered array of `{ "kind": "user" \| "assistant" \| "tool", "content": string }`. This is the full material you have — there is no separate raw transcript to fetch. |
+| `ignored_unknown_event_count` | Count of transcript records Munshi couldn't normalize into an event. Usually 0; nonzero just means some records were dropped before reaching you. |
+
+When `previous_summary` is set, the instruction asks for a **complete replacement** summary,
+not a diff or an append: read the prior summary, read the new events, and return a full
+`StructuredSummary` that still covers everything still true plus what changed. Do not assume
+the caller will merge fields for you — nothing downstream stitches old and new together.
+
+## 3. The required output
+
+Your summarizer must print **exactly one JSON object** to stdout, matching `StructuredSummary`:
+
+```json
+{
+  "title": "Add munshi delivery retry command",
+  "goal": "Let failed Notesmith deliveries be retried individually or in bulk without a full re-summarize.",
+  "work_completed": [
+    "Implemented `munshi delivery retry [SESSION_ID] [--all] [--force]`.",
+    "Wired retry into the existing bounded-attempt/dead-letter state machine."
+  ],
+  "decisions": [
+    "Reused the delivery attempt counter rather than adding a separate retry counter."
+  ],
+  "files_changed": [
+    "crates/munshi/src/cli/delivery.rs",
+    "crates/munshi/src/delivery/retry.rs"
+  ],
+  "commands_and_validation": [
+    "cargo test -p munshi delivery::retry -- passed"
+  ],
+  "open_items": [
+    "Decide whether --force should also reset the dead-letter timestamp."
+  ],
+  "tags": ["delivery", "cli", "retry"]
+}
+```
+
+Validation rules Munshi enforces on the parsed object (violating any of these is a summary
+failure):
+
+- **Exactly these eight fields**, nothing else — `deny_unknown_fields` is on, so extra keys
+  reject the whole object.
+- `title`: non-empty, single line, ≤200 characters.
+- `goal`: non-empty, ≤4000 characters (newlines allowed, but not a line starting with `## `,
+  which Munshi's Markdown renderer reserves).
+- The six list fields (`work_completed`, `decisions`, `files_changed`,
+  `commands_and_validation`, `open_items`, `tags`) must each be a JSON array of strings, with
+  **at least one item** — if there's genuinely nothing to report, use a placeholder like
+  `"none"` rather than an empty array. Each item is non-empty, single line, ≤4000 characters
+  (≤100 for `tags`), and each list holds at most 200 items.
+- No control characters other than `\n`/`\t` in any string.
+- Output must be **valid JSON and only JSON** — a Markdown code fence around it, a leading
+  sentence like "Here's the summary:", or trailing commentary all cause a parse failure.
+
+Common rejection causes in practice: the model wraps its answer in a ` ```json ``` ` fence; the
+model returns an empty array for a list it considers not applicable instead of a placeholder;
+the model adds an extra field (like `summary` or `notes`) alongside the required ones; the
+process writes progress/log lines to stdout instead of stderr, corrupting the single JSON
+object Munshi expects; or the process exceeds `--timeout-ms` or `--max-stdout-bytes`.
+
+## 4. Example: Copilot CLI as summarizer
+
+Copilot CLI can act as a summarizer directly, since its noninteractive mode reads a prompt
+and can be told to answer without a fence:
+
+```bash
+munshi register --accept-transcript-processing \
+  --summarizer /absolute/path/to/copilot \
+  --summarizer-arg=-s \
+  --summarizer-arg=--no-ask-user \
+  --output-dir /absolute/path/to/munshi-summaries
+```
+
+`-s` runs Copilot CLI in noninteractive/scripting mode; `--no-ask-user` prevents it from
+pausing to ask clarifying questions (there's no user to answer). See
+[`docs/automatic-archive.md`](automatic-archive.md) for the full registration walkthrough.
+
+## 5. Example: Claude Code via `contrib/claude-summarizer.sh`
+
+Bare `claude -p` is not directly usable as a summarizer: it tends to wrap its JSON answer in a
+` ```json ``` ` Markdown fence, and for small/trivial sessions it sometimes returns empty
+arrays for optional lists — both of which fail validation (fenced output isn't valid JSON on
+its own, and Munshi rejects empty required lists).
+
+[`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh) is a verified wrapper that
+fixes both problems: it runs `claude -p` with an appended system prompt asking for a bare JSON
+object, then pipes the output through a small Python filter that strips any Markdown fence and
+replaces any empty list with `["none"]` before re-emitting the JSON. It has been verified
+end-to-end against real sessions.
+
+Before using it:
+
+- Edit the hardcoded `claude` binary path and `--model` flag at the top of the script to match
+  your local install (`which claude`, and whichever Claude Code model you want to pay for
+  summarization with — a small/cheap model is usually enough).
+- Make it executable: `chmod +x contrib/claude-summarizer.sh`.
+- Point `--summarizer` at its **absolute** path:
+
+```bash
+munshi register --accept-transcript-processing \
+  --summarizer /absolute/path/to/munshi/contrib/claude-summarizer.sh \
+  --output-dir /absolute/path/to/munshi-summaries
+```
+
+The script takes no `--summarizer-arg`s of its own; all Claude Code flags are baked in so the
+wrapper's stdin contract (whole request in, whole `StructuredSummary` out) stays exact.
+
+## 6. Writing your own
+
+A summarizer can be written in any language, as a script or a compiled binary — Munshi only
+cares that it is executable and speaks the stdin/stdout contract above. At minimum it must:
+
+1. Read all of stdin (the full `SummaryRequest` JSON) before producing output.
+2. Ask whatever backend you use to fill in `required_schema`, instructing it to return bare
+   JSON (no fence, no commentary) — most stray-output failures come from skipping this.
+3. Post-process the backend's answer defensively: strip any Markdown fence, and backfill any
+   empty required list with a placeholder like `["none"]`, the way
+   `contrib/claude-summarizer.sh` does — don't trust the model to always comply.
+4. Write exactly one JSON object matching `StructuredSummary` to stdout, nothing else. Send
+   logs/diagnostics to stderr instead.
+5. Exit 0 on success; any nonzero exit is treated as a failed attempt regardless of what was
+   printed.
+
+Handle `previous_summary` explicitly for good revision behavior: when present, feed it back
+into your prompt as prior context and ask the model to merge/update rather than start over from
+just the new `events` — this keeps titles/goals stable across a session's resumes. Ignoring it
+still works, but revisions may drift each time.
+
+Test a summarizer standalone before registering it, by handing it a sample request the same way
+Munshi would — save a request like the one in [section 2](#2-the-input-request) to
+`sample-request.json`, then:
+
+```bash
+cat sample-request.json | /absolute/path/to/your-summarizer | python3 -m json.tool; echo "exit=$?"
+```
+
+If `python3 -m json.tool` prints a clean, re-formatted object with all eight fields and no
+error, your summarizer is producing valid output. Also try a session with genuinely little to
+report, to confirm your placeholder-backfill logic covers empty lists.
+
+You can also exercise a registered summarizer against one real session without registering
+automatic capture, using [`munshi archive`](manual-archive.md).
+
+## 7. Cost/privacy notes
+
+- Munshi sends the **full normalized transcript** (`events`) of a session to your summarizer on
+  every invocation — and by extension to whatever backend your summarizer calls (a hosted model
+  API, a local model, etc.). Treat your summarizer choice as the actual data-handling boundary:
+  Munshi does not filter, sample, or truncate transcript content for privacy before handing it
+  over, only for size (`--max-input-bytes`, default 1048576).
+- Invocations are bounded by per-project budgets so a busy project can't cause unbounded spend:
+  `--max-calls-per-hour` (default 10) and `--max-calls-per-day` (default 50), plus
+  `--max-concurrency` (default 2) across all projects. Once a budget is hit, further summaries
+  for that project defer until the window rolls over rather than being dropped.
+- **v1 does not redact secrets.** If a transcript contains credentials, tokens, or other
+  sensitive text, that text is sent to your summarizer verbatim like everything else. Choose a
+  summarizer backend you're comfortable sending session content to, and keep that in mind for
+  any project where transcripts might contain secrets.
+
+## 8. Cross-links
+
+- [`docs/getting-started.md`](getting-started.md) — installing and registering Munshi for the
+  first time.
+- [`docs/troubleshooting.md`](troubleshooting.md) — diagnosing failed/pending sessions,
+  including summarizer failures, with `munshi doctor` and `munshi sessions --state failed`.
+- [`docs/automatic-archive.md`](automatic-archive.md) — full `munshi register` walkthrough.
+- [`docs/manual-archive.md`](manual-archive.md) — running `munshi archive` against one session.

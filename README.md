@@ -6,7 +6,25 @@ metadata, and can deliver the result to remote archives such as Notesmith.
 
 The first release targets GitHub Copilot CLI on macOS and Linux. The architecture must remain open
 to Claude Code, OpenAI Codex CLI, and other harnesses without coupling capture, summarization,
-rendering, or delivery to one vendor.
+rendering, or delivery to one vendor. Copilot CLI and Claude Code capture are both live today.
+
+## Documentation
+
+New here? Start with the user guides:
+
+| Guide | What it covers |
+| --- | --- |
+| [Getting started](docs/getting-started.md) | Build, register, and see your first archived session |
+| [Summarizers](docs/summarizers.md) | The summarizer contract, Copilot and Claude Code examples, writing your own |
+| [Using Munshi day to day](docs/user-guide.md) | Status, sessions, retries, budgets, project policy, delivery |
+| [Troubleshooting](docs/troubleshooting.md) | Why a session didn't archive, and how to find out |
+
+Design and reference material: [automatic archival](docs/automatic-archive.md),
+[manual archival](docs/manual-archive.md), [harness adapters](docs/harness-adapters.md),
+[ADRs](docs/adr/), and the phase-0 probe findings for
+[Copilot 1.0.70](docs/phase-0-findings.md) and
+[Claude Code 2.1.205](docs/phase-0-claude-code-findings.md). The rest of this README is the
+product specification and design record.
 
 ## Status
 
