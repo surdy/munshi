@@ -265,6 +265,7 @@ pub fn run_recovery(
     let unresolved = state.unresolved_sessions()?;
     let stale = state.stale_known_sessions(cutoff)?;
 
+    let copilot_home = stored.harnesses.copilot_home.as_deref().map(PathBuf::from);
     for session in unresolved {
         // Only Copilot has a safe, version-pinned session-ID transcript fallback
         // (`session-state/<id>/events.jsonl`). Other sources are left pending rather than
@@ -272,7 +273,10 @@ pub fn run_recovery(
         if session.source != SourceKind::Copilot {
             continue;
         }
-        let Ok(path) = resolve_fallback_transcript(state_directory, &session.session_id) else {
+        let Some(home) = copilot_home.as_deref() else {
+            continue;
+        };
+        let Ok(path) = resolve_fallback_transcript(home, &session.session_id) else {
             continue;
         };
         let metadata = fs::metadata(&path)?;
@@ -319,12 +323,9 @@ pub fn run_recovery(
             reserved_sessions.push((session.source, session.session_id));
         }
     }
-    discover_unknown_sessions(
-        &mut state,
-        state_directory,
-        cutoff,
-        stored.limits.max_source_bytes,
-    )?;
+    if let Some(home) = copilot_home.as_deref() {
+        discover_unknown_sessions(&mut state, home, cutoff, stored.limits.max_source_bytes)?;
+    }
     reserved_sessions.extend(state.reserve_eligible_workers(force_retry, RECOVERY_SCAN_LIMIT)?);
     reserved_sessions.sort();
     reserved_sessions.dedup();
@@ -477,9 +478,10 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
         .flatten()
         .is_none_or(|session| session.transcript_path.is_none());
     let fallback = needs_fallback
-        .then(|| resolve_fallback_transcript(state_directory, &payload.session_id))
-        .transpose()
-        .ok()
+        .then(|| {
+            let home = configured_copilot_home(state_directory)?;
+            resolve_fallback_transcript(&home, &payload.session_id).ok()
+        })
         .flatten();
     let reserved = state
         .ingest_session_end(
@@ -520,7 +522,15 @@ fn process_claim(
         .session
         .transcript_path
         .clone()
-        .or_else(|| resolve_fallback_transcript(state_directory, &claim.session.session_id).ok())
+        .or_else(|| {
+            // Only Copilot has a version-pinned session-ID transcript fallback, rooted at the
+            // configured Copilot home.
+            if source != SourceKind::Copilot {
+                return None;
+            }
+            let home = PathBuf::from(stored.harnesses.copilot_home.as_deref()?);
+            resolve_fallback_transcript(&home, &claim.session.session_id).ok()
+        })
         .ok_or(SourceError::TranscriptNotFound)?;
     let resolved = resolve_session_reference(&SessionReference {
         source,
@@ -1003,19 +1013,24 @@ fn current_result(state: &StateStore, session_id: &str) -> Result<HookResult, Ho
     })
 }
 
+/// The Copilot home this registration manages, from stored configuration. The state directory is
+/// harness-neutral (ADR 0008), so the home can no longer be derived from its parent; a missing or
+/// unreadable configuration degrades to `None` and callers skip the version-pinned fallback.
+fn configured_copilot_home(state_directory: &Path) -> Option<PathBuf> {
+    load_stored_config(state_directory)
+        .ok()
+        .and_then(|config| config.harnesses.copilot_home.map(PathBuf::from))
+}
+
 fn resolve_fallback_transcript(
-    state_directory: &Path,
+    copilot_home: &Path,
     session_id: &str,
 ) -> Result<PathBuf, SourceError> {
-    let copilot_home = state_directory
-        .parent()
-        .ok_or(SourceError::MissingCopilotHome)?
-        .to_path_buf();
     let resolved = resolve_session_reference(&SessionReference {
         source: SourceKind::Copilot,
         session_id: Some(session_id.to_owned()),
         events_path: None,
-        copilot_home: Some(copilot_home),
+        copilot_home: Some(copilot_home.to_path_buf()),
     })?;
     validate_transcript_envelope(SourceKind::Copilot, &resolved.events_path, 8 * 1024 * 1024)?;
     Ok(resolved.events_path)
@@ -1023,13 +1038,10 @@ fn resolve_fallback_transcript(
 
 fn discover_unknown_sessions(
     state: &mut StateStore,
-    state_directory: &Path,
+    copilot_home: &Path,
     cutoff_ms: i64,
     max_source_bytes: usize,
 ) -> Result<(), HookWorkerError> {
-    let Some(copilot_home) = state_directory.parent() else {
-        return Ok(());
-    };
     let session_state = copilot_home.join("session-state");
     if !session_state.is_dir() {
         return Ok(());

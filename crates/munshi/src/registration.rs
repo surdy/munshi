@@ -17,6 +17,8 @@ use crate::state::{StateStore, migrate_legacy_state};
 
 const HOOK_FILE_NAME: &str = "munshi.json";
 const CONFIG_FILE_NAME: &str = "config.json";
+/// Dot-prefixed so it can never collide with a `locks/<session_id>.lock` file.
+const REGISTRATION_LOCK_NAME: &str = ".munshi-registration.lock";
 const DEFAULT_MAX_CALLS_PER_HOUR: u32 = 10;
 const DEFAULT_MAX_CALLS_PER_DAY: u32 = 50;
 const DEFAULT_MAX_CONCURRENCY: usize = 2;
@@ -34,9 +36,16 @@ Remote delivery remains DISABLED.
 Disabling future project capture does not delete summaries already written.
 ";
 
+/// A Copilot CLI installation whose `hooks/` directory receives Munshi's dedicated hook file.
+#[derive(Debug, Clone)]
+pub struct CopilotTarget {
+    pub home: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct RegisterConfig {
-    pub copilot_home: PathBuf,
+    /// Install lifecycle hooks into this Copilot home, when targeting Copilot.
+    pub copilot: Option<CopilotTarget>,
     pub state_directory: PathBuf,
     pub output_directory: PathBuf,
     pub archive_git_history: bool,
@@ -53,6 +62,12 @@ pub struct RegisterConfig {
     pub executable: PathBuf,
 }
 
+impl RegisterConfig {
+    fn harnesses_selected(&self) -> bool {
+        self.copilot.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisclosureDecision {
     AcceptedByFlag,
@@ -63,6 +78,8 @@ pub enum DisclosureDecision {
 pub enum RegistrationError {
     #[error("registration disclosure was not accepted")]
     DisclosureDeclined,
+    #[error("registration requires at least one harness target")]
+    NoHarnessSelected,
     #[error("noninteractive registration requires --accept-transcript-processing")]
     NoninteractiveAcceptanceRequired,
     #[error("registration paths and executables must be absolute")]
@@ -101,6 +118,34 @@ pub(crate) struct StoredConfig {
     pub delivery: StoredDelivery,
     #[serde(default = "StoredPolicy::defaults")]
     pub policy: StoredPolicy,
+    /// Which harness installations this registration manages hooks for. The state store is
+    /// harness-neutral (ADR 0008); each recorded home locates that harness's hook installation.
+    #[serde(default)]
+    pub harnesses: StoredHarnesses,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredHarnesses {
+    /// Copilot home whose `hooks/munshi.json` this registration owns.
+    #[serde(default)]
+    pub copilot_home: Option<String>,
+    /// Claude Code home whose `settings.json` carries Munshi's hook entries.
+    #[serde(default)]
+    pub claude_home: Option<String>,
+}
+
+impl StoredHarnesses {
+    fn paths_are_absolute(&self) -> bool {
+        self.copilot_home
+            .as_deref()
+            .is_none_or(|home| Path::new(home).is_absolute())
+            && self
+                .claude_home
+                .as_deref()
+                .is_none_or(|home| Path::new(home).is_absolute())
+    }
+
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,20 +335,26 @@ pub fn accept_disclosure_from_terminal(
 
 pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     validate_absolute_paths(config)?;
-    if config.state_directory != config.copilot_home.join("munshi") {
-        return Err(RegistrationError::UnsafePath(
-            config.state_directory.clone(),
-        ));
+    if !config.harnesses_selected() {
+        return Err(RegistrationError::NoHarnessSelected);
     }
-    let copilot_home = ensure_directory(&config.copilot_home)?;
-    let hooks_directory = ensure_child_directory(&copilot_home, "hooks")?;
-    let hook = HookFile::new(config)?;
-    let hook_path = hooks_directory.join(HOOK_FILE_NAME);
-    let config_path = config.state_directory.join(CONFIG_FILE_NAME);
-    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let state_directory = ensure_directory(&config.state_directory)?;
+    let locks_directory = ensure_child_directory(&state_directory, "locks")?;
+    let config_path = state_directory.join(CONFIG_FILE_NAME);
+    let lock_path = locks_directory.join(REGISTRATION_LOCK_NAME);
     let _lock = acquire_registration_lock(&lock_path)?;
     validate_owned_file::<StoredConfig>(&config_path)?;
-    validate_owned_file::<HookFile>(&hook_path)?;
+    let copilot_hook = config
+        .copilot
+        .as_ref()
+        .map(|target| {
+            let home = ensure_directory(&target.home)?;
+            let hooks_directory = ensure_child_directory(&home, "hooks")?;
+            let hook_path = hooks_directory.join(HOOK_FILE_NAME);
+            validate_owned_file::<HookFile>(&hook_path)?;
+            Ok::<_, RegistrationError>((hook_path, HookFile::new(config)?))
+        })
+        .transpose()?;
     // Re-registration must not silently re-enable projects an explicit `project disable` excluded.
     let disabled_projects = existing_disabled_projects(&config_path)?;
     let stored = StoredConfig::from_register(config, disabled_projects)?;
@@ -311,8 +362,6 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
         ensure_archive_repository(&config.output_directory)
             .map_err(RegistrationError::ArchiveGit)?;
     }
-    let state_directory = ensure_directory(&config.state_directory)?;
-    ensure_child_directory(&state_directory, "locks")?;
     install_or_update_json(&config_path, &stored)?;
     let mut state = StateStore::open(&state_directory).map_err(state_registration_error)?;
     state
@@ -324,7 +373,10 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
         config.timeout.saturating_add(Duration::from_secs(60)),
     )
     .map_err(state_registration_error)?;
-    install_or_update_json(&hook_path, &hook)
+    if let Some((hook_path, hook)) = &copilot_hook {
+        install_or_update_json(hook_path, hook)?;
+    }
+    Ok(())
 }
 
 fn existing_disabled_projects(config_path: &Path) -> Result<Vec<String>, RegistrationError> {
@@ -337,34 +389,57 @@ fn existing_disabled_projects(config_path: &Path) -> Result<Vec<String>, Registr
     Ok(config.policy.disabled_projects)
 }
 
-pub fn unregister(copilot_home: &Path, state_directory: &Path) -> Result<(), RegistrationError> {
-    if !copilot_home.is_absolute() || !state_directory.is_absolute() {
+/// Removes Munshi's hook installations and active configuration. Hook locations come from the
+/// stored configuration's harness records; `copilot_home_fallback` covers an orphaned Copilot
+/// hook file left behind without a readable configuration.
+pub fn unregister(
+    state_directory: &Path,
+    copilot_home_fallback: &Path,
+) -> Result<(), RegistrationError> {
+    if !copilot_home_fallback.is_absolute() || !state_directory.is_absolute() {
         return Err(RegistrationError::RelativePath);
     }
-    validate_existing_directory_if_present(copilot_home)?;
     validate_existing_directory_if_present(state_directory)?;
-    let hooks = copilot_home.join("hooks");
-    validate_existing_directory_if_present(&hooks)?;
-    if !copilot_home.exists() {
-        return Ok(());
-    }
-    let hook_path = hooks.join(HOOK_FILE_NAME);
+    validate_existing_directory_if_present(copilot_home_fallback)?;
     let config_path = state_directory.join(CONFIG_FILE_NAME);
-    if !hooks.exists() {
-        validate_owned_file::<StoredConfig>(&config_path)?;
-        return durable_remove(&config_path);
-    }
-    let hook_exists = recognized_owned_file_exists::<HookFile>(&hook_path)?;
     let config_exists = recognized_owned_file_exists::<StoredConfig>(&config_path)?;
+    let copilot_home = if config_exists {
+        let config = load_stored_config(state_directory)?;
+        config.harnesses.copilot_home.map(PathBuf::from)
+    } else {
+        Some(copilot_home_fallback.to_path_buf())
+    };
+    let hook_path = copilot_home.map(|home| home.join("hooks").join(HOOK_FILE_NAME));
+    let hook_exists = match hook_path.as_deref() {
+        Some(path) => {
+            if let Some(hooks) = path.parent() {
+                validate_existing_directory_if_present(hooks)?;
+            }
+            recognized_owned_file_exists::<HookFile>(path)?
+        }
+        None => false,
+    };
     if !hook_exists && !config_exists {
         return Ok(());
     }
-    let lock_path = hooks.join(".munshi-registration.lock");
-    let _lock = acquire_registration_lock(&lock_path)?;
-    validate_owned_file::<HookFile>(&hook_path)?;
-    validate_owned_file::<StoredConfig>(&config_path)?;
-    durable_remove(&hook_path)?;
-    durable_remove(&config_path)
+    let _lock = if state_directory.exists() {
+        let locks_directory = ensure_child_directory(state_directory, "locks")?;
+        Some(acquire_registration_lock(
+            &locks_directory.join(REGISTRATION_LOCK_NAME),
+        )?)
+    } else {
+        None
+    };
+    if hook_exists {
+        let hook_path = hook_path.expect("hook existence implies a path");
+        validate_owned_file::<HookFile>(&hook_path)?;
+        durable_remove(&hook_path)?;
+    }
+    if config_exists {
+        validate_owned_file::<StoredConfig>(&config_path)?;
+        durable_remove(&config_path)?;
+    }
+    Ok(())
 }
 
 impl StoredConfig {
@@ -408,6 +483,14 @@ impl StoredConfig {
                 max_concurrency: config.max_concurrency,
                 disabled_projects,
             },
+            harnesses: StoredHarnesses {
+                copilot_home: config
+                    .copilot
+                    .as_ref()
+                    .map(|target| utf8(&target.home))
+                    .transpose()?,
+                claude_home: None,
+            },
         })
     }
 }
@@ -427,6 +510,7 @@ impl ManagedFile for StoredConfig {
             && Path::new(&self.output_directory).is_absolute()
             && Path::new(&self.state_directory).is_absolute()
             && Path::new(&self.summarizer.executable).is_absolute()
+            && self.harnesses.paths_are_absolute()
     }
 }
 
@@ -486,6 +570,7 @@ pub(crate) fn load_stored_config(
         || config.policy.max_concurrency < 1
         || (config.remote_delivery && !config.delivery.is_addressable())
         || Path::new(&config.state_directory) != state_directory
+        || !config.harnesses.paths_are_absolute()
     {
         return Err(RegistrationError::MalformedOwnedFile);
     }
@@ -507,13 +592,11 @@ pub struct ProjectStatus {
 /// holding the registration lock, loading the recognized config, applying `update`, and writing it
 /// atomically. Returns the resulting config and the closure's value.
 pub(crate) fn update_stored_config<T>(
-    copilot_home: &Path,
     state_directory: &Path,
     update: impl FnOnce(&mut StoredConfig) -> Result<T, RegistrationError>,
 ) -> Result<(StoredConfig, T), RegistrationError> {
-    let hooks_directory = copilot_home.join("hooks");
-    validate_existing_directory_if_present(&hooks_directory)?;
-    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let locks_directory = ensure_child_directory(state_directory, "locks")?;
+    let lock_path = locks_directory.join(REGISTRATION_LOCK_NAME);
     let _lock = acquire_registration_lock(&lock_path)?;
     let config_path = state_directory.join(CONFIG_FILE_NAME);
     let mut config = load_stored_config(state_directory)?;
@@ -527,7 +610,6 @@ pub(crate) fn update_stored_config<T>(
 /// Disabling stops future processing and delivery for the project; it never touches archives
 /// already written locally or delivered remotely.
 pub fn set_project_enabled(
-    copilot_home: &Path,
     state_directory: &Path,
     project_directory: &Path,
     enabled: bool,
@@ -535,9 +617,8 @@ pub fn set_project_enabled(
     let identity = inspect_project(project_directory)
         .map_err(project_identity_error)?
         .identity;
-    let hooks_directory = copilot_home.join("hooks");
-    validate_existing_directory_if_present(&hooks_directory)?;
-    let lock_path = hooks_directory.join(".munshi-registration.lock");
+    let locks_directory = ensure_child_directory(state_directory, "locks")?;
+    let lock_path = locks_directory.join(REGISTRATION_LOCK_NAME);
     let _lock = acquire_registration_lock(&lock_path)?;
     let config_path = state_directory.join(CONFIG_FILE_NAME);
     let mut config = load_stored_config(state_directory)?;
@@ -793,13 +874,16 @@ fn lock_open_error(path: &Path, error: io::Error) -> RegistrationError {
 }
 
 fn validate_absolute_paths(config: &RegisterConfig) -> Result<(), RegistrationError> {
-    for path in [
-        &config.copilot_home,
+    let mut paths = vec![
         &config.state_directory,
         &config.output_directory,
         &config.summarizer_binary,
         &config.executable,
-    ] {
+    ];
+    if let Some(copilot) = &config.copilot {
+        paths.push(&copilot.home);
+    }
+    for path in paths {
         if !path.is_absolute() {
             return Err(RegistrationError::RelativePath);
         }

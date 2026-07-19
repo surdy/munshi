@@ -398,7 +398,7 @@ impl Harness {
         );
         let copilot_home = directory.path().join("copilot-home");
         Self {
-            state: copilot_home.join("munshi"),
+            state: directory.path().join("munshi-home"),
             output: directory.path().join("archives"),
             copilot_home,
             project,
@@ -426,6 +426,8 @@ impl Harness {
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
             .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .arg("--output-dir")
             .arg(&self.output)
             .arg("--summarizer")
@@ -444,8 +446,8 @@ impl Harness {
             .arg("project")
             .arg("disable")
             .arg(&self.project)
-            .arg("--copilot-home")
-            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .output()
             .unwrap()
     }
@@ -591,7 +593,7 @@ impl Harness {
         let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
             .arg("hook")
             .arg(event)
-            .env("COPILOT_HOME", &self.copilot_home)
+            .env("MUNSHI_HOME", &self.state)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -1648,13 +1648,12 @@ pub fn verify_history(
 /// Configures the Notesmith sink without enabling delivery. The credential source is recorded, but
 /// never the secret itself.
 pub fn configure_sink(
-    copilot_home: &Path,
     state_directory: &Path,
     sink: DeliverySinkConfig,
 ) -> Result<DeliverySettings, DeliveryError> {
     // Validate the endpoint eagerly so a bad URL is rejected at configure time.
     parse_http_endpoint(&sink.endpoint)?;
-    let (config, ()) = update_stored_config(copilot_home, state_directory, |config| {
+    let (config, ()) = update_stored_config(state_directory, |config| {
         config.delivery.endpoint = Some(sink.endpoint.clone());
         config.delivery.vault = Some(sink.vault.clone());
         config.delivery.folder = sink.folder.clone().filter(|value| !value.is_empty());
@@ -1676,11 +1675,10 @@ pub fn configure_sink(
 
 /// Enables or disables delivery. Disabling stops future delivery while retaining delivery history.
 pub fn set_enabled(
-    copilot_home: &Path,
     state_directory: &Path,
     enabled: bool,
 ) -> Result<DeliverySettings, DeliveryError> {
-    let result = update_stored_config(copilot_home, state_directory, |config| {
+    let result = update_stored_config(state_directory, |config| {
         if enabled && !config.delivery.is_addressable() {
             return Err(RegistrationError::MalformedOwnedFile);
         }

@@ -100,7 +100,7 @@ fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema(
         let output = unregister_command(&paths);
         assert_success(&output);
     }
-    let registration_lock = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    let registration_lock = paths.state.join("locks/.munshi-registration.lock");
     assert!(registration_lock.is_file());
     assert_eq!(
         fs::metadata(&registration_lock).unwrap().mode() & 0o777,
@@ -131,19 +131,23 @@ fn registration_rejects_symlinked_or_malformed_owned_paths() {
 
     fs::remove_file(paths.copilot_home.join("hooks")).unwrap();
     fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
+    fs::create_dir_all(paths.state.join("locks")).unwrap();
+    // The failed register above legitimately left a lock file behind; replace it with the
+    // hostile symlink under test.
+    let _ = fs::remove_file(paths.state.join("locks/.munshi-registration.lock"));
     let lock_target = elsewhere.join("lock-target");
     fs::write(&lock_target, b"lock-target-bytes").unwrap();
     symlink(
         &lock_target,
-        paths.copilot_home.join("hooks/.munshi-registration.lock"),
+        paths.state.join("locks/.munshi-registration.lock"),
     )
     .unwrap();
     let output = register_command(&paths, fake("success.sh"), 2_000, true);
     assert!(!output.status.success());
     assert_eq!(fs::read(&lock_target).unwrap(), b"lock-target-bytes");
-    fs::remove_file(paths.copilot_home.join("hooks/.munshi-registration.lock")).unwrap();
+    fs::remove_file(paths.state.join("locks/.munshi-registration.lock")).unwrap();
 
-    let unsafe_lock = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    let unsafe_lock = paths.state.join("locks/.munshi-registration.lock");
     fs::write(&unsafe_lock, b"").unwrap();
     fs::set_permissions(&unsafe_lock, fs::Permissions::from_mode(0o666)).unwrap();
     let output = register_command(&paths, fake("success.sh"), 2_000, true);
@@ -203,7 +207,6 @@ fn absent_hooks_cleanup_removes_only_recognized_config_without_creating_hooks() 
     let paths = Paths::new(&directory);
     assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
     fs::remove_file(paths.copilot_home.join("hooks/munshi.json")).unwrap();
-    fs::remove_file(paths.copilot_home.join("hooks/.munshi-registration.lock")).unwrap();
     fs::remove_dir(paths.copilot_home.join("hooks")).unwrap();
     fs::set_permissions(&paths.copilot_home, fs::Permissions::from_mode(0o500)).unwrap();
 
@@ -218,8 +221,8 @@ fn absent_hooks_cleanup_removes_only_recognized_config_without_creating_hooks() 
 fn stale_lock_is_reusable_and_existing_hook_unregister_honors_contention() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
-    fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
-    let lock = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    fs::create_dir_all(paths.state.join("locks")).unwrap();
+    let lock = paths.state.join("locks/.munshi-registration.lock");
     fs::write(&lock, b"").unwrap();
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -251,8 +254,8 @@ fn stale_lock_is_reusable_and_existing_hook_unregister_honors_contention() {
 fn active_registration_lock_reports_distinct_contention() {
     let directory = test_directory();
     let paths = Paths::new(&directory);
-    fs::create_dir_all(paths.copilot_home.join("hooks")).unwrap();
-    let lock_path = paths.copilot_home.join("hooks/.munshi-registration.lock");
+    fs::create_dir_all(paths.state.join("locks")).unwrap();
+    let lock_path = paths.state.join("locks/.munshi-registration.lock");
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -592,7 +595,7 @@ impl Paths {
     fn new(directory: &TempDir) -> Self {
         Self {
             copilot_home: directory.path().join("copilot-home"),
-            state: directory.path().join("copilot-home/munshi"),
+            state: directory.path().join("munshi-home"),
             output: directory.path().join("archives"),
         }
     }
@@ -614,6 +617,8 @@ fn register_command_args(
         .arg("register")
         .arg("--copilot-home")
         .arg(&paths.copilot_home)
+        .arg("--state-dir")
+        .arg(&paths.state)
         .arg("--output-dir")
         .arg(&paths.output)
         .arg("--summarizer")
@@ -635,6 +640,8 @@ fn unregister_command(paths: &Paths) -> Output {
         .arg("unregister")
         .arg("--copilot-home")
         .arg(&paths.copilot_home)
+        .arg("--state-dir")
+        .arg(&paths.state)
         .output()
         .unwrap()
 }
@@ -643,7 +650,7 @@ fn hook_command(paths: &Paths, event: &str, input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
         .arg("hook")
         .arg(event)
-        .env("COPILOT_HOME", &paths.copilot_home)
+        .env("MUNSHI_HOME", &paths.state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

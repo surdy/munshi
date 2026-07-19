@@ -1374,7 +1374,7 @@ impl Harness {
         );
         let copilot_home = directory.path().join("copilot-home");
         Self {
-            state: copilot_home.join("munshi"),
+            state: directory.path().join("munshi-home"),
             output: directory.path().join("archives"),
             copilot_home,
             project,
@@ -1409,6 +1409,8 @@ impl Harness {
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
             .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .arg("--output-dir")
             .arg(&self.output)
             .arg("--summarizer")
@@ -1429,6 +1431,8 @@ impl Harness {
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
             .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .arg("--output-dir")
             .arg(&self.output)
             .arg("--archive-git-history")
@@ -1452,8 +1456,8 @@ impl Harness {
             .args(["delivery", "configure", "--endpoint"])
             .arg(endpoint)
             .args(["--vault", VAULT, "--folder", folder])
-            .arg("--copilot-home")
-            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .output()
             .unwrap();
         assert_success(&output);
@@ -1472,8 +1476,8 @@ impl Harness {
                 "--credential-env",
                 TOKEN_ENV,
             ])
-            .arg("--copilot-home")
-            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .output()
             .unwrap();
         assert_success(&output);
@@ -1493,8 +1497,8 @@ impl Harness {
                 "Munshi",
                 "--provision-history",
             ])
-            .arg("--copilot-home")
-            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .output()
             .unwrap();
         assert_success(&output);
@@ -1534,8 +1538,8 @@ impl Harness {
         let output = self
             .munshi()
             .args(["delivery", "enable"])
-            .arg("--copilot-home")
-            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .output()
             .unwrap();
         assert_success(&output);
@@ -1546,8 +1550,8 @@ impl Harness {
             .munshi()
             .args(["project", "disable"])
             .arg(&self.project)
-            .arg("--copilot-home")
-            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
             .output()
             .unwrap();
         assert_success(&output);
@@ -1764,7 +1768,7 @@ impl Harness {
             .munshi()
             .arg("hook")
             .arg(event)
-            .env("COPILOT_HOME", &self.copilot_home)
+            .env("MUNSHI_HOME", &self.state)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

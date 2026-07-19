@@ -1,5 +1,9 @@
 # Use rebuildable SQLite operational state
 
+> Amended by [ADR 0008](0008-harness-neutral-munshi-home.md): the state directory moved from
+> `$COPILOT_HOME/munshi` to the harness-neutral Munshi home (`$MUNSHI_HOME`, default `~/.munshi`).
+> Everything else in this ADR stands.
+
 Munshi stores synchronous multi-process hook state in `$COPILOT_HOME/munshi/munshi.db` through
 forward `schema_migrations`. Short SQLite transactions own observation deduplication, lifecycle
 transitions, worker claims, current cursor/revision metadata, the current structured-summary cache,

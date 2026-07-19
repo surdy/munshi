@@ -24,19 +24,19 @@ successful non-cursor summary revision in the configured output directory's dedi
 The default locations are:
 
 - hooks: `$COPILOT_HOME/hooks/munshi.json`, or `~/.copilot/hooks/munshi.json`
-- state/config: `$COPILOT_HOME/munshi`, or `~/.copilot/munshi`
+- state/config: `$MUNSHI_HOME`, or `~/.munshi` (harness-neutral; ADR 0008)
 
-`--copilot-home` overrides the root. Registration writes only Munshi's dedicated hook and config
+`--copilot-home` overrides the Copilot hooks root and `--state-dir` the Munshi home. Registration writes only Munshi's dedicated hook and config
 files, rejects symlinked or wrongly owned managed paths, and does not rewrite equivalent files.
 `munshi unregister` removes only those two positively recognized files; archives and pending
 diagnostic state remain.
 
-Register, and unregister when an existing hooks directory contains managed removal work, serialize
-changes with a persistent owner-only `hooks/.munshi-registration.lock` file and a nonblocking OS
-advisory lock held for the complete operation. The file is intentionally not unlinked; an unheld
-file is immediately reusable, and the kernel releases an active lock if the process exits or
-crashes. Unregister does not create a missing hooks directory or lock; it may remove a positively
-recognized config directly when no hooks directory exists.
+Register and unregister serialize changes with a persistent owner-only
+`<state>/locks/.munshi-registration.lock` file and a nonblocking OS advisory lock held for the
+complete operation. The file is intentionally not unlinked; an unheld file is immediately reusable,
+and the kernel releases an active lock if the process exits or crashes. Unregister does not create
+a missing hooks directory; it removes the hook installations the stored configuration records and
+may remove a positively recognized config directly when no hooks directory exists.
 
 The hooks use direct `exec`/`args` fields with a two-second timeout, read exactly one bounded JSON
 object, and emit nothing. Each hook performs only a short SQLite transaction and detached-process
@@ -59,7 +59,7 @@ is not treated as evidence that the schema changed.
 
 ## SQLite state, locking, and revisions
 
-Operational state is `$COPILOT_HOME/munshi/munshi.db`. The synchronous `rusqlite` store uses
+Operational state is `$MUNSHI_HOME/munshi.db` (default `~/.munshi/munshi.db`). The synchronous `rusqlite` store uses
 forward migrations, foreign keys, WAL, full synchronous commits, a short busy timeout, and brief
 `BEGIN IMMEDIATE` transitions. It stores stable session identity, first origin, latest transcript
 reference, lifecycle/completion state, current cursor and hashes, the current structured-summary
@@ -136,7 +136,7 @@ untouched, and a legacy result alone never proves archival without corresponding
 
 ## Project policy and cost budgets
 
-Registration also stores a `policy` section in `$COPILOT_HOME/munshi/config.json`: global
+Registration also stores a `policy` section in `$MUNSHI_HOME/config.json`: global
 `max_calls_per_hour`, `max_calls_per_day`, and `max_concurrency` defaults (`--max-calls-per-hour`,
 `--max-calls-per-day`, and `--max-concurrency` at registration; 10/50/2 unless overridden), plus the
 explicit `disabled_projects` list written by:
