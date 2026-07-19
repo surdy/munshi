@@ -509,7 +509,7 @@ Git history is optional. When disabled, Munshi retains only the current summary 
 
 ## State and concurrency
 
-`$COPILOT_HOME/munshi/munshi.db` stores session state, current cursors, worker claims, attempts, and
+`$MUNSHI_HOME/munshi.db` (default `~/.munshi/munshi.db`) stores session state, current cursors, worker claims, attempts, and
 safe diagnostics. It uses forward migrations, foreign keys, WAL, short writer transactions, and a
 brief migration advisory lock. Markdown, with optional future Git history, remains the durable
 record; SQLite is rebuildable operational state rather than the authority for an existing archive.
@@ -631,7 +631,7 @@ Configuration precedence:
 4. User configuration.
 5. Built-in defaults.
 
-Implemented today: global configuration is written as `$COPILOT_HOME/munshi/config.json` from
+Implemented today: global configuration is written as `$MUNSHI_HOME/config.json` from
 `munshi register` flags (including `--max-calls-per-hour`, `--max-calls-per-day`, and
 `--max-concurrency`) rather than a hand-edited global TOML file, and the nearest-parent project
 override is the `.munshi.toml` file described in

@@ -76,6 +76,9 @@ enum Command {
         /// Copilot home whose hooks directory should contain Munshi's dedicated file.
         #[arg(long)]
         copilot_home: Option<PathBuf>,
+        /// Munshi state directory. Defaults to `$MUNSHI_HOME`, then `~/.munshi`.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
         /// Root directory for Munshi-owned Markdown archives.
         #[arg(long)]
         output_dir: PathBuf,
@@ -110,8 +113,12 @@ enum Command {
     },
     /// Remove only Munshi's dedicated user hook and active configuration.
     Unregister {
+        /// Copilot home checked for an orphaned hook file when no configuration records one.
         #[arg(long)]
         copilot_home: Option<PathBuf>,
+        /// Munshi state directory. Defaults to `$MUNSHI_HOME`, then `~/.munshi`.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
     /// Enable, disable, or inspect future processing and delivery for one project.
     #[command(subcommand)]
@@ -232,21 +239,21 @@ enum ProjectCommand {
         /// Project directory whose canonical identity should be disabled.
         project_dir: PathBuf,
         #[arg(long)]
-        copilot_home: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     },
     /// Resume future processing and delivery for a previously disabled project.
     Enable {
         /// Project directory whose canonical identity should be re-enabled.
         project_dir: PathBuf,
         #[arg(long)]
-        copilot_home: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     },
     /// Print the effective enabled state and budgets for a project.
     Status {
         /// Project directory to inspect.
         project_dir: PathBuf,
         #[arg(long)]
-        copilot_home: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -280,17 +287,17 @@ enum DeliveryCommand {
         #[arg(long, overrides_with = "provision_history", hide = true)]
         no_provision_history: bool,
         #[arg(long)]
-        copilot_home: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     },
     /// Enable delivery. Reports the pending backfill count; existing summaries need confirmation.
     Enable {
         #[arg(long)]
-        copilot_home: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     },
     /// Disable delivery. Future delivery stops while delivery history is retained.
     Disable {
         #[arg(long)]
-        copilot_home: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     },
     /// Verify (or, with `--configure`, explicitly enable) the Notesmith vault's revision-history
     /// capability required for versioned delivery.
@@ -720,6 +727,15 @@ struct RawStoredConfig {
     #[serde(default)]
     delivery: Option<RawDelivery>,
     policy: Option<RawPolicy>,
+    #[serde(default)]
+    harnesses: Option<RawHarnesses>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawHarnesses {
+    copilot_home: Option<String>,
+    #[allow(dead_code)]
+    claude_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -998,6 +1014,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             accept_transcript_processing,
             dry_run,
             copilot_home,
+            state_dir,
             output_dir,
             archive_git_history,
             summarizer,
@@ -1017,7 +1034,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             );
             accept_disclosure_from_terminal(accept_transcript_processing)?;
             let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
+            let state_directory = resolve_state_directory(state_dir)?;
             let executable = std::env::current_exe()?.canonicalize()?;
             if dry_run {
                 println!(
@@ -1028,7 +1045,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 return Ok(Outcome::DryRun);
             }
             register(&RegisterConfig {
-                copilot_home: copilot_home.clone(),
+                copilot: Some(munshi::CopilotTarget {
+                    home: copilot_home.clone(),
+                }),
                 state_directory,
                 output_directory: output_dir,
                 archive_git_history,
@@ -1048,20 +1067,21 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 hook_path: copilot_home.join("hooks/munshi.json"),
             })
         }
-        Command::Unregister { copilot_home } => {
+        Command::Unregister {
+            copilot_home,
+            state_dir,
+        } => {
             let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
-            unregister(&copilot_home, &state_directory)?;
+            let state_directory = resolve_state_directory(state_dir)?;
+            unregister(&state_directory, &copilot_home)?;
             Ok(Outcome::Unregistered)
         }
         Command::Project(ProjectCommand::Disable {
             project_dir,
-            copilot_home,
+            state_dir,
         }) => {
-            let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
+            let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Project(set_project_enabled(
-                &copilot_home,
                 &state_directory,
                 &project_dir,
                 false,
@@ -1069,12 +1089,10 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         }
         Command::Project(ProjectCommand::Enable {
             project_dir,
-            copilot_home,
+            state_dir,
         }) => {
-            let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
+            let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Project(set_project_enabled(
-                &copilot_home,
                 &state_directory,
                 &project_dir,
                 true,
@@ -1082,10 +1100,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         }
         Command::Project(ProjectCommand::Status {
             project_dir,
-            copilot_home,
+            state_dir,
         }) => {
-            let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
+            let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Project(project_status(
                 &state_directory,
                 &project_dir,
@@ -1227,10 +1244,9 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
             max_attempts,
             provision_history,
             no_provision_history,
-            copilot_home,
+            state_dir,
         } => {
-            let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
+            let state_directory = resolve_state_directory(state_dir)?;
             let credential = resolve_credential_source(credential_env, credential_keychain)?;
             let provision = if provision_history {
                 Some(true)
@@ -1240,7 +1256,6 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 None
             };
             let settings = configure_delivery(
-                &copilot_home,
                 &state_directory,
                 DeliverySinkConfig {
                     endpoint,
@@ -1255,10 +1270,9 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 settings: Box::new(settings),
             })
         }
-        DeliveryCommand::Enable { copilot_home } => {
-            let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
-            let settings = set_delivery_enabled(&copilot_home, &state_directory, true)?;
+        DeliveryCommand::Enable { state_dir } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = set_delivery_enabled(&state_directory, true)?;
             // Report the pending backfill as a dry run so existing summaries need confirmation.
             let backfill = delivery_backfill(&state_directory, false, usize::MAX)
                 .ok()
@@ -1268,10 +1282,9 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 backfill,
             })
         }
-        DeliveryCommand::Disable { copilot_home } => {
-            let copilot_home = resolve_copilot_home(copilot_home)?;
-            let state_directory = copilot_home.join("munshi");
-            let settings = set_delivery_enabled(&copilot_home, &state_directory, false)?;
+        DeliveryCommand::Disable { state_dir } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = set_delivery_enabled(&state_directory, false)?;
             Ok(Outcome::DeliveryDisabled {
                 settings: Box::new(settings),
             })
@@ -1855,10 +1868,9 @@ fn build_doctor_report(state_directory: &Path) -> Result<DoctorReport, Box<dyn E
 
 fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
     let config_path = state_directory.join("config.json");
-    let hook_path = state_directory
-        .parent()
-        .map(|parent| parent.join("hooks/munshi.json"))
-        .unwrap_or_else(|| PathBuf::from("hooks/munshi.json"));
+    // The state directory is harness-neutral (ADR 0008); hook locations come from the
+    // configuration's recorded harness homes, not from the state directory's parent.
+    let mut copilot_home_recorded: Option<PathBuf> = None;
 
     let mut checks = Vec::new();
     let mut capture_state = CaptureState::Unknown;
@@ -1908,6 +1920,11 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         config.summarizer.and_then(|command| command.executable);
                     output_directory = config.output_directory;
                     archive_git_history = config.archive_git_history;
+                    copilot_home_recorded = config
+                        .harnesses
+                        .as_ref()
+                        .and_then(|harnesses| harnesses.copilot_home.as_deref())
+                        .map(PathBuf::from);
                     let policy = config.policy.unwrap_or(RawPolicy {
                         max_calls_per_hour: None,
                         max_calls_per_day: None,
@@ -2192,56 +2209,17 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
         }
     }
 
-    let hook_recognized = if !hook_path.exists() {
+    let hook_path = copilot_home_recorded.map(|home| home.join("hooks/munshi.json"));
+    let hook_recognized = if let Some(hook_path) = hook_path.as_deref() {
+        inspect_copilot_hook(hook_path, &mut checks)
+    } else {
         push_check(
             &mut checks,
             "hook-file",
             CheckStatus::Error,
-            format!("missing {}", hook_path.display()),
+            "no Copilot hook installation recorded in configuration".to_owned(),
         );
         false
-    } else {
-        match fs::read(&hook_path) {
-            Ok(bytes) => match serde_json::from_slice::<RawHookFile>(&bytes) {
-                Ok(hook) => {
-                    if hook_is_recognized(&hook) {
-                        push_check(
-                            &mut checks,
-                            "hook-contract",
-                            CheckStatus::Ok,
-                            "hook file matches the 1.0.70 managed contract".to_owned(),
-                        );
-                        true
-                    } else {
-                        push_check(
-                            &mut checks,
-                            "hook-contract",
-                            CheckStatus::Error,
-                            "hook file does not match the managed contract".to_owned(),
-                        );
-                        false
-                    }
-                }
-                Err(error) => {
-                    push_check(
-                        &mut checks,
-                        "hook-parse",
-                        CheckStatus::Error,
-                        format!("invalid JSON at {}: {error}", hook_path.display()),
-                    );
-                    false
-                }
-            },
-            Err(error) => {
-                push_check(
-                    &mut checks,
-                    "hook-read",
-                    CheckStatus::Error,
-                    format!("failed to read {}: {error}", hook_path.display()),
-                );
-                false
-            }
-        }
     };
 
     let runtime_compatible = config_recognized && hook_recognized;
@@ -2271,10 +2249,66 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
         provision_remote_history,
         disabled_projects,
         config_path: config_path.display().to_string(),
-        hook_path: hook_path.display().to_string(),
+        hook_path: hook_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<not-recorded>".to_owned()),
         summarizer_executable,
         output_directory,
         checks,
+    }
+}
+
+fn inspect_copilot_hook(hook_path: &Path, checks: &mut Vec<CheckResult>) -> bool {
+    if !hook_path.exists() {
+        push_check(
+            checks,
+            "hook-file",
+            CheckStatus::Error,
+            format!("missing {}", hook_path.display()),
+        );
+        false
+    } else {
+        match fs::read(hook_path) {
+            Ok(bytes) => match serde_json::from_slice::<RawHookFile>(&bytes) {
+                Ok(hook) => {
+                    if hook_is_recognized(&hook) {
+                        push_check(
+                            checks,
+                            "hook-contract",
+                            CheckStatus::Ok,
+                            "hook file matches the 1.0.70 managed contract".to_owned(),
+                        );
+                        true
+                    } else {
+                        push_check(
+                            checks,
+                            "hook-contract",
+                            CheckStatus::Error,
+                            "hook file does not match the managed contract".to_owned(),
+                        );
+                        false
+                    }
+                }
+                Err(error) => {
+                    push_check(
+                        checks,
+                        "hook-parse",
+                        CheckStatus::Error,
+                        format!("invalid JSON at {}: {error}", hook_path.display()),
+                    );
+                    false
+                }
+            },
+            Err(error) => {
+                push_check(
+                    checks,
+                    "hook-read",
+                    CheckStatus::Error,
+                    format!("failed to read {}: {error}", hook_path.display()),
+                );
+                false
+            }
+        }
     }
 }
 
@@ -2778,11 +2812,17 @@ fn emit_json(value: &impl Serialize) {
     );
 }
 
+/// The harness-neutral Munshi home (ADR 0008): the state directory holding `config.json`,
+/// `munshi.db`, and `locks/`. Explicit flag, then `$MUNSHI_HOME`, then `~/.munshi`.
 fn resolve_state_directory(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {
-    match value {
-        Some(value) => Ok(value),
-        None => Ok(resolve_copilot_home(None)?.join("munshi")),
+    if let Some(value) = value {
+        return Ok(value);
     }
+    if let Some(value) = std::env::var_os("MUNSHI_HOME") {
+        return Ok(PathBuf::from(value));
+    }
+    let home = std::env::var_os("HOME").ok_or("MUNSHI_HOME or HOME is required")?;
+    Ok(Path::new(&home).join(".munshi"))
 }
 
 fn resolve_copilot_home(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {

@@ -807,7 +807,7 @@ impl StateHarness {
         let directory = test_directory();
         let project = git_project(directory.path());
         let copilot_home = directory.path().join("copilot-home");
-        let state = copilot_home.join("munshi");
+        let state = directory.path().join("munshi-home");
         let output = directory.path().join("archives");
         let summarizer = adapter_summarizer(directory.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
@@ -816,6 +816,8 @@ impl StateHarness {
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
             .arg(&copilot_home)
+            .arg("--state-dir")
+            .arg(&state)
             .arg("--output-dir")
             .arg(&output)
             .arg("--summarizer")
