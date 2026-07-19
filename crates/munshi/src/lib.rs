@@ -40,8 +40,8 @@ pub use render::{
 };
 pub use source::{
     CursorFallbackReason, NormalizedEvent, NormalizedSession, PreviousSource, SourceError,
-    SourceKind, TranscriptLoadMode, TranscriptUpdate, load_session, load_session_update,
-    resolve_session_reference, validate_transcript_envelope,
+    SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin, load_session,
+    load_session_update, resolve_session_reference, validate_transcript_envelope,
 };
 pub use state::{
     BudgetOutcome, ClaimOutcome, CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic,

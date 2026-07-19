@@ -22,7 +22,8 @@ use crate::render::{
 };
 use crate::source::{
     PreviousSource, SessionReference, SourceError, SourceKind, TranscriptLoadMode,
-    load_session_update, resolve_session_reference, validate_transcript_envelope,
+    claude_transcript_origin, load_session_update, resolve_session_reference,
+    validate_transcript_envelope,
 };
 use crate::state::{
     BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlannedArchive,
@@ -357,6 +358,26 @@ pub fn run_recovery(
     }
     if let Some(home) = copilot_home.as_deref() {
         discover_unknown_sessions(&mut state, home, cutoff, stored.limits.max_source_bytes)?;
+    }
+    if let Some(home) = stored.harnesses.claude_home.as_deref() {
+        let projects = Path::new(home).join("projects");
+        let store = recovery_store(
+            &mut state,
+            &mut source_stores,
+            state_directory,
+            SourceKind::ClaudeCode,
+        )?;
+        let swept = discover_unknown_claude_sessions(
+            store,
+            &projects,
+            cutoff,
+            stored.limits.max_source_bytes,
+        )?;
+        reserved_sessions.extend(
+            swept
+                .into_iter()
+                .map(|session_id| (SourceKind::ClaudeCode, session_id)),
+        );
     }
     reserved_sessions.extend(state.reserve_eligible_workers(force_retry, RECOVERY_SCAN_LIMIT)?);
     reserved_sessions.sort();
@@ -1240,6 +1261,78 @@ fn discover_unknown_sessions(
         inspected += 1;
     }
     Ok(())
+}
+
+/// Recovery sweep of `~/.claude/projects` for sessions whose hooks never fired (force-kill emits
+/// none — phase-0 finding). Sessions are regular `<session-id>.jsonl` files inside per-project
+/// subdirectories; sibling `<uuid>/` directories and entries like `memory/` are not sessions and
+/// are skipped by the file-type and extension checks. The sweep yields explicit transcript paths,
+/// so the "no session-ID-only transcript lookup for Claude Code" rule is preserved.
+fn discover_unknown_claude_sessions(
+    state: &mut StateStore,
+    claude_projects: &Path,
+    cutoff_ms: i64,
+    max_source_bytes: usize,
+) -> Result<Vec<String>, HookWorkerError> {
+    let mut reserved = Vec::new();
+    if !claude_projects.is_dir() {
+        return Ok(reserved);
+    }
+    let mut inspected = 0;
+    'projects: for project_entry in fs::read_dir(claude_projects)? {
+        let project_entry = project_entry?;
+        if project_entry.file_type()?.is_symlink() || !project_entry.metadata()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(project_entry.path())? {
+            if inspected >= RECOVERY_SCAN_LIMIT {
+                break 'projects;
+            }
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() || !entry.metadata()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            if validate_session_id(&session_id).is_err()
+                || state.get_session(&session_id)?.is_some()
+            {
+                continue;
+            }
+            if !source_is_stale_and_supported(
+                SourceKind::ClaudeCode,
+                &path,
+                cutoff_ms,
+                max_source_bytes,
+            ) {
+                continue;
+            }
+            let metadata = fs::metadata(&path)?;
+            let evidence = format!(
+                "{}:{}:{}",
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec()
+            );
+            let origin = claude_transcript_origin(&path);
+            // `mark_recovery_interrupted` reserves the archive worker inside its transaction, so
+            // the caller must spawn for every reservation it reports.
+            if state.mark_recovery_interrupted(&session_id, &path, origin.as_deref(), &evidence)? {
+                reserved.push(session_id);
+            }
+            inspected += 1;
+        }
+    }
+    Ok(reserved)
 }
 
 fn source_is_stale_and_supported(

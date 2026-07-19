@@ -500,6 +500,50 @@ pub fn load_session_update(
     })
 }
 
+/// Bounded, privacy-safe read of a Claude Code transcript's origin project directory: the first
+/// absolute top-level `cwd` value among the leading records (bookkeeping records such as
+/// `queue-operation` may precede the first turn and lack one). Only the pinned `cwd` key is
+/// inspected, mirroring the envelope-validation read discipline; content is never read. Lets the
+/// recovery sweep hand `mark_recovery_interrupted` an origin so swept sessions can compute
+/// project identity instead of parking as origin-unresolved.
+pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let limit = 256 * 1024;
+    let mut line = Vec::new();
+    for _ in 0..32 {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(limit as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .ok()?;
+        if read == 0 || line.len() > limit {
+            return None;
+        }
+        while line
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&line).ok()?;
+        let object = value.as_object()?;
+        if let Some(cwd) = object.get("cwd").and_then(Value::as_str) {
+            if Path::new(cwd).is_absolute() {
+                return Some(PathBuf::from(cwd));
+            }
+        }
+    }
+    None
+}
+
 pub fn validate_transcript_envelope(
     source: SourceKind,
     path: &Path,

@@ -907,6 +907,129 @@ fn claude_hook_rejects_misrouted_and_malformed_payloads_without_state_rows() {
     assert_eq!(rows, 0);
 }
 
+#[test]
+fn claude_recovery_sweep_archives_hookless_sessions_and_skips_non_sessions() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+    let project = git_project(directory.path());
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+
+    // A force-killed session leaves only its transcript behind — no hooks ever fired.
+    let project_dir = claude_home.join("projects/-work-demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    let fixture = fs::read_to_string(claude_fixture_transcript()).unwrap();
+    let transcript = project_dir.join(format!("{CLAUDE_SESSION_ID}.jsonl"));
+    // Point the transcript's origin cwd at a real project so identity resolution succeeds.
+    fs::write(
+        &transcript,
+        fixture.replace("/work/demo", project.to_str().unwrap()),
+    )
+    .unwrap();
+    // Non-session entries the sweep must ignore: a sibling `<uuid>/` directory, a `memory/`
+    // directory, and a foreign-envelope `.jsonl` with a plausible session-id stem.
+    fs::create_dir_all(project_dir.join(CLAUDE_SESSION_ID)).unwrap();
+    fs::create_dir_all(project_dir.join("memory")).unwrap();
+    let foreign_id = "0c1a0de0-0000-4000-8000-00000000fefe";
+    fs::write(
+        project_dir.join(format!("{foreign_id}.jsonl")),
+        b"{\"type\":\"session_meta\",\"payload\":{}}\n",
+    )
+    .unwrap();
+
+    let recover = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("hook")
+        .arg("recover")
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .arg("--stale-after-ms")
+        .arg("0")
+        .output()
+        .unwrap();
+    assert_success(&recover);
+
+    let waited = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("hook")
+        .arg("wait")
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .arg("--source")
+        .arg("claude-code")
+        .arg("--session-id")
+        .arg(CLAUDE_SESSION_ID)
+        .arg("--timeout-ms")
+        .arg("15000")
+        .output()
+        .unwrap();
+    assert_success(&waited);
+    let relative = serde_json::from_slice::<Value>(&waited.stdout).unwrap()["relative_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(relative.contains("/claude-code/"));
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(paths.output.join(&relative)).unwrap()).unwrap();
+    assert_eq!(archived.source, SourceKind::ClaudeCode);
+    // Swept sessions carry the interrupted (unknown end) completion reason.
+    assert_eq!(archived.completion_reason, "unknown");
+
+    // Only the real session entered the store: the sibling directory and the foreign-envelope
+    // file were skipped, and nothing landed in the Copilot scope.
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let rows: Vec<(String, String)> = connection
+        .prepare("SELECT source_kind, source_session_id FROM sessions")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("claude-code".to_owned(), CLAUDE_SESSION_ID.to_owned())]
+    );
+}
+
+#[test]
+fn claude_recovery_sweep_leaves_fresh_transcripts_alone() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+    let project_dir = claude_home.join("projects/-work-demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    // fs::write (not fs::copy, which preserves the fixture's old mtime on macOS) so the
+    // transcript's modification time is genuinely fresh.
+    fs::write(
+        project_dir.join(format!("{CLAUDE_SESSION_ID}.jsonl")),
+        fs::read(claude_fixture_transcript()).unwrap(),
+    )
+    .unwrap();
+
+    // A generous staleness window means the just-written transcript is not yet stale.
+    let recover = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("hook")
+        .arg("recover")
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .arg("--stale-after-ms")
+        .arg("3600000")
+        .output()
+        .unwrap();
+    assert_success(&recover);
+
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
 struct Paths {
     copilot_home: PathBuf,
     state: PathBuf,
