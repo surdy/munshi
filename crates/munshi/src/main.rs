@@ -14,7 +14,7 @@ use munshi::{
     accept_disclosure_from_terminal, archive_session, configure_delivery, delivery_backfill,
     delivery_retry, delivery_status, delivery_verify_history, handle_hook, parse_archive_markdown,
     project_status, read_last_failure, register, run_archive_worker_for_source, run_recovery,
-    set_delivery_enabled, set_project_enabled, unregister, wait_for_hook_result,
+    set_delivery_enabled, set_project_enabled, unregister, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -73,9 +73,16 @@ enum Command {
         /// Print the intended managed paths without writing files.
         #[arg(long)]
         dry_run: bool,
+        /// Harness to install lifecycle hooks for. Repeatable. Defaults to every harness whose
+        /// home directory exists.
+        #[arg(long = "harness", value_enum)]
+        harnesses: Vec<HarnessSelector>,
         /// Copilot home whose hooks directory should contain Munshi's dedicated file.
         #[arg(long)]
         copilot_home: Option<PathBuf>,
+        /// Claude Code home whose `settings.json` receives Munshi's hook entries.
+        #[arg(long)]
+        claude_home: Option<PathBuf>,
         /// Munshi state directory. Defaults to `$MUNSHI_HOME`, then `~/.munshi`.
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -214,6 +221,13 @@ enum Command {
         #[arg(long)]
         session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum HarnessSelector {
+    Copilot,
+    ClaudeCode,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -360,14 +374,23 @@ enum HookCommand {
     AgentStop {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Capturing harness whose payload shape and state scope this hook uses.
+        #[arg(long, default_value = "copilot")]
+        source: String,
     },
     SessionEnd {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Capturing harness whose payload shape and state scope this hook uses.
+        #[arg(long, default_value = "copilot")]
+        source: String,
     },
     Wait {
         #[arg(long)]
         state_dir: PathBuf,
+        /// Capturing harness whose state scope holds the awaited session.
+        #[arg(long, default_value = "copilot")]
+        source: String,
         #[arg(long)]
         session_id: String,
         #[arg(long, default_value_t = 10_000)]
@@ -388,7 +411,7 @@ enum HookCommand {
 enum Outcome {
     Archive(ArchiveOutcome),
     Registered {
-        hook_path: PathBuf,
+        hook_paths: Vec<PathBuf>,
     },
     Unregistered,
     DryRun,
@@ -541,6 +564,9 @@ struct ConfigurationAssessment {
     disabled_projects: usize,
     config_path: String,
     hook_path: String,
+    /// Claude Code settings file carrying Munshi's managed hook entries, when that harness is
+    /// registered.
+    claude_settings_path: Option<String>,
     summarizer_executable: Option<String>,
     output_directory: Option<String>,
     checks: Vec<CheckResult>,
@@ -802,8 +828,10 @@ fn main() -> ExitCode {
             eprintln!("not archived: {id} is not archive-worthy");
             ExitCode::from(2)
         }
-        Ok(Outcome::Registered { hook_path }) => {
-            println!("registered Munshi hooks at {}", hook_path.display());
+        Ok(Outcome::Registered { hook_paths }) => {
+            for hook_path in hook_paths {
+                println!("registered Munshi hooks at {}", hook_path.display());
+            }
             ExitCode::SUCCESS
         }
         Ok(Outcome::Unregistered) => {
@@ -1013,7 +1041,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         Command::Register {
             accept_transcript_processing,
             dry_run,
+            harnesses,
             copilot_home,
+            claude_home,
             state_dir,
             output_dir,
             archive_git_history,
@@ -1033,21 +1063,76 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 output_dir.display()
             );
             accept_disclosure_from_terminal(accept_transcript_processing)?;
+            let copilot_home_selected = copilot_home.is_some();
+            let claude_home_selected = claude_home.is_some();
             let copilot_home = resolve_copilot_home(copilot_home)?;
+            let claude_home = resolve_claude_home(claude_home)?;
             let state_directory = resolve_state_directory(state_dir)?;
             let executable = std::env::current_exe()?.canonicalize()?;
+            let selected = if !harnesses.is_empty() {
+                harnesses
+            } else if copilot_home_selected || claude_home_selected {
+                // An explicit home flag is an explicit harness selection; never widen it to
+                // other harnesses the machine happens to have installed.
+                let mut selected = Vec::new();
+                if copilot_home_selected {
+                    selected.push(HarnessSelector::Copilot);
+                }
+                if claude_home_selected {
+                    selected.push(HarnessSelector::ClaudeCode);
+                }
+                selected
+            } else {
+                // Nothing specified: target every harness that appears installed.
+                let mut detected = Vec::new();
+                if copilot_home.is_dir() {
+                    detected.push(HarnessSelector::Copilot);
+                }
+                if claude_home.is_dir() {
+                    detected.push(HarnessSelector::ClaudeCode);
+                }
+                if detected.is_empty() {
+                    return Err(format!(
+                        "no harness detected at {} or {}; pass --harness copilot or --harness claude-code",
+                        copilot_home.display(),
+                        claude_home.display()
+                    )
+                    .into());
+                }
+                detected
+            };
+            let copilot =
+                selected
+                    .contains(&HarnessSelector::Copilot)
+                    .then(|| munshi::CopilotTarget {
+                        home: copilot_home.clone(),
+                    });
+            let claude =
+                selected
+                    .contains(&HarnessSelector::ClaudeCode)
+                    .then(|| munshi::ClaudeTarget {
+                        home: claude_home.clone(),
+                    });
+            let mut hook_paths = Vec::new();
+            if copilot.is_some() {
+                hook_paths.push(copilot_home.join("hooks/munshi.json"));
+            }
+            if claude.is_some() {
+                hook_paths.push(claude_home.join("settings.json"));
+            }
             if dry_run {
+                for hook_path in &hook_paths {
+                    println!("would write {}", hook_path.display());
+                }
                 println!(
-                    "would write {} and {}",
-                    copilot_home.join("hooks/munshi.json").display(),
+                    "would write {}",
                     state_directory.join("config.json").display()
                 );
                 return Ok(Outcome::DryRun);
             }
             register(&RegisterConfig {
-                copilot: Some(munshi::CopilotTarget {
-                    home: copilot_home.clone(),
-                }),
+                copilot,
+                claude,
                 state_directory,
                 output_directory: output_dir,
                 archive_git_history,
@@ -1063,9 +1148,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 max_concurrency,
                 executable,
             })?;
-            Ok(Outcome::Registered {
-                hook_path: copilot_home.join("hooks/munshi.json"),
-            })
+            Ok(Outcome::Registered { hook_paths })
         }
         Command::Unregister {
             copilot_home,
@@ -1186,15 +1269,31 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 json,
             })
         }
-        Command::Hook(HookCommand::AgentStop { state_dir }) => {
-            if let Ok(state_dir) = resolve_state_directory(state_dir) {
-                handle_hook(HookEvent::AgentStop, &state_dir, std::io::stdin().lock());
+        Command::Hook(HookCommand::AgentStop { state_dir, source }) => {
+            if let (Ok(state_dir), Ok(source)) = (
+                resolve_state_directory(state_dir),
+                parse_source_selector(&source),
+            ) {
+                handle_hook(
+                    HookEvent::AgentStop,
+                    source,
+                    &state_dir,
+                    std::io::stdin().lock(),
+                );
             }
             Ok(Outcome::Hook)
         }
-        Command::Hook(HookCommand::SessionEnd { state_dir }) => {
-            if let Ok(state_dir) = resolve_state_directory(state_dir) {
-                handle_hook(HookEvent::SessionEnd, &state_dir, std::io::stdin().lock());
+        Command::Hook(HookCommand::SessionEnd { state_dir, source }) => {
+            if let (Ok(state_dir), Ok(source)) = (
+                resolve_state_directory(state_dir),
+                parse_source_selector(&source),
+            ) {
+                handle_hook(
+                    HookEvent::SessionEnd,
+                    source,
+                    &state_dir,
+                    std::io::stdin().lock(),
+                );
             }
             Ok(Outcome::Hook)
         }
@@ -1209,10 +1308,12 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         }
         Command::Hook(HookCommand::Wait {
             state_dir,
+            source,
             session_id,
             timeout_ms,
-        }) => Ok(Outcome::Wait(wait_for_hook_result(
+        }) => Ok(Outcome::Wait(wait_for_hook_result_for_source(
             &state_dir,
+            parse_source_selector(&source)?,
             &session_id,
             Duration::from_millis(timeout_ms),
         )?)),
@@ -1871,6 +1972,7 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
     // The state directory is harness-neutral (ADR 0008); hook locations come from the
     // configuration's recorded harness homes, not from the state directory's parent.
     let mut copilot_home_recorded: Option<PathBuf> = None;
+    let mut claude_home_recorded: Option<PathBuf> = None;
 
     let mut checks = Vec::new();
     let mut capture_state = CaptureState::Unknown;
@@ -1924,6 +2026,11 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         .harnesses
                         .as_ref()
                         .and_then(|harnesses| harnesses.copilot_home.as_deref())
+                        .map(PathBuf::from);
+                    claude_home_recorded = config
+                        .harnesses
+                        .as_ref()
+                        .and_then(|harnesses| harnesses.claude_home.as_deref())
                         .map(PathBuf::from);
                     let policy = config.policy.unwrap_or(RawPolicy {
                         max_calls_per_hour: None,
@@ -2210,17 +2317,24 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
     }
 
     let hook_path = copilot_home_recorded.map(|home| home.join("hooks/munshi.json"));
-    let hook_recognized = if let Some(hook_path) = hook_path.as_deref() {
-        inspect_copilot_hook(hook_path, &mut checks)
-    } else {
+    let claude_settings_path = claude_home_recorded.map(|home| home.join("settings.json"));
+    let copilot_recognized = hook_path
+        .as_deref()
+        .map(|hook_path| inspect_copilot_hook(hook_path, &mut checks));
+    let claude_recognized = claude_settings_path
+        .as_deref()
+        .map(|settings_path| inspect_claude_hooks(settings_path, &mut checks));
+    if copilot_recognized.is_none() && claude_recognized.is_none() {
         push_check(
             &mut checks,
             "hook-file",
             CheckStatus::Error,
-            "no Copilot hook installation recorded in configuration".to_owned(),
+            "no harness hook installation recorded in configuration".to_owned(),
         );
-        false
-    };
+    }
+    let hook_recognized = (copilot_recognized.is_some() || claude_recognized.is_some())
+        && copilot_recognized.unwrap_or(true)
+        && claude_recognized.unwrap_or(true);
 
     let runtime_compatible = config_recognized && hook_recognized;
     if runtime_compatible {
@@ -2252,9 +2366,63 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
         hook_path: hook_path
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<not-recorded>".to_owned()),
+        claude_settings_path: claude_settings_path.map(|path| path.display().to_string()),
         summarizer_executable,
         output_directory,
         checks,
+    }
+}
+
+/// Doctor check for Munshi's managed entries inside Claude Code's `settings.json`. Compared
+/// against the current executable, mirroring how the Copilot hook contract pins absolute paths.
+fn inspect_claude_hooks(settings_path: &Path, checks: &mut Vec<CheckResult>) -> bool {
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .unwrap_or_default();
+    match munshi::claude_hooks_status(settings_path, &executable) {
+        munshi::ClaudeHookStatus::Installed => {
+            push_check(
+                checks,
+                "claude-hook-contract",
+                CheckStatus::Ok,
+                "Claude Code settings carry the managed hook entries".to_owned(),
+            );
+            true
+        }
+        munshi::ClaudeHookStatus::Missing => {
+            push_check(
+                checks,
+                "claude-hook-contract",
+                CheckStatus::Error,
+                format!(
+                    "missing managed hook entries in {}",
+                    settings_path.display()
+                ),
+            );
+            false
+        }
+        munshi::ClaudeHookStatus::Stale => {
+            push_check(
+                checks,
+                "claude-hook-contract",
+                CheckStatus::Error,
+                "Claude Code hook entries do not match the managed contract for this executable"
+                    .to_owned(),
+            );
+            false
+        }
+        munshi::ClaudeHookStatus::Foreign => {
+            push_check(
+                checks,
+                "claude-hook-contract",
+                CheckStatus::Error,
+                format!(
+                    "cannot interpret {} as a settings object",
+                    settings_path.display()
+                ),
+            );
+            false
+        }
     }
 }
 
@@ -2823,6 +2991,18 @@ fn resolve_state_directory(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Er
     }
     let home = std::env::var_os("HOME").ok_or("MUNSHI_HOME or HOME is required")?;
     Ok(Path::new(&home).join(".munshi"))
+}
+
+/// The Claude Code configuration home: explicit flag, then `$CLAUDE_CONFIG_DIR`, then `~/.claude`.
+fn resolve_claude_home(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok(PathBuf::from(value));
+    }
+    let home = std::env::var_os("HOME").ok_or("CLAUDE_CONFIG_DIR or HOME is required")?;
+    Ok(Path::new(&home).join(".claude"))
 }
 
 fn resolve_copilot_home(value: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {

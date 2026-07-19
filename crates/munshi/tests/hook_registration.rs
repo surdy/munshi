@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use munshi::{DisclosureDecision, accept_disclosure, parse_archive_markdown, read_last_failure};
+use munshi::{
+    DisclosureDecision, SourceKind, accept_disclosure, parse_archive_markdown, read_last_failure,
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -546,6 +548,8 @@ fn dry_run_writes_nothing_and_direct_exec_preserves_spaces() {
         .arg("--accept-transcript-processing")
         .arg("--copilot-home")
         .arg(&paths.copilot_home)
+        .arg("--state-dir")
+        .arg(&paths.state)
         .arg("--output-dir")
         .arg(&paths.output)
         .arg("--summarizer")
@@ -565,6 +569,8 @@ fn dry_run_writes_nothing_and_direct_exec_preserves_spaces() {
         .arg("--accept-transcript-processing")
         .arg("--copilot-home")
         .arg(&paths.copilot_home)
+        .arg("--state-dir")
+        .arg(&paths.state)
         .arg("--output-dir")
         .arg(&paths.output)
         .arg("--summarizer")
@@ -583,6 +589,322 @@ fn dry_run_writes_nothing_and_direct_exec_preserves_spaces() {
             .to_string_lossy()
             .as_ref()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code registration and hook ingestion
+// ---------------------------------------------------------------------------
+
+const CLAUDE_SESSION_ID: &str = "0c1a0de0-0000-4000-8000-000000000001";
+
+fn claude_paths(directory: &TempDir) -> (Paths, PathBuf) {
+    let paths = Paths::new(directory);
+    (paths, directory.path().join("claude-home"))
+}
+
+fn claude_register_command(paths: &Paths, claude_home: &Path, summarizer: PathBuf) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("register")
+        .arg("--accept-transcript-processing")
+        .arg("--harness")
+        .arg("claude-code")
+        .arg("--claude-home")
+        .arg(claude_home)
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .arg("--output-dir")
+        .arg(&paths.output)
+        .arg("--summarizer")
+        .arg(summarizer)
+        .arg("--timeout-ms")
+        .arg("10000")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn claude_hook_command(paths: &Paths, event: &str, input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("hook")
+        .arg(event)
+        .arg("--source")
+        .arg("claude-code")
+        .env("MUNSHI_HOME", &paths.state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// A realistic 2.1.205 `Stop` payload including the undocumented extra fields the phase-0 probe
+/// observed, proving tolerant parsing.
+fn claude_stop_payload(project: &Path, transcript: &Path) -> Value {
+    json!({
+        "session_id": CLAUDE_SESSION_ID,
+        "transcript_path": transcript,
+        "cwd": project,
+        "prompt_id": "840061a3-a65c-40ba-bb39-44fa3524b129",
+        "permission_mode": "default",
+        "hook_event_name": "Stop",
+        "stop_hook_active": false,
+        "last_assistant_message": "Done. Added hello().",
+        "background_tasks": [],
+        "session_crons": [],
+    })
+}
+
+fn claude_session_end_payload(project: &Path, transcript: &Path, reason: &str) -> Value {
+    json!({
+        "session_id": CLAUDE_SESSION_ID,
+        "transcript_path": transcript,
+        "cwd": project,
+        "prompt_id": "840061a3-a65c-40ba-bb39-44fa3524b129",
+        "hook_event_name": "SessionEnd",
+        "reason": reason,
+    })
+}
+
+fn claude_fixture_transcript() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/claude-code-2.1.44/normal")
+        .join(format!("{CLAUDE_SESSION_ID}.jsonl"))
+        .canonicalize()
+        .unwrap()
+}
+
+#[test]
+fn claude_registration_merges_settings_and_unregister_removes_only_ours() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+    fs::create_dir_all(&claude_home).unwrap();
+    let settings_path = claude_home.join("settings.json");
+    let foreign_stop = json!({
+        "hooks": [{"type": "command", "command": "/usr/local/bin/other-tool --notify"}]
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&json!({
+            "theme": "dark",
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/audit"}]}],
+                "Stop": [foreign_stop],
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+
+    let text = fs::read_to_string(&settings_path).unwrap();
+    let settings: Value = serde_json::from_str(&text).unwrap();
+    // User keys and their order survive the merge.
+    assert_eq!(settings["theme"], "dark");
+    assert_eq!(settings["model"], "opus");
+    assert!(text.find("\"theme\"").unwrap() < text.find("\"model\"").unwrap());
+    assert!(text.find("\"model\"").unwrap() < text.find("\"hooks\"").unwrap());
+    // Foreign hooks are untouched; Munshi appended one entry per managed event.
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 2);
+    assert_eq!(stop[0], foreign_stop);
+    let installed = stop[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(installed.ends_with(" hook agent-stop --source claude-code"));
+    let session_end = settings["hooks"]["SessionEnd"].as_array().unwrap();
+    assert_eq!(session_end.len(), 1);
+    assert_eq!(session_end[0]["hooks"][0]["timeout"], 2);
+    // Mode preserved; no Copilot installation was created.
+    assert_eq!(fs::metadata(&settings_path).unwrap().mode() & 0o777, 0o644);
+    assert!(!paths.copilot_home.exists());
+    let config: Value =
+        serde_json::from_slice(&fs::read(paths.state.join("config.json")).unwrap()).unwrap();
+    assert_eq!(
+        config["harnesses"]["claude_home"],
+        claude_home.to_string_lossy().as_ref()
+    );
+    assert_eq!(config["harnesses"]["copilot_home"], Value::Null);
+
+    // Re-registration is idempotent: managed entries are replaced, not duplicated.
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+    let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+    assert_eq!(settings["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+
+    // Unregister removes only Munshi's entries and keeps the file.
+    assert_success(&unregister_command(&paths));
+    let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings["theme"], "dark");
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(settings["hooks"]["Stop"][0], foreign_stop);
+    assert!(settings["hooks"].get("SessionEnd").is_none());
+    assert!(!paths.state.join("config.json").exists());
+}
+
+#[test]
+fn claude_registration_creates_minimal_settings_and_prunes_on_unregister() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+    let settings_path = claude_home.join("settings.json");
+    let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(settings["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+
+    assert_success(&unregister_command(&paths));
+    // Only Munshi entries existed, so the hooks object is pruned entirely; the file remains.
+    let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings, json!({}));
+}
+
+#[test]
+fn claude_registration_refuses_a_foreign_non_object_settings_file() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+    fs::create_dir_all(&claude_home).unwrap();
+    fs::write(claude_home.join("settings.json"), b"[1,2,3]\n").unwrap();
+
+    let output = claude_register_command(&paths, &claude_home, fake("success.sh"));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not a JSON settings object"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(claude_home.join("settings.json")).unwrap(),
+        b"[1,2,3]\n"
+    );
+    assert!(!paths.state.join("config.json").exists());
+}
+
+#[test]
+fn claude_hooks_drive_full_lifecycle_to_archive() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+    let project = git_project(directory.path());
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+    let transcript = claude_fixture_transcript();
+
+    // Stop fires once per assistant turn; a duplicate must not break ingestion.
+    for _ in 0..2 {
+        let output = claude_hook_command(
+            &paths,
+            "agent-stop",
+            claude_stop_payload(&project, &transcript)
+                .to_string()
+                .as_bytes(),
+        );
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    assert_success(&claude_hook_command(
+        &paths,
+        "session-end",
+        claude_session_end_payload(&project, &transcript, "other")
+            .to_string()
+            .as_bytes(),
+    ));
+
+    let waited = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("hook")
+        .arg("wait")
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .arg("--source")
+        .arg("claude-code")
+        .arg("--session-id")
+        .arg(CLAUDE_SESSION_ID)
+        .arg("--timeout-ms")
+        .arg("10000")
+        .output()
+        .unwrap();
+    assert_success(&waited);
+
+    let relative = serde_json::from_slice::<Value>(&waited.stdout).unwrap()["relative_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        relative.contains("/claude-code/"),
+        "unexpected archive path {relative}"
+    );
+    assert!(relative.ends_with(&format!("{CLAUDE_SESSION_ID}.md")));
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(paths.output.join(&relative)).unwrap()).unwrap();
+    assert_eq!(archived.source, SourceKind::ClaudeCode);
+    // Phase-0 finding: reason "other" is ambiguous, so completion degrades to unknown while the
+    // session is still archived.
+    assert_eq!(archived.completion_reason, "unknown");
+
+    // The Copilot scope must not see the Claude session.
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let copilot_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source_session_id=?1 AND source_kind='copilot'",
+            [CLAUDE_SESSION_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copilot_rows, 0);
+}
+
+#[test]
+fn claude_hook_rejects_misrouted_and_malformed_payloads_without_state_rows() {
+    let directory = test_directory();
+    let (paths, claude_home) = claude_paths(&directory);
+    let project = git_project(directory.path());
+    assert_success(&claude_register_command(
+        &paths,
+        &claude_home,
+        fake("success.sh"),
+    ));
+    let transcript = claude_fixture_transcript();
+
+    // A SessionEnd payload delivered to the agent-stop hook is rejected by hook_event_name.
+    let output = claude_hook_command(
+        &paths,
+        "agent-stop",
+        claude_session_end_payload(&project, &transcript, "other")
+            .to_string()
+            .as_bytes(),
+    );
+    assert_success(&output);
+    let failure = read_last_failure(&paths.state).unwrap().unwrap();
+    assert!(
+        failure.code == "unexpected-hook-event" || failure.code == "payload-invalid-json",
+        "unexpected failure code {}",
+        failure.code
+    );
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
 }
 
 struct Paths {

@@ -1,5 +1,6 @@
 mod archive;
 mod archive_git;
+mod claude_settings;
 mod delivery;
 mod hooks;
 mod policy;
@@ -11,6 +12,7 @@ mod state;
 mod summary;
 
 pub use archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, SessionReference, archive_session};
+pub use claude_settings::{ClaudeHookStatus, claude_hooks_status};
 pub use delivery::{
     DeliveryCredentialSource, DeliveryError, DeliveryItem, DeliveryOutcome, DeliveryRunItem,
     DeliveryRunReport, DeliverySettings, DeliverySinkConfig, DeliveryStatusReport,
@@ -23,13 +25,14 @@ pub use delivery::{
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook, read_last_failure,
     run_archive_worker, run_archive_worker_for_source, run_recovery, wait_for_hook_result,
+    wait_for_hook_result_for_source,
 };
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
 pub use registration::{
-    CopilotTarget, DisclosureDecision, ProjectStatus, RegisterConfig, RegistrationError,
-    accept_disclosure, accept_disclosure_from_terminal, project_status, register,
-    set_project_enabled, unregister,
+    ClaudeTarget, CopilotTarget, DisclosureDecision, ProjectStatus, RegisterConfig,
+    RegistrationError, accept_disclosure, accept_disclosure_from_terminal, project_status,
+    register, set_project_enabled, unregister,
 };
 pub use render::{
     ArchiveMetadata, ArchiveVersion, ArchivedCursor, ArchivedMarkdown, atomic_replace,
