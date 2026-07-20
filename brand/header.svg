@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="240" viewBox="0 0 1000 240" role="img" aria-label="munshi — a quiet scribe for your AI coding sessions">
+  <defs>
+    <linearGradient id="triad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+  </defs>
+  <rect width="1000" height="240" rx="24" fill="#0d1320"/>
+  <svg x="56" y="52" width="136" height="136" viewBox="0 0 96 96">
+    <rect x="4" y="4" width="88" height="88" rx="21" fill="#131b2e"/>
+    <path fill="#22d3ee" d="M36,24 L60,24 Q64,24 64,28 L64,44 L51,71 Q48,75 45,71 L32,44 L32,28 Q32,24 36,24 Z"/>
+    <circle cx="48" cy="46" r="4.5" fill="#131b2e"/>
+    <line x1="48" y1="52.5" x2="48" y2="63" stroke="#131b2e" stroke-width="3" stroke-linecap="round"/>
+  </svg>
+  <text x="228" y="116" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="66" font-weight="600" fill="#e8eef7">munshi</text>
+  <text x="231" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" fill="#8fa0b8">a quiet scribe for your AI coding sessions</text>
+  <rect x="228" y="182" width="716" height="6" rx="3" fill="url(#triad)"/>
+</svg>

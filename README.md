@@ -1,4 +1,6 @@
-# Munshi
+<p align="center">
+  <img src="brand/header.svg" alt="munshi — a quiet scribe for your AI coding sessions" width="720">
+</p>
 
 Munshi quietly archives your AI coding sessions. When you finish a session in GitHub Copilot CLI
 or Claude Code, Munshi captures it through the harness's own lifecycle hooks, has a model
