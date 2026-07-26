@@ -13,6 +13,7 @@ mod retrieve;
 mod source;
 mod state;
 mod summary;
+mod verify_archive;
 
 pub use archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, SessionReference, archive_session};
 pub use claude_settings::{ClaudeHookStatus, claude_hooks_status};
@@ -69,3 +70,4 @@ pub use summary::{
     StructuredSummary, SummaryError, build_revision_summary_input, build_summary_input,
     run_summary, validate_structured_summary,
 };
+pub use verify_archive::{VerifyArchiveError, VerifyArchiveReport, verify_archive_parse};
