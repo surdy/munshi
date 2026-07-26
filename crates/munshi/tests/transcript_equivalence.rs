@@ -4,6 +4,13 @@
 //! `updated_at` window, and — event by event, in order — the exact legacy
 //! `(kind, content)` strings. This pins the extracted read-time interpreter to today's
 //! observable capture behavior before issue #27 rewires the capture path onto it.
+//!
+//! Since issue #27 rebuilt `load_session` on the stream itself, the count and window
+//! assertions are equivalences by construction. The test is kept as the guard for the
+//! `legacy_content` contract: what capture persists as `NormalizedEvent` `(kind, content)`
+//! must remain byte-identical to what [`Event::kind`]/[`Event::legacy_content`] promise
+//! read-time consumers, and every committed fixture must keep streaming with zero
+//! malformed records.
 
 use std::fs::{self, File};
 use std::io::BufReader;

@@ -4,9 +4,9 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use munshi_transcript::{Classification, RecordError, SessionSummary, TranscriptStream};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -88,6 +88,19 @@ impl SourceKind {
     /// harnesses require an explicit transcript path.
     fn supports_session_id_lookup(self) -> bool {
         matches!(self, Self::Copilot)
+    }
+}
+
+/// The capture-side [`SourceKind`] and the read-time [`munshi_transcript::Source`] name
+/// the same three-harness identity; the crate defines its own copy so it never depends on
+/// `munshi` (ADR 0011).
+impl From<SourceKind> for munshi_transcript::Source {
+    fn from(source: SourceKind) -> Self {
+        match source {
+            SourceKind::Copilot => Self::Copilot,
+            SourceKind::ClaudeCode => Self::ClaudeCode,
+            SourceKind::Codex => Self::Codex,
+        }
     }
 }
 
@@ -527,16 +540,16 @@ pub fn load_session_update(
         if mode == TranscriptLoadMode::Delta {
             let previous = previous.expect("delta loads have a previous cursor");
             (
-                previous.user_requests + normalized.user_requests,
-                previous.assistant_messages + normalized.assistant_messages,
-                previous.tool_activities + normalized.tool_activities,
+                previous.user_requests + normalized.summary.user_requests,
+                previous.assistant_messages + normalized.summary.assistant_messages,
+                previous.tool_activities + normalized.summary.tool_activities,
                 previous
                     .started_at
                     .clone()
-                    .or_else(|| normalized.first_timestamp.map(format_timestamp)),
+                    .or_else(|| normalized.summary.started_at()),
                 normalized
-                    .last_timestamp
-                    .map(format_timestamp)
+                    .summary
+                    .updated_at()
                     .or_else(|| previous.updated_at.clone()),
             )
         } else if mode == TranscriptLoadMode::Unchanged {
@@ -550,11 +563,11 @@ pub fn load_session_update(
             )
         } else {
             (
-                normalized.user_requests,
-                normalized.assistant_messages,
-                normalized.tool_activities,
-                normalized.first_timestamp.map(format_timestamp),
-                normalized.last_timestamp.map(format_timestamp),
+                normalized.summary.user_requests,
+                normalized.summary.assistant_messages,
+                normalized.summary.tool_activities,
+                normalized.summary.started_at(),
+                normalized.summary.updated_at(),
             )
         };
 
@@ -572,7 +585,7 @@ pub fn load_session_update(
             user_requests,
             assistant_messages,
             tool_activities,
-            ignored_events: normalized.ignored_events,
+            ignored_events: normalized.summary.ignored_events,
             source_cursor: total_records,
             source_byte_cursor: bytes.len() as u64,
             source_prefix_hash,
@@ -590,10 +603,11 @@ pub fn load_session_update(
 
 /// Bounded, privacy-safe read of a Claude Code transcript's origin project directory: the first
 /// absolute top-level `cwd` value among the leading records (bookkeeping records such as
-/// `queue-operation` may precede the first turn and lack one). Only the pinned `cwd` key is
-/// inspected, mirroring the envelope-validation read discipline; content is never read. Lets the
-/// recovery sweep hand `mark_recovery_interrupted` an origin so swept sessions can compute
-/// project identity instead of parking as origin-unresolved.
+/// `queue-operation` may precede the first turn and lack one). The pinned-`cwd` format predicate is
+/// [`munshi_transcript::claude_origin_cwd`]; this wrapper keeps only the I/O discipline — symlink
+/// rejection, a bounded number of bounded-size lines — mirroring the envelope-validation read
+/// discipline; content is never read. Lets the recovery sweep hand `mark_recovery_interrupted` an
+/// origin so swept sessions can compute project identity instead of parking as origin-unresolved.
 pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -623,15 +637,17 @@ pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
         }
         let value: Value = serde_json::from_slice(&line).ok()?;
         let object = value.as_object()?;
-        if let Some(cwd) = object.get("cwd").and_then(Value::as_str) {
-            if Path::new(cwd).is_absolute() {
-                return Some(PathBuf::from(cwd));
-            }
+        if let Some(cwd) = munshi_transcript::claude_origin_cwd(object) {
+            return Some(PathBuf::from(cwd));
         }
     }
     None
 }
 
+/// Validates that the first meaningful record of `path` matches `source`'s version-pinned
+/// envelope. The structural predicate is [`munshi_transcript::envelope_matches`] (ADR 0011,
+/// issue #27); this wrapper keeps only the I/O discipline — symlink rejection, the bounded
+/// first-line read, and the line-size cap.
 pub fn validate_transcript_envelope(
     source: SourceKind,
     path: &Path,
@@ -669,40 +685,10 @@ pub fn validate_transcript_envelope(
         let value: Value =
             serde_json::from_slice(&line).map_err(|_| SourceError::UnsupportedEnvelope)?;
         let object = value.as_object().ok_or(SourceError::UnsupportedEnvelope)?;
-        if !envelope_matches(source, object) {
+        if !munshi_transcript::envelope_matches(source.into(), object) {
             return Err(SourceError::UnsupportedEnvelope);
         }
         return Ok(());
-    }
-}
-
-/// Structural envelope recognition for the first meaningful transcript record.
-///
-/// Each check is intentionally shallow and privacy-safe: it inspects only the
-/// version-pinned discriminator keys, never record content, so a different
-/// harness's transcript is rejected before any normalization occurs.
-fn envelope_matches(source: SourceKind, object: &Map<String, Value>) -> bool {
-    match source {
-        SourceKind::Copilot => {
-            object.get("id").is_some_and(Value::is_string)
-                && object.contains_key("timestamp")
-                && object.contains_key("parentId")
-                && object.get("type").is_some_and(Value::is_string)
-                && object.get("data").is_some_and(Value::is_object)
-        }
-        SourceKind::ClaudeCode => {
-            let has_type = object.get("type").is_some_and(Value::is_string);
-            let claude_shaped = object.get("message").is_some_and(Value::is_object)
-                || object.contains_key("leafUuid")
-                || object.contains_key("sessionId")
-                || object.contains_key("uuid");
-            has_type && claude_shaped && !object.contains_key("payload")
-        }
-        SourceKind::Codex => {
-            object.get("type").is_some_and(Value::is_string)
-                && object.contains_key("timestamp")
-                && object.contains_key("payload")
-        }
     }
 }
 
@@ -742,47 +728,36 @@ fn read_stable_source(
     Ok((bytes, snapshot))
 }
 
+/// One normalization pass folded off the shared transcript stream: the (possibly elided)
+/// normalized events plus the crate's [`SessionSummary`] counting fold, which carries the
+/// event counts, the lumped ignored count, and the started/updated timestamp window.
 #[derive(Default)]
 struct NormalizedRecords {
     events: Vec<NormalizedEvent>,
-    user_requests: usize,
-    assistant_messages: usize,
-    tool_activities: usize,
-    ignored_events: usize,
-    line_count: u64,
-    first_timestamp: Option<DateTime<Utc>>,
-    last_timestamp: Option<DateTime<Utc>>,
+    summary: SessionSummary,
 }
 
-/// Outcome of classifying one raw transcript record for a source adapter.
-struct RecordClass {
-    events: Vec<NormalizedEvent>,
-    ignored: usize,
+/// Opens the shared streaming interpreter (ADR 0011) over in-memory transcript bytes,
+/// keyed by the capture source and the artifact-set version capture provenance records
+/// ([`crate::patwari::INITIAL_ARTIFACT_SET_VERSION`]). Both are compile-time constants, so
+/// an unsupported pairing is a build defect, not a runtime condition.
+fn transcript_stream(source: SourceKind, bytes: &[u8]) -> TranscriptStream<&[u8]> {
+    TranscriptStream::new(
+        source.into(),
+        crate::patwari::INITIAL_ARTIFACT_SET_VERSION,
+        bytes,
+    )
+    .expect("munshi-transcript supports the capture artifact-set version")
 }
 
-impl RecordClass {
-    fn ignored() -> Self {
-        Self {
-            events: Vec::new(),
-            ignored: 1,
-        }
-    }
-
-    fn skipped() -> Self {
-        Self {
-            events: Vec::new(),
-            ignored: 0,
-        }
-    }
-
-    fn event(kind: &'static str, content: String) -> Self {
-        Self {
-            events: vec![NormalizedEvent { kind, content }],
-            ignored: 0,
-        }
-    }
-}
-
+/// Folds the shared transcript stream (ADR 0011, issue #27) into the legacy normalized shape:
+/// a [`NormalizedEvent`] per content event (from its kind and byte-identical `legacy_content`),
+/// with counts and the timestamp window taken from the crate's [`SessionSummary`] fold.
+///
+/// The stream itself is lossless; strictness is capture-side policy. The first malformed record
+/// aborts the whole load as [`SourceError::MalformedJson`], numbered exactly like the legacy
+/// whole-parse normalizer: 1-based among non-empty lines, offset by `prior_records` on delta
+/// loads.
 fn normalize_records(
     bytes: &[u8],
     prior_records: u64,
@@ -790,49 +765,29 @@ fn normalize_records(
     max_event_text_bytes: usize,
 ) -> Result<NormalizedRecords, SourceError> {
     let mut normalized = NormalizedRecords::default();
-    for raw_line in bytes.split(|byte| *byte == b'\n') {
-        if raw_line.is_empty() {
-            continue;
-        }
-        normalized.line_count += 1;
-        let value: Value =
-            serde_json::from_slice(raw_line).map_err(|_| SourceError::MalformedJson {
-                line: prior_records + normalized.line_count,
-            })?;
-        let Some(object) = value.as_object() else {
-            normalized.ignored_events += 1;
-            continue;
-        };
-
-        if let Some(timestamp) = object.get("timestamp").and_then(parse_timestamp) {
-            normalized.first_timestamp = Some(
-                normalized
-                    .first_timestamp
-                    .map_or(timestamp, |old| old.min(timestamp)),
-            );
-            normalized.last_timestamp = Some(
-                normalized
-                    .last_timestamp
-                    .map_or(timestamp, |old| old.max(timestamp)),
-            );
-        }
-
-        let class = classify_record(source, object)?;
-        normalized.ignored_events += class.ignored;
-        for event in class.events {
-            match event.kind {
-                "user" => normalized.user_requests += 1,
-                "assistant" => normalized.assistant_messages += 1,
-                "tool" => normalized.tool_activities += 1,
-                _ => {}
+    for item in transcript_stream(source, bytes) {
+        normalized.summary.observe(&item);
+        let record = item.map_err(|error| match error {
+            RecordError::MalformedJson { record, .. } => SourceError::MalformedJson {
+                line: prior_records + record,
+            },
+            RecordError::Io { source, .. } => SourceError::Io(source),
+        })?;
+        if let Classification::Content { events } = record.classification {
+            for event in events {
+                // Oversized content is extracted, not truncated: the full bytes become an
+                // `outputs/<sha256>` snapshot artifact (re-derived at upload time from the same
+                // transcript, see `extract_outputs`) and the summarizer sees a hash+size marker in
+                // their place. The activity counts in the summary reflect the original event
+                // either way.
+                normalized.events.push(elide_if_oversized(
+                    NormalizedEvent {
+                        kind: event.kind(),
+                        content: event.legacy_content(),
+                    },
+                    max_event_text_bytes,
+                ));
             }
-            // Oversized content is extracted, not truncated: the full bytes become an
-            // `outputs/<sha256>` snapshot artifact (re-derived at upload time from the same
-            // transcript, see `extract_outputs`) and the summarizer sees a hash+size marker in
-            // their place. The activity counts above reflect the original event either way.
-            normalized
-                .events
-                .push(elide_if_oversized(event, max_event_text_bytes));
         }
     }
     Ok(normalized)
@@ -885,443 +840,39 @@ fn claim_ticket_marker(label: &str, content: &str) -> String {
 /// Extraction is a pure function of the transcript bytes, the source adapter, and the threshold, and
 /// classification is pinned by [`NORMALIZER_VERSION`]; every retry of a reused capture id therefore
 /// re-produces a byte-identical, deterministically ordered set (ascending by hash), and each
-/// `outputs/<sha256>` resolves to exactly the bytes the summarizer's elision marker names. Malformed
-/// lines are skipped so a partial trailing record appended after archival never fails the upload.
+/// `outputs/<sha256>` resolves to exactly the bytes the summarizer's elision marker names. Unlike
+/// the strict load, malformed records (per-record stream errors) are skipped so a partial trailing
+/// record appended after archival never fails the upload.
 pub fn extract_outputs(
     bytes: &[u8],
     source: SourceKind,
     max_event_text_bytes: usize,
 ) -> Vec<ExtractedOutput> {
     let mut extracted: BTreeMap<String, ExtractedOutput> = BTreeMap::new();
-    for raw_line in bytes.split(|byte| *byte == b'\n') {
-        if raw_line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(raw_line) else {
+    for item in transcript_stream(source, bytes) {
+        let Ok(record) = item else {
             continue;
         };
-        let Some(object) = value.as_object() else {
+        let Classification::Content { events } = record.classification else {
             continue;
         };
-        let Ok(class) = classify_record(source, object) else {
-            continue;
-        };
-        for event in class.events {
-            if event.content.len() <= max_event_text_bytes {
+        for event in events {
+            let content = event.legacy_content();
+            if content.len() <= max_event_text_bytes {
                 continue;
             }
-            let sha256 = content_sha256_hex(event.content.as_bytes());
+            let sha256 = content_sha256_hex(content.as_bytes());
             extracted
                 .entry(sha256.clone())
                 .or_insert_with(|| ExtractedOutput {
                     sha256,
                     media_type: Some("text/plain; charset=utf-8".to_owned()),
-                    label: event.kind.to_owned(),
-                    content: event.content.into_bytes(),
+                    label: event.kind().to_owned(),
+                    content: content.into_bytes(),
                 });
         }
     }
     extracted.into_values().collect()
-}
-
-fn classify_record(
-    source: SourceKind,
-    object: &Map<String, Value>,
-) -> Result<RecordClass, SourceError> {
-    match source {
-        SourceKind::Copilot => classify_copilot(object),
-        SourceKind::ClaudeCode => classify_claude(object),
-        SourceKind::Codex => classify_codex(object),
-    }
-}
-
-fn classify_copilot(object: &Map<String, Value>) -> Result<RecordClass, SourceError> {
-    let Some(event_type) = object.get("type").and_then(Value::as_str) else {
-        return Ok(RecordClass::ignored());
-    };
-    match event_type {
-        "user.message" => {
-            let Some(data) = event_data(object) else {
-                return Ok(RecordClass::ignored());
-            };
-            let Some(content) = data.get("content").and_then(Value::as_str) else {
-                return Ok(RecordClass::ignored());
-            };
-            match nonempty(content) {
-                Some(content) => Ok(RecordClass::event("user", content)),
-                None => Ok(RecordClass::skipped()),
-            }
-        }
-        "assistant.message" => {
-            let Some(data) = event_data(object) else {
-                return Ok(RecordClass::ignored());
-            };
-            if !data.get("messageId").is_some_and(Value::is_string) {
-                return Ok(RecordClass::ignored());
-            }
-            let Some(content) = data.get("content").and_then(Value::as_str) else {
-                return Ok(RecordClass::ignored());
-            };
-            match nonempty(content) {
-                Some(content) => Ok(RecordClass::event("assistant", content)),
-                None => Ok(RecordClass::skipped()),
-            }
-        }
-        "tool.execution_start" => {
-            let Some(data) = event_data(object).filter(|data| valid_tool_start(data)) else {
-                return Ok(RecordClass::ignored());
-            };
-            Ok(RecordClass::event("tool", extract_tool_start(data)?))
-        }
-        "tool.execution_complete" => {
-            let Some(data) = event_data(object).filter(|data| valid_tool_complete(data)) else {
-                return Ok(RecordClass::ignored());
-            };
-            Ok(RecordClass::event("tool", extract_tool_complete(data)?))
-        }
-        _ => Ok(RecordClass::ignored()),
-    }
-}
-
-/// Classify one Anthropic Claude Code transcript record.
-///
-/// Version-pinned assumption (documented in `docs/harness-adapters.md`): each line is a
-/// JSON object with a string `type`. Genuine user prompts and assistant replies live under
-/// `message.content` (a string or an array of typed blocks). `tool_use` blocks on assistant
-/// messages and `tool_result` blocks on user messages are normalized as tool activity, while
-/// `summary`, `system`, and queue/bookkeeping records are treated as ignored metadata.
-fn classify_claude(object: &Map<String, Value>) -> Result<RecordClass, SourceError> {
-    let Some(record_type) = object.get("type").and_then(Value::as_str) else {
-        return Ok(RecordClass::ignored());
-    };
-    match record_type {
-        "user" | "assistant" => {
-            let Some(message) = object.get("message").and_then(Value::as_object) else {
-                return Ok(RecordClass::ignored());
-            };
-            let assistant = record_type == "assistant";
-            let Some(content) = message.get("content") else {
-                return Ok(RecordClass::ignored());
-            };
-            classify_claude_content(content, assistant)
-        }
-        // Compaction summaries, system notices, and queue bookkeeping carry no
-        // archive-worthy user or agent content.
-        _ => Ok(RecordClass::ignored()),
-    }
-}
-
-fn classify_claude_content(content: &Value, assistant: bool) -> Result<RecordClass, SourceError> {
-    match content {
-        Value::String(text) => match nonempty(text) {
-            Some(text) => Ok(RecordClass::event(
-                if assistant { "assistant" } else { "user" },
-                text,
-            )),
-            None => Ok(RecordClass::skipped()),
-        },
-        Value::Array(blocks) => {
-            let mut events = Vec::new();
-            let mut recognized = false;
-            for block in blocks {
-                let Some(block) = block.as_object() else {
-                    continue;
-                };
-                let Some(block_type) = block.get("type").and_then(Value::as_str) else {
-                    continue;
-                };
-                recognized = true;
-                match block_type {
-                    "text" => {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            if let Some(text) = nonempty(text) {
-                                events.push(NormalizedEvent {
-                                    kind: if assistant { "assistant" } else { "user" },
-                                    content: text,
-                                });
-                            }
-                        }
-                    }
-                    "tool_use" if assistant => {
-                        if let Some(event) = extract_claude_tool_use(block)? {
-                            events.push(event);
-                        }
-                    }
-                    "tool_result" if !assistant => {
-                        if let Some(event) = extract_claude_tool_result(block)? {
-                            events.push(event);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if events.is_empty() && !recognized {
-                Ok(RecordClass::ignored())
-            } else {
-                Ok(RecordClass { events, ignored: 0 })
-            }
-        }
-        _ => Ok(RecordClass::ignored()),
-    }
-}
-
-fn extract_claude_tool_use(
-    block: &Map<String, Value>,
-) -> Result<Option<NormalizedEvent>, SourceError> {
-    let Some(name) = block.get("name").and_then(Value::as_str).and_then(nonempty) else {
-        return Ok(None);
-    };
-    let mut fields = BTreeMap::new();
-    fields.insert("event", "tool_use".to_owned());
-    if let Some(id) = block.get("id").and_then(Value::as_str).and_then(nonempty) {
-        fields.insert("tool_use_id", id);
-    }
-    fields.insert("name", name);
-    if let Some(input) = block.get("input").and_then(compact_value) {
-        fields.insert("input", input);
-    }
-    Ok(Some(NormalizedEvent {
-        kind: "tool",
-        content: render_tool_fields(fields),
-    }))
-}
-
-fn extract_claude_tool_result(
-    block: &Map<String, Value>,
-) -> Result<Option<NormalizedEvent>, SourceError> {
-    let mut fields = BTreeMap::new();
-    fields.insert("event", "tool_result".to_owned());
-    if let Some(id) = block
-        .get("tool_use_id")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
-        fields.insert("tool_use_id", id);
-    }
-    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
-        fields.insert("is_error", "true".to_owned());
-    }
-    if let Some(output) = block.get("content").and_then(extract_claude_result_text) {
-        fields.insert("output", output);
-    }
-    if fields.len() == 1 {
-        return Ok(None);
-    }
-    Ok(Some(NormalizedEvent {
-        kind: "tool",
-        content: render_tool_fields(fields),
-    }))
-}
-
-fn extract_claude_result_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => nonempty(text),
-        Value::Array(items) => {
-            let parts: Vec<_> = items
-                .iter()
-                .filter_map(extract_claude_result_text)
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
-        }
-        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("text") => object
-                .get("text")
-                .and_then(Value::as_str)
-                .and_then(nonempty),
-            _ => None,
-        },
-        Value::Null | Value::Bool(_) | Value::Number(_) => None,
-    }
-}
-
-/// Classify one OpenAI Codex CLI rollout record.
-///
-/// Version-pinned assumption (documented in `docs/harness-adapters.md`): each line is a
-/// `RolloutLine` wrapping a tagged `RolloutItem` as `{"type": <kind>, "payload": {..}}`.
-/// Only `response_item` payloads carry conversation content; `session_meta`, `turn_context`,
-/// `compacted`, `event_msg`, and world-state records are ignored metadata. Within a
-/// `response_item`, user/assistant messages, function/custom tool calls, and their outputs
-/// are normalized; model reasoning is deliberately dropped.
-fn classify_codex(object: &Map<String, Value>) -> Result<RecordClass, SourceError> {
-    let Some(record_type) = object.get("type").and_then(Value::as_str) else {
-        return Ok(RecordClass::ignored());
-    };
-    if record_type != "response_item" {
-        return Ok(RecordClass::ignored());
-    }
-    let Some(payload) = object.get("payload").and_then(Value::as_object) else {
-        return Ok(RecordClass::ignored());
-    };
-    let Some(item_type) = payload.get("type").and_then(Value::as_str) else {
-        return Ok(RecordClass::ignored());
-    };
-    match item_type {
-        "message" => {
-            let Some(role) = payload.get("role").and_then(Value::as_str) else {
-                return Ok(RecordClass::ignored());
-            };
-            let text = payload
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|blocks| extract_codex_message_text(blocks))
-                .unwrap_or_default();
-            match nonempty(&text) {
-                Some(text) => match role {
-                    "user" => Ok(RecordClass::event("user", text)),
-                    "assistant" => Ok(RecordClass::event("assistant", text)),
-                    _ => Ok(RecordClass::ignored()),
-                },
-                None => Ok(RecordClass::skipped()),
-            }
-        }
-        "function_call" | "custom_tool_call" => Ok(codex_tool_call(payload, item_type)?
-            .map_or_else(RecordClass::ignored, |event| RecordClass {
-                events: vec![event],
-                ignored: 0,
-            })),
-        "function_call_output" | "custom_tool_call_output" => Ok(codex_tool_output(payload)?
-            .map_or_else(RecordClass::ignored, |event| RecordClass {
-                events: vec![event],
-                ignored: 0,
-            })),
-        "local_shell_call" => Ok(codex_local_shell_call(payload)?.map_or_else(
-            RecordClass::ignored,
-            |event| RecordClass {
-                events: vec![event],
-                ignored: 0,
-            },
-        )),
-        // Reasoning is internal model output and is intentionally not archived.
-        _ => Ok(RecordClass::ignored()),
-    }
-}
-
-fn extract_codex_message_text(blocks: &[Value]) -> String {
-    let mut parts = Vec::new();
-    for block in blocks {
-        let Some(block) = block.as_object() else {
-            continue;
-        };
-        if let Some("input_text" | "output_text" | "text") =
-            block.get("type").and_then(Value::as_str)
-        {
-            if let Some(text) = block.get("text").and_then(Value::as_str).and_then(nonempty) {
-                parts.push(text);
-            }
-        }
-    }
-    parts.join("\n")
-}
-
-fn codex_tool_call(
-    payload: &Map<String, Value>,
-    item_type: &str,
-) -> Result<Option<NormalizedEvent>, SourceError> {
-    let Some(call_id) = payload
-        .get("call_id")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    else {
-        return Ok(None);
-    };
-    let mut fields = BTreeMap::new();
-    fields.insert("event", item_type.to_owned());
-    fields.insert("call_id", call_id);
-    if let Some(name) = payload
-        .get("name")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
-        fields.insert("name", name);
-    }
-    if let Some(arguments) = payload
-        .get("arguments")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
-        fields.insert("arguments", arguments);
-    } else if let Some(input) = payload
-        .get("input")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
-        fields.insert("input", input);
-    }
-    Ok(Some(NormalizedEvent {
-        kind: "tool",
-        content: render_tool_fields(fields),
-    }))
-}
-
-fn codex_tool_output(payload: &Map<String, Value>) -> Result<Option<NormalizedEvent>, SourceError> {
-    let Some(call_id) = payload
-        .get("call_id")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    else {
-        return Ok(None);
-    };
-    let mut fields = BTreeMap::new();
-    fields.insert("event", "function_call_output".to_owned());
-    fields.insert("call_id", call_id);
-    if let Some(output) = payload.get("output").and_then(extract_codex_output_text) {
-        fields.insert("output", output);
-    }
-    Ok(Some(NormalizedEvent {
-        kind: "tool",
-        content: render_tool_fields(fields),
-    }))
-}
-
-fn extract_codex_output_text(value: &Value) -> Option<String> {
-    match value {
-        // `function_call_output.output` is either a plain string or an array of
-        // structured content items on the wire.
-        Value::String(text) => nonempty(text),
-        Value::Array(items) => {
-            let parts: Vec<_> = items.iter().filter_map(extract_codex_output_text).collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
-        }
-        Value::Object(object) => object
-            .get("content")
-            .and_then(extract_codex_output_text)
-            .or_else(|| {
-                object
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .and_then(nonempty)
-            }),
-        Value::Null | Value::Bool(_) | Value::Number(_) => None,
-    }
-}
-
-fn codex_local_shell_call(
-    payload: &Map<String, Value>,
-) -> Result<Option<NormalizedEvent>, SourceError> {
-    let mut fields = BTreeMap::new();
-    fields.insert("event", "local_shell_call".to_owned());
-    if let Some(call_id) = payload
-        .get("call_id")
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
-        fields.insert("call_id", call_id);
-    }
-    if let Some(command) = payload
-        .get("action")
-        .and_then(Value::as_object)
-        .and_then(|action| action.get("command"))
-        .and_then(compact_value)
-    {
-        fields.insert("command", command);
-    }
-    if fields.len() == 1 {
-        return Ok(None);
-    }
-    Ok(Some(NormalizedEvent {
-        kind: "tool",
-        content: render_tool_fields(fields),
-    }))
 }
 
 fn count_records(bytes: &[u8]) -> u64 {
@@ -1354,10 +905,6 @@ fn content_sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn event_data(object: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    object.get("data").and_then(Value::as_object)
-}
-
 fn validate_session_id(value: &str) -> Result<&str, SourceError> {
     if value.is_empty()
         || value.len() > 128
@@ -1373,182 +920,6 @@ fn validate_session_id(value: &str) -> Result<&str, SourceError> {
         Err(SourceError::InvalidSessionId)
     } else {
         Ok(value)
-    }
-}
-
-fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value.as_str()?)
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-}
-
-fn format_timestamp(timestamp: DateTime<Utc>) -> String {
-    timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-fn nonempty(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-fn valid_tool_start(data: &Map<String, Value>) -> bool {
-    data.get("toolCallId").is_some_and(Value::is_string)
-        && data.get("toolName").is_some_and(Value::is_string)
-}
-
-fn valid_tool_complete(data: &Map<String, Value>) -> bool {
-    if !data.get("toolCallId").is_some_and(Value::is_string)
-        || !data.get("success").is_some_and(Value::is_boolean)
-    {
-        return false;
-    }
-    if let Some(result) = data.get("result") {
-        if !valid_tool_result(result) {
-            return false;
-        }
-    }
-    if let Some(error) = data.get("error") {
-        let Some(error) = error.as_object() else {
-            return false;
-        };
-        if !error.get("message").is_some_and(Value::is_string) {
-            return false;
-        }
-    }
-    true
-}
-
-fn valid_tool_result(result: &Value) -> bool {
-    let Some(result) = result.as_object() else {
-        return false;
-    };
-    let has_content = match result.get("content") {
-        Some(Value::String(_)) => true,
-        Some(_) => return false,
-        None => false,
-    };
-    let has_textual_contents = match result.get("contents") {
-        Some(Value::Array(contents)) => contents
-            .iter()
-            .any(|content| extract_tool_result_text(content).is_some()),
-        Some(_) => return false,
-        None => false,
-    };
-    has_content || has_textual_contents
-}
-
-fn extract_tool_start(data: &Map<String, Value>) -> Result<String, SourceError> {
-    let mut fields = BTreeMap::new();
-    fields.insert("event", "tool.execution_start".to_owned());
-    fields.insert(
-        "tool_call_id",
-        data["toolCallId"]
-            .as_str()
-            .expect("validated tool call ID")
-            .to_owned(),
-    );
-    fields.insert(
-        "name",
-        data["toolName"]
-            .as_str()
-            .expect("validated tool name")
-            .to_owned(),
-    );
-    if let Some(arguments) = data.get("arguments").and_then(compact_value) {
-        fields.insert("arguments", arguments);
-    }
-    Ok(render_tool_fields(fields))
-}
-
-fn extract_tool_complete(data: &Map<String, Value>) -> Result<String, SourceError> {
-    let mut fields = BTreeMap::new();
-    fields.insert("event", "tool.execution_complete".to_owned());
-    fields.insert(
-        "tool_call_id",
-        data["toolCallId"]
-            .as_str()
-            .expect("validated tool call ID")
-            .to_owned(),
-    );
-    fields.insert(
-        "success",
-        data["success"]
-            .as_bool()
-            .expect("validated tool success")
-            .to_string(),
-    );
-    if let Some(message) = data
-        .get("error")
-        .and_then(Value::as_object)
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
-        fields.insert("error", message);
-    }
-    if let Some(result) = data.get("result").and_then(Value::as_object) {
-        let mut output = Vec::new();
-        if let Some(content) = result
-            .get("content")
-            .and_then(Value::as_str)
-            .and_then(nonempty)
-        {
-            output.push(content);
-        }
-        if let Some(contents) = result.get("contents").and_then(Value::as_array) {
-            output.extend(contents.iter().filter_map(extract_tool_result_text));
-        }
-        if !output.is_empty() {
-            fields.insert("output", output.join("\n"));
-        }
-    }
-    Ok(render_tool_fields(fields))
-}
-
-fn extract_tool_result_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => nonempty(text),
-        Value::Array(items) => {
-            let parts: Vec<_> = items.iter().filter_map(extract_tool_result_text).collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
-        }
-        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("text" | "terminal") => object
-                .get("text")
-                .and_then(Value::as_str)
-                .and_then(nonempty),
-            Some("shell_exit") => object
-                .get("outputPreview")
-                .and_then(Value::as_str)
-                .and_then(nonempty),
-            Some("resource") => object
-                .get("resource")
-                .and_then(Value::as_object)
-                .and_then(|resource| resource.get("text"))
-                .and_then(Value::as_str)
-                .and_then(nonempty),
-            Some("resource_link" | "image" | "audio") => None,
-            _ => None,
-        },
-        Value::Null | Value::Bool(_) | Value::Number(_) => None,
-    }
-}
-
-fn render_tool_fields(fields: BTreeMap<&str, String>) -> String {
-    fields
-        .into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn compact_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => nonempty(text),
-        Value::Null => None,
-        Value::Array(_) | Value::Object(_) | Value::Bool(_) | Value::Number(_) => {
-            serde_json::to_string(value).ok()
-        }
     }
 }
 
