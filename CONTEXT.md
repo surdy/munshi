@@ -131,3 +131,32 @@ _Avoid_: Transcript, conversation log
 The latest successful summary revision. When Git history is disabled, it is the only summary text
 Munshi retains.
 _Avoid_: Summary history, transcript
+
+**Archive upload**:
+An attempt to submit one summary revision's full snapshot — verbatim transcript, rendered summary,
+and extracted outputs — to the Patwari archive server. It runs downstream of local archival, in
+parallel with delivery, and never blocks either.
+_Avoid_: Delivery, backup, sync
+
+**Extracted output**:
+The complete content of an oversized normalized event, preserved as its own content-addressed
+snapshot artifact instead of being truncated away. The summarizer sees a claim ticket in its place.
+_Avoid_: Truncated output, attachment
+
+**Claim ticket**:
+A marker standing in for elided content, carrying the original content's sha256, size, and a short
+label. Any holder can redeem it for the exact original bytes through retrieval once its snapshot is
+archived.
+_Avoid_: Link, citation, placeholder
+
+**Snapshot artifact set**:
+The versioned convention naming what a snapshot contains and how artifact roles are expressed
+through reserved logical paths. Consumers interpret paths per the artifact-set version recorded in
+the manifest; new artifact kinds are added under a bumped version.
+_Avoid_: File list, attachment set
+
+**Retrieval**:
+Fetching original content back from Patwari by its original sha256, verified against both stored and
+original hashes and decompressed locally. Search within retrieved content happens client-side;
+Patwari never interprets content.
+_Avoid_: Restore, delivery

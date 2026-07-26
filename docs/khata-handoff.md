@@ -1,5 +1,12 @@
 # Khata planning handoff
 
+> **Historical:** Khata was realized as [Patwari](https://github.com/surdy/patwari). The integration
+> decisions this document left open are now settled in
+> [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) (full snapshots to Patwari, no
+> client-side encryption in v1) and
+> [ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md) (claim tickets and retrieval).
+> This document is preserved as planning history and is no longer authoritative.
+
 Use this document to start a separate planning session for **Khata**, the remote history and backup
 server paired with [Munshi](../README.md).
 

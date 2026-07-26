@@ -63,8 +63,9 @@ is in [getting started](docs/getting-started.md).
 Munshi is the local scribe in a small family of tools:
 
 - **[Patwari](https://github.com/surdy/patwari)** — a self-hosted archive server for *complete*
-  session captures: verified, immutable, content-addressed. Munshi will submit full transcripts
-  there for permanent keeping.
+  session captures: verified, immutable, content-addressed. Munshi will submit full session
+  snapshots there for permanent keeping: the verbatim transcript, each summary revision, and
+  oversized tool outputs preserved as individually retrievable artifacts.
 - **Notesmith** — an optional notes sink; Munshi can deliver each summary into a vault alongside
   your own notes (disabled by default, opt-in via `munshi delivery`).
 - **Madari** — a session-discovery GUI that reads Munshi's JSON status contracts to show archive
@@ -93,5 +94,8 @@ this README used to be), [automatic archival](docs/automatic-archive.md),
 Actively developed. Automatic capture, summarization, resumed-session revisions,
 interrupted-session recovery, per-project policy and budgets, operational CLI contracts
 (`status`, `sessions`, `show`, `retry`, `doctor`, …), optional archive Git history, and opt-in
-Notesmith delivery are all implemented and tested. Full-transcript backup to Patwari is the next
-major slice. License: MIT OR Apache-2.0.
+Notesmith delivery are all implemented and tested. Full-snapshot archive upload to Patwari is the
+next major slice; its shape is settled in
+[ADR 0009](docs/adr/0009-archive-full-snapshots-to-patwari.md) (full snapshots, parallel to
+delivery) and [ADR 0010](docs/adr/0010-elide-with-claim-tickets-retrieve-on-demand.md) (claim
+tickets and on-demand retrieval). License: MIT OR Apache-2.0.
