@@ -341,6 +341,7 @@ dependencies = [
  "clap",
  "libc",
  "munshi-runner",
+ "munshi-transcript",
  "rusqlite",
  "serde",
  "serde_json",
@@ -368,6 +369,16 @@ name = "munshi-runner"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "thiserror",
+]
+
+[[package]]
+name = "munshi-transcript"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
