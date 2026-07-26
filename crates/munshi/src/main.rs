@@ -12,13 +12,13 @@ use munshi::{
     ArchiveUploadStatusReport, ArtifactMatch, DeliveryCredentialSource, DeliveryRunReport,
     DeliverySinkConfig, DeliveryStatusReport, HistoryReport, HookEvent, HookFailure, HookResult,
     ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults, SessionRecord,
-    SessionReference, SourceKind, StateStore, StructuredSummary, accept_disclosure_from_terminal,
-    archive_session, archive_upload_retry, archive_upload_status, configure_archive_upload,
-    configure_delivery, delivery_backfill, delivery_retry, delivery_status,
-    delivery_verify_history, handle_hook, parse_archive_markdown, project_status,
-    read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
-    set_archive_upload_enabled, set_delivery_enabled, set_project_enabled, unregister,
-    wait_for_hook_result_for_source,
+    SessionReference, SourceKind, StateStore, StructuredSummary, VerifyArchiveError,
+    VerifyArchiveReport, accept_disclosure_from_terminal, archive_session, archive_upload_retry,
+    archive_upload_status, configure_archive_upload, configure_delivery, delivery_backfill,
+    delivery_retry, delivery_status, delivery_verify_history, handle_hook, parse_archive_markdown,
+    project_status, read_last_failure, register, retrieve, run_archive_worker_for_source,
+    run_recovery, set_archive_upload_enabled, set_delivery_enabled, set_project_enabled,
+    unregister, verify_archive_parse, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -202,6 +202,29 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Emit a stable machine-readable contract (for `--list` and `--query`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Walk the Patwari archive, download and verify each snapshot's transcript, and stream-parse
+    /// it with the shared read-time interpreter, reporting per-session parse accounting
+    /// (the ADR 0011/0012 acceptance check; rerun manually after format bumps).
+    VerifyArchiveParse {
+        /// Verify only the snapshots belonging to this Patwari session ID.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        session: Option<String>,
+        /// Verify every snapshot in the archive.
+        #[arg(long)]
+        all: bool,
+        /// Verify against this archive server instead of the configured archive-upload endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Raise the maximum stored bytes downloaded for one artifact (default 128 MiB). A larger
+        /// transcript is otherwise skipped with an accounting line instead of downloaded.
+        #[arg(long)]
+        max_download_bytes: Option<usize>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
         #[arg(long)]
         json: bool,
     },
@@ -566,6 +589,10 @@ enum Outcome {
         query: Option<String>,
         output: Option<PathBuf>,
         force: bool,
+        json: bool,
+    },
+    VerifyArchiveParse {
+        result: Box<Result<VerifyArchiveReport, VerifyArchiveError>>,
         json: bool,
     },
     Retry {
@@ -1107,6 +1134,9 @@ fn main() -> ExitCode {
             force,
             json,
         }) => emit_retrieve(*result, query, output, force, json),
+        Ok(Outcome::VerifyArchiveParse { result, json }) => {
+            emit_verify_archive_parse(*result, json)
+        }
         Ok(Outcome::Retry { report, json }) => {
             if json {
                 emit_json(&report);
@@ -1417,6 +1447,28 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 query,
                 output,
                 force,
+                json,
+            })
+        }
+        Command::VerifyArchiveParse {
+            session,
+            all,
+            endpoint,
+            max_download_bytes,
+            state_dir,
+            json,
+        } => {
+            // clap guarantees exactly one of --session/--all; `all` needs no further inspection.
+            let _ = all;
+            let state_directory = resolve_state_directory(state_dir)?;
+            let result = verify_archive_parse(
+                &state_directory,
+                endpoint.as_deref(),
+                session.as_deref(),
+                max_download_bytes,
+            );
+            Ok(Outcome::VerifyArchiveParse {
+                result: Box::new(result),
                 json,
             })
         }
@@ -3308,6 +3360,29 @@ fn emit_retrieve(
                 }
                 ExitCode::SUCCESS
             }
+        }
+    }
+}
+
+/// Emits a completed archive parse verification. A finished walk always prints its full report
+/// (human or `--json`) before exiting with the report's own code, so findings never hide the
+/// accounting; only a walk that could not run at all takes the error path.
+fn emit_verify_archive_parse(
+    result: Result<VerifyArchiveReport, VerifyArchiveError>,
+    json: bool,
+) -> ExitCode {
+    match result {
+        Ok(report) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            ExitCode::from(report.exit_code())
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(error.exit_code())
         }
     }
 }
