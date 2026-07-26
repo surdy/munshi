@@ -852,7 +852,17 @@ Madari's local control socket is not available from remote SSH panes. Future opt
 
 Remote integration is not part of the MVP.
 
-## Future full-session backup
+## Full-session archive upload
+
+> **Implemented.** This section predates the implementation and is preserved as design history.
+> The realized server is [Patwari](https://github.com/surdy/patwari); the realized client design is
+> [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) (full snapshots — verbatim transcript,
+> summary revision, extracted outputs — uploaded downstream of local archival) and
+> [ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md) (claim tickets and
+> `munshi retrieve`). Operation is documented in the [user guide](user-guide.md); the manifest
+> below is the speculative pre-implementation shape, not the wire format Patwari accepts. Contrary
+> to the requirements list below, v1 uploads are unencrypted on the trusted network (patwari
+> ADR 0006 records why).
 
 Full backup belongs in a later phase and uses a separate server repository. Munshi remains the
 client responsible for discovering, packaging, uploading, verifying, downloading, and restoring

@@ -203,6 +203,25 @@ metadata and the structured-summary cache by re-reading your validated Munshi-ow
 Existing Markdown is never deleted or invalidated by this. Add `--force-retry` in the same call
 to also make any failed-but-retryable work immediately eligible again, bypassing normal backoff.
 
+## "My session archived but never uploaded to Patwari"
+
+Archive upload is opt-in and separate from local archival: a session is archived once its Markdown
+exists, even if no snapshot reached Patwari. Check in order:
+
+1. `munshi archive-upload status` (add `--json` for the machine contract) — if upload is not
+   configured or not enabled, run `munshi archive-upload configure --endpoint <url>` then
+   `munshi archive-upload enable`. Enabling does not retroactively upload; the next revision (or a
+   retry, below) does.
+2. If the status shows a failed upload, the server was likely unreachable; failed uploads retry
+   with backoff on later hooks and `munshi hook recover`, or immediately via
+   `munshi archive-upload retry <session-id>` (`--all` for every eligible session, `--force` to
+   bypass backoff and revive dead-lettered uploads).
+3. A `transcript-changed` failure means the live transcript gained events between archival and
+   upload; the next revision re-archives and uploads the grown transcript, converging on its own.
+4. `munshi retrieve <sha256>` failing with "not found" for a hash a summary references usually
+   means that session's snapshot has not been uploaded yet — same checks as above. Manually
+   archived sessions (`munshi archive`) never upload; only the hook pipeline does.
+
 ## Getting more signal
 
 Every inspection command (`status`, `sessions`, `show`) accepts `--json` for the stable
@@ -220,7 +239,7 @@ session content.
   archived session.
 - [`docs/summarizers.md`](summarizers.md) — the summarizer contract in full, with examples.
 - [`docs/user-guide.md`](user-guide.md) — day-to-day operation: session states, retries,
-  recovery, budgets, project policy, delivery.
+  recovery, budgets, project policy, delivery, archive upload.
 - [`docs/automatic-archive.md`](automatic-archive.md) — full detail on hooks, recovery, and
   state internals.
 - [`docs/phase-0-claude-code-findings.md`](phase-0-claude-code-findings.md) — the evidence

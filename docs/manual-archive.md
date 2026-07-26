@@ -28,6 +28,13 @@ existence-checked `$COPILOT_HOME/session-state/<session-id>/events.jsonl` fallba
 must be a regular, non-symlink `events.jsonl` whose parent is the session ID. `session.db` is never
 opened.
 
+Oversized event content is elided from the summarizer input and replaced with a claim-ticket
+marker, using the same threshold as the hook pipeline: pass `--state-dir` so a registered
+installation's configured `limits.max_event_text_bytes` applies; without it the 128 KiB default is
+used. The manual path writes a standalone record and never uploads to Patwari, so claim tickets in
+a manually produced summary are only redeemable once the same session is archived and uploaded
+through the hook pipeline.
+
 The summary executable is never implicit. Transcript and prompt data are supplied only on stdin.
 Munshi owns a hard timeout, process-group cancellation, and stdout/stderr limits; errors report only
 safe categories and byte counts. Tests use committed fake executables and consume no AI credits.
