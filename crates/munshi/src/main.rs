@@ -8,13 +8,17 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
-    ArchiveConfig, ArchiveOutcome, DeliveryCredentialSource, DeliveryRunReport, DeliverySinkConfig,
-    DeliveryStatusReport, HistoryReport, HookEvent, HookFailure, HookResult, ProjectStatus,
-    RegisterConfig, SessionRecord, SessionReference, SourceKind, StateStore, StructuredSummary,
-    accept_disclosure_from_terminal, archive_session, configure_delivery, delivery_backfill,
-    delivery_retry, delivery_status, delivery_verify_history, handle_hook, parse_archive_markdown,
-    project_status, read_last_failure, register, run_archive_worker_for_source, run_recovery,
-    set_delivery_enabled, set_project_enabled, unregister, wait_for_hook_result_for_source,
+    ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
+    ArchiveUploadStatusReport, ArtifactMatch, DeliveryCredentialSource, DeliveryRunReport,
+    DeliverySinkConfig, DeliveryStatusReport, HistoryReport, HookEvent, HookFailure, HookResult,
+    ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults, SessionRecord,
+    SessionReference, SourceKind, StateStore, StructuredSummary, accept_disclosure_from_terminal,
+    archive_session, archive_upload_retry, archive_upload_status, configure_archive_upload,
+    configure_delivery, delivery_backfill, delivery_retry, delivery_status,
+    delivery_verify_history, handle_hook, parse_archive_markdown, project_status,
+    read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
+    set_archive_upload_enabled, set_delivery_enabled, set_project_enabled, unregister,
+    wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +68,10 @@ enum Command {
         max_stdout_bytes: usize,
         #[arg(long, default_value_t = 65_536)]
         max_stderr_bytes: usize,
+        /// Munshi state directory whose registration supplies the extraction threshold. Defaults to
+        /// `$MUNSHI_HOME`, then `~/.munshi`; when unregistered the built-in default threshold is used.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
     /// Disclose transcript processing, save configuration, and install user hooks.
     Register {
@@ -133,6 +141,9 @@ enum Command {
     /// Configure and operate opt-in Notesmith delivery of current summaries.
     #[command(subcommand)]
     Delivery(DeliveryCommand),
+    /// Configure and operate opt-in Patwari archive upload of full session snapshots.
+    #[command(subcommand)]
+    ArchiveUpload(ArchiveUploadCommand),
     /// Show overall operational status.
     Status {
         #[arg(long)]
@@ -162,6 +173,35 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Redeem a claim ticket: retrieve original content from Patwari by its sha256.
+    Retrieve {
+        /// The original content sha256 (64-char lowercase hex, optional `sha256:` prefix).
+        sha256: String,
+        /// Search the retrieved content for a case-insensitive substring instead of emitting it.
+        #[arg(long, conflicts_with_all = ["output", "force", "list"])]
+        query: Option<String>,
+        /// Write the original bytes to this file instead of stdout.
+        #[arg(long, conflicts_with = "list")]
+        output: Option<PathBuf>,
+        /// Overwrite an existing `--output` file.
+        #[arg(long, requires = "output")]
+        force: bool,
+        /// List every matching artifact across snapshots without downloading anything.
+        #[arg(long)]
+        list: bool,
+        /// Retrieve from this archive server instead of the configured archive-upload endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Raise the maximum stored bytes downloaded for one artifact (default 128 MiB). Needed to
+        /// deliberately retrieve an artifact larger than the default cap.
+        #[arg(long)]
+        max_download_bytes: Option<usize>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract (for `--list` and `--query`).
         #[arg(long)]
         json: bool,
     },
@@ -370,6 +410,57 @@ enum DeliveryCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ArchiveUploadCommand {
+    /// Record the Patwari archive server endpoint without enabling upload.
+    Configure {
+        /// Base URL of the Patwari archive server, for example `http://127.0.0.1:8080`.
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Enable archive upload. Requires a configured, addressable server.
+    Enable {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Disable archive upload. Future upload stops while upload history is retained.
+    Disable {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show archive-upload configuration and per-session upload state.
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry failed uploads, or one session's upload.
+    Retry {
+        /// A single session ID to retry; omit with `--all` to retry every failed upload.
+        session_id: Option<String>,
+        /// Disambiguate when the same session ID exists under multiple sources.
+        #[arg(long)]
+        source: Option<String>,
+        /// Retry every failed upload.
+        #[arg(long)]
+        all: bool,
+        /// Revive dead-letter uploads and reset their bounded attempt count.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum HookCommand {
     AgentStop {
         #[arg(long)]
@@ -441,6 +532,23 @@ enum Outcome {
         report: Box<HistoryReport>,
         json: bool,
     },
+    ArchiveUploadConfigured {
+        settings: Box<ArchiveUploadSettings>,
+    },
+    ArchiveUploadEnabled {
+        settings: Box<ArchiveUploadSettings>,
+    },
+    ArchiveUploadDisabled {
+        settings: Box<ArchiveUploadSettings>,
+    },
+    ArchiveUploadStatus {
+        report: Box<ArchiveUploadStatusReport>,
+        json: bool,
+    },
+    ArchiveUploadRun {
+        report: Box<ArchiveUploadRunReport>,
+        json: bool,
+    },
     Status {
         report: Box<StatusReport>,
         json: bool,
@@ -451,6 +559,13 @@ enum Outcome {
     },
     Show {
         report: Box<ShowReport>,
+        json: bool,
+    },
+    Retrieve {
+        result: Box<Result<RetrieveResult, RetrieveError>>,
+        query: Option<String>,
+        output: Option<PathBuf>,
+        force: bool,
         json: bool,
     },
     Retry {
@@ -918,6 +1033,45 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        Ok(Outcome::ArchiveUploadConfigured { settings }) => {
+            println!(
+                "configured Patwari archive server endpoint={}",
+                settings.endpoint.as_deref().unwrap_or("<unset>")
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::ArchiveUploadEnabled { settings }) => {
+            println!(
+                "archive upload enabled (endpoint {})",
+                settings.endpoint.as_deref().unwrap_or("<unset>")
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::ArchiveUploadDisabled { settings }) => {
+            let _ = settings;
+            println!("archive upload disabled; existing upload history is retained");
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::ArchiveUploadStatus { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::ArchiveUploadRun { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            if report.failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Ok(Outcome::Status { report, json }) => {
             if json {
                 emit_json(&report);
@@ -946,6 +1100,13 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         }
+        Ok(Outcome::Retrieve {
+            result,
+            query,
+            output,
+            force,
+            json,
+        }) => emit_retrieve(*result, query, output, force, json),
         Ok(Outcome::Retry { report, json }) => {
             if json {
                 emit_json(&report);
@@ -1017,9 +1178,15 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_input_bytes,
             max_stdout_bytes,
             max_stderr_bytes,
+            state_dir,
         } => {
             let source = SourceKind::parse_selector(&source)
                 .ok_or_else(|| format!("unsupported source: {source}"))?;
+            // Elide oversized events on the registered threshold so manual archival matches the hook
+            // path; fall back to the built-in default when the directory is not a registration.
+            let max_event_text_bytes = resolve_state_directory(state_dir)
+                .map(|dir| munshi::configured_max_event_text_bytes(&dir))
+                .unwrap_or(munshi::DEFAULT_MAX_EVENT_TEXT_BYTES);
             Ok(Outcome::Archive(archive_session(&ArchiveConfig {
                 reference: SessionReference {
                     source,
@@ -1036,6 +1203,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 max_input_bytes,
                 max_stdout_bytes,
                 max_stderr_bytes,
+                max_event_text_bytes,
             })?))
         }
         Command::Register {
@@ -1192,6 +1360,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             )?))
         }
         Command::Delivery(command) => run_delivery(command),
+        Command::ArchiveUpload(command) => run_archive_upload(command),
         Command::Status { state_dir, json } => {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Status {
@@ -1221,6 +1390,33 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             let source = source.as_deref().map(parse_source_selector).transpose()?;
             Ok(Outcome::Show {
                 report: Box::new(build_show_report(&state_directory, source, &session_id)?),
+                json,
+            })
+        }
+        Command::Retrieve {
+            sha256,
+            query,
+            output,
+            force,
+            list,
+            endpoint,
+            max_download_bytes,
+            state_dir,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let result = retrieve(
+                &state_directory,
+                endpoint.as_deref(),
+                &sha256,
+                list,
+                max_download_bytes,
+            );
+            Ok(Outcome::Retrieve {
+                result: Box::new(result),
+                query,
+                output,
+                force,
                 json,
             })
         }
@@ -1436,6 +1632,68 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
             let source = source.as_deref().map(parse_source_selector).transpose()?;
             Ok(Outcome::DeliveryRun {
                 report: Box::new(delivery_retry(
+                    &state_directory,
+                    source,
+                    session_id,
+                    all,
+                    force,
+                    limit,
+                )?),
+                json,
+            })
+        }
+    }
+}
+
+fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn Error>> {
+    match command {
+        ArchiveUploadCommand::Configure {
+            endpoint,
+            state_dir,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = configure_archive_upload(&state_directory, &endpoint)?;
+            Ok(Outcome::ArchiveUploadConfigured {
+                settings: Box::new(settings),
+            })
+        }
+        ArchiveUploadCommand::Enable { state_dir } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = set_archive_upload_enabled(&state_directory, true)?;
+            Ok(Outcome::ArchiveUploadEnabled {
+                settings: Box::new(settings),
+            })
+        }
+        ArchiveUploadCommand::Disable { state_dir } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = set_archive_upload_enabled(&state_directory, false)?;
+            Ok(Outcome::ArchiveUploadDisabled {
+                settings: Box::new(settings),
+            })
+        }
+        ArchiveUploadCommand::Status { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::ArchiveUploadStatus {
+                report: Box::new(archive_upload_status(&state_directory)?),
+                json,
+            })
+        }
+        ArchiveUploadCommand::Retry {
+            session_id,
+            source,
+            all,
+            force,
+            state_dir,
+            limit,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            if session_id.is_none() && !all {
+                return Err("pass a session ID or --all to retry archive uploads".into());
+            }
+            let source = source.as_deref().map(parse_source_selector).transpose()?;
+            Ok(Outcome::ArchiveUploadRun {
+                report: Box::new(archive_upload_retry(
                     &state_directory,
                     source,
                     session_id,
@@ -2971,6 +3229,132 @@ fn print_doctor_human(report: &DoctorReport) {
             failure.session_id.as_deref().unwrap_or("<none>")
         );
     }
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveListingReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    hash_matched: bool,
+    total: usize,
+    items: &'a [ArtifactMatch],
+}
+
+/// Emits a completed retrieval: the listing, the search results, the output file, or the raw
+/// verified bytes to stdout. Domain errors carry their own distinguishable process exit code, and
+/// no bytes are ever written on the error path (verification happens before this point).
+fn emit_retrieve(
+    result: Result<RetrieveResult, RetrieveError>,
+    query: Option<String>,
+    output: Option<PathBuf>,
+    force: bool,
+    json: bool,
+) -> ExitCode {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    match result {
+        RetrieveResult::Listing(matches) => {
+            if json {
+                emit_json(&RetrieveListingReport {
+                    schema_version: 1,
+                    command: "retrieve",
+                    hash_matched: !matches.is_empty(),
+                    total: matches.len(),
+                    items: &matches,
+                });
+            } else {
+                print_matches_human(&matches);
+            }
+            ExitCode::SUCCESS
+        }
+        RetrieveResult::Retrieved(content) => {
+            if let Some(query) = query {
+                let results = munshi::search_content(
+                    &content.original_bytes,
+                    &query,
+                    munshi::QUERY_CONTEXT_LINES,
+                );
+                if json {
+                    emit_json(&results);
+                } else {
+                    print_search_human(&results);
+                }
+                ExitCode::SUCCESS
+            } else if let Some(path) = output {
+                match munshi::write_retrieved_output(&path, &content.original_bytes, force) {
+                    Ok(()) => {
+                        eprintln!(
+                            "wrote {} bytes to {}",
+                            content.original_bytes.len(),
+                            path.display()
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::from(error.exit_code())
+                    }
+                }
+            } else {
+                use std::io::Write;
+                if let Err(error) = std::io::stdout().write_all(&content.original_bytes) {
+                    eprintln!("error: could not write to stdout: {error}");
+                    return ExitCode::FAILURE;
+                }
+                ExitCode::SUCCESS
+            }
+        }
+    }
+}
+
+fn print_matches_human(matches: &[ArtifactMatch]) {
+    if matches.is_empty() {
+        eprintln!("no matching artifacts");
+        return;
+    }
+    println!("{} matching artifact(s), newest first:", matches.len());
+    for artifact in matches {
+        let media = artifact.media_type.as_deref().unwrap_or("-");
+        println!(
+            "  {}  snapshot={}  path={}  original={}B  stored={}B  {}  {}  {}",
+            artifact.artifact_id,
+            artifact.snapshot_id,
+            artifact.logical_path,
+            artifact.original_size_bytes,
+            artifact.stored_size_bytes,
+            artifact.compression,
+            media,
+            artifact.created_at,
+        );
+    }
+}
+
+fn print_search_human(results: &SearchResults) {
+    if results.groups.is_empty() {
+        eprintln!(
+            "no lines matched \"{}\" ({} line(s) searched)",
+            results.query, results.total_lines
+        );
+        return;
+    }
+    for (index, group) in results.groups.iter().enumerate() {
+        if index > 0 {
+            println!("--");
+        }
+        for line in group {
+            let separator = if line.matched { ':' } else { '-' };
+            println!("{}{}{}", line.line_number, separator, line.text);
+        }
+    }
+    eprintln!(
+        "{} matching line(s) across {} line(s)",
+        results.match_count, results.total_lines
+    );
 }
 
 fn emit_json(value: &impl Serialize) {

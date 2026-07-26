@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceKind};
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 #[derive(Debug, Error)]
@@ -188,6 +188,56 @@ pub struct DeliverySuccess {
     pub remote_hash: Option<String>,
     /// The correlated remote history commit that preserved this revision, when versioned.
     pub history_commit: Option<String>,
+}
+
+/// The Munshi-owned Patwari archive-upload record for one logical session and one archive server.
+///
+/// This is rebuildable operational state (ADR 0004/0009) that mirrors [`DeliveryRecord`]: it holds
+/// the last successfully uploaded summary revision and its snapshot id, the in-flight capture
+/// identity used to resume an interrupted upload, and bounded retry/dead-letter bookkeeping. It
+/// never gates local archival, and an upload failure never mutates a session's archival lifecycle.
+#[derive(Debug, Clone)]
+pub struct ArchiveUploadRecord {
+    pub session_database_id: i64,
+    pub source: SourceKind,
+    pub session_id: String,
+    pub endpoint: String,
+    /// The capture id of the current in-flight snapshot attempt (a fresh UUID per distinct
+    /// revision, reused verbatim on retry of the same one).
+    pub capture_id: Option<String>,
+    /// The summary revision the current `capture_id`/`captured_at`/`upload_id` were minted for.
+    pub capture_revision: Option<u64>,
+    /// The `captured_at` timestamp fixed when the current capture was minted, held stable across
+    /// retries so the canonical manifest — and therefore the capture idempotency — does not drift.
+    pub captured_at: Option<String>,
+    /// The server upload id of the current attempt, persisted so a crashed run can resume it.
+    pub upload_id: Option<String>,
+    pub uploaded_revision: Option<u64>,
+    pub uploaded_summary_hash: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub upload_state: String,
+    pub attempts: u32,
+    pub next_attempt_at_ms: Option<i64>,
+    pub last_error_category: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// The resolved capture identity for one upload attempt returned by
+/// [`StateStore::prepare_archive_capture`].
+#[derive(Debug, Clone)]
+pub struct CapturePrep {
+    pub capture_id: String,
+    pub captured_at: String,
+    /// A previously created server upload id to resume, when the same capture is being retried.
+    pub resume_upload_id: Option<String>,
+}
+
+/// A successful archive-upload result to persist for one session's server row.
+#[derive(Debug, Clone)]
+pub struct ArchiveUploadSuccess {
+    pub uploaded_revision: u64,
+    pub uploaded_summary_hash: String,
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +565,50 @@ impl StateStore {
                 params![4, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 4)?;
+            transaction.commit()?;
+        }
+        if current < 5 {
+            // Issue #19 (ADR 0009): rebuildable operational state tracking one Patwari archive
+            // upload per (session, endpoint), mirroring `deliveries`. Upload runs strictly
+            // downstream of local archival and never gates it. `capture_id`/`captured_at` are the
+            // idempotency identity of the current snapshot attempt: a fresh pair is minted per
+            // distinct revision and reused verbatim on retry so an interrupted upload resumes
+            // rather than duplicates (Patwari keys idempotency on the client + capture id). The
+            // persistent client UUID lives in durable `config.json`, not here, so it survives a
+            // rebuild of this database.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE archive_uploads (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL,
+                    capture_id TEXT,
+                    capture_revision INTEGER,
+                    captured_at TEXT,
+                    upload_id TEXT,
+                    uploaded_revision INTEGER,
+                    uploaded_summary_hash TEXT,
+                    snapshot_id TEXT,
+                    upload_state TEXT NOT NULL CHECK (upload_state IN (
+                        'pending','uploaded','failed','dead-letter'
+                    )),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_ms INTEGER,
+                    last_error_category TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(session_id, endpoint)
+                 );
+                 CREATE INDEX archive_uploads_state_idx
+                    ON archive_uploads(upload_state, next_attempt_at_ms);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![5, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 5)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -1019,6 +1113,329 @@ impl StateStore {
         self.get_delivery(session_id, endpoint, vault)
     }
 
+    /// Ensures a `pending` archive-upload row exists for one session and server, returning the
+    /// current record. Created idempotently on the `(session, endpoint)` key. Returns `None` when
+    /// the session is unknown in this source scope.
+    pub fn ensure_archive_upload_target(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<Option<ArchiveUploadRecord>, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        self.connection.execute(
+            "INSERT INTO archive_uploads(
+                session_id,endpoint,upload_state,attempts,created_at_ms,updated_at_ms
+             ) VALUES (?1,?2,'pending',0,?3,?3)
+             ON CONFLICT(session_id,endpoint) DO NOTHING",
+            params![database_id, endpoint, now],
+        )?;
+        self.get_archive_upload(session_id, endpoint)
+    }
+
+    /// Reads the archive-upload record for one session and server in this source scope, if any.
+    pub fn get_archive_upload(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<Option<ArchiveUploadRecord>, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT
+                    au.session_id,s.source_kind,s.source_session_id,au.endpoint,
+                    au.capture_id,au.capture_revision,au.captured_at,au.upload_id,
+                    au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
+                    au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
+                    au.updated_at_ms
+                 FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
+                 WHERE au.session_id=?1 AND au.endpoint=?2",
+                params![database_id, endpoint],
+                archive_upload_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Lists every recorded archive upload across all sources, most recently updated first.
+    pub fn list_archive_uploads(&self) -> Result<Vec<ArchiveUploadRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                au.session_id,s.source_kind,s.source_session_id,au.endpoint,
+                au.capture_id,au.capture_revision,au.captured_at,au.upload_id,
+                au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
+                au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
+                au.updated_at_ms
+             FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
+             ORDER BY au.updated_at_ms DESC,au.id DESC",
+        )?;
+        statement
+            .query_map([], archive_upload_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Lists archive-upload rows eligible for a retry attempt across all sources, driven by
+    /// `archive_uploads_state_idx`: rows in `pending` or `failed` (never `uploaded` or `dead-letter`)
+    /// whose backoff has elapsed. A `failed` row is due once `next_attempt_at_ms <= now`; a `pending`
+    /// row carries no schedule and is always due. Because a `failed` row that exhausts its bounded
+    /// attempts becomes `dead-letter`, the state filter alone excludes exhausted uploads. Ordered
+    /// oldest-scheduled first so a backlog drains fairly, capped at `limit`.
+    pub fn eligible_archive_uploads(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<ArchiveUploadRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                au.session_id,s.source_kind,s.source_session_id,au.endpoint,
+                au.capture_id,au.capture_revision,au.captured_at,au.upload_id,
+                au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
+                au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
+                au.updated_at_ms
+             FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
+             WHERE au.upload_state IN ('pending','failed')
+               AND (au.next_attempt_at_ms IS NULL OR au.next_attempt_at_ms <= ?1)
+             ORDER BY COALESCE(au.next_attempt_at_ms, 0),au.id
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![now, limit as i64], archive_upload_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Resolves the capture identity for uploading `revision`, minting a fresh `capture_id` and
+    /// `captured_at` for a distinct snapshot attempt or reusing the persisted pair (and any server
+    /// upload id) when retrying the same one.
+    ///
+    /// A distinct attempt is any that targets a different `revision` than the persisted capture, or
+    /// one whose prior attempt already terminally uploaded; those mint fresh identity so a changed
+    /// snapshot can never collide with the previous capture id. An in-flight or failed attempt for
+    /// the same revision reuses the exact stored `capture_id`/`captured_at`/`upload_id`, so an
+    /// interrupted upload resumes rather than creating a duplicate capture.
+    pub fn prepare_archive_capture(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        revision: u64,
+        fresh_capture_id: &str,
+        fresh_captured_at: &str,
+    ) -> Result<CapturePrep, StateError> {
+        self.ensure_archive_upload_target(session_id, endpoint)?;
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<CaptureRow> = transaction
+            .query_row(
+                "SELECT capture_id,capture_revision,captured_at,upload_id,upload_state
+                     FROM archive_uploads WHERE session_id=?1 AND endpoint=?2",
+                params![database_id, endpoint],
+                |row| {
+                    Ok(CaptureRow {
+                        capture_id: row.get(0)?,
+                        capture_revision: row.get(1)?,
+                        captured_at: row.get(2)?,
+                        upload_id: row.get(3)?,
+                        upload_state: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        let revision_i64 = i64::try_from(revision).unwrap_or(i64::MAX);
+        let reuse = existing.and_then(|row| match row {
+            CaptureRow {
+                capture_id: Some(capture_id),
+                capture_revision: Some(capture_revision),
+                captured_at: Some(captured_at),
+                upload_id,
+                upload_state,
+            } if capture_revision == revision_i64
+                && (upload_state == "pending" || upload_state == "failed") =>
+            {
+                Some(CapturePrep {
+                    capture_id,
+                    captured_at,
+                    resume_upload_id: upload_id,
+                })
+            }
+            _ => None,
+        });
+        let prep = if let Some(prep) = reuse {
+            prep
+        } else {
+            transaction.execute(
+                "UPDATE archive_uploads SET
+                    capture_id=?3,capture_revision=?4,captured_at=?5,upload_id=NULL,
+                    upload_state='pending',updated_at_ms=?6
+                 WHERE session_id=?1 AND endpoint=?2",
+                params![
+                    database_id,
+                    endpoint,
+                    fresh_capture_id,
+                    revision_i64,
+                    fresh_captured_at,
+                    now,
+                ],
+            )?;
+            CapturePrep {
+                capture_id: fresh_capture_id.to_owned(),
+                captured_at: fresh_captured_at.to_owned(),
+                resume_upload_id: None,
+            }
+        };
+        transaction.commit()?;
+        Ok(prep)
+    }
+
+    /// Persists the server upload id for the current capture so a crashed run can resume it.
+    pub fn record_archive_upload_id(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        upload_id: &str,
+    ) -> Result<(), StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        self.connection.execute(
+            "UPDATE archive_uploads SET upload_id=?3,updated_at_ms=?4
+             WHERE session_id=?1 AND endpoint=?2",
+            params![database_id, endpoint, upload_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a successful archive upload: stores the uploaded revision, its summary hash, and the
+    /// server snapshot id, clears retry bookkeeping, and marks the row `uploaded`.
+    pub fn record_archive_upload_success(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        success: &ArchiveUploadSuccess,
+    ) -> Result<(), StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        self.connection.execute(
+            "UPDATE archive_uploads SET
+                uploaded_revision=?3,uploaded_summary_hash=?4,snapshot_id=?5,
+                upload_state='uploaded',attempts=0,next_attempt_at_ms=NULL,
+                last_error_category=NULL,updated_at_ms=?6
+             WHERE session_id=?1 AND endpoint=?2",
+            params![
+                database_id,
+                endpoint,
+                i64::try_from(success.uploaded_revision).unwrap_or(i64::MAX),
+                success.uploaded_summary_hash,
+                success.snapshot_id,
+                now_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records a failed archive-upload attempt. Increments the attempt count, then either schedules
+    /// the next attempt (bounded backoff) while under `max_attempts` or parks the row as a
+    /// `dead-letter` once attempts are exhausted. Never touches archival state.
+    pub fn record_archive_upload_failure(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        category: &str,
+        max_attempts: u32,
+        next_attempt_at_ms: i64,
+    ) -> Result<ArchiveUploadRecord, StateError> {
+        if self.session_database_id(session_id)?.is_none() {
+            return Err(StateError::InvalidState);
+        }
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempts: u32 = transaction
+            .query_row(
+                "SELECT attempts FROM archive_uploads au
+                 JOIN sessions s ON s.id=au.session_id
+                 WHERE s.source_kind=?2 AND s.source_session_id=?1 AND au.endpoint=?3",
+                params![session_id, self.source_kind, endpoint],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let attempts = attempts.saturating_add(1);
+        let exhausted = attempts >= max_attempts;
+        let (state, next_attempt) = if exhausted {
+            ("dead-letter", None)
+        } else {
+            ("failed", Some(next_attempt_at_ms))
+        };
+        transaction.execute(
+            "UPDATE archive_uploads SET
+                upload_state=?4,attempts=?5,next_attempt_at_ms=?6,
+                last_error_category=?7,updated_at_ms=?8
+             WHERE session_id=(
+                    SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
+                 ) AND endpoint=?3",
+            params![
+                session_id,
+                self.source_kind,
+                endpoint,
+                state,
+                attempts,
+                next_attempt,
+                category,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        self.get_archive_upload(session_id, endpoint)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Resets an archive-upload row to `pending` so a subsequent attempt is eligible, clearing
+    /// backoff. With `force`, a `dead-letter` row is revived and its attempt count reset.
+    pub fn reset_archive_upload_for_retry(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        force: bool,
+    ) -> Result<Option<ArchiveUploadRecord>, StateError> {
+        let Some(current) = self.get_archive_upload(session_id, endpoint)? else {
+            return Ok(None);
+        };
+        if current.upload_state == "dead-letter" && !force {
+            return Ok(Some(current));
+        }
+        let reset_attempts = force || current.upload_state == "dead-letter";
+        self.connection.execute(
+            "UPDATE archive_uploads SET
+                upload_state='pending',next_attempt_at_ms=NULL,
+                attempts=CASE WHEN ?4 THEN 0 ELSE attempts END,updated_at_ms=?5
+             WHERE session_id=(
+                    SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
+                 ) AND endpoint=?3",
+            params![
+                session_id,
+                self.source_kind,
+                endpoint,
+                reset_attempts,
+                now_ms()
+            ],
+        )?;
+        self.get_archive_upload(session_id, endpoint)
+    }
+
     pub fn record_diagnostic(
         &mut self,
         operation: &str,
@@ -1280,6 +1697,47 @@ fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord
         next_attempt_at_ms: row.get(12)?,
         last_error_category: row.get(13)?,
         updated_at_ms: row.get(14)?,
+    })
+}
+
+/// The in-flight capture columns read by [`StateStore::prepare_archive_capture`].
+struct CaptureRow {
+    capture_id: Option<String>,
+    capture_revision: Option<i64>,
+    captured_at: Option<String>,
+    upload_id: Option<String>,
+    upload_state: String,
+}
+
+fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveUploadRecord> {
+    let revision = |index: usize| -> rusqlite::Result<Option<u64>> {
+        Ok(row
+            .get::<_, Option<i64>>(index)?
+            .map(|value| u64::try_from(value).unwrap_or_default()))
+    };
+    Ok(ArchiveUploadRecord {
+        session_database_id: row.get(0)?,
+        source: SourceKind::from_agent_label(&row.get::<_, String>(1)?).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other("unknown source kind")),
+            )
+        })?,
+        session_id: row.get(2)?,
+        endpoint: row.get(3)?,
+        capture_id: row.get(4)?,
+        capture_revision: revision(5)?,
+        captured_at: row.get(6)?,
+        upload_id: row.get(7)?,
+        uploaded_revision: revision(8)?,
+        uploaded_summary_hash: row.get(9)?,
+        snapshot_id: row.get(10)?,
+        upload_state: row.get(11)?,
+        attempts: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
+        next_attempt_at_ms: row.get(13)?,
+        last_error_category: row.get(14)?,
+        updated_at_ms: row.get(15)?,
     })
 }
 

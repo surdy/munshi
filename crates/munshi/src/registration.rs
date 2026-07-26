@@ -24,6 +24,8 @@ const DEFAULT_MAX_CALLS_PER_DAY: u32 = 50;
 const DEFAULT_MAX_CONCURRENCY: usize = 2;
 /// Bounded delivery attempts before a session's delivery is parked as a dead letter.
 pub(crate) const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 5;
+/// Bounded archive-upload attempts before a session's upload is parked as a dead letter.
+pub(crate) const DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS: u32 = 5;
 
 pub const DISCLOSURE: &str = "\
 IMPORTANT: MUNSHI TRANSCRIPT PROCESSING DISCLOSURE
@@ -128,6 +130,11 @@ pub(crate) struct StoredConfig {
     pub delivery: StoredDelivery,
     #[serde(default = "StoredPolicy::defaults")]
     pub policy: StoredPolicy,
+    /// Opt-in Patwari archive-upload configuration (ADR 0009). Disabled by default; it holds the
+    /// persistent client identity that must survive an operational-database rebuild, so it lives
+    /// here in durable configuration rather than in rebuildable SQLite state.
+    #[serde(default)]
+    pub archive_upload: StoredArchiveUpload,
     /// Which harness installations this registration manages hooks for. The state store is
     /// harness-neutral (ADR 0008); each recorded home locates that harness's hook installation.
     #[serde(default)]
@@ -231,6 +238,52 @@ pub(crate) enum StoredCredential {
     Keychain { service: String, account: String },
 }
 
+/// The Munshi-owned Patwari archive-upload configuration (ADR 0009). Archive upload is opt-in and
+/// disabled by default via `enabled`; it records where to upload and the persistent client UUID
+/// Munshi registers with Patwari. The client UUID is generated once and stored here because it must
+/// survive an operational-database rebuild (ADR 0004): SQLite state is rebuildable, this is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredArchiveUpload {
+    /// Whether archive upload runs after a successful local archive. Opt-in; disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the Patwari archive server, for example `http://127.0.0.1:8080`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// The persistent client UUID Munshi registers and uploads under. Generated once, reused
+    /// verbatim, and durable across database rebuilds.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Bounded number of upload attempts before a session's upload is parked as a dead letter.
+    #[serde(default = "default_max_archive_upload_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_max_archive_upload_attempts() -> u32 {
+    DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS
+}
+
+impl Default for StoredArchiveUpload {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            client_id: None,
+            max_attempts: DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS,
+        }
+    }
+}
+
+impl StoredArchiveUpload {
+    /// A server is addressable only when an endpoint is present.
+    pub(crate) fn is_addressable(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    }
+}
+
 /// Global project-policy defaults: default-on processing, bounded summarization cost, and bounded
 /// worker concurrency. `disabled_projects` holds canonical project identities excluded from future
 /// processing and delivery by an explicit `munshi project disable`; existing archives are untouched.
@@ -271,6 +324,15 @@ pub(crate) struct StoredLimits {
     pub max_input_bytes: usize,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    /// Per-event extraction threshold: content larger than this is extracted as an
+    /// `outputs/<sha256>` snapshot artifact and elided from summarizer input (ADR 0010). Defaulted
+    /// so configurations written before issue #20 keep the historical 128 KB cap.
+    #[serde(default = "default_max_event_text_bytes")]
+    pub max_event_text_bytes: usize,
+}
+
+fn default_max_event_text_bytes() -> usize {
+    crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,9 +564,11 @@ impl StoredConfig {
                 max_input_bytes: config.max_input_bytes,
                 max_stdout_bytes: config.max_stdout_bytes,
                 max_stderr_bytes: config.max_stderr_bytes,
+                max_event_text_bytes: crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES,
             },
             remote_delivery: false,
             delivery: StoredDelivery::default(),
+            archive_upload: StoredArchiveUpload::default(),
             policy: StoredPolicy {
                 max_calls_per_hour: config.max_calls_per_hour,
                 max_calls_per_day: config.max_calls_per_day,
@@ -539,6 +603,7 @@ impl ManagedFile for StoredConfig {
             && self.project_origin == "agent_stop_cwd"
             && self.policy.max_concurrency >= 1
             && (!self.remote_delivery || self.delivery.is_addressable())
+            && (!self.archive_upload.enabled || self.archive_upload.is_addressable())
             && Path::new(&self.output_directory).is_absolute()
             && Path::new(&self.state_directory).is_absolute()
             && Path::new(&self.summarizer.executable).is_absolute()
@@ -601,12 +666,22 @@ pub(crate) fn load_stored_config(
         || config.project_origin != "agent_stop_cwd"
         || config.policy.max_concurrency < 1
         || (config.remote_delivery && !config.delivery.is_addressable())
+        || (config.archive_upload.enabled && !config.archive_upload.is_addressable())
         || Path::new(&config.state_directory) != state_directory
         || !config.harnesses.paths_are_absolute()
     {
         return Err(RegistrationError::MalformedOwnedFile);
     }
     Ok(config)
+}
+
+/// The configured per-event extraction threshold for a registered state directory, or the built-in
+/// default when the directory holds no readable Munshi registration. Manual archival reads this so
+/// it elides oversized events on exactly the same threshold the hook path uses (ADR 0010).
+pub fn configured_max_event_text_bytes(state_directory: &Path) -> usize {
+    load_stored_config(state_directory)
+        .map(|config| config.limits.max_event_text_bytes)
+        .unwrap_or(crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES)
 }
 
 /// The effective enable/disable state and budgets for one project directory, combining an explicit

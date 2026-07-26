@@ -392,6 +392,7 @@ fn renderer_is_deterministic_and_atomic_replace_replaces_existing_file() {
         source_bytes: 128,
         started_at: Some("2026-07-12T00:00:00.000Z".to_owned()),
         updated_at: Some("2026-07-12T00:01:00.000Z".to_owned()),
+        artifact_index: Default::default(),
     };
     let project = ProjectIdentity {
         identity: "github.com/surdy/munshi".to_owned(),
@@ -482,6 +483,7 @@ fn config(
         max_input_bytes: 1024 * 1024,
         max_stdout_bytes: 16 * 1024,
         max_stderr_bytes: 4 * 1024,
+        max_event_text_bytes: munshi::DEFAULT_MAX_EVENT_TEXT_BYTES,
     }
 }
 

@@ -732,6 +732,7 @@ impl SharedArchives {
             max_input_bytes: 1 << 20,
             max_stdout_bytes: 16 * 1024,
             max_stderr_bytes: 4 * 1024,
+            max_event_text_bytes: munshi::DEFAULT_MAX_EVENT_TEXT_BYTES,
         })
         .unwrap();
         let ArchiveOutcome::Archived { relative_path, .. } = outcome else {
@@ -801,6 +802,7 @@ fn archive_fixture(
         max_input_bytes: 1 << 20,
         max_stdout_bytes: 16 * 1024,
         max_stderr_bytes: 4 * 1024,
+        max_event_text_bytes: munshi::DEFAULT_MAX_EVENT_TEXT_BYTES,
     })
     .unwrap();
     (outcome, output, project, directory)

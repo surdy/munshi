@@ -390,6 +390,15 @@ pub fn run_recovery(
                 store.record_diagnostic("recovery", "worker-spawn-failed", None, Some(&session_id));
         }
     }
+    // Drain archive uploads whose backoff has elapsed, independent of any new revision (ADR 0009):
+    // a transient Patwari outage recovers here rather than waiting for the session to change. This
+    // is best-effort like delivery — a failure is recorded as a safe diagnostic and never affects
+    // the recovery of local archival above.
+    if let Err(error) = crate::patwari::retry_pending_uploads(state_directory, RECOVERY_SCAN_LIMIT)
+    {
+        let _ = error;
+        let _ = state.record_diagnostic("archive-upload", "archive-upload-retry-error", None, None);
+    }
     Ok(())
 }
 
@@ -745,6 +754,7 @@ fn process_claim(
         &resolved,
         stored.limits.max_source_bytes,
         previous_source.as_ref(),
+        stored.limits.max_event_text_bytes,
     )?;
     if update.mode == TranscriptLoadMode::Unchanged {
         state.complete_no_change(claim)?;
@@ -955,6 +965,20 @@ fn process_claim(
         let _ = state.record_diagnostic(
             "delivery",
             "delivery-error",
+            None,
+            Some(&claim.session.session_id),
+        );
+    }
+    // Archive upload runs strictly downstream of the successful local archive too, in parallel with
+    // and independent of Notesmith delivery above (ADR 0009): a Patwari outage is recorded as a
+    // bounded retry or a safe diagnostic and never changes the archived result the worker returns.
+    if let Err(error) =
+        crate::patwari::upload_after_archive(state, stored, &claim.session.session_id)
+    {
+        let _ = error;
+        let _ = state.record_diagnostic(
+            "archive-upload",
+            "archive-upload-error",
             None,
             Some(&claim.session.session_id),
         );

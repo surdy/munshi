@@ -10,8 +10,6 @@
 //! and delivered notes carry stable session/revision frontmatter a future versioned sink can use.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -19,6 +17,7 @@ use std::time::Duration;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::http::{self, Header, HttpError, HttpResponse, encode_path, parse_http_endpoint};
 use crate::registration::{
     DEFAULT_MAX_DELIVERY_ATTEMPTS, RegistrationError, StoredConfig, StoredCredential,
     StoredDelivery, load_stored_config, stored_config_exists, update_stored_config,
@@ -31,8 +30,6 @@ use crate::state::{
 const BASE_BACKOFF_MS: i64 = 60_000;
 /// Upper bound on delivery backoff so a long outage still retries roughly hourly.
 const MAX_BACKOFF_MS: i64 = 3_600_000;
-/// Bounds the delivery HTTP response body Munshi will read from a sink.
-const MAX_RESPONSE_BYTES: usize = 1_048_576;
 /// Network timeout for a single delivery request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -52,6 +49,15 @@ pub enum DeliveryError {
     Credential(String),
     #[error("delivery endpoint {0} is not a supported http URL")]
     UnsupportedEndpoint(String),
+}
+
+impl From<HttpError> for DeliveryError {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::UnsupportedEndpoint(endpoint) => Self::UnsupportedEndpoint(endpoint),
+            other => Self::Io(std::io::Error::other(other.to_string())),
+        }
+    }
 }
 
 /// Where the Notesmith bearer credential is read from. The secret itself is never stored.
@@ -970,16 +976,56 @@ impl HttpNotesmithSink {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<HttpResponse, SinkError> {
-        http_request(
+        self.send_json(method, path, body, None)
+    }
+
+    /// Sends a JSON request, adding the `Accept`/`Content-Type`, optional bearer, and optional
+    /// `If-Match` headers. The bearer token is passed as opaque header data and never logged.
+    fn send_json(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        if_match: Option<&str>,
+    ) -> Result<HttpResponse, SinkError> {
+        let mut headers = vec![Header {
+            name: "Accept",
+            value: "application/json",
+        }];
+        let bearer;
+        if let Some(token) = self.token.as_deref() {
+            bearer = format!("Bearer {token}");
+            headers.push(Header {
+                name: "Authorization",
+                value: &bearer,
+            });
+        }
+        let etag;
+        if let Some(if_match) = if_match {
+            etag = format!("\"{if_match}\"");
+            headers.push(Header {
+                name: "If-Match",
+                value: &etag,
+            });
+        }
+        if body.is_some() {
+            headers.push(Header {
+                name: "Content-Type",
+                value: "application/json",
+            });
+        }
+        http::send(
             &self.host,
             self.port,
             self.timeout,
-            method,
-            path,
-            self.token.as_deref(),
-            body,
-            None,
+            &http::HttpRequest {
+                method,
+                path,
+                headers: &headers,
+                body,
+            },
         )
+        .map_err(sink_http_error)
     }
 }
 
@@ -1063,13 +1109,9 @@ impl NotesmithSink for HttpNotesmithSink {
         set_git_enabled(&mut updated, true)?;
         let payload =
             serde_json::to_vec(&updated).map_err(|error| SinkError::Protocol(error.to_string()))?;
-        let response = http_request(
-            &self.host,
-            self.port,
-            self.timeout,
+        let response = self.send_json(
             "PUT",
             &format!("/api/v/{}/config", encode_path(&self.vault)),
-            self.token.as_deref(),
             Some(&payload),
             Some(&hash),
         )?;
@@ -1280,176 +1322,14 @@ fn parse_note_ref(body: &[u8]) -> Result<NoteRef, SinkError> {
     Ok(NoteRef { path, hash })
 }
 
-/// Percent-encodes a path segment string for safe inclusion in a request-target, preserving `/`.
-fn encode_path(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                encoded.push(byte as char);
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
+/// Maps a shared-transport [`HttpError`] onto a [`SinkError`] retry category.
+fn sink_http_error(error: HttpError) -> SinkError {
+    match error {
+        HttpError::Protocol(message) => SinkError::Protocol(message),
+        HttpError::Transport(message) | HttpError::UnsupportedEndpoint(message) => {
+            SinkError::Transport(message)
         }
     }
-    encoded
-}
-
-fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16), DeliveryError> {
-    let rest = endpoint
-        .strip_prefix("http://")
-        .ok_or_else(|| DeliveryError::UnsupportedEndpoint(endpoint.to_owned()))?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port
-                .parse::<u16>()
-                .map_err(|_| DeliveryError::UnsupportedEndpoint(endpoint.to_owned()))?;
-            (host.to_owned(), port)
-        }
-        None => (authority.to_owned(), 80),
-    };
-    if host.is_empty() {
-        return Err(DeliveryError::UnsupportedEndpoint(endpoint.to_owned()));
-    }
-    Ok((host, port))
-}
-
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-impl HttpResponse {
-    fn body_text(&self) -> String {
-        String::from_utf8_lossy(&self.body)
-            .chars()
-            .take(512)
-            .collect()
-    }
-}
-
-// A minimal hand-rolled HTTP/1.1 client: host/port/timeout plus optional bearer and If-Match
-// headers are all independent request inputs, so they are passed positionally.
-#[allow(clippy::too_many_arguments)]
-fn http_request(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-    method: &str,
-    path: &str,
-    token: Option<&str>,
-    body: Option<&[u8]>,
-    if_match: Option<&str>,
-) -> Result<HttpResponse, SinkError> {
-    let address = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| SinkError::Transport(error.to_string()))?
-        .next()
-        .ok_or_else(|| SinkError::Transport(format!("could not resolve {host}:{port}")))?;
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|error| SinkError::Transport(error.to_string()))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| SinkError::Transport(error.to_string()))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| SinkError::Transport(error.to_string()))?;
-
-    let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
-    );
-    if let Some(token) = token {
-        // Notesmith itself is unauthenticated and defers auth to a reverse proxy that expects
-        // a bearer token (notes-method docs/adr/0010, khata-handoff.md). The token is written
-        // on its own line with a trailing CRLF and is never placed in a format string or log.
-        request.push_str("Authorization: Bearer ");
-        request.push_str(token);
-        request.push_str("\r\n");
-    }
-    if let Some(if_match) = if_match {
-        // Notesmith's config PUT requires an If-Match ETag for conflict detection.
-        request.push_str(&format!("If-Match: \"{if_match}\"\r\n"));
-    }
-    if let Some(body) = body {
-        request.push_str("Content-Type: application/json\r\n");
-        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    request.push_str("\r\n");
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| SinkError::Transport(error.to_string()))?;
-    if let Some(body) = body {
-        stream
-            .write_all(body)
-            .map_err(|error| SinkError::Transport(error.to_string()))?;
-    }
-    stream
-        .flush()
-        .map_err(|error| SinkError::Transport(error.to_string()))?;
-
-    let mut raw = Vec::new();
-    stream
-        .take(MAX_RESPONSE_BYTES as u64)
-        .read_to_end(&mut raw)
-        .map_err(|error| SinkError::Transport(error.to_string()))?;
-    parse_http_response(&raw)
-}
-
-fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, SinkError> {
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| SinkError::Protocol("response has no header terminator".to_owned()))?;
-    let head = &raw[..split];
-    let body = &raw[split + 4..];
-    let head = String::from_utf8_lossy(head);
-    let mut lines = head.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| SinkError::Protocol("empty response".to_owned()))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| SinkError::Protocol("unparseable status line".to_owned()))?;
-    let chunked = lines.any(|line| {
-        let line = line.to_ascii_lowercase();
-        line.starts_with("transfer-encoding:") && line.contains("chunked")
-    });
-    let body = if chunked {
-        dechunk(body)?
-    } else {
-        body.to_vec()
-    };
-    Ok(HttpResponse { status, body })
-}
-
-fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, SinkError> {
-    let mut output = Vec::new();
-    loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| SinkError::Protocol("malformed chunk header".to_owned()))?;
-        let size_text = String::from_utf8_lossy(&body[..line_end]);
-        let size =
-            usize::from_str_radix(size_text.trim().split(';').next().unwrap_or("").trim(), 16)
-                .map_err(|_| SinkError::Protocol("malformed chunk size".to_owned()))?;
-        body = &body[line_end + 2..];
-        if size == 0 {
-            break;
-        }
-        if body.len() < size {
-            return Err(SinkError::Protocol("truncated chunk body".to_owned()));
-        }
-        output.extend_from_slice(&body[..size]);
-        body = &body[size..];
-        if body.starts_with(b"\r\n") {
-            body = &body[2..];
-        }
-    }
-    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -2107,26 +1987,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_http_endpoints_and_rejects_others() {
-        assert_eq!(
-            parse_http_endpoint("http://127.0.0.1:27183").unwrap(),
-            ("127.0.0.1".to_owned(), 27183)
-        );
-        assert_eq!(
-            parse_http_endpoint("http://localhost").unwrap(),
-            ("localhost".to_owned(), 80)
-        );
-        assert!(parse_http_endpoint("https://example.com").is_err());
-        assert!(parse_http_endpoint("ftp://host").is_err());
-    }
-
-    #[test]
-    fn encode_path_preserves_slashes_and_escapes_spaces() {
-        assert_eq!(encode_path("Munshi/a b.md"), "Munshi/a%20b.md");
-        assert_eq!(encode_path("plain-note.md"), "plain-note.md");
-    }
-
-    #[test]
     fn archive_body_strips_the_leading_frontmatter_block() {
         let archive =
             "---\nschema_version: 2\nid: \"copilot:abc\"\ntags: []\n---\n\n# Title\n\nBody.";
@@ -2177,19 +2037,6 @@ mod tests {
         assert!(!unavailable.available);
         assert!(!unavailable.configured);
         assert_eq!(unavailable.detail.as_deref(), Some("disabled"));
-    }
-
-    #[test]
-    fn dechunks_a_chunked_body() {
-        let chunked = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        assert_eq!(dechunk(chunked).unwrap(), b"Wikipedia");
-    }
-
-    #[test]
-    fn parses_a_content_length_response() {
-        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 13\r\n\r\n{\"path\":\"x\"}\n";
-        let response = parse_http_response(raw).unwrap();
-        assert_eq!(response.status, 201);
     }
 
     #[test]

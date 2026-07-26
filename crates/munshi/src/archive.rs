@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::project::{ProjectIdentityError, inspect_project};
 use crate::render::{ArchiveMetadata, RenderError, archive_path, atomic_replace, render_markdown};
 pub use crate::source::SessionReference;
-use crate::source::{SourceError, load_session, resolve_session_reference};
+use crate::source::{SourceError, load_session_update, resolve_session_reference};
 use crate::summary::{SummarizerConfig, SummaryError, build_summary_input, run_summary};
 
 #[derive(Debug, Clone)]
@@ -22,6 +22,11 @@ pub struct ArchiveConfig {
     pub max_input_bytes: usize,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    /// Per-event extraction threshold: content larger than this is preserved as an extracted output
+    /// and elided from summarizer input (ADR 0010). Threaded from the registered stored config so
+    /// manual `munshi archive` elides on exactly the same threshold the hook path uses; it falls
+    /// back to the built-in default when no registration is present.
+    pub max_event_text_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +49,13 @@ pub enum ArchiveError {
 
 pub fn archive_session(config: &ArchiveConfig) -> Result<ArchiveOutcome, ArchiveError> {
     let resolved = resolve_session_reference(&config.reference)?;
-    let session = load_session(&resolved, config.max_source_bytes)?;
+    let session = load_session_update(
+        &resolved,
+        config.max_source_bytes,
+        None,
+        config.max_event_text_bytes,
+    )?
+    .session;
     let id = format!("{}:{}", session.source.id_prefix(), session.session_id);
     if !session.is_archive_worthy() {
         return Ok(ArchiveOutcome::NotArchiveWorthy { id });

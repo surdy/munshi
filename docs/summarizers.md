@@ -75,8 +75,34 @@ Field reference:
 | `session.project_identity` | Canonical project identity Munshi resolved the session to: the normalized Git remote (for example `github.com/you/your-repo`) or `local:sha256:<digest>` for repositories without one. |
 | `session.repository` | Best-effort repository name, or `null` if none was resolved. |
 | `previous_summary` | Present only when revising an already-archived summary (a resumed/updated session): the last accepted `StructuredSummary`, same shape as the required output. Field is omitted entirely on a first-time summary. |
-| `events` | Normalized transcript: an ordered array of `{ "kind": "user" \| "assistant" \| "tool", "content": string }`. This is the full material you have — there is no separate raw transcript to fetch. |
+| `events` | Normalized transcript: an ordered array of `{ "kind": "user" \| "assistant" \| "tool", "content": string }`. This is the full material you have — there is no separate raw transcript to fetch. An event's `content` may be a *claim ticket* rather than the original text (see below). |
 | `ignored_unknown_event_count` | Count of transcript records Munshi couldn't normalize into an event. Usually 0; nonzero just means some records were dropped before reaching you. |
+
+### Claim tickets (elided oversized events)
+
+When a single event's content is very large (over Munshi's per-event extraction threshold,
+default 128 KiB, configurable via `limits.max_event_text_bytes`), Munshi does **not** truncate it
+and does not send you the raw bytes. Instead the event's `content` is replaced by a one-line
+**claim ticket** marker, and the full content is preserved as its own content-addressed snapshot
+artifact (ADR 0010). The marker has exactly this shape:
+
+```text
+[munshi claim-ticket sha256:<hex> bytes:<n> label:<label>]
+```
+
+- `<hex>` — the original content's lowercase-hex SHA-256 (unprefixed). This is the content address:
+  it also names the `outputs/<hex>` snapshot artifact and appears in the rendered summary's
+  frontmatter artifact index.
+- `<n>` — the original content size in bytes.
+- `<label>` — the event's kind (`user`, `assistant`, or `tool`), a hint at what was elided.
+
+The marker is a single line, deterministic (a pure function of the content and its kind), and stable
+across retries. **Reference these markers; never invent them.** Treat a claim ticket as "content
+that exists but was too large to inline here": you may mention that a large tool output / message was
+produced and, if useful, cite its `sha256`, but do not fabricate the elided text or guess at its
+contents. There is no way to redeem a ticket mid-summary — the summarizer contract stays one-shot.
+A holder of the finished summary can later fetch the exact original bytes with
+`munshi retrieve <sha256>` once the snapshot is archived.
 
 When `previous_summary` is set, the instruction asks for a **complete replacement** summary,
 not a diff or an append: read the prior summary, read the new events, and return a full

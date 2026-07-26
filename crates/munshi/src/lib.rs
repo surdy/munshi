@@ -3,10 +3,13 @@ mod archive_git;
 mod claude_settings;
 mod delivery;
 mod hooks;
+mod http;
+mod patwari;
 mod policy;
 mod project;
 mod registration;
 mod render;
+mod retrieve;
 mod source;
 mod state;
 mod summary;
@@ -27,25 +30,40 @@ pub use hooks::{
     run_archive_worker, run_archive_worker_for_source, run_recovery, wait_for_hook_result,
     wait_for_hook_result_for_source,
 };
+pub use patwari::{
+    ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
+    ArchiveUploadStatusReport, ArtifactSource, CaptureContext, INITIAL_ARTIFACT_SET_VERSION,
+    PatwariClient, PatwariError, PreparedArtifact, SessionContext, UploadOutcome, UploadReceipt,
+    assemble_artifact_sources, build_manifest, configure as configure_archive_upload,
+    prepare_artifact, prepare_artifacts, retry as archive_upload_retry,
+    set_enabled as set_archive_upload_enabled, status as archive_upload_status,
+};
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
 pub use registration::{
     ClaudeTarget, CopilotTarget, DisclosureDecision, ProjectStatus, RegisterConfig,
-    RegistrationError, accept_disclosure, accept_disclosure_from_terminal, project_status,
-    register, set_project_enabled, unregister,
+    RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
+    configured_max_event_text_bytes, project_status, register, set_project_enabled, unregister,
 };
 pub use render::{
     ArchiveMetadata, ArchiveVersion, ArchivedCursor, ArchivedMarkdown, atomic_replace,
     content_hash, parse_archive_markdown, render_markdown, render_revision_markdown,
 };
+pub use retrieve::{
+    ArtifactMatch, MatchLine, QUERY_CONTEXT_LINES, RetrieveError, RetrieveResult, RetrievedContent,
+    SearchResults, retrieve, search_content, write_output as write_retrieved_output,
+};
 pub use source::{
-    CursorFallbackReason, NormalizedEvent, NormalizedSession, PreviousSource, SourceError,
-    SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin, load_session,
-    load_session_update, resolve_session_reference, validate_transcript_envelope,
+    ArtifactIndexEntry, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES, ExtractedOutput,
+    NormalizedEvent, NormalizedSession, PreviousSource, SnapshotArtifactIndex, SourceError,
+    SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin, extract_outputs,
+    load_session, load_session_update, resolve_session_reference, snapshot_artifact_index,
+    validate_transcript_envelope,
 };
 pub use state::{
-    BudgetOutcome, ClaimOutcome, CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic,
-    SessionRecord, StateError, StateStore, WaitState, try_acquire_session_lock,
+    ArchiveUploadRecord, ArchiveUploadSuccess, BudgetOutcome, CapturePrep, ClaimOutcome,
+    CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic, SessionRecord, StateError,
+    StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
     StructuredSummary, SummaryError, build_revision_summary_input, build_summary_input,

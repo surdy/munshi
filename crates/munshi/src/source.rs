@@ -10,7 +10,11 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const MAX_EVENT_TEXT_BYTES: usize = 128 * 1024;
+/// The default per-event extraction threshold: when a normalized event's content exceeds this many
+/// bytes it is extracted as its own content-addressed snapshot artifact and elided from summarizer
+/// input, rather than failing the load (ADR 0010). The default preserves the historical 128 KB cap
+/// on per-event summarizer input size; it is configurable via `limits.max_event_text_bytes`.
+pub const DEFAULT_MAX_EVENT_TEXT_BYTES: usize = 128 * 1024;
 pub const NORMALIZER_VERSION: u32 = 2;
 
 /// Vendor-neutral identity of the coding-agent harness that produced a session.
@@ -108,6 +112,69 @@ pub struct NormalizedEvent {
     pub content: String,
 }
 
+/// The complete content of an oversized normalized event, preserved as its own content-addressed
+/// snapshot artifact instead of being truncated away (ADR 0010, CONTEXT.md "extracted output").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedOutput {
+    /// Lowercase hex sha256 of `content` (unprefixed) — the stem of the `outputs/<sha256>` artifact
+    /// logical path and the address the summarizer's claim ticket carries.
+    pub sha256: String,
+    /// The source event's media type, when known. Normalized event content is always UTF-8 text.
+    pub media_type: Option<String>,
+    /// A short human label — the normalized event's kind (`user`/`assistant`/`tool`) — that the
+    /// claim ticket and the frontmatter artifact index reproduce so a reader can tell at a glance
+    /// what kind of content was elided. Deduplication keeps the label of the first occurrence.
+    pub label: String,
+    /// The complete original content bytes.
+    pub content: Vec<u8>,
+}
+
+/// One entry in a revision's snapshot artifact index (ADR 0010, CONTEXT.md "snapshot artifact set"):
+/// the content address, original size, and short label of one extracted output. Mirrors the
+/// claim-ticket marker the summarizer saw in its place, and points at the `outputs/<sha256>` artifact
+/// the snapshot uploads. Derived purely from local extraction, never from any upload result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactIndexEntry {
+    /// Bare lowercase-hex sha256, matching the `outputs/<sha256>` logical path and the claim ticket.
+    pub sha256: String,
+    /// The original (uncompressed) content size in bytes.
+    pub bytes: u64,
+    /// The extracted event's kind label (`user`/`assistant`/`tool`).
+    pub label: String,
+}
+
+/// A revision's snapshot artifact index, derived from the transcript bytes read during
+/// normalization (ADR 0010). Carried on [`NormalizedSession`] so the renderer can record it in
+/// archive frontmatter without a later re-read of the transcript, keeping the index consistent with
+/// the exact bytes this revision summarized. Empty when no event exceeded the extraction threshold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotArtifactIndex {
+    /// Every extracted output for the full transcript, deduplicated and sorted ascending by hash —
+    /// byte-for-byte the set [`extract_outputs`] re-derives at upload time.
+    pub extracted_outputs: Vec<ArtifactIndexEntry>,
+}
+
+/// Builds the snapshot artifact index for a full transcript from the bytes read during normalization.
+/// A pure, deterministic function of the transcript bytes, the source adapter, and the extraction
+/// threshold — identical to the ordered set [`assemble_artifact_sources`] uploads — so the frontmatter
+/// index, the claim tickets in summarizer input, and the `outputs/<sha256>` artifacts always agree.
+pub fn snapshot_artifact_index(
+    bytes: &[u8],
+    source: SourceKind,
+    max_event_text_bytes: usize,
+) -> SnapshotArtifactIndex {
+    SnapshotArtifactIndex {
+        extracted_outputs: extract_outputs(bytes, source, max_event_text_bytes)
+            .into_iter()
+            .map(|output| ArtifactIndexEntry {
+                bytes: output.content.len() as u64,
+                sha256: output.sha256,
+                label: output.label,
+            })
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NormalizedSession {
     pub source: SourceKind,
@@ -124,6 +191,10 @@ pub struct NormalizedSession {
     pub source_bytes: u64,
     pub started_at: Option<String>,
     pub updated_at: Option<String>,
+    /// This revision's snapshot artifact index (ADR 0010), derived from the same transcript read
+    /// that produced `source_hash`. Populated for full transcript bytes even on delta loads, so it
+    /// always describes the complete snapshot the renderer records and the upload path assembles.
+    pub artifact_index: SnapshotArtifactIndex,
 }
 
 impl NormalizedSession {
@@ -226,8 +297,6 @@ pub enum SourceError {
     SourceLimit { limit: usize },
     #[error("transcript line {line} is not valid JSON")]
     MalformedJson { line: u64 },
-    #[error("normalized event content exceeds the per-event safety limit")]
-    EventContentLimit,
     #[error("transcript changed while it was being read")]
     ChangedDuringRead,
     #[error("transcript ends with an incomplete JSON record")]
@@ -353,13 +422,20 @@ pub fn load_session(
     resolved: &ResolvedSession,
     max_source_bytes: usize,
 ) -> Result<NormalizedSession, SourceError> {
-    Ok(load_session_update(resolved, max_source_bytes, None)?.session)
+    Ok(load_session_update(
+        resolved,
+        max_source_bytes,
+        None,
+        DEFAULT_MAX_EVENT_TEXT_BYTES,
+    )?
+    .session)
 }
 
 pub fn load_session_update(
     resolved: &ResolvedSession,
     max_source_bytes: usize,
     previous: Option<&PreviousSource>,
+    max_event_text_bytes: usize,
 ) -> Result<TranscriptUpdate, SourceError> {
     let (bytes, snapshot) = read_stable_source(&resolved.events_path, max_source_bytes)?;
     validate_trailing_record(&bytes)?;
@@ -367,7 +443,7 @@ pub fn load_session_update(
 
     let (mode, fallback_reason, normalized, total_records) = match previous {
         None => {
-            let normalized = normalize_records(&bytes, 0, resolved.source)?;
+            let normalized = normalize_records(&bytes, 0, resolved.source, max_event_text_bytes)?;
             (
                 TranscriptLoadMode::Full,
                 None,
@@ -376,7 +452,7 @@ pub fn load_session_update(
             )
         }
         Some(previous) if previous.normalizer_version != NORMALIZER_VERSION => {
-            let normalized = normalize_records(&bytes, 0, resolved.source)?;
+            let normalized = normalize_records(&bytes, 0, resolved.source, max_event_text_bytes)?;
             (
                 TranscriptLoadMode::Full,
                 Some(CursorFallbackReason::NormalizerChanged),
@@ -385,7 +461,7 @@ pub fn load_session_update(
             )
         }
         Some(previous) if bytes.len() < previous.byte_offset as usize => {
-            let normalized = normalize_records(&bytes, 0, resolved.source)?;
+            let normalized = normalize_records(&bytes, 0, resolved.source, max_event_text_bytes)?;
             (
                 TranscriptLoadMode::Full,
                 Some(CursorFallbackReason::SourceTruncated),
@@ -399,7 +475,8 @@ pub fn load_session_update(
             let prefix_valid = sha256(prefix) == previous.prefix_hash
                 && count_records(prefix) == previous.record_count;
             if !prefix_valid {
-                let normalized = normalize_records(&bytes, 0, resolved.source)?;
+                let normalized =
+                    normalize_records(&bytes, 0, resolved.source, max_event_text_bytes)?;
                 (
                     TranscriptLoadMode::Full,
                     Some(CursorFallbackReason::CursorMismatch),
@@ -413,7 +490,8 @@ pub fn load_session_update(
                     && bytes[offset - 1] != b'\n'
                     && delta[0] != b'\n'
                 {
-                    let normalized = normalize_records(&bytes, 0, resolved.source)?;
+                    let normalized =
+                        normalize_records(&bytes, 0, resolved.source, max_event_text_bytes)?;
                     (
                         TranscriptLoadMode::Full,
                         Some(CursorFallbackReason::CursorMismatch),
@@ -428,8 +506,12 @@ pub fn load_session_update(
                         previous.record_count,
                     )
                 } else {
-                    let normalized =
-                        normalize_records(delta, previous.record_count, resolved.source)?;
+                    let normalized = normalize_records(
+                        delta,
+                        previous.record_count,
+                        resolved.source,
+                        max_event_text_bytes,
+                    )?;
                     (
                         TranscriptLoadMode::Delta,
                         None,
@@ -477,6 +559,11 @@ pub fn load_session_update(
         };
 
     let source_prefix_hash = sha256(&bytes);
+    // Derive the snapshot artifact index from the full transcript bytes this load read — never a
+    // later re-read (ADR 0010) — so the frontmatter index the renderer writes matches the exact
+    // bytes summarized. Computed over the whole file even on a delta load, since the uploaded
+    // snapshot is always the full transcript.
+    let artifact_index = snapshot_artifact_index(&bytes, resolved.source, max_event_text_bytes);
     Ok(TranscriptUpdate {
         session: NormalizedSession {
             source: resolved.source,
@@ -493,6 +580,7 @@ pub fn load_session_update(
             source_bytes: bytes.len() as u64,
             started_at,
             updated_at,
+            artifact_index,
         },
         mode,
         fallback_reason,
@@ -699,6 +787,7 @@ fn normalize_records(
     bytes: &[u8],
     prior_records: u64,
     source: SourceKind,
+    max_event_text_bytes: usize,
 ) -> Result<NormalizedRecords, SourceError> {
     let mut normalized = NormalizedRecords::default();
     for raw_line in bytes.split(|byte| *byte == b'\n') {
@@ -737,10 +826,102 @@ fn normalize_records(
                 "tool" => normalized.tool_activities += 1,
                 _ => {}
             }
-            normalized.events.push(event);
+            // Oversized content is extracted, not truncated: the full bytes become an
+            // `outputs/<sha256>` snapshot artifact (re-derived at upload time from the same
+            // transcript, see `extract_outputs`) and the summarizer sees a hash+size marker in
+            // their place. The activity counts above reflect the original event either way.
+            normalized
+                .events
+                .push(elide_if_oversized(event, max_event_text_bytes));
         }
     }
     Ok(normalized)
+}
+
+/// Replaces an oversized event's content with its claim-ticket marker, leaving smaller events
+/// intact. The ticket carries the content's sha256, size, and label — the same address
+/// `extract_outputs` computes — so summaries render before any upload and stay losslessly expandable
+/// (ADR 0010, CONTEXT.md "claim ticket"). See [`claim_ticket_marker`] for the exact format.
+fn elide_if_oversized(event: NormalizedEvent, max_event_text_bytes: usize) -> NormalizedEvent {
+    if event.content.len() <= max_event_text_bytes {
+        return event;
+    }
+    let content = claim_ticket_marker(event.kind, &event.content);
+    NormalizedEvent {
+        kind: event.kind,
+        content,
+    }
+}
+
+/// Formats the claim-ticket marker that stands in for an elided oversized event in summarizer input
+/// (ADR 0010, CONTEXT.md "claim ticket"), documented in `docs/summarizers.md` so summarizers
+/// reference these markers rather than invent them.
+///
+/// The format is a single line, unambiguous, and deterministic — a pure function of the event
+/// content (its sha256 and byte size) and its classification (`label`, the normalized event kind):
+///
+/// ```text
+/// [munshi claim-ticket sha256:<hex> bytes:<n> label:<label>]
+/// ```
+///
+/// `sha256` is bare lowercase hex (matching the `outputs/<sha256>` artifact path and the frontmatter
+/// artifact index), `bytes` the original content size, and `label` a whitespace-free event kind. A
+/// holder redeems the ticket by its sha256 through `munshi retrieve` once the snapshot is archived.
+fn claim_ticket_marker(label: &str, content: &str) -> String {
+    format!(
+        "[munshi claim-ticket sha256:{} bytes:{} label:{}]",
+        content_sha256_hex(content.as_bytes()),
+        content.len(),
+        label,
+    )
+}
+
+/// Re-derives every extracted output for a full transcript: the complete content of each normalized
+/// event whose size exceeds `max_event_text_bytes`, content-addressed and deduplicated by sha256.
+///
+/// ADR 0010 stages nothing at capture time (option a). Extracted outputs are re-derived here from
+/// the same verbatim transcript bytes the snapshot uploads, so no raw content lands in the
+/// rebuildable SQLite state (ADR 0004) and the upload path stays retryable after process exit.
+/// Extraction is a pure function of the transcript bytes, the source adapter, and the threshold, and
+/// classification is pinned by [`NORMALIZER_VERSION`]; every retry of a reused capture id therefore
+/// re-produces a byte-identical, deterministically ordered set (ascending by hash), and each
+/// `outputs/<sha256>` resolves to exactly the bytes the summarizer's elision marker names. Malformed
+/// lines are skipped so a partial trailing record appended after archival never fails the upload.
+pub fn extract_outputs(
+    bytes: &[u8],
+    source: SourceKind,
+    max_event_text_bytes: usize,
+) -> Vec<ExtractedOutput> {
+    let mut extracted: BTreeMap<String, ExtractedOutput> = BTreeMap::new();
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        if raw_line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(raw_line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let Ok(class) = classify_record(source, object) else {
+            continue;
+        };
+        for event in class.events {
+            if event.content.len() <= max_event_text_bytes {
+                continue;
+            }
+            let sha256 = content_sha256_hex(event.content.as_bytes());
+            extracted
+                .entry(sha256.clone())
+                .or_insert_with(|| ExtractedOutput {
+                    sha256,
+                    media_type: Some("text/plain; charset=utf-8".to_owned()),
+                    label: event.kind.to_owned(),
+                    content: event.content.into_bytes(),
+                });
+        }
+    }
+    extracted.into_values().collect()
 }
 
 fn classify_record(
@@ -767,7 +948,7 @@ fn classify_copilot(object: &Map<String, Value>) -> Result<RecordClass, SourceEr
                 return Ok(RecordClass::ignored());
             };
             match nonempty(content) {
-                Some(content) => Ok(RecordClass::event("user", validate_content(content)?)),
+                Some(content) => Ok(RecordClass::event("user", content)),
                 None => Ok(RecordClass::skipped()),
             }
         }
@@ -782,7 +963,7 @@ fn classify_copilot(object: &Map<String, Value>) -> Result<RecordClass, SourceEr
                 return Ok(RecordClass::ignored());
             };
             match nonempty(content) {
-                Some(content) => Ok(RecordClass::event("assistant", validate_content(content)?)),
+                Some(content) => Ok(RecordClass::event("assistant", content)),
                 None => Ok(RecordClass::skipped()),
             }
         }
@@ -835,7 +1016,7 @@ fn classify_claude_content(content: &Value, assistant: bool) -> Result<RecordCla
         Value::String(text) => match nonempty(text) {
             Some(text) => Ok(RecordClass::event(
                 if assistant { "assistant" } else { "user" },
-                validate_content(text)?,
+                text,
             )),
             None => Ok(RecordClass::skipped()),
         },
@@ -856,7 +1037,7 @@ fn classify_claude_content(content: &Value, assistant: bool) -> Result<RecordCla
                             if let Some(text) = nonempty(text) {
                                 events.push(NormalizedEvent {
                                     kind: if assistant { "assistant" } else { "user" },
-                                    content: validate_content(text)?,
+                                    content: text,
                                 });
                             }
                         }
@@ -901,7 +1082,7 @@ fn extract_claude_tool_use(
     }
     Ok(Some(NormalizedEvent {
         kind: "tool",
-        content: render_tool_fields(fields)?,
+        content: render_tool_fields(fields),
     }))
 }
 
@@ -928,7 +1109,7 @@ fn extract_claude_tool_result(
     }
     Ok(Some(NormalizedEvent {
         kind: "tool",
-        content: render_tool_fields(fields)?,
+        content: render_tool_fields(fields),
     }))
 }
 
@@ -986,8 +1167,8 @@ fn classify_codex(object: &Map<String, Value>) -> Result<RecordClass, SourceErro
                 .unwrap_or_default();
             match nonempty(&text) {
                 Some(text) => match role {
-                    "user" => Ok(RecordClass::event("user", validate_content(text)?)),
-                    "assistant" => Ok(RecordClass::event("assistant", validate_content(text)?)),
+                    "user" => Ok(RecordClass::event("user", text)),
+                    "assistant" => Ok(RecordClass::event("assistant", text)),
                     _ => Ok(RecordClass::ignored()),
                 },
                 None => Ok(RecordClass::skipped()),
@@ -1068,7 +1249,7 @@ fn codex_tool_call(
     }
     Ok(Some(NormalizedEvent {
         kind: "tool",
-        content: render_tool_fields(fields)?,
+        content: render_tool_fields(fields),
     }))
 }
 
@@ -1088,7 +1269,7 @@ fn codex_tool_output(payload: &Map<String, Value>) -> Result<Option<NormalizedEv
     }
     Ok(Some(NormalizedEvent {
         kind: "tool",
-        content: render_tool_fields(fields)?,
+        content: render_tool_fields(fields),
     }))
 }
 
@@ -1139,7 +1320,7 @@ fn codex_local_shell_call(
     }
     Ok(Some(NormalizedEvent {
         kind: "tool",
-        content: render_tool_fields(fields)?,
+        content: render_tool_fields(fields),
     }))
 }
 
@@ -1165,6 +1346,12 @@ fn validate_trailing_record(bytes: &[u8]) -> Result<(), SourceError> {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// Bare lowercase-hex sha256, unprefixed — the content address used for extracted-output logical
+/// paths and elision markers. Matches Patwari's stored digest hex (minus the `sha256:` prefix).
+fn content_sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn event_data(object: &Map<String, Value>) -> Option<&Map<String, Value>> {
@@ -1202,14 +1389,6 @@ fn format_timestamp(timestamp: DateTime<Utc>) -> String {
 fn nonempty(text: &str) -> Option<String> {
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-fn validate_content(content: String) -> Result<String, SourceError> {
-    if content.len() > MAX_EVENT_TEXT_BYTES {
-        Err(SourceError::EventContentLimit)
-    } else {
-        Ok(content)
-    }
 }
 
 fn valid_tool_start(data: &Map<String, Value>) -> bool {
@@ -1278,7 +1457,7 @@ fn extract_tool_start(data: &Map<String, Value>) -> Result<String, SourceError> 
     if let Some(arguments) = data.get("arguments").and_then(compact_value) {
         fields.insert("arguments", arguments);
     }
-    render_tool_fields(fields)
+    Ok(render_tool_fields(fields))
 }
 
 fn extract_tool_complete(data: &Map<String, Value>) -> Result<String, SourceError> {
@@ -1323,7 +1502,7 @@ fn extract_tool_complete(data: &Map<String, Value>) -> Result<String, SourceErro
             fields.insert("output", output.join("\n"));
         }
     }
-    render_tool_fields(fields)
+    Ok(render_tool_fields(fields))
 }
 
 fn extract_tool_result_text(value: &Value) -> Option<String> {
@@ -1355,14 +1534,12 @@ fn extract_tool_result_text(value: &Value) -> Option<String> {
     }
 }
 
-fn render_tool_fields(fields: BTreeMap<&str, String>) -> Result<String, SourceError> {
-    validate_content(
-        fields
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+fn render_tool_fields(fields: BTreeMap<&str, String>) -> String {
+    fields
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn compact_value(value: &Value) -> Option<String> {
@@ -1372,5 +1549,72 @@ fn compact_value(value: &Value) -> Option<String> {
         Value::Array(_) | Value::Object(_) | Value::Bool(_) | Value::Number(_) => {
             serde_json::to_string(value).ok()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn copilot_tool_complete(call_id: &str, output: &str) -> String {
+        serde_json::json!({
+            "id": call_id,
+            "timestamp": "2026-07-25T00:00:00Z",
+            "parentId": "root",
+            "type": "tool.execution_complete",
+            "data": { "toolCallId": call_id, "success": true, "result": { "content": output } },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn claim_ticket_marker_is_single_line_and_carries_hash_size_label() {
+        let content = "x".repeat(500);
+        let marker = claim_ticket_marker("tool", &content);
+        assert!(!marker.contains('\n'), "the claim ticket is a single line");
+        assert_eq!(
+            marker,
+            format!(
+                "[munshi claim-ticket sha256:{} bytes:500 label:tool]",
+                content_sha256_hex(content.as_bytes())
+            )
+        );
+    }
+
+    #[test]
+    fn markers_and_artifact_index_are_deterministic_across_normalizations() {
+        let threshold = 64;
+        let transcript =
+            format!("{}\n", copilot_tool_complete("call-1", &"a".repeat(300))).into_bytes();
+
+        // The snapshot artifact index is a pure function of the transcript: two normalizations of
+        // the same bytes produce byte-identical index entries (ADR 0010 determinism).
+        let first = snapshot_artifact_index(&transcript, SourceKind::Copilot, threshold);
+        let second = snapshot_artifact_index(&transcript, SourceKind::Copilot, threshold);
+        assert_eq!(first, second);
+        assert_eq!(first.extracted_outputs.len(), 1);
+        let entry = &first.extracted_outputs[0];
+        assert_eq!(entry.label, "tool");
+
+        // The ticket the summarizer sees in the normalized events carries the same address, size,
+        // and label as the matching artifact-index entry.
+        let normalized = normalize_records(&transcript, 0, SourceKind::Copilot, threshold).unwrap();
+        let ticket = normalized
+            .events
+            .iter()
+            .find(|event| event.content.starts_with("[munshi claim-ticket"))
+            .expect("the oversized event is replaced by a claim ticket");
+        assert_eq!(
+            ticket.content,
+            format!(
+                "[munshi claim-ticket sha256:{} bytes:{} label:{}]",
+                entry.sha256, entry.bytes, entry.label
+            )
+        );
+        // The address matches the content-addressed extracted output byte-for-byte.
+        let outputs = extract_outputs(&transcript, SourceKind::Copilot, threshold);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].sha256, entry.sha256);
+        assert_eq!(outputs[0].content.len() as u64, entry.bytes);
     }
 }

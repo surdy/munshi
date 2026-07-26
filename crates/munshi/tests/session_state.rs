@@ -39,7 +39,7 @@ fn registration_migrates_schema_idempotently_and_uses_wal() {
     let foreign_keys: i64 = connection
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(journal, "wal");
     assert_eq!(foreign_keys, 1);
     assert!(!harness.state.join("pending").exists());

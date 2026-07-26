@@ -243,6 +243,32 @@ revives dead-letter sessions). Full design and rationale:
 [`automatic-archive.md`](automatic-archive.md) and
 [ADR 0006](adr/0006-deliver-to-notesmith-downstream-of-local-archival.md).
 
+## Archive upload (Patwari) in brief
+
+Archive upload publishes each summary revision's full snapshot — the rendered summary, the verbatim
+transcript, and any extracted outputs — to a Patwari archive server. Like delivery, it is disabled
+by default and strictly downstream of local archival: a Patwari outage never blocks or rolls back a
+local Markdown write, and it runs in parallel with, and independently of, Notesmith delivery.
+
+```bash
+munshi archive-upload configure --endpoint http://127.0.0.1:8080
+munshi archive-upload enable
+munshi archive-upload status
+munshi archive-upload retry --all
+munshi archive-upload retry <session-id> --force
+```
+
+`configure` records the server without turning upload on; `enable` requires a configured server and
+turns upload on; `disable` stops future upload while keeping upload history. `status` shows the
+configuration and per-session upload state. `retry` re-attempts failed uploads (`--force` revives
+dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
+also retried automatically by the recovery sweep (`munshi hook recover`), so a transient outage
+recovers without a new revision. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
+claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
+download cap for a deliberately large artifact). Full design and rationale:
+[ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and
+[ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md).
+
 ## Unregistering and cleanup
 
 ```bash

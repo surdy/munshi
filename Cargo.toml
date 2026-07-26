@@ -21,3 +21,6 @@ sha2 = "0.10.9"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 toml = "0.8.19"
+# First compression dependency: archive-upload artifacts are zstd-compressed before transfer, with
+# both the original and stored (compressed) size and sha256 recorded per artifact (ADR 0009).
+zstd = "0.13.3"
