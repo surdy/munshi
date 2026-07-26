@@ -10,6 +10,7 @@ chrono.workspace = true
 clap.workspace = true
 libc.workspace = true
 munshi-runner = { path = "../munshi-runner" }
+munshi-transcript = { path = "../munshi-transcript" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,7 +21,4 @@ toml.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
-# Equivalence gate for the read-time interpretation crate (ADR 0011): production capture
-# still runs on this crate's own normalizer until issue #27 rewires it.
-munshi-transcript = { path = "../munshi-transcript" }
 tempfile.workspace = true
