@@ -16,7 +16,7 @@
 //! a stable `captured_at`) per distinct snapshot attempt and reuses that exact pair on retry, so an
 //! interrupted upload resumes rather than duplicates. The client UUID is persistent and durable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1447,13 +1447,32 @@ pub struct ArchiveUploadRunItem {
 impl ArchiveUploadRunReport {
     pub fn print_human(&self) {
         print_settings(&self.settings);
+        let label = match self.command {
+            "archive-upload-backfill" => "archive-upload backfill",
+            _ => "archive-upload retry",
+        };
         println!(
-            "archive-upload retry candidates={} uploaded={} already-uploaded={} skipped={} failed={}",
+            "{label} candidates={} uploaded={} already-uploaded={} skipped={} failed={}",
             self.candidates, self.uploaded, self.already_uploaded, self.skipped, self.failed
         );
         for item in &self.items {
             println!("{} -> {}", item.session_id, item.outcome.as_kind());
         }
+    }
+
+    /// Tallies one session's outcome into the counts and appends its per-session item.
+    fn record(&mut self, source: SourceKind, session_id: &str, outcome: UploadOutcome) {
+        match &outcome {
+            UploadOutcome::Uploaded { .. } => self.uploaded += 1,
+            UploadOutcome::AlreadyUploaded { .. } => self.already_uploaded += 1,
+            UploadOutcome::Skipped { .. } => self.skipped += 1,
+            UploadOutcome::Failed { .. } => self.failed += 1,
+        }
+        self.items.push(ArchiveUploadRunItem {
+            source: source.as_selector().to_owned(),
+            session_id: session_id.to_owned(),
+            outcome,
+        });
     }
 }
 
@@ -1530,54 +1549,126 @@ pub fn retry(
         items: Vec::new(),
     };
     for record in candidates {
-        let outcome = retry_one(
+        let outcome = locked_upload_one(
             state_directory,
             &config.archive_upload,
             &client_id,
             &endpoint,
             &output_directory,
-            &record,
+            record.source,
+            &record.session_id,
             config.limits.max_event_text_bytes,
-            force,
+            Some(force),
         )?;
-        match &outcome {
-            UploadOutcome::Uploaded { .. } => report.uploaded += 1,
-            UploadOutcome::AlreadyUploaded { .. } => report.already_uploaded += 1,
-            UploadOutcome::Skipped { .. } => report.skipped += 1,
-            UploadOutcome::Failed { .. } => report.failed += 1,
-        }
-        report.items.push(ArchiveUploadRunItem {
-            source: record.source.as_selector().to_owned(),
-            session_id: record.session_id.clone(),
-            outcome,
-        });
+        report.record(record.source, &record.session_id, outcome);
     }
     Ok(report)
 }
 
-/// Resets one session's upload row for retry and runs the attempt under its advisory lock. A locked
-/// session (an archive worker is uploading it) is reported skipped rather than contended.
+/// Uploads every archived session the configured server has no recorded row for (issue #32).
+///
+/// `upload_after_archive` runs only in the worker downstream of a fresh archive, and the retry
+/// paths operate on existing `archive_uploads` rows, so a session archived while upload was
+/// disabled (or before configuration) is otherwise never uploaded. Backfill scans archived
+/// sessions across every source, keeps those with no row for the currently configured endpoint,
+/// and runs each through the normal `upload_one` path — row creation, capture-id minting, bounded
+/// attempts, and failure recording behave exactly like a post-archive upload. Requires archive
+/// upload to be enabled and addressable; candidates are bounded by `limit`; a session whose
+/// advisory lock is held (an archive worker is on it) is reported skipped this run. Never mutates
+/// the session's archival lifecycle.
+pub fn backfill(
+    state_directory: &Path,
+    limit: usize,
+) -> Result<ArchiveUploadRunReport, PatwariError> {
+    let config = load_stored_config(state_directory)?;
+    let settings = ArchiveUploadSettings::from_config(&config);
+    if !config.archive_upload.enabled {
+        return Err(PatwariError::NotEnabled);
+    }
+    if !config.archive_upload.is_addressable() {
+        return Err(PatwariError::NotConfigured);
+    }
+    let endpoint = config.archive_upload.endpoint.clone().unwrap();
+    let client_id = ensure_client_id(Path::new(&config.state_directory))?;
+    let output_directory = PathBuf::from(&config.output_directory);
+
+    let (sessions, uploads) = if StateStore::database_path(state_directory).exists() {
+        let store = StateStore::open(state_directory)?;
+        (store.list_sessions()?, store.list_archive_uploads()?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    // Sessions already holding a row for this endpoint — whatever its state — belong to the worker
+    // and retry paths; a row recorded for a different endpoint (e.g. before reconfiguration) does
+    // not count as uploaded here, matching `retry`'s endpoint scoping.
+    let recorded: BTreeSet<(SourceKind, &str)> = uploads
+        .iter()
+        .filter(|record| record.endpoint == endpoint)
+        .map(|record| (record.source, record.session_id.as_str()))
+        .collect();
+    let mut candidates: Vec<&SessionRecord> = sessions
+        .iter()
+        .filter(|session| session.lifecycle_state == "archived")
+        .filter(|session| !recorded.contains(&(session.source, session.session_id.as_str())))
+        .collect();
+    candidates.truncate(limit);
+
+    let mut report = ArchiveUploadRunReport {
+        schema_version: 1,
+        command: "archive-upload-backfill",
+        settings,
+        candidates: candidates.len(),
+        uploaded: 0,
+        already_uploaded: 0,
+        skipped: 0,
+        failed: 0,
+        items: Vec::new(),
+    };
+    for session in candidates {
+        let outcome = locked_upload_one(
+            state_directory,
+            &config.archive_upload,
+            &client_id,
+            &endpoint,
+            &output_directory,
+            session.source,
+            &session.session_id,
+            config.limits.max_event_text_bytes,
+            None,
+        )?;
+        report.record(session.source, &session.session_id, outcome);
+    }
+    Ok(report)
+}
+
+/// Runs one session's upload attempt under its advisory lock, opening the store in the session's
+/// source scope. `reset_for_retry` is `Some(force)` for an explicit retry, which clears the row's
+/// backoff first (and, with force, revives a dead-letter row and resets its bounded attempt
+/// count) — this is the one caller of `reset_archive_upload_for_retry`; `None` (backfill) leaves
+/// any row as found. A locked session (an archive worker is uploading it) is reported skipped
+/// rather than contended.
 #[allow(clippy::too_many_arguments)]
-fn retry_one(
+fn locked_upload_one(
     state_directory: &Path,
     settings: &crate::registration::StoredArchiveUpload,
     client_id: &str,
     endpoint: &str,
     output_directory: &Path,
-    record: &ArchiveUploadRecord,
+    source: SourceKind,
+    session_id: &str,
     max_event_text_bytes: usize,
-    force: bool,
+    reset_for_retry: Option<bool>,
 ) -> Result<UploadOutcome, PatwariError> {
-    let Some(_lock) = try_acquire_session_lock(state_directory, &record.session_id)? else {
+    let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
         return Ok(UploadOutcome::Skipped {
             reason: "worker-busy".to_owned(),
         });
     };
-    let mut state = StateStore::open_for_source(state_directory, record.source)?;
-    // Clear backoff (and, with force, revive a dead-letter row and reset its attempts) so the
-    // attempt is due now; this is the one caller of `reset_archive_upload_for_retry`.
-    state.reset_archive_upload_for_retry(&record.session_id, endpoint, force)?;
-    let Some(session) = state.get_session(&record.session_id)? else {
+    let mut state = StateStore::open_for_source(state_directory, source)?;
+    if let Some(force) = reset_for_retry {
+        state.reset_archive_upload_for_retry(session_id, endpoint, force)?;
+    }
+    let Some(session) = state.get_session(session_id)? else {
         return Ok(UploadOutcome::Skipped {
             reason: "session-unknown".to_owned(),
         });

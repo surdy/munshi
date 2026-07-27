@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -458,6 +460,291 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
         .prepare_archive_capture(session, endpoint, 2, "capture-C", "2026-07-25T02:00:00Z")
         .unwrap();
     assert_eq!(after_success.capture_id, "capture-C");
+}
+
+// ---------------------------------------------------------------------------
+// CLI backfill of sessions archived while upload was disabled (issue #32)
+// ---------------------------------------------------------------------------
+
+const BACKFILL_SESSION: &str = "33333333-3333-4333-8333-333333333333";
+
+/// A session archived while upload was disabled has no `archive_uploads` row, so neither the
+/// post-archive worker nor `archive-upload retry` ever uploads it. `archive-upload backfill` finds
+/// it, runs the normal upload path against the (fake) server, and records the row; a second run
+/// finds no candidates and never contacts the server again.
+#[test]
+fn backfill_uploads_archived_sessions_without_rows_and_is_idempotent() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(BACKFILL_SESSION);
+
+    // Archived with upload disabled: no upload row exists anywhere.
+    let status = harness.archive_upload_status();
+    assert_eq!(status["total"], 0);
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let (report, success) = harness.backfill();
+    assert!(success, "backfill exits zero when nothing fails");
+    assert_eq!(report["command"], "archive-upload-backfill");
+    assert_eq!(report["candidates"], 1);
+    assert_eq!(report["uploaded"], 1);
+    assert_eq!(report["already_uploaded"], 0);
+    assert_eq!(report["skipped"], 0);
+    assert_eq!(report["failed"], 0);
+    assert_eq!(report["items"][0]["session_id"], BACKFILL_SESSION);
+    assert_eq!(report["items"][0]["outcome"]["result"], "uploaded");
+    assert_eq!(server.completed_count(), 1);
+    // The upload registered the durable client UUID minted at configure time.
+    let client_id = harness
+        .configured_client_id()
+        .expect("configure minted a persistent client UUID");
+    assert_eq!(
+        server.registered_client().as_deref(),
+        Some(client_id.as_str()),
+        "backfill uploads under the persistent configured client UUID"
+    );
+
+    // The row is now recorded as uploaded for the configured endpoint.
+    let status = harness.archive_upload_status();
+    assert_eq!(status["total"], 1);
+    assert_eq!(status["uploaded"], 1);
+    assert_eq!(status["items"][0]["session_id"], BACKFILL_SESSION);
+    assert_eq!(status["items"][0]["state"], "uploaded");
+    assert!(status["items"][0]["snapshot_id"].is_string());
+
+    // Idempotent: the recorded row excludes the session, so a second run finds no candidates and
+    // performs no further server work.
+    let (again, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(again["candidates"], 0);
+    assert_eq!(again["uploaded"], 0);
+    assert_eq!(server.completed_count(), 1, "no second upload happened");
+    assert_eq!(server.upload_count(), 1);
+}
+
+/// With upload disabled (or never configured) backfill refuses up front with the same clear
+/// guard message the retry path uses, uploading nothing.
+#[test]
+fn backfill_is_a_guarded_no_op_when_upload_is_disabled() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(BACKFILL_SESSION);
+
+    let output = harness.munshi(&["archive-upload", "backfill"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("archive upload is not enabled"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Nothing was scanned into an upload row.
+    assert_eq!(harness.archive_upload_status()["total"], 0);
+}
+
+/// Drives the real munshi binary: registration, one hook-driven archive lifecycle, and the
+/// `archive-upload` CLI. Mirrors the delivery-test harness, narrowed to what backfill needs.
+struct CliHarness {
+    #[allow(dead_code)]
+    directory: TempDir,
+    copilot_home: PathBuf,
+    state: PathBuf,
+    output: PathBuf,
+    project: PathBuf,
+}
+
+impl CliHarness {
+    fn new() -> Self {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/munshi-patwari-test-artifacts");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("backfill-case-")
+            .tempdir_in(root)
+            .unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        Self {
+            copilot_home: directory.path().join("copilot-home"),
+            state: directory.path().join("munshi-home"),
+            output: directory.path().join("archives"),
+            project,
+            directory,
+        }
+    }
+
+    /// Runs the binary with `args` plus `--state-dir`.
+    fn munshi(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn json(&self, args: &[&str]) -> Value {
+        let output = self.munshi(args);
+        assert!(
+            !output.stdout.is_empty(),
+            "empty stdout; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("valid JSON")
+    }
+
+    fn register(&self) {
+        let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/manual/fake-summarizer/status-contract.sh");
+        std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("register")
+            .arg("--accept-transcript-processing")
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--output-dir")
+            .arg(&self.output)
+            .arg("--summarizer")
+            .arg(summarizer.canonicalize().unwrap())
+            .arg("--timeout-ms")
+            .arg("5000")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_cli_success(&output);
+    }
+
+    fn configure_and_enable(&self, endpoint: &str) {
+        assert_cli_success(&self.munshi(&["archive-upload", "configure", "--endpoint", endpoint]));
+        assert_cli_success(&self.munshi(&["archive-upload", "enable"]));
+    }
+
+    fn configured_client_id(&self) -> Option<String> {
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(self.state.join("config.json")).unwrap())
+                .unwrap();
+        config["archive_upload"]["client_id"]
+            .as_str()
+            .map(ToOwned::to_owned)
+    }
+
+    fn archive_upload_status(&self) -> Value {
+        self.json(&["archive-upload", "status", "--json"])
+    }
+
+    fn backfill(&self) -> (Value, bool) {
+        let output = self.munshi(&["archive-upload", "backfill", "--json"]);
+        assert!(
+            !output.stdout.is_empty(),
+            "empty stdout; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        (report, output.status.success())
+    }
+
+    /// Writes a transcript and drives one full hook-driven archive lifecycle.
+    fn archive_session(&self, session_id: &str) {
+        let transcript = self.write_transcript(session_id);
+        self.hook(
+            "agent-stop",
+            &json!({
+                "sessionId": session_id,
+                "timestamp": 10_000,
+                "cwd": self.project,
+                "transcriptPath": transcript,
+                "stopReason": "end_turn",
+            }),
+        );
+        self.hook(
+            "session-end",
+            &json!({
+                "sessionId": session_id,
+                "timestamp": 10_001,
+                "cwd": self.project,
+                "reason": "complete",
+            }),
+        );
+        assert_cli_success(&self.munshi(&[
+            "hook",
+            "wait",
+            "--session-id",
+            session_id,
+            "--timeout-ms",
+            "10000",
+        ]));
+    }
+
+    fn hook(&self, event: &str, payload: &Value) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("hook")
+            .arg(event)
+            .env("MUNSHI_HOME", &self.state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        assert_cli_success(&child.wait_with_output().unwrap());
+    }
+
+    fn write_transcript(&self, session_id: &str) -> PathBuf {
+        let path = self
+            .copilot_home
+            .join("session-state")
+            .join(session_id)
+            .join("events.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = [
+            json!({
+                "id": "initial-start",
+                "timestamp": "2026-07-12T00:00:00.000Z",
+                "parentId": null,
+                "type": "session.start",
+                "data": {"sessionId": session_id},
+            }),
+            json!({
+                "id": "initial-user",
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "parentId": "initial-start",
+                "type": "user.message",
+                "data": {"content": "please summarize the build"},
+            }),
+            json!({
+                "id": "initial-assistant",
+                "timestamp": "2026-07-12T00:00:02.000Z",
+                "parentId": "initial-user",
+                "type": "assistant.message",
+                "data": {"content": "done", "messageId": "initial-message"},
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, content).unwrap();
+        path.canonicalize().unwrap()
+    }
+}
+
+fn assert_cli_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------

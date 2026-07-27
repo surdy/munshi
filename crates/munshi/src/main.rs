@@ -13,12 +13,12 @@ use munshi::{
     DeliverySinkConfig, DeliveryStatusReport, HistoryReport, HookEvent, HookFailure, HookResult,
     ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults, SessionRecord,
     SessionReference, SourceKind, StateStore, StructuredSummary, VerifyArchiveError,
-    VerifyArchiveReport, accept_disclosure_from_terminal, archive_session, archive_upload_retry,
-    archive_upload_status, configure_archive_upload, configure_delivery, delivery_backfill,
-    delivery_retry, delivery_status, delivery_verify_history, handle_hook, parse_archive_markdown,
-    project_status, read_last_failure, register, retrieve, run_archive_worker_for_source,
-    run_recovery, set_archive_upload_enabled, set_delivery_enabled, set_project_enabled,
-    unregister, verify_archive_parse, wait_for_hook_result_for_source,
+    VerifyArchiveReport, accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
+    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
+    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    parse_archive_markdown, project_status, read_last_failure, register, retrieve,
+    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
+    set_project_enabled, unregister, verify_archive_parse, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -456,6 +456,16 @@ enum ArchiveUploadCommand {
     Status {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Upload archived sessions with no recorded upload for the configured server.
+    Backfill {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
         /// Emit a stable machine-readable contract.
         #[arg(long)]
         json: bool,
@@ -1727,6 +1737,17 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::ArchiveUploadStatus {
                 report: Box::new(archive_upload_status(&state_directory)?),
+                json,
+            })
+        }
+        ArchiveUploadCommand::Backfill {
+            state_dir,
+            limit,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::ArchiveUploadRun {
+                report: Box::new(archive_upload_backfill(&state_directory, limit)?),
                 json,
             })
         }

@@ -256,6 +256,7 @@ munshi archive-upload enable
 munshi archive-upload status
 munshi archive-upload retry --all
 munshi archive-upload retry <session-id> --force
+munshi archive-upload backfill
 ```
 
 `configure` records the server without turning upload on; `enable` requires a configured server and
@@ -263,7 +264,9 @@ turns upload on; `disable` stops future upload while keeping upload history. `st
 configuration and per-session upload state. `retry` re-attempts failed uploads (`--force` revives
 dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
 also retried automatically by the recovery sweep (`munshi hook recover`), so a transient outage
-recovers without a new revision. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
+recovers without a new revision. `backfill` uploads archived sessions the configured server has no
+upload record for — sessions archived while upload was disabled or unconfigured — running each
+through the normal upload path (`--limit` bounds one run, default 200). Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
 claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
 download cap for a deliberately large artifact). Full design and rationale:
 [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and

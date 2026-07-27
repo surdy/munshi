@@ -35,9 +35,10 @@ pub use patwari::{
     ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
     ArchiveUploadStatusReport, ArtifactSource, CaptureContext, INITIAL_ARTIFACT_SET_VERSION,
     PatwariClient, PatwariError, PreparedArtifact, SessionContext, UploadOutcome, UploadReceipt,
-    assemble_artifact_sources, build_manifest, configure as configure_archive_upload,
-    prepare_artifact, prepare_artifacts, retry as archive_upload_retry,
-    set_enabled as set_archive_upload_enabled, status as archive_upload_status,
+    assemble_artifact_sources, backfill as archive_upload_backfill, build_manifest,
+    configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
+    retry as archive_upload_retry, set_enabled as set_archive_upload_enabled,
+    status as archive_upload_status,
 };
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
