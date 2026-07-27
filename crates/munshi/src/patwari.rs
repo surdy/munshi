@@ -293,8 +293,12 @@ struct UploadSession {
     artifacts: Vec<ArtifactStatus>,
 }
 
-/// Per-artifact chunk status: which chunk indexes Patwari still needs.
+/// Per-artifact chunk status: which chunk indexes Patwari still needs. The entry is identified by
+/// its canonical `logical_path`; `artifact_index` is the server's position in its canonicalized
+/// (path-sorted) artifact list and is only ever used to address the chunk PUT route, never to
+/// index into the locally assembled artifact list (issue #33).
 struct ArtifactStatus {
+    logical_path: String,
     artifact_index: u32,
     missing_chunk_indexes: Vec<u64>,
 }
@@ -429,16 +433,29 @@ impl PatwariClient {
     }
 
     /// Uploads every currently-missing chunk of every artifact in the negotiated session.
+    ///
+    /// Server entries are matched to the locally prepared artifacts by canonical `logical_path`,
+    /// never by position: Patwari orders its `artifacts[]` canonically (sorted by logical path),
+    /// which need not agree with the local assembly order (issue #33). An unknown, locally
+    /// missing, or repeated path is a protocol error naming the path.
     fn upload_missing_chunks(
         &self,
         session: &UploadSession,
         artifacts: &[PreparedArtifact],
     ) -> Result<(), PatwariError> {
+        let by_path = index_artifacts_by_path(artifacts)?;
+        let mut seen_paths = BTreeSet::new();
         for status in &session.artifacts {
-            let Some(artifact) = artifacts.get(status.artifact_index as usize) else {
+            if !seen_paths.insert(status.logical_path.as_str()) {
                 return Err(PatwariError::Protocol(format!(
-                    "server referenced unknown artifact index {}",
-                    status.artifact_index
+                    "server repeated artifact logical path {}",
+                    status.logical_path
+                )));
+            }
+            let Some(artifact) = by_path.get(status.logical_path.as_str()) else {
+                return Err(PatwariError::Protocol(format!(
+                    "server referenced artifact logical path {} that is not in this snapshot",
+                    status.logical_path
                 )));
             };
             // The server supplies the missing chunk indexes; validate each against the locally
@@ -450,7 +467,7 @@ impl PatwariClient {
                 if chunk_index >= count {
                     return Err(PatwariError::Protocol(format!(
                         "server requested chunk index {chunk_index} outside the {count}-chunk range of artifact {}",
-                        status.artifact_index
+                        status.logical_path
                     )));
                 }
                 self.put_chunk(
@@ -607,6 +624,15 @@ fn upload_session_from_value(value: &Value) -> Result<UploadSession, PatwariErro
         .ok_or_else(|| PatwariError::Protocol("response missing artifacts".to_owned()))?
         .iter()
         .map(|artifact| {
+            // The path is the artifact's identity for chunk routing (issue #33); the index only
+            // addresses the PUT route. Both are required.
+            let logical_path = artifact
+                .get("logical_path")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    PatwariError::Protocol("artifact missing logical_path".to_owned())
+                })?;
             let artifact_index = artifact
                 .get("artifact_index")
                 .and_then(Value::as_u64)
@@ -618,6 +644,7 @@ fn upload_session_from_value(value: &Value) -> Result<UploadSession, PatwariErro
                 .map(|values| values.iter().filter_map(Value::as_u64).collect())
                 .unwrap_or_default();
             Ok(ArtifactStatus {
+                logical_path,
                 artifact_index,
                 missing_chunk_indexes,
             })
@@ -700,6 +727,27 @@ fn protocol(error: &impl std::fmt::Display) -> PatwariError {
 // ---------------------------------------------------------------------------
 // Small pure helpers
 // ---------------------------------------------------------------------------
+
+/// Indexes the locally prepared artifacts by logical path for matching server status entries
+/// (issue #33). A repeated local path is a protocol error naming the path: routing chunks by path
+/// would be ambiguous, and Patwari rejects such a manifest anyway.
+fn index_artifacts_by_path(
+    artifacts: &[PreparedArtifact],
+) -> Result<BTreeMap<&str, &PreparedArtifact>, PatwariError> {
+    let mut by_path = BTreeMap::new();
+    for artifact in artifacts {
+        if by_path
+            .insert(artifact.logical_path.as_str(), artifact)
+            .is_some()
+        {
+            return Err(PatwariError::Protocol(format!(
+                "snapshot repeats artifact logical path {}",
+                artifact.logical_path
+            )));
+        }
+    }
+    Ok(by_path)
+}
 
 /// The number of `chunk_size`-byte chunks the stored artifact is split into, mirroring Patwari's
 /// server-side `chunk_count` exactly (ingestion.rs): an empty artifact has zero chunks, otherwise
@@ -921,14 +969,17 @@ fn collect_artifacts(
 
 /// Assembles the ordered snapshot artifact set v1 (ADR 0009/0010) from already-read bytes:
 /// `summary.md` (this revision's rendered summary), `transcript.jsonl` (the verbatim source bytes),
-/// then every re-derived `outputs/<sha256>` extracted output sorted ascending by hash.
+/// and every re-derived `outputs/<sha256>` extracted output.
 ///
 /// Extracted outputs are re-derived from the exact transcript bytes this snapshot uploads
 /// (`extract_outputs`, ADR 0010 option a), so the `outputs/<sha256>` set is always consistent with
-/// `transcript.jsonl` and, for a reused capture id, byte-identical across retries. The ordering is
-/// fully deterministic (fixed roles first, then hash-sorted outputs) so the canonical manifest is
-/// stable, and identical content dedups to one artifact and one blob server-side. Pure and I/O-free
-/// so the exact set the upload path builds is unit-testable.
+/// `transcript.jsonl` and, for a reused capture id, byte-identical across retries. The list is
+/// returned in Patwari's canonical order — ascending by logical path (issue #33) — so the locally
+/// built manifest lists artifacts exactly as the server's canonicalized `artifacts[]` does; the
+/// ordering is fully deterministic, the canonical manifest is stable, and identical content dedups
+/// to one artifact and one blob server-side. Chunk routing during upload matches artifacts by
+/// logical path and never relies on this order agreement. Pure and I/O-free so the exact set the
+/// upload path builds is unit-testable.
 pub fn assemble_artifact_sources(
     summary_md: Option<Vec<u8>>,
     transcript_jsonl: Option<Vec<u8>>,
@@ -958,6 +1009,10 @@ pub fn assemble_artifact_sources(
             });
         }
     }
+    // Canonicalize: Patwari sorts `artifacts[]` by logical path (`outputs/…` before `summary.md`
+    // before `transcript.jsonl`). Logical paths are unique here (fixed roles plus content-addressed
+    // outputs), so the sort is a total order and stable across retries.
+    sources.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
     sources
 }
 
@@ -1814,6 +1869,95 @@ mod tests {
         assert_eq!(backoff_ms(2), BASE_BACKOFF_MS * 2);
         assert!(backoff_ms(3) > backoff_ms(2));
         assert_eq!(backoff_ms(100), MAX_BACKOFF_MS);
+    }
+
+    #[test]
+    fn chunk_routing_rejects_unknown_repeated_and_duplicated_logical_paths() {
+        // Endpoint parsing succeeds but nothing listens on port 1; every failure below is raised
+        // before any network I/O, proving the path checks front-run the chunk PUTs.
+        let client = PatwariClient::connect("http://127.0.0.1:1", "client").unwrap();
+        let source = |path: &str, bytes: &[u8]| ArtifactSource {
+            logical_path: path.to_owned(),
+            media_type: None,
+            bytes: bytes.to_vec(),
+        };
+        let entry = |path: &str| ArtifactStatus {
+            logical_path: path.to_owned(),
+            artifact_index: 0,
+            missing_chunk_indexes: Vec::new(),
+        };
+        let session = |entries: Vec<ArtifactStatus>| UploadSession {
+            upload_id: "upl-00000000".to_owned(),
+            capture_id: "capture".to_owned(),
+            chunk_size_bytes: 8,
+            artifacts: entries,
+        };
+        let artifacts = prepare_artifacts(vec![
+            source("transcript.jsonl", b"{}\n"),
+            source("summary.md", b"# s\n"),
+        ]);
+
+        // A server path that is not part of this snapshot is a protocol error naming the path.
+        let error = client
+            .upload_missing_chunks(&session(vec![entry("outputs/feed")]), &artifacts)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PatwariError::Protocol(message) if message.contains("outputs/feed")),
+            "got {error:?}"
+        );
+
+        // A repeated server path is a protocol error naming the path.
+        let error = client
+            .upload_missing_chunks(
+                &session(vec![entry("summary.md"), entry("summary.md")]),
+                &artifacts,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, PatwariError::Protocol(message)
+                if message.contains("repeated") && message.contains("summary.md")),
+            "got {error:?}"
+        );
+
+        // A duplicated local path is rejected up front, before any server entry is consulted.
+        let duplicated =
+            prepare_artifacts(vec![source("summary.md", b"a"), source("summary.md", b"b")]);
+        let error = client
+            .upload_missing_chunks(&session(Vec::new()), &duplicated)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PatwariError::Protocol(message) if message.contains("summary.md")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn assembled_artifact_sources_are_in_canonical_path_order() {
+        // `outputs/…` sorts before the fixed roles; the assembled list is canonical (issue #33).
+        let transcript = format!(
+            "{{\"id\":\"call-1\",\"timestamp\":\"2026-07-25T00:00:00Z\",\"parentId\":\"root\",\
+             \"type\":\"tool.execution_complete\",\"data\":{{\"toolCallId\":\"call-1\",\
+             \"success\":true,\"result\":{{\"content\":\"{}\"}}}}}}\n",
+            "x".repeat(500)
+        )
+        .into_bytes();
+        let sources = assemble_artifact_sources(
+            Some(b"# Summary\n".to_vec()),
+            Some(transcript),
+            SourceKind::Copilot,
+            64,
+        );
+        let paths: Vec<&str> = sources
+            .iter()
+            .map(|source| source.logical_path.as_str())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "assembly order is sorted by logical path");
+        assert!(
+            paths[0].starts_with("outputs/") && paths.contains(&"summary.md"),
+            "the extracted output was assembled and sorts first: {paths:?}"
+        );
     }
 
     #[test]

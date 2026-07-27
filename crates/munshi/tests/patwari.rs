@@ -195,17 +195,18 @@ fn an_oversized_output_becomes_a_content_addressed_artifact() {
         SourceKind::Copilot,
         threshold,
     );
-    // Set v1 with one extraction: summary.md, transcript.jsonl, then one outputs/<sha256>.
+    // Set v1 with one extraction, in canonical (path-sorted) order: the outputs/<sha256> artifact
+    // sorts before the fixed roles (issue #33).
     let paths: Vec<&str> = sources.iter().map(|s| s.logical_path.as_str()).collect();
     assert_eq!(sources.len(), 3);
-    assert_eq!(paths[0], "summary.md");
-    assert_eq!(paths[1], "transcript.jsonl");
-    let stem = paths[2]
+    assert_eq!(paths[1], "summary.md");
+    assert_eq!(paths[2], "transcript.jsonl");
+    let stem = paths[0]
         .strip_prefix("outputs/")
         .expect("extracted output uses the outputs/ role path")
         .to_owned();
     // The logical path is the bare lowercase hex sha256 of the extracted content itself.
-    assert_eq!(sha256_hex(&sources[2].bytes), stem);
+    assert_eq!(sha256_hex(&sources[0].bytes), stem);
 
     // The extraction flows into the manifest with a matching prefixed original digest.
     let artifacts = prepare_artifacts(sources);
@@ -218,10 +219,10 @@ fn an_oversized_output_becomes_a_content_addressed_artifact() {
         .collect();
     assert_eq!(
         listed,
-        vec!["summary.md", "transcript.jsonl", &format!("outputs/{stem}")]
+        vec![&format!("outputs/{stem}"), "summary.md", "transcript.jsonl"]
     );
     assert_eq!(
-        manifest["artifacts"][2]["original_sha256"]
+        manifest["artifacts"][0]["original_sha256"]
             .as_str()
             .unwrap(),
         format!("sha256:{stem}")
@@ -247,7 +248,8 @@ fn multiple_oversized_outputs_are_hash_sorted_with_correct_digests() {
         assert_eq!(sha256_hex(&output.content), output.sha256);
     }
 
-    // The assembled set keeps the fixed roles first, then the same hash-sorted outputs.
+    // The assembled set is in canonical path order: the hash-sorted outputs (which sort below
+    // "summary.md") first, then the fixed roles (issue #33).
     let sources = assemble_artifact_sources(
         Some(b"# Summary\n".to_vec()),
         Some(transcript),
@@ -261,10 +263,10 @@ fn multiple_oversized_outputs_are_hash_sorted_with_correct_digests() {
     assert_eq!(
         paths,
         vec![
-            "summary.md".to_owned(),
-            "transcript.jsonl".to_owned(),
             format!("outputs/{}", outputs[0].sha256),
             format!("outputs/{}", outputs[1].sha256),
+            "summary.md".to_owned(),
+            "transcript.jsonl".to_owned(),
         ]
     );
 }
@@ -386,6 +388,87 @@ fn retry_reuses_capture_with_extracted_outputs_and_identical_manifest() {
     assert_eq!(first.snapshot_id, again.snapshot_id);
     assert_eq!(server.upload_count(), 1, "no duplicate upload was created");
     assert_eq!(server.create_status_codes(), vec![201, 200]);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk routing by logical path against a canonicalizing server (issue #33)
+// ---------------------------------------------------------------------------
+
+/// The live failure of issue #33: a snapshot with extracted outputs assembles a local artifact
+/// list whose order once differed from Patwari's canonical (path-sorted) `artifact_index` space,
+/// so a positional client PUT the wrong artifact's bytes and the server 422'd on the negotiated
+/// chunk layout. The fake now canonicalizes exactly like the real server; this round-trip proves
+/// every chunk of every artifact lands and the receipt completes.
+#[test]
+fn a_snapshot_with_extracted_outputs_uploads_every_chunk_and_completes() {
+    let threshold = 64;
+    let transcript = format!(
+        "{}\n{}\n",
+        copilot_user("run the build"),
+        copilot_tool_complete("call-1", &"x".repeat(500)),
+    )
+    .into_bytes();
+    let sources = assemble_artifact_sources(
+        Some(b"# Summary\n\nA body that says enough to be worth archiving.\n".to_vec()),
+        Some(transcript),
+        SourceKind::Copilot,
+        threshold,
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.logical_path.starts_with("outputs/")),
+        "the snapshot carries an extracted output"
+    );
+    let artifacts = prepare_artifacts(sources);
+    let manifest = manifest_for(&artifacts, "sess-outputs");
+    let expected_chunks: u64 = artifacts
+        .iter()
+        .map(|artifact| (artifact.stored_bytes.len() as u64).div_ceil(CHUNK_SIZE))
+        .sum();
+
+    let server = FakePatwari::start();
+    let client = PatwariClient::connect(&server.endpoint(), CLIENT_ID).unwrap();
+    let receipt = client
+        .upload_snapshot("capture-outputs", &manifest, &artifacts, None, |_| {})
+        .expect("a snapshot with extracted outputs uploads cleanly");
+    assert!(receipt.snapshot_id.starts_with("snap-"));
+    assert_eq!(receipt.artifact_count, artifacts.len() as u32);
+    assert_eq!(
+        server.accepted_chunk_count() as u64,
+        expected_chunks,
+        "every chunk of every artifact landed"
+    );
+    assert_eq!(server.completed_count(), 1, "the receipt completed");
+}
+
+/// Path matching is the load-bearing fix, not order agreement: the client hands its artifacts over
+/// in a deliberately non-canonical order with distinct sizes, and the fake (like the real Patwari)
+/// indexes them path-sorted. Positional routing would trip the fake's negotiated chunk-length
+/// check — the live 422 of issue #33 — while path-based routing uploads each artifact's own bytes.
+#[test]
+fn chunk_routing_matches_server_artifacts_by_path_not_position() {
+    let artifacts = prepare_artifacts(vec![
+        artifact(
+            "transcript.jsonl",
+            b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n{\"type\":\"tool\"}\n",
+        ),
+        artifact("summary.md", b"# Short\n"),
+    ]);
+    let manifest = manifest_for(&artifacts, "sess-unordered");
+    let expected_chunks: u64 = artifacts
+        .iter()
+        .map(|artifact| (artifact.stored_bytes.len() as u64).div_ceil(CHUNK_SIZE))
+        .sum();
+
+    let server = FakePatwari::start();
+    let client = PatwariClient::connect(&server.endpoint(), CLIENT_ID).unwrap();
+    let receipt = client
+        .upload_snapshot("capture-unordered", &manifest, &artifacts, None, |_| {})
+        .expect("a non-canonical local order still routes every chunk to the right artifact");
+    assert!(receipt.snapshot_id.starts_with("snap-"));
+    assert_eq!(server.accepted_chunk_count() as u64, expected_chunks);
+    assert_eq!(server.completed_count(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -911,12 +994,15 @@ struct Upload {
     capture_id: String,
     manifest_sig: u64,
     session_id: String,
-    /// Accepted chunk indexes per artifact index.
+    /// Accepted chunk indexes per artifact index, in the server's canonical (path-sorted) order —
+    /// like the real Patwari, NOT the manifest's order (issue #33).
     artifacts: Vec<AcceptedArtifact>,
     completed: bool,
 }
 
 struct AcceptedArtifact {
+    logical_path: String,
+    stored_size: u64,
     chunk_count: u64,
     accepted: Vec<u64>,
 }
@@ -1084,7 +1170,7 @@ fn create_upload(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
         return json_response(200, &response);
     }
 
-    let artifacts = manifest["artifacts"]
+    let mut artifacts: Vec<AcceptedArtifact> = manifest["artifacts"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -1092,11 +1178,19 @@ fn create_upload(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
         .map(|artifact| {
             let stored = artifact["stored_size_bytes"].as_u64().unwrap_or(0);
             AcceptedArtifact {
+                logical_path: artifact["logical_path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                stored_size: stored,
                 chunk_count: stored.div_ceil(CHUNK_SIZE),
                 accepted: Vec::new(),
             }
         })
         .collect();
+    // Canonicalize like the real Patwari: `artifact_index` is assigned over the artifacts sorted by
+    // logical path, whatever order the manifest listed them in (issue #33).
+    artifacts.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
     let index = state.uploads.len();
     state.uploads.push(Upload {
         capture_id: capture_id.clone(),
@@ -1173,11 +1267,30 @@ fn put_chunk(
             &json!({ "error": { "code": "not_found", "message": "x" } }),
         );
     };
-    let already = state.uploads[index]
-        .artifacts
-        .get(artifact_index as usize)
-        .map(|artifact| artifact.accepted.contains(&chunk_index))
-        .unwrap_or(false);
+    let Some(artifact) = state.uploads[index].artifacts.get(artifact_index as usize) else {
+        return json_response(
+            404,
+            &json!({ "error": { "code": "not_found", "message": "unknown artifact index" } }),
+        );
+    };
+    // Enforce the negotiated chunk layout like the real server: every chunk of this (canonically
+    // indexed) artifact is CHUNK_SIZE bytes except a smaller final chunk. A client that routes
+    // another artifact's bytes here — the positional-mapping bug of issue #33 — is rejected.
+    let expected_len = if chunk_index + 1 == artifact.chunk_count {
+        artifact.stored_size - (artifact.chunk_count - 1) * CHUNK_SIZE
+    } else {
+        CHUNK_SIZE
+    };
+    if chunk_index >= artifact.chunk_count || request.body.len() as u64 != expected_len {
+        return json_response(
+            422,
+            &json!({ "error": {
+                "code": "chunk_length_mismatch",
+                "message": "chunk length does not match the negotiated chunk layout",
+            } }),
+        );
+    }
+    let already = artifact.accepted.contains(&chunk_index);
     if !already {
         // A budget of accepted new chunks models an interruption after N chunks.
         if let Some(budget) = state.accept_budget {
@@ -1267,6 +1380,7 @@ fn upload_status_value(index: usize, state: &FakeState) -> Value {
                 .filter(|chunk| !artifact.accepted.contains(chunk))
                 .collect();
             json!({
+                "logical_path": artifact.logical_path,
                 "artifact_index": artifact_index,
                 "chunk_count": artifact.chunk_count,
                 "missing_chunk_indexes": missing,
