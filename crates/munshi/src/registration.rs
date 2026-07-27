@@ -436,9 +436,11 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
             Ok::<_, RegistrationError>(settings_path)
         })
         .transpose()?;
-    // Re-registration must not silently re-enable projects an explicit `project disable` excluded.
-    let disabled_projects = existing_disabled_projects(&config_path)?;
-    let stored = StoredConfig::from_register(config, disabled_projects)?;
+    // Re-registration must not silently re-enable projects an explicit `project disable` excluded,
+    // nor reset the delivery and archive-upload sections their own commands configured (issue #31):
+    // the existing configuration is carried into the freshly written one.
+    let existing = existing_stored_config(&config_path)?;
+    let stored = StoredConfig::from_register(config, existing)?;
     if config.archive_git_history {
         ensure_archive_repository(&config.output_directory)
             .map_err(RegistrationError::ArchiveGit)?;
@@ -463,14 +465,19 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     Ok(())
 }
 
-fn existing_disabled_projects(config_path: &Path) -> Result<Vec<String>, RegistrationError> {
+/// The existing Munshi-owned configuration at `config_path`, when one is present. Re-registration
+/// reads it so sections owned by other commands survive a config rewrite: the explicit
+/// disabled-projects list, the delivery sink and its enablement, and the archive-upload section
+/// with the persistent client UUID (issue #31). The file was already validated as recognized by
+/// `validate_owned_file` under the registration lock before this runs.
+fn existing_stored_config(config_path: &Path) -> Result<Option<StoredConfig>, RegistrationError> {
     if !config_path.exists() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let bytes = fs::read(config_path).map_err(RegistrationError::Io)?;
-    let config: StoredConfig =
-        serde_json::from_slice(&bytes).map_err(|_| RegistrationError::MalformedOwnedFile)?;
-    Ok(config.policy.disabled_projects)
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| RegistrationError::MalformedOwnedFile)
 }
 
 /// Removes Munshi's hook installations and active configuration. Hook locations come from the
@@ -535,8 +542,26 @@ pub fn unregister(
 impl StoredConfig {
     fn from_register(
         config: &RegisterConfig,
-        disabled_projects: Vec<String>,
+        existing: Option<StoredConfig>,
     ) -> Result<Self, RegistrationError> {
+        // Carry sections owned by other commands forward from the existing configuration verbatim
+        // (issue #31): a re-register (e.g. to raise policy budgets) must not silently disable a
+        // configured delivery sink or archive upload, and the persistent Patwari client UUID must
+        // survive because it is the durable identity uploads are keyed under (ADR 0004/0009).
+        let (disabled_projects, remote_delivery, delivery, archive_upload) = match existing {
+            Some(previous) => (
+                previous.policy.disabled_projects,
+                previous.remote_delivery,
+                previous.delivery,
+                previous.archive_upload,
+            ),
+            None => (
+                Vec::new(),
+                false,
+                StoredDelivery::default(),
+                StoredArchiveUpload::default(),
+            ),
+        };
         Ok(Self {
             version: 1,
             summarizer: StoredCommand {
@@ -566,9 +591,9 @@ impl StoredConfig {
                 max_stderr_bytes: config.max_stderr_bytes,
                 max_event_text_bytes: crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES,
             },
-            remote_delivery: false,
-            delivery: StoredDelivery::default(),
-            archive_upload: StoredArchiveUpload::default(),
+            remote_delivery,
+            delivery,
+            archive_upload,
             policy: StoredPolicy {
                 max_calls_per_hour: config.max_calls_per_hour,
                 max_calls_per_day: config.max_calls_per_day,

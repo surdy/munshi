@@ -34,6 +34,67 @@ fn disclosure_requires_explicit_noninteractive_acceptance_and_prompt_is_testable
     assert!(String::from_utf8(output).unwrap().contains("Type I ACCEPT"));
 }
 
+/// Issue #31: re-running `register` (e.g. to raise policy budgets) must not reset the
+/// archive-upload and delivery sections their own commands configured — most critically the
+/// persistent Patwari client UUID, which uploads are durably keyed under.
+#[test]
+fn reregistration_preserves_archive_upload_and_delivery_configuration() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+
+    // Configure and enable archive upload and delivery through their own commands (never by
+    // hand-editing config.json). Neither endpoint is contacted by these commands.
+    let munshi = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&paths.state)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    };
+    munshi(&[
+        "archive-upload",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:9",
+    ]);
+    munshi(&["archive-upload", "enable"]);
+    munshi(&[
+        "delivery",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:10",
+        "--vault",
+        "Vault",
+        "--folder",
+        "Munshi",
+    ]);
+    munshi(&["delivery", "enable"]);
+
+    let config_path = paths.state.join("config.json");
+    let before: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    let client_id = before["archive_upload"]["client_id"]
+        .as_str()
+        .expect("configure minted a persistent client UUID")
+        .to_owned();
+
+    // Re-register with a different unrelated flag: registration-owned settings still update
+    // normally while the carried-forward sections survive verbatim.
+    assert_success(&register_command(&paths, fake("success.sh"), 7_000, true));
+
+    let after: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(after["limits"]["timeout_ms"], 7_000);
+    assert_eq!(after["archive_upload"]["enabled"], true);
+    assert_eq!(after["archive_upload"]["endpoint"], "http://127.0.0.1:9");
+    assert_eq!(after["archive_upload"]["client_id"], client_id.as_str());
+    assert_eq!(after["remote_delivery"], true);
+    assert_eq!(after["delivery"]["endpoint"], "http://127.0.0.1:10");
+    assert_eq!(after["delivery"]["vault"], "Vault");
+    assert_eq!(after["delivery"]["folder"], "Munshi");
+}
+
 #[test]
 fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema() {
     let directory = test_directory();
