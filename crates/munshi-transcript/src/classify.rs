@@ -47,7 +47,9 @@ pub(crate) fn classify(source: crate::Source, object: &Map<String, Value>) -> Cl
 // ---------------------------------------------------------------------------
 
 /// Copilot event types observed in the pinned 1.0.70 envelope that carry no
-/// archive-worthy content (`docs/phase-0-findings.md`).
+/// archive-worthy content (`docs/phase-0-findings.md`), plus the
+/// `session.usage_checkpoint` bookkeeping kind surfaced by archived 1.0.5x
+/// snapshots (issue #34).
 const COPILOT_BOOKKEEPING: &[&str] = &[
     "assistant.turn_end",
     "assistant.turn_start",
@@ -57,6 +59,7 @@ const COPILOT_BOOKKEEPING: &[&str] = &[
     "session.resume",
     "session.shutdown",
     "session.start",
+    "session.usage_checkpoint",
     "system.message",
 ];
 
@@ -260,13 +263,19 @@ fn extract_tool_result_text(value: &Value) -> Option<String> {
 
 /// Claude Code record types known to be metadata/bookkeeping with no archive-worthy
 /// content: the 2.1.44 `summary`/`system` records, the 2.1.205 additions (`ai-title`,
-/// `attachment`, `last-prompt`, `mode`, `queue-operation`), and `file-history-snapshot`.
+/// `attachment`, `last-prompt`, `mode`, `queue-operation`), `file-history-snapshot`,
+/// and the newer session-bookkeeping kinds observed in live archives (issue #30:
+/// `file-history-delta`, `frame-link`, `permission-mode`, `pr-link`).
 const CLAUDE_BOOKKEEPING: &[&str] = &[
     "ai-title",
     "attachment",
+    "file-history-delta",
     "file-history-snapshot",
+    "frame-link",
     "last-prompt",
     "mode",
+    "permission-mode",
+    "pr-link",
     "queue-operation",
     "summary",
     "system",
@@ -646,6 +655,14 @@ mod tests {
             classify_json(Source::Copilot, r#"{"type":"assistant.message","data":"x"}"#),
             Class::Ignored(kind) if kind == "assistant.message"
         ));
+        // Archive-observed bookkeeping kind absent from the pinned 1.0.70 tables (#34).
+        assert!(matches!(
+            classify_json(
+                Source::Copilot,
+                r#"{"type":"session.usage_checkpoint","data":{"tokensUsed":123}}"#
+            ),
+            Class::Ignored(kind) if kind == "session.usage_checkpoint"
+        ));
     }
 
     #[test]
@@ -658,6 +675,23 @@ mod tests {
             classify_json(Source::ClaudeCode, r#"{"type":"totally-new-type"}"#),
             Class::Unknown
         ));
+        // Archive-observed bookkeeping kinds the pinned 2.1.44/2.1.205 schema predates (#30).
+        for json in [
+            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"s"}"#,
+            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"s"}"#,
+            r#"{"type":"pr-link","sessionId":"s"}"#,
+            r#"{"type":"file-history-delta","sessionId":"s"}"#,
+            r#"{"type":"frame-link","sessionId":"s"}"#,
+        ] {
+            let expected = serde_json::from_str::<Value>(json).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(matches!(
+                classify_json(Source::ClaudeCode, json),
+                Class::Ignored(kind) if kind == expected
+            ));
+        }
         // Blank string content is recognized-but-empty, counted nowhere.
         assert!(matches!(
             classify_json(
