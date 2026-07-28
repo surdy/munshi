@@ -73,6 +73,10 @@ const FIXTURES: &[Fixture] = &[
         "claude-code-2.1.205/transcript/0c1a0de0-0000-4000-8000-000000000205.jsonl",
     ),
     well_formed(
+        Source::ClaudeCode,
+        "claude-code-2.1.2xx-bookkeeping/transcript/0c1a0de0-0000-4000-8000-000000000230.jsonl",
+    ),
+    well_formed(
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
     ),
@@ -129,6 +133,10 @@ const FIXTURES: &[Fixture] = &[
     well_formed(
         Source::Copilot,
         "copilot-1.0.70/transcript/synthetic-envelope.jsonl",
+    ),
+    well_formed(
+        Source::Copilot,
+        "copilot-1.0.5x-bookkeeping/55555555-5555-4555-8555-555555555555/events.jsonl",
     ),
 ];
 
@@ -276,6 +284,75 @@ fn claude_bookkeeping_records_classify_as_typed_ignored_not_unknown() {
         .flatten()
         .collect();
     assert_eq!(content_kinds, ["user", "assistant"]);
+}
+
+#[test]
+fn archive_observed_bookkeeping_kinds_classify_as_typed_ignored_not_unknown() {
+    // Issue #30: newer Claude Code session bookkeeping the pinned 2.1.44/2.1.205
+    // schema predates.
+    let items = stream_fixture(
+        Source::ClaudeCode,
+        "claude-code-2.1.2xx-bookkeeping/transcript/0c1a0de0-0000-4000-8000-000000000230.jsonl",
+    );
+    let ignored_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Ignored { kind },
+                ..
+            }) => Some(kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ignored_kinds,
+        [
+            "permission-mode",
+            "permission-mode",
+            "pr-link",
+            "file-history-delta",
+            "frame-link",
+        ]
+    );
+    let content_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Content { events },
+                ..
+            }) => Some(events.iter().map(Event::kind).collect::<Vec<_>>()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(content_kinds, ["user", "assistant"]);
+
+    // Issue #34: the Copilot `session.usage_checkpoint` bookkeeping kind absent from
+    // the pinned 1.0.70 event tables.
+    let items = stream_fixture(
+        Source::Copilot,
+        "copilot-1.0.5x-bookkeeping/55555555-5555-4555-8555-555555555555/events.jsonl",
+    );
+    let ignored_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Ignored { kind },
+                ..
+            }) => Some(kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ignored_kinds,
+        [
+            "session.start",
+            "session.usage_checkpoint",
+            "session.shutdown"
+        ]
+    );
+    let summary = SessionSummary::summarize(&items);
+    assert_eq!(summary.ignored_events, 3);
 }
 
 #[test]
