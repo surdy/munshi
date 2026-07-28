@@ -5,7 +5,11 @@ to summarize it. This document records the version-pinned assumptions, normalize
 supported lifecycles for the Copilot, Claude Code, and Codex adapters, and the private-format risks
 that each one carries.
 
-The adapter boundary is [`SourceKind`](../crates/munshi/src/source.rs). Selecting a source
+Transcript-record classification lives in the [`munshi-transcript`](../crates/munshi-transcript)
+crate (ADR 0011): a streaming, lossless parser whose typed events, deliberately-ignored bookkeeping
+kinds, and `Unknown` fallthrough are the authority this document describes. The `munshi` crate keeps
+the operational adapter boundary — [`SourceKind`](../crates/munshi/src/source.rs), which bridges to
+the crate's `Source` — and folds the event stream into `NormalizedSession`. Selecting a source
 (`munshi archive --source <copilot|claude-code|codex>`, or `StateStore::open_for_source` /
 `run_archive_worker_for_source` for the shared state pipeline) is independent from selecting a
 summarizer: a Copilot summarizer can archive a Claude Code or Codex session and vice versa.
@@ -152,7 +156,8 @@ in `openai/codex` (`codex-rs/protocol/src/protocol.rs` and `models.rs`).
 | `response_item` → `function_call_output` / `custom_tool_call_output` | `tool` event (string or `content_items` output) |
 | `response_item` → `local_shell_call` | `tool` event |
 | `response_item` → `reasoning` | ignored (internal model output) |
-| `session_meta`, `turn_context`, `compacted`, `event_msg`, world-state | ignored metadata |
+| `session_meta`, `turn_context`, `compacted`, `event_msg` | ignored metadata (typed) |
+| any other top-level or `response_item` kind | `Unknown` — reported by `verify-archive-parse` as an interpretation gap, never silently ignored |
 
 **Lifecycles.**
 

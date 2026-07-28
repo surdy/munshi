@@ -275,6 +275,25 @@ download cap for a deliberately large artifact). Full design and rationale:
 [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and
 [ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md).
 
+### `munshi verify-archive-parse`
+
+The read-time acceptance check ([ADR 0011](adr/0011-interpret-transcripts-at-read-time-through-a-shared-streaming-crate.md)/
+[0012](adr/0012-defer-the-analysis-client-until-a-first-consumer-exists.md)): walks the Patwari
+archive, downloads and hash-verifies each snapshot's transcript, stream-parses it with the shared
+interpreter, and reports per-session accounting — records seen, share typed, deliberately-ignored
+kinds, `Unknown` kinds with bounded samples, and record errors.
+
+```sh
+munshi verify-archive-parse --all
+munshi verify-archive-parse --session <patwari-session-id>
+```
+
+Exit `0` means every transcript downloaded, verified, and parsed with zero unknowns and zero
+errors; distinct non-zero codes separate findings, verification failures, transport failures, and
+configuration problems (see the module docs' table, and `--json` for the machine report). Run it
+manually after a harness format bump or new-adapter support — Unknown kinds are interpretation
+gaps to type, not noise.
+
 ## Unregistering and cleanup
 
 ```bash

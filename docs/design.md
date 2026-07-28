@@ -809,7 +809,13 @@ munshi summary-delivery retry <session-id> --source <source> --json # retry one 
 its other two harnesses (Gemini, OpenCode), which Munshi does not capture.
 
 Every response carries `schema_version: 1` and a `command` discriminator (see
-["Commands and validation"](#commands-and-validation) above for the full contract). A consumer that
+["Commands and validation"](#commands-and-validation) above for the full contract). The
+compatibility key is `schema_version` plus the field shapes — consumers must not branch on the
+`command` string, which names the invoked subcommand and follows CLI renames: when `delivery`
+became `summary-delivery` (issue #36), the discriminators `delivery-status`/`delivery-history`/
+`delivery-backfill`/`delivery-retry` became `summary-delivery-*` under the same
+`schema_version: 1`, while the `delivery` CLI alias kept invocations working. Madari conforms: it
+invokes via the alias and validates only `schema_version`. A consumer that
 only knows a project directory — the common case before the user has ever run `munshi register`
 there — gets a valid, empty contract rather than an error: `sessions`, `status`, `show`, `retry`, and
 `delivery status` all degrade to `total: 0` / `found: false` / disabled settings instead of failing,
@@ -821,7 +827,8 @@ Madari surfaces, per agent session:
   `archived`, `delivery failed` (`delivery-related`), `failed`, and `disabled` (`disabled-project`)
   states, read from `sessions --json`.
 - A "View summary" action in the agent-session browser, backed by `show --json`.
-- A "Summarize now" / "Retry" action, backed by `retry --json` (and `delivery retry --json` for a
+- A "Summarize now" / "Retry" action, backed by `retry --json` (and `summary-delivery retry
+  --json` — the `delivery` alias remains valid — for a
   delivery-only failure, including a `blocked` delivery — issue #9's versioned delivery blocks
   rather than silently degrading when the Notesmith vault cannot preserve correlated revision
   history, or has unrelated uncommitted changes).
