@@ -1097,6 +1097,167 @@ fn schema_one_markdown_rebuild_forces_a_full_cursor_upgrade() {
     );
 }
 
+/// Issue #39: `hook recover --rebuild-state` used to re-discover unarchived transcripts into
+/// `interrupted` rows with no origin, which no worker path could ever claim — the queue
+/// deadlocked silently. A rebuild on a store whose session was previously processable must
+/// now leave the store in a shape a plain `hook recover` archives without intervention.
+#[test]
+fn rebuild_state_requeues_unarchived_sessions_through_normal_recovery() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("rebuild-requeue-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.write_workspace(SESSION_A);
+    // Previously processable: observed through both hooks, but never archived, so the
+    // rebuild has no archive to restore this session from.
+    harness.queue_direct(SESSION_A, &transcript, 10, 11);
+
+    assert_success(&harness.recover(0, false, true));
+    assert_success(&harness.recover(0, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(harness.archive_path(SESSION_A)).unwrap())
+            .unwrap();
+    assert_eq!(archived.completion_reason, "unknown");
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let hydrated: (String, Option<String>, Option<String>, bool) = connection
+        .query_row(
+            "SELECT lifecycle_state,origin_cwd,transcript_path,active
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(hydrated.0, "archived");
+    assert_eq!(hydrated.1.as_deref(), harness.project.to_str());
+    assert_eq!(
+        hydrated.2.as_deref(),
+        Some(transcript.to_str().unwrap()),
+        "the rebuilt session must keep its recovered transcript"
+    );
+    assert!(!hydrated.3);
+}
+
+/// Issue #39: rows an earlier rebuild left queued in `interrupted` with `active=0`, no
+/// origin, and no activity evidence must be hydrated by a plain recovery sweep — but only
+/// once the transcript has passed the mtime quiet period, so a live session is never
+/// captured.
+#[test]
+fn stuck_unhydrated_sessions_hydrate_after_the_quiet_period_and_archive() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("hydrate-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "STUCK_REQUEST", "stuck answer");
+    harness.write_workspace(SESSION_A);
+    // The exact row shape a pre-fix rebuild left behind on a live store.
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,last_error_category,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                       'interrupted',0,1,'origin-unresolved',1,1)",
+            params![SESSION_A, transcript.to_str().unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Fresh transcript: inside the quiet period the row must be left untouched.
+    assert_success(&harness.recover(600_000, false, false));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let untouched: (String, Option<String>) = connection
+        .query_row(
+            "SELECT lifecycle_state,origin_cwd FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(untouched, ("interrupted".to_owned(), None));
+    drop(connection);
+
+    // Once quiet, the same sweep hydrates the row and the normal worker archives it.
+    set_old_mtime(&transcript);
+    assert_success(&harness.recover(600_000, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let hydrated: (String, Option<String>, Option<i64>, Option<String>) = connection
+        .query_row(
+            "SELECT lifecycle_state,origin_cwd,last_agent_stop_ms,last_error_category
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(hydrated.0, "archived");
+    assert_eq!(hydrated.1.as_deref(), harness.project.to_str());
+    // Activity evidence comes from the transcript mtime set above (tv_sec=1).
+    assert_eq!(hydrated.2, Some(1_000));
+    assert_eq!(hydrated.3, None);
+}
+
+/// Never-drop: a queued session whose origin stays underivable is parked with one visible
+/// diagnostic (no per-sweep spam) and its transcript left alone, then hydrated and archived
+/// as soon as an origin record appears.
+#[test]
+fn unhydratable_sessions_stay_queued_until_an_origin_appears() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("park-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    // No workspace.yaml: the Copilot origin is underivable.
+    let transcript = harness.write_transcript(SESSION_A, "PARKED_REQUEST", "parked answer");
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                       'interrupted',0,1,1,1)",
+            params![SESSION_A, transcript.to_str().unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_success(&harness.recover(0, false, false));
+    assert_success(&harness.recover(0, false, false));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let parked: (String, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT lifecycle_state,origin_cwd,last_error_category
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(parked.0, "interrupted");
+    assert_eq!(parked.1, None);
+    assert_eq!(parked.2.as_deref(), Some("origin-unresolved"));
+    // One diagnostic on the transition, not one per sweep.
+    let diagnostics: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostics
+             WHERE operation='recovery' AND category='origin-unresolved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(diagnostics, 1);
+    drop(connection);
+    assert!(transcript.is_file(), "never-drop: the transcript survives");
+
+    harness.write_workspace(SESSION_A);
+    assert_success(&harness.recover(0, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(harness.archive_path(SESSION_A)).unwrap())
+            .unwrap();
+    assert_eq!(archived.completion_reason, "unknown");
+}
+
 #[test]
 fn stale_issue_three_files_migrate_to_retryable_sqlite_work() {
     let harness = Harness::new();
@@ -1527,6 +1688,25 @@ impl Harness {
             .join(session_id)
             .join("events.jsonl");
         fs::write(path, transcript(session_id, request, answer)).unwrap();
+    }
+
+    /// Stage the version-pinned `session-state/<id>/workspace.yaml` sibling record that
+    /// carries a Copilot session's origin project directory.
+    fn write_workspace(&self, session_id: &str) {
+        let path = self
+            .copilot_home
+            .join("session-state")
+            .join(session_id)
+            .join("workspace.yaml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "id: {session_id}\ncwd: {}\nclient_name: github/cli\n",
+                self.project.display()
+            ),
+        )
+        .unwrap();
     }
 
     fn append_turn(&self, transcript: &Path, request: &str, answer: &str) {

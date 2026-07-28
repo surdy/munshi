@@ -2866,6 +2866,129 @@ impl StateStore {
         transaction.commit()?;
         Ok(reserved)
     }
+
+    /// Known sessions the recovery queue holds but no worker path can ever claim: rows a
+    /// database rebuild (or an origin-less sweep) left in `interrupted` with a transcript but
+    /// no `origin_cwd` (issue #39). `stale_known_sessions` needs `active=1` plus agent-stop
+    /// evidence and `reserve_eligible_workers` needs an origin, so without hydration these
+    /// rows deadlock silently. Spans every source kind, like the other recovery work lists.
+    pub fn unhydrated_recovery_sessions(&self) -> Result<Vec<SessionRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                id,source_session_id,origin_cwd,
+                origin_project_identity,origin_project_component,origin_project_name,
+                origin_repository,origin_branch,transcript_path,lifecycle_state,
+                completion_reason,source_end_reason,current_summary_revision,
+                current_summary_json,current_summary_hash,current_markdown_relative_path,
+                current_markdown_hash,normalizer_version,source_cursor_records,
+                source_cursor_bytes,source_prefix_hash,source_hash,source_bytes,
+                source_started_at,source_updated_at,source_user_requests,
+                source_assistant_messages,source_tool_activities,last_fallback_reason,
+                state_generation,active,last_agent_stop_ms,last_session_end_ms,
+                last_error_category,source_kind
+             FROM sessions
+             WHERE active=0
+               AND lifecycle_state='interrupted'
+               AND transcript_path IS NOT NULL
+               AND origin_cwd IS NULL
+             ORDER BY updated_at_ms,id",
+        )?;
+        statement
+            .query_map([], session_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Hydrates one unhydrated recovery row (see [`unhydrated_recovery_sessions`]) with its
+    /// derived origin and transcript-mtime activity evidence, and reserves the normal archive
+    /// worker for it inside the same transaction — the caller must spawn a worker whenever
+    /// this reports a reservation, exactly as with [`mark_recovery_interrupted`]. The row
+    /// stays `active=0` so the worker's `claim_session` can take it. Returns `false` without
+    /// changes when the session no longer matches the unhydrated shape (a concurrent hook or
+    /// sweep already hydrated or advanced it).
+    ///
+    /// [`unhydrated_recovery_sessions`]: StateStore::unhydrated_recovery_sessions
+    /// [`mark_recovery_interrupted`]: StateStore::mark_recovery_interrupted
+    pub fn hydrate_recovery_origin(
+        &mut self,
+        session_id: &str,
+        origin_cwd: &Path,
+        activity_ms: i64,
+    ) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let database_id = transaction
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE source_kind=?2 AND source_session_id=?1
+                   AND active=0 AND lifecycle_state='interrupted'
+                   AND transcript_path IS NOT NULL AND origin_cwd IS NULL",
+                params![session_id, self.source_kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(database_id) = database_id else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        transaction.execute(
+            "UPDATE sessions SET
+                origin_cwd=?2,
+                last_agent_stop_ms=COALESCE(last_agent_stop_ms,?3),
+                state_generation=state_generation+1,
+                last_error_category=NULL,
+                updated_at_ms=?4
+             WHERE id=?1",
+            params![database_id, path_text(origin_cwd)?, activity_ms, now],
+        )?;
+        let reserved = reserve_worker_in_transaction(&transaction, database_id, now, false)?;
+        transaction.commit()?;
+        Ok(reserved)
+    }
+
+    /// Marks a recovery-held session that cannot be hydrated safely (never-drop: it stays
+    /// queued, nothing on disk is touched). The visible category is written to the row and,
+    /// only on the transition, one diagnostics entry is recorded — repeat sweeps over the
+    /// same parked session stay quiet.
+    pub fn park_recovery_session(
+        &mut self,
+        session_id: &str,
+        category: &str,
+    ) -> Result<(), StateError> {
+        validate_session_id(session_id)?;
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let database_id = transaction
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE source_kind=?2 AND source_session_id=?1
+                   AND (last_error_category IS NULL OR last_error_category<>?3)",
+                params![session_id, self.source_kind, category],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(database_id) = database_id else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        transaction.execute(
+            "UPDATE sessions SET last_error_category=?2,updated_at_ms=?3 WHERE id=?1",
+            params![database_id, category, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO diagnostics(
+                session_id,operation,category,cause_category,recorded_at_ms
+             ) VALUES (?1,'recovery',?2,NULL,?3)",
+            params![database_id, category, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

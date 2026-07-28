@@ -22,8 +22,8 @@ use crate::render::{
 };
 use crate::source::{
     PreviousSource, SessionReference, SourceError, SourceKind, TranscriptLoadMode,
-    claude_transcript_origin, load_session_update, resolve_session_reference,
-    validate_transcript_envelope,
+    claude_transcript_origin, copilot_workspace_origin, load_session_update,
+    resolve_session_reference, validate_transcript_envelope,
 };
 use crate::state::{
     BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlannedArchive,
@@ -297,6 +297,7 @@ pub fn run_recovery(
     // Read the work lists up front so later per-source mutations don't overlap the borrow.
     let unresolved = state.unresolved_sessions()?;
     let stale = state.stale_known_sessions(cutoff)?;
+    let unhydrated = state.unhydrated_recovery_sessions()?;
 
     let copilot_home = stored.harnesses.copilot_home.as_deref().map(PathBuf::from);
     for session in unresolved {
@@ -356,8 +357,64 @@ pub fn run_recovery(
             reserved_sessions.push((session.source, session.session_id));
         }
     }
+    // Sessions a database rebuild (or an origin-less sweep) queued in `interrupted` without an
+    // origin can never satisfy the worker reservation gates, so the queue would deadlock
+    // silently (issue #39). Hydrate them here — same quiet-period and adapter-envelope gates
+    // as first-time discovery, origin derived the same way first-time discovery derives it —
+    // and hand them to the normal worker spawn path. A session whose origin stays underivable
+    // is parked with a diagnostic, never dropped.
+    let mut hydrated = 0;
+    for session in unhydrated {
+        let Some(path) = session.transcript_path.as_deref() else {
+            continue;
+        };
+        if !source_is_stale_and_supported(
+            session.source,
+            path,
+            cutoff,
+            stored.limits.max_source_bytes,
+        ) {
+            // Inside the quiet period (or unsupported): leave the row untouched for a later
+            // sweep rather than risk capturing a live session.
+            continue;
+        }
+        let origin = match session.source {
+            SourceKind::ClaudeCode => claude_transcript_origin(path),
+            SourceKind::Copilot => copilot_workspace_origin(path),
+            SourceKind::Codex => None,
+        }
+        .filter(|origin| origin.is_dir());
+        let store = recovery_store(
+            &mut state,
+            &mut source_stores,
+            state_directory,
+            session.source,
+        )?;
+        let Some(origin) = origin else {
+            store.park_recovery_session(&session.session_id, "origin-unresolved")?;
+            continue;
+        };
+        if hydrated >= RECOVERY_SCAN_LIMIT {
+            continue;
+        }
+        let metadata = fs::metadata(path)?;
+        let activity_ms = metadata
+            .mtime()
+            .saturating_mul(1_000)
+            .saturating_add(metadata.mtime_nsec() / 1_000_000);
+        if store.hydrate_recovery_origin(&session.session_id, &origin, activity_ms)? {
+            reserved_sessions.push((session.source, session.session_id));
+        }
+        hydrated += 1;
+    }
     if let Some(home) = copilot_home.as_deref() {
-        discover_unknown_sessions(&mut state, home, cutoff, stored.limits.max_source_bytes)?;
+        let swept =
+            discover_unknown_sessions(&mut state, home, cutoff, stored.limits.max_source_bytes)?;
+        reserved_sessions.extend(
+            swept
+                .into_iter()
+                .map(|session_id| (SourceKind::Copilot, session_id)),
+        );
     }
     if let Some(home) = stored.harnesses.claude_home.as_deref() {
         let projects = Path::new(home).join("projects");
@@ -1231,15 +1288,23 @@ fn resolve_fallback_transcript(
     Ok(resolved.events_path)
 }
 
+/// Recovery sweep of the Copilot `session-state` directory for sessions whose hooks never
+/// fired. The origin project directory comes from the session's own `workspace.yaml` (see
+/// [`copilot_workspace_origin`]) — the transcript itself declares none — so swept sessions
+/// can be reserved and archived like the Claude sweep's; a session without a resolvable
+/// origin is still recorded (never dropped) and parked as origin-unresolved until an origin
+/// appears. Like `mark_recovery_interrupted`'s contract, the caller must spawn a worker for
+/// every session ID this returns.
 fn discover_unknown_sessions(
     state: &mut StateStore,
     copilot_home: &Path,
     cutoff_ms: i64,
     max_source_bytes: usize,
-) -> Result<(), HookWorkerError> {
+) -> Result<Vec<String>, HookWorkerError> {
+    let mut reserved = Vec::new();
     let session_state = copilot_home.join("session-state");
     if !session_state.is_dir() {
-        return Ok(());
+        return Ok(reserved);
     }
     let mut inspected = 0;
     for entry in fs::read_dir(session_state)? {
@@ -1280,11 +1345,19 @@ fn discover_unknown_sessions(
             metadata.mtime(),
             metadata.mtime_nsec()
         );
-        let _ =
-            state.mark_recovery_interrupted(&session_id, &resolved.events_path, None, &evidence)?;
+        let origin =
+            copilot_workspace_origin(&resolved.events_path).filter(|origin| origin.is_dir());
+        if state.mark_recovery_interrupted(
+            &session_id,
+            &resolved.events_path,
+            origin.as_deref(),
+            &evidence,
+        )? {
+            reserved.push(session_id);
+        }
         inspected += 1;
     }
-    Ok(())
+    Ok(reserved)
 }
 
 /// Recovery sweep of `~/.claude/projects` for sessions whose hooks never fired (force-kill emits

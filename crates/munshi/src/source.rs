@@ -644,6 +644,42 @@ pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Bounded, privacy-safe read of a Copilot session's origin project directory: the top-level
+/// `cwd` scalar of the `workspace.yaml` beside the session's `events.jsonl` in the
+/// version-pinned `session-state/<id>/` layout (observed on installed Copilot CLI 1.0.7x,
+/// where every session directory carries one). Copilot transcripts themselves declare no
+/// origin, so this sibling record is the only origin evidence once the hook-provided `cwd`
+/// is gone — it is what lets recovery hydrate rebuilt or swept sessions instead of parking
+/// them as origin-unresolved. Read discipline mirrors [`claude_transcript_origin`]: symlink
+/// rejection, a small size cap, a bounded number of leading lines, and only the pinned key
+/// is interpreted — no other workspace content is read. A missing file, foreign layout, or
+/// non-absolute value yields `None` rather than a guess.
+pub fn copilot_workspace_origin(events_path: &Path) -> Option<PathBuf> {
+    let workspace = events_path.parent()?.join("workspace.yaml");
+    let metadata = fs::symlink_metadata(&workspace).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return None;
+    }
+    let contents = fs::read_to_string(&workspace).ok()?;
+    for line in contents.lines().take(64) {
+        let Some(value) = line.strip_prefix("cwd:") else {
+            continue;
+        };
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|inner| inner.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        return Path::new(value).is_absolute().then(|| PathBuf::from(value));
+    }
+    None
+}
+
 /// Validates that the first meaningful record of `path` matches `source`'s version-pinned
 /// envelope. The structural predicate is [`munshi_transcript::envelope_matches`] (ADR 0011,
 /// issue #27); this wrapper keeps only the I/O discipline — symlink rejection, the bounded
