@@ -93,6 +93,41 @@ fn claude_transcript_origin_skips_leading_bookkeeping_records() {
 }
 
 #[test]
+fn copilot_workspace_origin_reads_only_the_pinned_cwd_key() {
+    let directory = test_directory();
+    let session = directory.path().join("session-state/copilot-origin");
+    fs::create_dir_all(&session).unwrap();
+    let events = session.join("events.jsonl");
+    fs::write(&events, b"").unwrap();
+
+    // No workspace.yaml yields no origin rather than a guess.
+    assert_eq!(munshi::copilot_workspace_origin(&events), None);
+
+    let workspace = session.join("workspace.yaml");
+    fs::write(
+        &workspace,
+        "id: copilot-origin\ncwd: /work/demo\nclient_name: github/cli\n",
+    )
+    .unwrap();
+    assert_eq!(
+        munshi::copilot_workspace_origin(&events),
+        Some(PathBuf::from("/work/demo"))
+    );
+
+    // Quoted scalars are unwrapped; non-absolute values are rejected.
+    fs::write(&workspace, "cwd: \"/work/quoted\"\n").unwrap();
+    assert_eq!(
+        munshi::copilot_workspace_origin(&events),
+        Some(PathBuf::from("/work/quoted"))
+    );
+    fs::write(&workspace, "cwd: relative/path\n").unwrap();
+    assert_eq!(munshi::copilot_workspace_origin(&events), None);
+    // Nested or foreign keys never match the pinned top-level key.
+    fs::write(&workspace, "meta:\n  cwd: /work/nested\n").unwrap();
+    assert_eq!(munshi::copilot_workspace_origin(&events), None);
+}
+
+#[test]
 fn codex_normal_normalizes_to_the_shared_model() {
     let session = load_fixture(
         SourceKind::Codex,

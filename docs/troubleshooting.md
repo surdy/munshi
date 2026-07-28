@@ -33,7 +33,7 @@ of named checks, each `ok`, `warning`, or `error`. The ones worth knowing:
 
 | Check | Failing means |
 | --- | --- |
-| `config-file` / `config-version` | `config.json` missing, unreadable, or the wrong schema version. Re-run `munshi register`. |
+| `config-file` / `config-version` | `config.json` missing, unreadable, or the wrong schema version (current: 2; a version-1 file loads fine and auto-migrates on the next configuration load — see [`configuration.md`](configuration.md)). Otherwise re-run `munshi register`. |
 | `state-directory-match` | `config.json`'s recorded state directory doesn't match the `--state-dir`/`$MUNSHI_HOME` this command is using — usually a copied config or wrong `--state-dir`. |
 | `transcript-disclosure` | Registration never completed acceptance of the disclosure. Re-register with `--accept-transcript-processing`. |
 | `summarizer-path` / `output-path` | The configured summarizer executable or output directory isn't an absolute path. Re-register with absolute paths. |
@@ -210,12 +210,14 @@ exists, even if no snapshot reached Patwari. Check in order:
 
 1. `munshi archive-upload status` (add `--json` for the machine contract) — if upload is not
    configured or not enabled, run `munshi archive-upload configure --endpoint <url>` then
-   `munshi archive-upload enable`. Enabling does not retroactively upload; the next revision (or a
-   retry, below) does.
+   `munshi archive-upload enable`. Enabling does not retroactively upload; run
+   `munshi archive-upload backfill` to upload the archived sessions that accumulated while upload
+   was off.
 2. If the status shows a failed upload, the server was likely unreachable; failed uploads retry
    with backoff on later hooks and `munshi hook recover`, or immediately via
    `munshi archive-upload retry <session-id>` (`--all` for every eligible session, `--force` to
-   bypass backoff and revive dead-lettered uploads).
+   bypass backoff and revive dead-lettered uploads). A session the status does not list at all was
+   archived before upload was enabled — that is what `backfill` scans for.
 3. A `transcript-changed` failure means the live transcript gained events between archival and
    upload; the next revision re-archives and uploads the grown transcript, converging on its own.
 4. `munshi retrieve <sha256>` failing with "not found" for a hash a summary references usually

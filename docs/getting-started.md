@@ -175,5 +175,6 @@ default) yourself if you also want the operational state gone.
 
 - [`docs/summarizers.md`](summarizers.md) — the summarizer contract, if you want to write your own.
 - [`docs/user-guide.md`](user-guide.md) — day-to-day operation: disabling projects, retries, budgets.
+- [`docs/configuration.md`](configuration.md) — every `config.json` setting in one place.
 - [`docs/troubleshooting.md`](troubleshooting.md) — what to check when a session doesn't archive.
 - [`docs/automatic-archive.md`](automatic-archive.md) — full detail on hooks, recovery, and state.

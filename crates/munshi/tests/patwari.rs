@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -193,17 +195,18 @@ fn an_oversized_output_becomes_a_content_addressed_artifact() {
         SourceKind::Copilot,
         threshold,
     );
-    // Set v1 with one extraction: summary.md, transcript.jsonl, then one outputs/<sha256>.
+    // Set v1 with one extraction, in canonical (path-sorted) order: the outputs/<sha256> artifact
+    // sorts before the fixed roles (issue #33).
     let paths: Vec<&str> = sources.iter().map(|s| s.logical_path.as_str()).collect();
     assert_eq!(sources.len(), 3);
-    assert_eq!(paths[0], "summary.md");
-    assert_eq!(paths[1], "transcript.jsonl");
-    let stem = paths[2]
+    assert_eq!(paths[1], "summary.md");
+    assert_eq!(paths[2], "transcript.jsonl");
+    let stem = paths[0]
         .strip_prefix("outputs/")
         .expect("extracted output uses the outputs/ role path")
         .to_owned();
     // The logical path is the bare lowercase hex sha256 of the extracted content itself.
-    assert_eq!(sha256_hex(&sources[2].bytes), stem);
+    assert_eq!(sha256_hex(&sources[0].bytes), stem);
 
     // The extraction flows into the manifest with a matching prefixed original digest.
     let artifacts = prepare_artifacts(sources);
@@ -216,10 +219,10 @@ fn an_oversized_output_becomes_a_content_addressed_artifact() {
         .collect();
     assert_eq!(
         listed,
-        vec!["summary.md", "transcript.jsonl", &format!("outputs/{stem}")]
+        vec![&format!("outputs/{stem}"), "summary.md", "transcript.jsonl"]
     );
     assert_eq!(
-        manifest["artifacts"][2]["original_sha256"]
+        manifest["artifacts"][0]["original_sha256"]
             .as_str()
             .unwrap(),
         format!("sha256:{stem}")
@@ -245,7 +248,8 @@ fn multiple_oversized_outputs_are_hash_sorted_with_correct_digests() {
         assert_eq!(sha256_hex(&output.content), output.sha256);
     }
 
-    // The assembled set keeps the fixed roles first, then the same hash-sorted outputs.
+    // The assembled set is in canonical path order: the hash-sorted outputs (which sort below
+    // "summary.md") first, then the fixed roles (issue #33).
     let sources = assemble_artifact_sources(
         Some(b"# Summary\n".to_vec()),
         Some(transcript),
@@ -259,10 +263,10 @@ fn multiple_oversized_outputs_are_hash_sorted_with_correct_digests() {
     assert_eq!(
         paths,
         vec![
-            "summary.md".to_owned(),
-            "transcript.jsonl".to_owned(),
             format!("outputs/{}", outputs[0].sha256),
             format!("outputs/{}", outputs[1].sha256),
+            "summary.md".to_owned(),
+            "transcript.jsonl".to_owned(),
         ]
     );
 }
@@ -387,6 +391,87 @@ fn retry_reuses_capture_with_extracted_outputs_and_identical_manifest() {
 }
 
 // ---------------------------------------------------------------------------
+// Chunk routing by logical path against a canonicalizing server (issue #33)
+// ---------------------------------------------------------------------------
+
+/// The live failure of issue #33: a snapshot with extracted outputs assembles a local artifact
+/// list whose order once differed from Patwari's canonical (path-sorted) `artifact_index` space,
+/// so a positional client PUT the wrong artifact's bytes and the server 422'd on the negotiated
+/// chunk layout. The fake now canonicalizes exactly like the real server; this round-trip proves
+/// every chunk of every artifact lands and the receipt completes.
+#[test]
+fn a_snapshot_with_extracted_outputs_uploads_every_chunk_and_completes() {
+    let threshold = 64;
+    let transcript = format!(
+        "{}\n{}\n",
+        copilot_user("run the build"),
+        copilot_tool_complete("call-1", &"x".repeat(500)),
+    )
+    .into_bytes();
+    let sources = assemble_artifact_sources(
+        Some(b"# Summary\n\nA body that says enough to be worth archiving.\n".to_vec()),
+        Some(transcript),
+        SourceKind::Copilot,
+        threshold,
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.logical_path.starts_with("outputs/")),
+        "the snapshot carries an extracted output"
+    );
+    let artifacts = prepare_artifacts(sources);
+    let manifest = manifest_for(&artifacts, "sess-outputs");
+    let expected_chunks: u64 = artifacts
+        .iter()
+        .map(|artifact| (artifact.stored_bytes.len() as u64).div_ceil(CHUNK_SIZE))
+        .sum();
+
+    let server = FakePatwari::start();
+    let client = PatwariClient::connect(&server.endpoint(), CLIENT_ID).unwrap();
+    let receipt = client
+        .upload_snapshot("capture-outputs", &manifest, &artifacts, None, |_| {})
+        .expect("a snapshot with extracted outputs uploads cleanly");
+    assert!(receipt.snapshot_id.starts_with("snap-"));
+    assert_eq!(receipt.artifact_count, artifacts.len() as u32);
+    assert_eq!(
+        server.accepted_chunk_count() as u64,
+        expected_chunks,
+        "every chunk of every artifact landed"
+    );
+    assert_eq!(server.completed_count(), 1, "the receipt completed");
+}
+
+/// Path matching is the load-bearing fix, not order agreement: the client hands its artifacts over
+/// in a deliberately non-canonical order with distinct sizes, and the fake (like the real Patwari)
+/// indexes them path-sorted. Positional routing would trip the fake's negotiated chunk-length
+/// check — the live 422 of issue #33 — while path-based routing uploads each artifact's own bytes.
+#[test]
+fn chunk_routing_matches_server_artifacts_by_path_not_position() {
+    let artifacts = prepare_artifacts(vec![
+        artifact(
+            "transcript.jsonl",
+            b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n{\"type\":\"tool\"}\n",
+        ),
+        artifact("summary.md", b"# Short\n"),
+    ]);
+    let manifest = manifest_for(&artifacts, "sess-unordered");
+    let expected_chunks: u64 = artifacts
+        .iter()
+        .map(|artifact| (artifact.stored_bytes.len() as u64).div_ceil(CHUNK_SIZE))
+        .sum();
+
+    let server = FakePatwari::start();
+    let client = PatwariClient::connect(&server.endpoint(), CLIENT_ID).unwrap();
+    let receipt = client
+        .upload_snapshot("capture-unordered", &manifest, &artifacts, None, |_| {})
+        .expect("a non-canonical local order still routes every chunk to the right artifact");
+    assert!(receipt.snapshot_id.starts_with("snap-"));
+    assert_eq!(server.accepted_chunk_count() as u64, expected_chunks);
+    assert_eq!(server.completed_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // State-layer capture lifecycle
 // ---------------------------------------------------------------------------
 
@@ -458,6 +543,291 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
         .prepare_archive_capture(session, endpoint, 2, "capture-C", "2026-07-25T02:00:00Z")
         .unwrap();
     assert_eq!(after_success.capture_id, "capture-C");
+}
+
+// ---------------------------------------------------------------------------
+// CLI backfill of sessions archived while upload was disabled (issue #32)
+// ---------------------------------------------------------------------------
+
+const BACKFILL_SESSION: &str = "33333333-3333-4333-8333-333333333333";
+
+/// A session archived while upload was disabled has no `archive_uploads` row, so neither the
+/// post-archive worker nor `archive-upload retry` ever uploads it. `archive-upload backfill` finds
+/// it, runs the normal upload path against the (fake) server, and records the row; a second run
+/// finds no candidates and never contacts the server again.
+#[test]
+fn backfill_uploads_archived_sessions_without_rows_and_is_idempotent() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(BACKFILL_SESSION);
+
+    // Archived with upload disabled: no upload row exists anywhere.
+    let status = harness.archive_upload_status();
+    assert_eq!(status["total"], 0);
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let (report, success) = harness.backfill();
+    assert!(success, "backfill exits zero when nothing fails");
+    assert_eq!(report["command"], "archive-upload-backfill");
+    assert_eq!(report["candidates"], 1);
+    assert_eq!(report["uploaded"], 1);
+    assert_eq!(report["already_uploaded"], 0);
+    assert_eq!(report["skipped"], 0);
+    assert_eq!(report["failed"], 0);
+    assert_eq!(report["items"][0]["session_id"], BACKFILL_SESSION);
+    assert_eq!(report["items"][0]["outcome"]["result"], "uploaded");
+    assert_eq!(server.completed_count(), 1);
+    // The upload registered the durable client UUID minted at configure time.
+    let client_id = harness
+        .configured_client_id()
+        .expect("configure minted a persistent client UUID");
+    assert_eq!(
+        server.registered_client().as_deref(),
+        Some(client_id.as_str()),
+        "backfill uploads under the persistent configured client UUID"
+    );
+
+    // The row is now recorded as uploaded for the configured endpoint.
+    let status = harness.archive_upload_status();
+    assert_eq!(status["total"], 1);
+    assert_eq!(status["uploaded"], 1);
+    assert_eq!(status["items"][0]["session_id"], BACKFILL_SESSION);
+    assert_eq!(status["items"][0]["state"], "uploaded");
+    assert!(status["items"][0]["snapshot_id"].is_string());
+
+    // Idempotent: the recorded row excludes the session, so a second run finds no candidates and
+    // performs no further server work.
+    let (again, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(again["candidates"], 0);
+    assert_eq!(again["uploaded"], 0);
+    assert_eq!(server.completed_count(), 1, "no second upload happened");
+    assert_eq!(server.upload_count(), 1);
+}
+
+/// With upload disabled (or never configured) backfill refuses up front with the same clear
+/// guard message the retry path uses, uploading nothing.
+#[test]
+fn backfill_is_a_guarded_no_op_when_upload_is_disabled() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(BACKFILL_SESSION);
+
+    let output = harness.munshi(&["archive-upload", "backfill"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("archive upload is not enabled"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Nothing was scanned into an upload row.
+    assert_eq!(harness.archive_upload_status()["total"], 0);
+}
+
+/// Drives the real munshi binary: registration, one hook-driven archive lifecycle, and the
+/// `archive-upload` CLI. Mirrors the delivery-test harness, narrowed to what backfill needs.
+struct CliHarness {
+    #[allow(dead_code)]
+    directory: TempDir,
+    copilot_home: PathBuf,
+    state: PathBuf,
+    output: PathBuf,
+    project: PathBuf,
+}
+
+impl CliHarness {
+    fn new() -> Self {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/munshi-patwari-test-artifacts");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("backfill-case-")
+            .tempdir_in(root)
+            .unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        Self {
+            copilot_home: directory.path().join("copilot-home"),
+            state: directory.path().join("munshi-home"),
+            output: directory.path().join("archives"),
+            project,
+            directory,
+        }
+    }
+
+    /// Runs the binary with `args` plus `--state-dir`.
+    fn munshi(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn json(&self, args: &[&str]) -> Value {
+        let output = self.munshi(args);
+        assert!(
+            !output.stdout.is_empty(),
+            "empty stdout; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("valid JSON")
+    }
+
+    fn register(&self) {
+        let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/manual/fake-summarizer/status-contract.sh");
+        std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("register")
+            .arg("--accept-transcript-processing")
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--output-dir")
+            .arg(&self.output)
+            .arg("--summarizer")
+            .arg(summarizer.canonicalize().unwrap())
+            .arg("--timeout-ms")
+            .arg("5000")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_cli_success(&output);
+    }
+
+    fn configure_and_enable(&self, endpoint: &str) {
+        assert_cli_success(&self.munshi(&["archive-upload", "configure", "--endpoint", endpoint]));
+        assert_cli_success(&self.munshi(&["archive-upload", "enable"]));
+    }
+
+    fn configured_client_id(&self) -> Option<String> {
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(self.state.join("config.json")).unwrap())
+                .unwrap();
+        config["archive_upload"]["client_id"]
+            .as_str()
+            .map(ToOwned::to_owned)
+    }
+
+    fn archive_upload_status(&self) -> Value {
+        self.json(&["archive-upload", "status", "--json"])
+    }
+
+    fn backfill(&self) -> (Value, bool) {
+        let output = self.munshi(&["archive-upload", "backfill", "--json"]);
+        assert!(
+            !output.stdout.is_empty(),
+            "empty stdout; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        (report, output.status.success())
+    }
+
+    /// Writes a transcript and drives one full hook-driven archive lifecycle.
+    fn archive_session(&self, session_id: &str) {
+        let transcript = self.write_transcript(session_id);
+        self.hook(
+            "agent-stop",
+            &json!({
+                "sessionId": session_id,
+                "timestamp": 10_000,
+                "cwd": self.project,
+                "transcriptPath": transcript,
+                "stopReason": "end_turn",
+            }),
+        );
+        self.hook(
+            "session-end",
+            &json!({
+                "sessionId": session_id,
+                "timestamp": 10_001,
+                "cwd": self.project,
+                "reason": "complete",
+            }),
+        );
+        assert_cli_success(&self.munshi(&[
+            "hook",
+            "wait",
+            "--session-id",
+            session_id,
+            "--timeout-ms",
+            "10000",
+        ]));
+    }
+
+    fn hook(&self, event: &str, payload: &Value) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("hook")
+            .arg(event)
+            .env("MUNSHI_HOME", &self.state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        assert_cli_success(&child.wait_with_output().unwrap());
+    }
+
+    fn write_transcript(&self, session_id: &str) -> PathBuf {
+        let path = self
+            .copilot_home
+            .join("session-state")
+            .join(session_id)
+            .join("events.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = [
+            json!({
+                "id": "initial-start",
+                "timestamp": "2026-07-12T00:00:00.000Z",
+                "parentId": null,
+                "type": "session.start",
+                "data": {"sessionId": session_id},
+            }),
+            json!({
+                "id": "initial-user",
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "parentId": "initial-start",
+                "type": "user.message",
+                "data": {"content": "please summarize the build"},
+            }),
+            json!({
+                "id": "initial-assistant",
+                "timestamp": "2026-07-12T00:00:02.000Z",
+                "parentId": "initial-user",
+                "type": "assistant.message",
+                "data": {"content": "done", "messageId": "initial-message"},
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, content).unwrap();
+        path.canonicalize().unwrap()
+    }
+}
+
+fn assert_cli_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -624,12 +994,15 @@ struct Upload {
     capture_id: String,
     manifest_sig: u64,
     session_id: String,
-    /// Accepted chunk indexes per artifact index.
+    /// Accepted chunk indexes per artifact index, in the server's canonical (path-sorted) order —
+    /// like the real Patwari, NOT the manifest's order (issue #33).
     artifacts: Vec<AcceptedArtifact>,
     completed: bool,
 }
 
 struct AcceptedArtifact {
+    logical_path: String,
+    stored_size: u64,
     chunk_count: u64,
     accepted: Vec<u64>,
 }
@@ -797,7 +1170,7 @@ fn create_upload(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
         return json_response(200, &response);
     }
 
-    let artifacts = manifest["artifacts"]
+    let mut artifacts: Vec<AcceptedArtifact> = manifest["artifacts"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -805,11 +1178,19 @@ fn create_upload(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
         .map(|artifact| {
             let stored = artifact["stored_size_bytes"].as_u64().unwrap_or(0);
             AcceptedArtifact {
+                logical_path: artifact["logical_path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                stored_size: stored,
                 chunk_count: stored.div_ceil(CHUNK_SIZE),
                 accepted: Vec::new(),
             }
         })
         .collect();
+    // Canonicalize like the real Patwari: `artifact_index` is assigned over the artifacts sorted by
+    // logical path, whatever order the manifest listed them in (issue #33).
+    artifacts.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
     let index = state.uploads.len();
     state.uploads.push(Upload {
         capture_id: capture_id.clone(),
@@ -886,11 +1267,30 @@ fn put_chunk(
             &json!({ "error": { "code": "not_found", "message": "x" } }),
         );
     };
-    let already = state.uploads[index]
-        .artifacts
-        .get(artifact_index as usize)
-        .map(|artifact| artifact.accepted.contains(&chunk_index))
-        .unwrap_or(false);
+    let Some(artifact) = state.uploads[index].artifacts.get(artifact_index as usize) else {
+        return json_response(
+            404,
+            &json!({ "error": { "code": "not_found", "message": "unknown artifact index" } }),
+        );
+    };
+    // Enforce the negotiated chunk layout like the real server: every chunk of this (canonically
+    // indexed) artifact is CHUNK_SIZE bytes except a smaller final chunk. A client that routes
+    // another artifact's bytes here — the positional-mapping bug of issue #33 — is rejected.
+    let expected_len = if chunk_index + 1 == artifact.chunk_count {
+        artifact.stored_size - (artifact.chunk_count - 1) * CHUNK_SIZE
+    } else {
+        CHUNK_SIZE
+    };
+    if chunk_index >= artifact.chunk_count || request.body.len() as u64 != expected_len {
+        return json_response(
+            422,
+            &json!({ "error": {
+                "code": "chunk_length_mismatch",
+                "message": "chunk length does not match the negotiated chunk layout",
+            } }),
+        );
+    }
+    let already = artifact.accepted.contains(&chunk_index);
     if !already {
         // A budget of accepted new chunks models an interruption after N chunks.
         if let Some(budget) = state.accept_budget {
@@ -980,6 +1380,7 @@ fn upload_status_value(index: usize, state: &FakeState) -> Value {
                 .filter(|chunk| !artifact.accepted.contains(chunk))
                 .collect();
             json!({
+                "logical_path": artifact.logical_path,
                 "artifact_index": artifact_index,
                 "chunk_count": artifact.chunk_count,
                 "missing_chunk_indexes": missing,

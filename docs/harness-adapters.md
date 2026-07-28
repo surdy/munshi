@@ -5,7 +5,11 @@ to summarize it. This document records the version-pinned assumptions, normalize
 supported lifecycles for the Copilot, Claude Code, and Codex adapters, and the private-format risks
 that each one carries.
 
-The adapter boundary is [`SourceKind`](../crates/munshi/src/source.rs). Selecting a source
+Transcript-record classification lives in the [`munshi-transcript`](../crates/munshi-transcript)
+crate (ADR 0011): a streaming, lossless parser whose typed events, deliberately-ignored bookkeeping
+kinds, and `Unknown` fallthrough are the authority this document describes. The `munshi` crate keeps
+the operational adapter boundary — [`SourceKind`](../crates/munshi/src/source.rs), which bridges to
+the crate's `Source` — and folds the event stream into `NormalizedSession`. Selecting a source
 (`munshi archive --source <copilot|claude-code|codex>`, or `StateStore::open_for_source` /
 `run_archive_worker_for_source` for the shared state pipeline) is independent from selecting a
 summarizer: a Copilot summarizer can archive a Claude Code or Codex session and vice versa.
@@ -84,7 +88,11 @@ Unchanged from the original adapter. Transcript envelope: `{id, timestamp, paren
 JSONL under `$COPILOT_HOME/session-state/<sessionId>/events.jsonl`. Event types
 `user.message`, `assistant.message`, `tool.execution_start`, `tool.execution_complete`. See
 [phase-0 findings](phase-0-findings.md). The session-state path remains a private,
-existence-validated fallback, not a public contract.
+existence-validated fallback, not a public contract. Archived 1.0.5x snapshots additionally
+carry a `session.usage_checkpoint` bookkeeping record (issue #34); it is typed ignored metadata
+alongside the pinned lifecycle/bookkeeping events (`session.start`, `session.resume`,
+`session.shutdown`, `session.model_change`, `assistant.turn_start`, `assistant.turn_end`,
+`hook.start`, `hook.end`, `system.message`).
 
 ## Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 
@@ -95,7 +103,10 @@ path. These files are a private, undocumented store; the mapping is treated as v
 evidence, not a stable contract. A 2.1.205 live probe
 ([phase-0 Claude Code findings](phase-0-claude-code-findings.md)) confirmed the `user`/`assistant`
 envelope is unchanged and that the record types added since 2.1.44 (`ai-title`, `attachment`,
-`last-prompt`, `mode`, `queue-operation`) degrade to ignored metadata.
+`last-prompt`, `mode`, `queue-operation`) degrade to ignored metadata. Live-archive verification
+(issue #30) surfaced four newer session-bookkeeping kinds the pinned schema predates —
+`permission-mode`, `pr-link`, `file-history-delta` (sibling of `file-history-snapshot`), and
+`frame-link` — all typed ignored metadata as well.
 
 **Envelope.** Each line is a JSON object with a string `type` and (for turns) a `message` object,
 plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `cwd`, `version`,
@@ -110,6 +121,7 @@ plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `c
 | `type: "assistant"`, `text` blocks | `assistant` event |
 | `type: "assistant"`, `tool_use` blocks | `tool` event (`event=tool_use`) |
 | `type: "summary"` (compaction), `type: "system"`, queue bookkeeping | ignored metadata |
+| `type: "permission-mode"` / `"pr-link"` / `"file-history-delta"` / `"frame-link"` (archive-observed session bookkeeping) | ignored metadata |
 
 **Lifecycles.**
 
@@ -144,7 +156,8 @@ in `openai/codex` (`codex-rs/protocol/src/protocol.rs` and `models.rs`).
 | `response_item` → `function_call_output` / `custom_tool_call_output` | `tool` event (string or `content_items` output) |
 | `response_item` → `local_shell_call` | `tool` event |
 | `response_item` → `reasoning` | ignored (internal model output) |
-| `session_meta`, `turn_context`, `compacted`, `event_msg`, world-state | ignored metadata |
+| `session_meta`, `turn_context`, `compacted`, `event_msg` | ignored metadata (typed) |
+| any other top-level or `response_item` kind | `Unknown` — reported by `verify-archive-parse` as an interpretation gap, never silently ignored |
 
 **Lifecycles.**
 
@@ -162,7 +175,9 @@ the shared pipeline and any completion reason is supplied by the caller.
 Synthetic/sanitized conformance fixtures live under `fixtures/claude-code-2.1.44/` and
 `fixtures/codex-rollout-0.x/`. They are hand-authored from the public schemas above — **no private
 transcript content is copied** — and cover missing fields, truncated (incomplete trailing record)
-transcripts, concurrent sessions, and source-specific metadata. `crates/munshi/tests/harness_adapters.rs`
+transcripts, concurrent sessions, and source-specific metadata. The archive-observed bookkeeping
+kinds (issues #30/#34) are exercised by hand-authored sessions under
+`fixtures/claude-code-2.1.2xx-bookkeeping/` and `fixtures/copilot-1.0.5x-bookkeeping/`. `crates/munshi/tests/harness_adapters.rs`
 exercises normalization, foreign-envelope rejection, the one-shot archive pipeline, and the shared
 archive/state worker pipeline (resumed revisions, interrupted completion reason, source isolation).
 

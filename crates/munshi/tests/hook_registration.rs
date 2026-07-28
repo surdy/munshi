@@ -34,6 +34,209 @@ fn disclosure_requires_explicit_noninteractive_acceptance_and_prompt_is_testable
     assert!(String::from_utf8(output).unwrap().contains("Type I ACCEPT"));
 }
 
+/// Issue #31: re-running `register` (e.g. to raise policy budgets) must not reset the
+/// archive-upload and summary-delivery sections their own commands configured — most critically
+/// the persistent Patwari client UUID, which uploads are durably keyed under. Since issue #36 both
+/// carried sections are self-contained (`enabled` lives inside them), so the carry-forward is a
+/// straight section copy with no separate top-level flag to remember.
+#[test]
+fn reregistration_preserves_archive_upload_and_summary_delivery_configuration() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+
+    // Configure and enable archive upload and summary delivery through their own commands (never
+    // by hand-editing config.json). Neither endpoint is contacted by these commands.
+    let munshi = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&paths.state)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    };
+    munshi(&[
+        "archive-upload",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:9",
+    ]);
+    munshi(&["archive-upload", "enable"]);
+    munshi(&[
+        "summary-delivery",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:10",
+        "--vault",
+        "Vault",
+        "--folder",
+        "Munshi",
+    ]);
+    munshi(&["summary-delivery", "enable"]);
+
+    let config_path = paths.state.join("config.json");
+    let before: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    let client_id = before["archive_upload"]["client_id"]
+        .as_str()
+        .expect("configure minted a persistent client UUID")
+        .to_owned();
+
+    // Re-register with a different unrelated flag: registration-owned settings still update
+    // normally while the carried-forward sections survive verbatim.
+    assert_success(&register_command(&paths, fake("success.sh"), 7_000, true));
+
+    let after: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(after["version"], 2);
+    assert_eq!(after["limits"]["timeout_ms"], 7_000);
+    assert_eq!(after["archive_upload"]["enabled"], true);
+    assert_eq!(after["archive_upload"]["endpoint"], "http://127.0.0.1:9");
+    assert_eq!(after["archive_upload"]["client_id"], client_id.as_str());
+    assert_eq!(after["summary_delivery"]["enabled"], true);
+    assert_eq!(after["summary_delivery"]["endpoint"], "http://127.0.0.1:10");
+    assert_eq!(after["summary_delivery"]["vault"], "Vault");
+    assert_eq!(after["summary_delivery"]["folder"], "Munshi");
+    assert!(after.get("remote_delivery").is_none());
+    assert!(after.get("delivery").is_none());
+}
+
+/// Issue #36: a version-1 configuration (top-level `remote_delivery` bool + `delivery` section)
+/// loads losslessly, is persisted as the unified version-2 `summary_delivery` shape on first load,
+/// and round-trips bit-for-bit thereafter.
+#[test]
+fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    let config_path = paths.state.join("config.json");
+
+    // Downgrade the freshly written v2 config to the exact v1 on-disk shape.
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    let mut delivery = config
+        .as_object_mut()
+        .unwrap()
+        .remove("summary_delivery")
+        .unwrap();
+    delivery.as_object_mut().unwrap().remove("enabled");
+    delivery["endpoint"] = json!("http://127.0.0.1:11");
+    delivery["vault"] = json!("MigratedVault");
+    delivery["folder"] = json!("Munshi");
+    delivery["credential"] = json!({"source": "env", "var": "MUNSHI_TOKEN"});
+    delivery["max_attempts"] = json!(7);
+    delivery["provision_history"] = json!(true);
+    config["version"] = json!(1);
+    config["remote_delivery"] = json!(true);
+    config["delivery"] = delivery;
+    let mut bytes = serde_json::to_vec_pretty(&config).unwrap();
+    bytes.push(b'\n');
+    fs::write(&config_path, bytes).unwrap();
+
+    // Any command that loads the configuration migrates it; the settings it reports come from the
+    // migrated view.
+    let status = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["summary-delivery", "status", "--json"])
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .output()
+        .unwrap();
+    assert_success(&status);
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["settings"]["enabled"], true);
+    assert_eq!(report["settings"]["endpoint"], "http://127.0.0.1:11");
+    assert_eq!(report["settings"]["vault"], "MigratedVault");
+    assert_eq!(report["settings"]["max_attempts"], 7);
+    assert_eq!(report["settings"]["provision_history"], true);
+
+    // The migration was persisted: version 2, one self-contained section, legacy keys gone, every
+    // v1 value carried losslessly.
+    let migrated: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(migrated["version"], 2);
+    assert!(migrated.get("remote_delivery").is_none());
+    assert!(migrated.get("delivery").is_none());
+    let section = &migrated["summary_delivery"];
+    assert_eq!(section["enabled"], true);
+    assert_eq!(section["endpoint"], "http://127.0.0.1:11");
+    assert_eq!(section["vault"], "MigratedVault");
+    assert_eq!(section["folder"], "Munshi");
+    assert_eq!(section["credential"]["source"], "env");
+    assert_eq!(section["credential"]["var"], "MUNSHI_TOKEN");
+    assert_eq!(section["max_attempts"], 7);
+    assert_eq!(section["provision_history"], true);
+
+    // A v2 config round-trips: a second load rewrites nothing.
+    let bytes_before = fs::read(&config_path).unwrap();
+    let inode_before = fs::metadata(&config_path).unwrap().ino();
+    let again = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["summary-delivery", "status", "--json"])
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .output()
+        .unwrap();
+    assert_success(&again);
+    assert_eq!(fs::read(&config_path).unwrap(), bytes_before);
+    assert_eq!(fs::metadata(&config_path).unwrap().ino(), inode_before);
+
+    // Re-registering over a v1 config also carries the section forward into the v2 shape.
+    fs::write(&config_path, {
+        let mut value = migrated.clone();
+        let mut delivery = value
+            .as_object_mut()
+            .unwrap()
+            .remove("summary_delivery")
+            .unwrap();
+        delivery.as_object_mut().unwrap().remove("enabled");
+        value["version"] = json!(1);
+        value["remote_delivery"] = json!(true);
+        value["delivery"] = delivery;
+        let mut bytes = serde_json::to_vec_pretty(&value).unwrap();
+        bytes.push(b'\n');
+        bytes
+    })
+    .unwrap();
+    assert_success(&register_command(&paths, fake("success.sh"), 9_000, true));
+    let reregistered: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(reregistered["version"], 2);
+    assert_eq!(reregistered["limits"]["timeout_ms"], 9_000);
+    assert_eq!(reregistered["summary_delivery"]["enabled"], true);
+    assert_eq!(reregistered["summary_delivery"]["vault"], "MigratedVault");
+    assert!(reregistered.get("remote_delivery").is_none());
+}
+
+/// Issue #36: the `delivery` subcommand remains a visible deprecated alias for `summary-delivery`,
+/// with identical behavior.
+#[test]
+fn delivery_alias_still_drives_summary_delivery_commands() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["delivery", "status", "--json"])
+        .arg("--state-dir")
+        .arg(&paths.state)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["command"], "summary-delivery-status");
+    assert_eq!(report["settings"]["enabled"], false);
+
+    let help = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_success(&help);
+    let text = String::from_utf8_lossy(&help.stdout).into_owned();
+    assert!(
+        text.contains("summary-delivery"),
+        "help must list the new subcommand: {text}"
+    );
+    assert!(
+        text.contains("[aliases: delivery]") || text.contains("alias: delivery"),
+        "help must advertise the deprecated alias: {text}"
+    );
+}
+
 #[test]
 fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema() {
     let directory = test_directory();
@@ -78,7 +281,8 @@ fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema(
     }
     let config: Value =
         serde_json::from_slice(&fs::read(paths.state.join("config.json")).unwrap()).unwrap();
-    assert_eq!(config["remote_delivery"], false);
+    assert_eq!(config["version"], 2);
+    assert_eq!(config["summary_delivery"]["enabled"], false);
     assert_eq!(config["archive_git_history"], false);
     assert_eq!(config["local_archival_enabled"], true);
     assert_eq!(config["transcript_processing_accepted"], true);

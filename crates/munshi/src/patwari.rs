@@ -16,7 +16,7 @@
 //! a stable `captured_at`) per distinct snapshot attempt and reuses that exact pair on retry, so an
 //! interrupted upload resumes rather than duplicates. The client UUID is persistent and durable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -293,8 +293,12 @@ struct UploadSession {
     artifacts: Vec<ArtifactStatus>,
 }
 
-/// Per-artifact chunk status: which chunk indexes Patwari still needs.
+/// Per-artifact chunk status: which chunk indexes Patwari still needs. The entry is identified by
+/// its canonical `logical_path`; `artifact_index` is the server's position in its canonicalized
+/// (path-sorted) artifact list and is only ever used to address the chunk PUT route, never to
+/// index into the locally assembled artifact list (issue #33).
 struct ArtifactStatus {
+    logical_path: String,
     artifact_index: u32,
     missing_chunk_indexes: Vec<u64>,
 }
@@ -429,16 +433,29 @@ impl PatwariClient {
     }
 
     /// Uploads every currently-missing chunk of every artifact in the negotiated session.
+    ///
+    /// Server entries are matched to the locally prepared artifacts by canonical `logical_path`,
+    /// never by position: Patwari orders its `artifacts[]` canonically (sorted by logical path),
+    /// which need not agree with the local assembly order (issue #33). An unknown, locally
+    /// missing, or repeated path is a protocol error naming the path.
     fn upload_missing_chunks(
         &self,
         session: &UploadSession,
         artifacts: &[PreparedArtifact],
     ) -> Result<(), PatwariError> {
+        let by_path = index_artifacts_by_path(artifacts)?;
+        let mut seen_paths = BTreeSet::new();
         for status in &session.artifacts {
-            let Some(artifact) = artifacts.get(status.artifact_index as usize) else {
+            if !seen_paths.insert(status.logical_path.as_str()) {
                 return Err(PatwariError::Protocol(format!(
-                    "server referenced unknown artifact index {}",
-                    status.artifact_index
+                    "server repeated artifact logical path {}",
+                    status.logical_path
+                )));
+            }
+            let Some(artifact) = by_path.get(status.logical_path.as_str()) else {
+                return Err(PatwariError::Protocol(format!(
+                    "server referenced artifact logical path {} that is not in this snapshot",
+                    status.logical_path
                 )));
             };
             // The server supplies the missing chunk indexes; validate each against the locally
@@ -450,7 +467,7 @@ impl PatwariClient {
                 if chunk_index >= count {
                     return Err(PatwariError::Protocol(format!(
                         "server requested chunk index {chunk_index} outside the {count}-chunk range of artifact {}",
-                        status.artifact_index
+                        status.logical_path
                     )));
                 }
                 self.put_chunk(
@@ -607,6 +624,15 @@ fn upload_session_from_value(value: &Value) -> Result<UploadSession, PatwariErro
         .ok_or_else(|| PatwariError::Protocol("response missing artifacts".to_owned()))?
         .iter()
         .map(|artifact| {
+            // The path is the artifact's identity for chunk routing (issue #33); the index only
+            // addresses the PUT route. Both are required.
+            let logical_path = artifact
+                .get("logical_path")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    PatwariError::Protocol("artifact missing logical_path".to_owned())
+                })?;
             let artifact_index = artifact
                 .get("artifact_index")
                 .and_then(Value::as_u64)
@@ -618,6 +644,7 @@ fn upload_session_from_value(value: &Value) -> Result<UploadSession, PatwariErro
                 .map(|values| values.iter().filter_map(Value::as_u64).collect())
                 .unwrap_or_default();
             Ok(ArtifactStatus {
+                logical_path,
                 artifact_index,
                 missing_chunk_indexes,
             })
@@ -700,6 +727,27 @@ fn protocol(error: &impl std::fmt::Display) -> PatwariError {
 // ---------------------------------------------------------------------------
 // Small pure helpers
 // ---------------------------------------------------------------------------
+
+/// Indexes the locally prepared artifacts by logical path for matching server status entries
+/// (issue #33). A repeated local path is a protocol error naming the path: routing chunks by path
+/// would be ambiguous, and Patwari rejects such a manifest anyway.
+fn index_artifacts_by_path(
+    artifacts: &[PreparedArtifact],
+) -> Result<BTreeMap<&str, &PreparedArtifact>, PatwariError> {
+    let mut by_path = BTreeMap::new();
+    for artifact in artifacts {
+        if by_path
+            .insert(artifact.logical_path.as_str(), artifact)
+            .is_some()
+        {
+            return Err(PatwariError::Protocol(format!(
+                "snapshot repeats artifact logical path {}",
+                artifact.logical_path
+            )));
+        }
+    }
+    Ok(by_path)
+}
 
 /// The number of `chunk_size`-byte chunks the stored artifact is split into, mirroring Patwari's
 /// server-side `chunk_count` exactly (ingestion.rs): an empty artifact has zero chunks, otherwise
@@ -921,14 +969,17 @@ fn collect_artifacts(
 
 /// Assembles the ordered snapshot artifact set v1 (ADR 0009/0010) from already-read bytes:
 /// `summary.md` (this revision's rendered summary), `transcript.jsonl` (the verbatim source bytes),
-/// then every re-derived `outputs/<sha256>` extracted output sorted ascending by hash.
+/// and every re-derived `outputs/<sha256>` extracted output.
 ///
 /// Extracted outputs are re-derived from the exact transcript bytes this snapshot uploads
 /// (`extract_outputs`, ADR 0010 option a), so the `outputs/<sha256>` set is always consistent with
-/// `transcript.jsonl` and, for a reused capture id, byte-identical across retries. The ordering is
-/// fully deterministic (fixed roles first, then hash-sorted outputs) so the canonical manifest is
-/// stable, and identical content dedups to one artifact and one blob server-side. Pure and I/O-free
-/// so the exact set the upload path builds is unit-testable.
+/// `transcript.jsonl` and, for a reused capture id, byte-identical across retries. The list is
+/// returned in Patwari's canonical order — ascending by logical path (issue #33) — so the locally
+/// built manifest lists artifacts exactly as the server's canonicalized `artifacts[]` does; the
+/// ordering is fully deterministic, the canonical manifest is stable, and identical content dedups
+/// to one artifact and one blob server-side. Chunk routing during upload matches artifacts by
+/// logical path and never relies on this order agreement. Pure and I/O-free so the exact set the
+/// upload path builds is unit-testable.
 pub fn assemble_artifact_sources(
     summary_md: Option<Vec<u8>>,
     transcript_jsonl: Option<Vec<u8>>,
@@ -958,6 +1009,10 @@ pub fn assemble_artifact_sources(
             });
         }
     }
+    // Canonicalize: Patwari sorts `artifacts[]` by logical path (`outputs/…` before `summary.md`
+    // before `transcript.jsonl`). Logical paths are unique here (fixed roles plus content-addressed
+    // outputs), so the sort is a total order and stable across retries.
+    sources.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
     sources
 }
 
@@ -1447,13 +1502,32 @@ pub struct ArchiveUploadRunItem {
 impl ArchiveUploadRunReport {
     pub fn print_human(&self) {
         print_settings(&self.settings);
+        let label = match self.command {
+            "archive-upload-backfill" => "archive-upload backfill",
+            _ => "archive-upload retry",
+        };
         println!(
-            "archive-upload retry candidates={} uploaded={} already-uploaded={} skipped={} failed={}",
+            "{label} candidates={} uploaded={} already-uploaded={} skipped={} failed={}",
             self.candidates, self.uploaded, self.already_uploaded, self.skipped, self.failed
         );
         for item in &self.items {
             println!("{} -> {}", item.session_id, item.outcome.as_kind());
         }
+    }
+
+    /// Tallies one session's outcome into the counts and appends its per-session item.
+    fn record(&mut self, source: SourceKind, session_id: &str, outcome: UploadOutcome) {
+        match &outcome {
+            UploadOutcome::Uploaded { .. } => self.uploaded += 1,
+            UploadOutcome::AlreadyUploaded { .. } => self.already_uploaded += 1,
+            UploadOutcome::Skipped { .. } => self.skipped += 1,
+            UploadOutcome::Failed { .. } => self.failed += 1,
+        }
+        self.items.push(ArchiveUploadRunItem {
+            source: source.as_selector().to_owned(),
+            session_id: session_id.to_owned(),
+            outcome,
+        });
     }
 }
 
@@ -1530,54 +1604,126 @@ pub fn retry(
         items: Vec::new(),
     };
     for record in candidates {
-        let outcome = retry_one(
+        let outcome = locked_upload_one(
             state_directory,
             &config.archive_upload,
             &client_id,
             &endpoint,
             &output_directory,
-            &record,
+            record.source,
+            &record.session_id,
             config.limits.max_event_text_bytes,
-            force,
+            Some(force),
         )?;
-        match &outcome {
-            UploadOutcome::Uploaded { .. } => report.uploaded += 1,
-            UploadOutcome::AlreadyUploaded { .. } => report.already_uploaded += 1,
-            UploadOutcome::Skipped { .. } => report.skipped += 1,
-            UploadOutcome::Failed { .. } => report.failed += 1,
-        }
-        report.items.push(ArchiveUploadRunItem {
-            source: record.source.as_selector().to_owned(),
-            session_id: record.session_id.clone(),
-            outcome,
-        });
+        report.record(record.source, &record.session_id, outcome);
     }
     Ok(report)
 }
 
-/// Resets one session's upload row for retry and runs the attempt under its advisory lock. A locked
-/// session (an archive worker is uploading it) is reported skipped rather than contended.
+/// Uploads every archived session the configured server has no recorded row for (issue #32).
+///
+/// `upload_after_archive` runs only in the worker downstream of a fresh archive, and the retry
+/// paths operate on existing `archive_uploads` rows, so a session archived while upload was
+/// disabled (or before configuration) is otherwise never uploaded. Backfill scans archived
+/// sessions across every source, keeps those with no row for the currently configured endpoint,
+/// and runs each through the normal `upload_one` path — row creation, capture-id minting, bounded
+/// attempts, and failure recording behave exactly like a post-archive upload. Requires archive
+/// upload to be enabled and addressable; candidates are bounded by `limit`; a session whose
+/// advisory lock is held (an archive worker is on it) is reported skipped this run. Never mutates
+/// the session's archival lifecycle.
+pub fn backfill(
+    state_directory: &Path,
+    limit: usize,
+) -> Result<ArchiveUploadRunReport, PatwariError> {
+    let config = load_stored_config(state_directory)?;
+    let settings = ArchiveUploadSettings::from_config(&config);
+    if !config.archive_upload.enabled {
+        return Err(PatwariError::NotEnabled);
+    }
+    if !config.archive_upload.is_addressable() {
+        return Err(PatwariError::NotConfigured);
+    }
+    let endpoint = config.archive_upload.endpoint.clone().unwrap();
+    let client_id = ensure_client_id(Path::new(&config.state_directory))?;
+    let output_directory = PathBuf::from(&config.output_directory);
+
+    let (sessions, uploads) = if StateStore::database_path(state_directory).exists() {
+        let store = StateStore::open(state_directory)?;
+        (store.list_sessions()?, store.list_archive_uploads()?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    // Sessions already holding a row for this endpoint — whatever its state — belong to the worker
+    // and retry paths; a row recorded for a different endpoint (e.g. before reconfiguration) does
+    // not count as uploaded here, matching `retry`'s endpoint scoping.
+    let recorded: BTreeSet<(SourceKind, &str)> = uploads
+        .iter()
+        .filter(|record| record.endpoint == endpoint)
+        .map(|record| (record.source, record.session_id.as_str()))
+        .collect();
+    let mut candidates: Vec<&SessionRecord> = sessions
+        .iter()
+        .filter(|session| session.lifecycle_state == "archived")
+        .filter(|session| !recorded.contains(&(session.source, session.session_id.as_str())))
+        .collect();
+    candidates.truncate(limit);
+
+    let mut report = ArchiveUploadRunReport {
+        schema_version: 1,
+        command: "archive-upload-backfill",
+        settings,
+        candidates: candidates.len(),
+        uploaded: 0,
+        already_uploaded: 0,
+        skipped: 0,
+        failed: 0,
+        items: Vec::new(),
+    };
+    for session in candidates {
+        let outcome = locked_upload_one(
+            state_directory,
+            &config.archive_upload,
+            &client_id,
+            &endpoint,
+            &output_directory,
+            session.source,
+            &session.session_id,
+            config.limits.max_event_text_bytes,
+            None,
+        )?;
+        report.record(session.source, &session.session_id, outcome);
+    }
+    Ok(report)
+}
+
+/// Runs one session's upload attempt under its advisory lock, opening the store in the session's
+/// source scope. `reset_for_retry` is `Some(force)` for an explicit retry, which clears the row's
+/// backoff first (and, with force, revives a dead-letter row and resets its bounded attempt
+/// count) — this is the one caller of `reset_archive_upload_for_retry`; `None` (backfill) leaves
+/// any row as found. A locked session (an archive worker is uploading it) is reported skipped
+/// rather than contended.
 #[allow(clippy::too_many_arguments)]
-fn retry_one(
+fn locked_upload_one(
     state_directory: &Path,
     settings: &crate::registration::StoredArchiveUpload,
     client_id: &str,
     endpoint: &str,
     output_directory: &Path,
-    record: &ArchiveUploadRecord,
+    source: SourceKind,
+    session_id: &str,
     max_event_text_bytes: usize,
-    force: bool,
+    reset_for_retry: Option<bool>,
 ) -> Result<UploadOutcome, PatwariError> {
-    let Some(_lock) = try_acquire_session_lock(state_directory, &record.session_id)? else {
+    let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
         return Ok(UploadOutcome::Skipped {
             reason: "worker-busy".to_owned(),
         });
     };
-    let mut state = StateStore::open_for_source(state_directory, record.source)?;
-    // Clear backoff (and, with force, revive a dead-letter row and reset its attempts) so the
-    // attempt is due now; this is the one caller of `reset_archive_upload_for_retry`.
-    state.reset_archive_upload_for_retry(&record.session_id, endpoint, force)?;
-    let Some(session) = state.get_session(&record.session_id)? else {
+    let mut state = StateStore::open_for_source(state_directory, source)?;
+    if let Some(force) = reset_for_retry {
+        state.reset_archive_upload_for_retry(session_id, endpoint, force)?;
+    }
+    let Some(session) = state.get_session(session_id)? else {
         return Ok(UploadOutcome::Skipped {
             reason: "session-unknown".to_owned(),
         });
@@ -1723,6 +1869,95 @@ mod tests {
         assert_eq!(backoff_ms(2), BASE_BACKOFF_MS * 2);
         assert!(backoff_ms(3) > backoff_ms(2));
         assert_eq!(backoff_ms(100), MAX_BACKOFF_MS);
+    }
+
+    #[test]
+    fn chunk_routing_rejects_unknown_repeated_and_duplicated_logical_paths() {
+        // Endpoint parsing succeeds but nothing listens on port 1; every failure below is raised
+        // before any network I/O, proving the path checks front-run the chunk PUTs.
+        let client = PatwariClient::connect("http://127.0.0.1:1", "client").unwrap();
+        let source = |path: &str, bytes: &[u8]| ArtifactSource {
+            logical_path: path.to_owned(),
+            media_type: None,
+            bytes: bytes.to_vec(),
+        };
+        let entry = |path: &str| ArtifactStatus {
+            logical_path: path.to_owned(),
+            artifact_index: 0,
+            missing_chunk_indexes: Vec::new(),
+        };
+        let session = |entries: Vec<ArtifactStatus>| UploadSession {
+            upload_id: "upl-00000000".to_owned(),
+            capture_id: "capture".to_owned(),
+            chunk_size_bytes: 8,
+            artifacts: entries,
+        };
+        let artifacts = prepare_artifacts(vec![
+            source("transcript.jsonl", b"{}\n"),
+            source("summary.md", b"# s\n"),
+        ]);
+
+        // A server path that is not part of this snapshot is a protocol error naming the path.
+        let error = client
+            .upload_missing_chunks(&session(vec![entry("outputs/feed")]), &artifacts)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PatwariError::Protocol(message) if message.contains("outputs/feed")),
+            "got {error:?}"
+        );
+
+        // A repeated server path is a protocol error naming the path.
+        let error = client
+            .upload_missing_chunks(
+                &session(vec![entry("summary.md"), entry("summary.md")]),
+                &artifacts,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, PatwariError::Protocol(message)
+                if message.contains("repeated") && message.contains("summary.md")),
+            "got {error:?}"
+        );
+
+        // A duplicated local path is rejected up front, before any server entry is consulted.
+        let duplicated =
+            prepare_artifacts(vec![source("summary.md", b"a"), source("summary.md", b"b")]);
+        let error = client
+            .upload_missing_chunks(&session(Vec::new()), &duplicated)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PatwariError::Protocol(message) if message.contains("summary.md")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn assembled_artifact_sources_are_in_canonical_path_order() {
+        // `outputs/…` sorts before the fixed roles; the assembled list is canonical (issue #33).
+        let transcript = format!(
+            "{{\"id\":\"call-1\",\"timestamp\":\"2026-07-25T00:00:00Z\",\"parentId\":\"root\",\
+             \"type\":\"tool.execution_complete\",\"data\":{{\"toolCallId\":\"call-1\",\
+             \"success\":true,\"result\":{{\"content\":\"{}\"}}}}}}\n",
+            "x".repeat(500)
+        )
+        .into_bytes();
+        let sources = assemble_artifact_sources(
+            Some(b"# Summary\n".to_vec()),
+            Some(transcript),
+            SourceKind::Copilot,
+            64,
+        );
+        let paths: Vec<&str> = sources
+            .iter()
+            .map(|source| source.logical_path.as_str())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "assembly order is sorted by logical path");
+        assert!(
+            paths[0].starts_with("outputs/") && paths.contains(&"summary.md"),
+            "the extracted output was assembled and sorts first: {paths:?}"
+        );
     }
 
     #[test]

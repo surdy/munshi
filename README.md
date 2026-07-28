@@ -67,7 +67,7 @@ Munshi is the local scribe in a small family of tools:
   snapshots there for permanent keeping: the verbatim transcript, each summary revision, and
   oversized tool outputs preserved as individually retrievable artifacts.
 - **Notesmith** — an optional notes sink; Munshi can deliver each summary into a vault alongside
-  your own notes (disabled by default, opt-in via `munshi delivery`).
+  your own notes (disabled by default, opt-in via `munshi summary-delivery`).
 - **Madari** — a session-discovery GUI that reads Munshi's JSON status contracts to show archive
   state next to each discovered session.
 

@@ -13,6 +13,7 @@ mod retrieve;
 mod source;
 mod state;
 mod summary;
+mod verify_archive;
 
 pub use archive::{ArchiveConfig, ArchiveError, ArchiveOutcome, SessionReference, archive_session};
 pub use claude_settings::{ClaudeHookStatus, claude_hooks_status};
@@ -34,9 +35,10 @@ pub use patwari::{
     ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
     ArchiveUploadStatusReport, ArtifactSource, CaptureContext, INITIAL_ARTIFACT_SET_VERSION,
     PatwariClient, PatwariError, PreparedArtifact, SessionContext, UploadOutcome, UploadReceipt,
-    assemble_artifact_sources, build_manifest, configure as configure_archive_upload,
-    prepare_artifact, prepare_artifacts, retry as archive_upload_retry,
-    set_enabled as set_archive_upload_enabled, status as archive_upload_status,
+    assemble_artifact_sources, backfill as archive_upload_backfill, build_manifest,
+    configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
+    retry as archive_upload_retry, set_enabled as set_archive_upload_enabled,
+    status as archive_upload_status,
 };
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
@@ -56,9 +58,9 @@ pub use retrieve::{
 pub use source::{
     ArtifactIndexEntry, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES, ExtractedOutput,
     NormalizedEvent, NormalizedSession, PreviousSource, SnapshotArtifactIndex, SourceError,
-    SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin, extract_outputs,
-    load_session, load_session_update, resolve_session_reference, snapshot_artifact_index,
-    validate_transcript_envelope,
+    SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin,
+    copilot_workspace_origin, extract_outputs, load_session, load_session_update,
+    resolve_session_reference, snapshot_artifact_index, validate_transcript_envelope,
 };
 pub use state::{
     ArchiveUploadRecord, ArchiveUploadSuccess, BudgetOutcome, CapturePrep, ClaimOutcome,
@@ -69,3 +71,4 @@ pub use summary::{
     StructuredSummary, SummaryError, build_revision_summary_input, build_summary_input,
     run_summary, validate_structured_summary,
 };
+pub use verify_archive::{VerifyArchiveError, VerifyArchiveReport, verify_archive_parse};

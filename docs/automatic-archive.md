@@ -233,8 +233,9 @@ or by `munshi hook recover`, once concurrency frees up, the budget window rolls 
 is re-enabled. No diagnostic category or log ever contains transcript content. See
 [ADR 0005](adr/0005-defer-project-policy-and-budgets-never-drop.md).
 
-Opt-in Notesmith delivery is downstream of local archival and never blocks or rolls back an
-archive; it is operated with the `munshi delivery` commands and disabled by default. See
+Opt-in Notesmith summary delivery is downstream of local archival and never blocks or rolls back
+an archive; it is operated with the `munshi summary-delivery` commands (`delivery` remains a
+deprecated alias) and disabled by default. See
 [ADR 0006](adr/0006-deliver-to-notesmith-downstream-of-local-archival.md). Opt-in archive upload
 to Patwari runs in the same position — downstream of local archival, in parallel with delivery,
 never blocking either — and uploads each successful summary revision as a full snapshot (verbatim
@@ -243,5 +244,5 @@ commands, is disabled by default, and failed uploads are retried with backoff by
 `munshi hook recover`; see [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and the
 [user guide](user-guide.md). Operational inspection
 and repair use stable `status`, `sessions`, `show`, `retry`, `retry-all`, `doctor`,
-`configuration-check`, `delivery status`/`backfill`/`retry`, and `archive-upload status`/`retry`
-commands (with `--json` machine contracts).
+`configuration-check`, `summary-delivery status`/`backfill`/`retry`, and `archive-upload
+status`/`retry` commands (with `--json` machine contracts).

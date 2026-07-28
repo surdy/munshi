@@ -12,8 +12,9 @@ recovery, per-project policy with bounded hourly/daily/input/timeout/concurrency
 defer rather than drop work, and optional dedicated archive Git history. Markdown remains the
 durable archive. Operational status/query/retry contracts are now available through
 `status`, `sessions`, `show`, `retry`, `retry-all`, `doctor`, and `configuration-check`.
-Opt-in Notesmith delivery is now implemented (disabled by default) through the `munshi delivery`
-commands: latest-revision create/replace with bounded retry and a dead-letter state, confirmed
+Opt-in Notesmith summary delivery is now implemented (disabled by default) through the
+`munshi summary-delivery` commands (`munshi delivery` remains a deprecated alias):
+latest-revision create/replace with bounded retry and a dead-letter state, confirmed
 backfill of existing summaries, and delivery state surfaced in `status`, `doctor`, and `show`.
 The mandatory remote revision-history capability remains a later slice. Madari's optional status
 and action integration (issue #10) is implemented as a pure CLI/JSON consumer of the contract
@@ -557,28 +558,29 @@ The following commands expose stable human-readable output and stable machine ou
 - `munshi retry-all [--limit N] [--force]`
 - `munshi doctor`
 - `munshi configuration-check`
-- `munshi delivery status`
-- `munshi delivery backfill [--confirm] [--limit N]`
-- `munshi delivery retry [<session-id>] [--all] [--force] [--limit N]`
-- `munshi delivery history [--configure]`
+- `munshi summary-delivery status`
+- `munshi summary-delivery backfill [--confirm] [--limit N]`
+- `munshi summary-delivery retry [<session-id>] [--all] [--force] [--limit N]`
+- `munshi summary-delivery history [--configure]`
 
-The delivery sink is managed with `munshi delivery configure --endpoint <url> --vault <name>
-[--folder <path>] [--credential-env <VAR> | --credential-keychain <service:account>]
-[--max-attempts N] [--provision-history]`, `munshi delivery enable`, and `munshi delivery disable`.
+The delivery sink is managed with `munshi summary-delivery configure --endpoint <url>
+--vault <name> [--folder <path>] [--credential-env <VAR> | --credential-keychain
+<service:account>] [--max-attempts N] [--provision-history]`, `munshi summary-delivery enable`,
+and `munshi summary-delivery disable`.
 Delivery is disabled by default; the endpoint/vault/folder and the *source* of the credential are
 recorded in the Munshi-owned `config.json`, but the credential itself is only ever resolved at
 delivery time from an environment variable or the OS credential store. Enabling delivery reports
-the pending backfill as a dry run so existing summaries require an explicit `munshi delivery
-backfill --confirm` before publishing.
+the pending backfill as a dry run so existing summaries require an explicit
+`munshi summary-delivery backfill --confirm` before publishing.
 
 When local archive Git history is enabled (`--archive-git-history`) alongside delivery, delivery is
 **versioned** (issue #9): each delivered revision is preserved as a correlated commit in the
 Notesmith vault's own per-vault Git history, keyed by the same source-scoped session identity and
 revision as the local archive commit. Munshi verifies the vault's revision-history capability
 (`config.git.enabled`); if it is unavailable, versioned delivery is **blocked** with an actionable
-status rather than degrading to latest-only storage. `munshi delivery history` reports the live
-capability, `--configure` (or `--provision-history` at configure time) explicitly enables it, and
-blocked deliveries recover via `munshi delivery retry` once the capability is present.
+status rather than degrading to latest-only storage. `munshi summary-delivery history` reports
+the live capability, `--configure` (or `--provision-history` at configure time) enables it, and
+blocked deliveries recover via `munshi summary-delivery retry` once the capability is present.
 
 Every JSON response emits `schema_version: 1` and a command discriminator. Session states are
 classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, `failed`,
@@ -650,7 +652,8 @@ Implemented today: global configuration is written as `$MUNSHI_HOME/config.json`
 `munshi register` flags (including `--max-calls-per-hour`, `--max-calls-per-day`, and
 `--max-concurrency`) rather than a hand-edited global TOML file, and the nearest-parent project
 override is the `.munshi.toml` file described in
-[`docs/automatic-archive.md`](automatic-archive.md#project-policy-and-cost-budgets). A
+[`docs/automatic-archive.md`](automatic-archive.md#project-policy-and-cost-budgets). Every
+`config.json` setting is documented in [`docs/configuration.md`](configuration.md). A
 full user-editable global TOML file and environment-variable overrides remain later work.
 
 ## Notesmith delivery
@@ -709,15 +712,17 @@ Delivery behavior (implemented):
 - When delivery is first enabled, report a count/dry run and require confirmation before
   backfilling existing current summaries.
 - Retry transport and server errors with bounded exponential backoff.
-- Place exhausted deliveries in a dead-letter state (`munshi delivery retry --force` revives them).
+- Place exhausted deliveries in a dead-letter state (`munshi summary-delivery retry --force`
+  revives them).
 - A disabled project stops future delivery while retaining existing delivery history.
 - Keep local Markdown authoritative and untouched when Notesmith is unavailable; a delivery outage
   never rolls back, invalidates, or blocks a local archive.
 
 Versioned delivery (issue #9): when local archive Git history is enabled alongside delivery, Munshi
-verifies (or, with `--provision-history`/`munshi delivery history --configure`, explicitly enables)
-the Notesmith vault's revision-history capability. Each delivered revision is committed into the
-vault's own Git history with a message correlated to the local archive commit by source-scoped
+verifies (or, with `--provision-history`/`munshi summary-delivery history --configure`,
+explicitly enables) the Notesmith vault's revision-history capability. Each delivered revision
+is committed into the vault's own Git history with a message correlated to the local archive
+commit by source-scoped
 session identity and revision. If the capability is absent, versioned delivery is blocked with an
 actionable `remote-history-unavailable` status and never degrades to latest-only storage; the block
 never affects the already-successful local archive, and recovers on retry once the capability is
@@ -795,8 +800,8 @@ munshi sessions --json                                   # list + states, for th
 munshi show <session-id> --source <source> --json         # local summary + Notesmith note link
 munshi retry <session-id> --source <source> --json        # "Summarize now" / retry a pending session
 munshi retry <session-id> --source <source> --force --json  # retry past a permanent-failure marker
-munshi delivery status --json                              # delivery settings + per-session state
-munshi delivery retry <session-id> --source <source> --json # retry one failed delivery
+munshi summary-delivery status --json                      # delivery settings + per-session state
+munshi summary-delivery retry <session-id> --source <source> --json # retry one failed delivery
 ```
 
 `<source>` is `copilot`, `claude-code`, or `codex` — Madari's own harness ids `copilot`/`claude`/
@@ -804,7 +809,13 @@ munshi delivery retry <session-id> --source <source> --json # retry one failed d
 its other two harnesses (Gemini, OpenCode), which Munshi does not capture.
 
 Every response carries `schema_version: 1` and a `command` discriminator (see
-["Commands and validation"](#commands-and-validation) above for the full contract). A consumer that
+["Commands and validation"](#commands-and-validation) above for the full contract). The
+compatibility key is `schema_version` plus the field shapes — consumers must not branch on the
+`command` string, which names the invoked subcommand and follows CLI renames: when `delivery`
+became `summary-delivery` (issue #36), the discriminators `delivery-status`/`delivery-history`/
+`delivery-backfill`/`delivery-retry` became `summary-delivery-*` under the same
+`schema_version: 1`, while the `delivery` CLI alias kept invocations working. Madari conforms: it
+invokes via the alias and validates only `schema_version`. A consumer that
 only knows a project directory — the common case before the user has ever run `munshi register`
 there — gets a valid, empty contract rather than an error: `sessions`, `status`, `show`, `retry`, and
 `delivery status` all degrade to `total: 0` / `found: false` / disabled settings instead of failing,
@@ -816,7 +827,8 @@ Madari surfaces, per agent session:
   `archived`, `delivery failed` (`delivery-related`), `failed`, and `disabled` (`disabled-project`)
   states, read from `sessions --json`.
 - A "View summary" action in the agent-session browser, backed by `show --json`.
-- A "Summarize now" / "Retry" action, backed by `retry --json` (and `delivery retry --json` for a
+- A "Summarize now" / "Retry" action, backed by `retry --json` (and `summary-delivery retry
+  --json` — the `delivery` alias remains valid — for a
   delivery-only failure, including a `blocked` delivery — issue #9's versioned delivery blocks
   rather than silently degrading when the Notesmith vault cannot preserve correlated revision
   history, or has unrelated uncommitted changes).

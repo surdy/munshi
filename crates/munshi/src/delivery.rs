@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::http::{self, Header, HttpError, HttpResponse, encode_path, parse_http_endpoint};
 use crate::registration::{
     DEFAULT_MAX_DELIVERY_ATTEMPTS, RegistrationError, StoredConfig, StoredCredential,
-    StoredDelivery, load_stored_config, stored_config_exists, update_stored_config,
+    StoredSummaryDelivery, load_stored_config, stored_config_exists, update_stored_config,
 };
 use crate::state::{
     DeliveryRecord, DeliverySuccess, SessionRecord, StateError, StateStore, now_ms,
@@ -41,9 +41,9 @@ pub enum DeliveryError {
     State(#[from] StateError),
     #[error("delivery I/O failed")]
     Io(#[source] std::io::Error),
-    #[error("Notesmith delivery is not enabled; run `munshi delivery enable`")]
+    #[error("Notesmith delivery is not enabled; run `munshi summary-delivery enable`")]
     NotEnabled,
-    #[error("Notesmith sink is not configured; run `munshi delivery configure`")]
+    #[error("Notesmith sink is not configured; run `munshi summary-delivery configure`")]
     NotConfigured,
     #[error("delivery credential could not be resolved: {0}")]
     Credential(String),
@@ -88,7 +88,7 @@ impl DeliveryCredentialSource {
     }
 }
 
-/// Sink details supplied by `munshi delivery configure`.
+/// Sink details supplied by `munshi summary-delivery configure`.
 #[derive(Debug, Clone)]
 pub struct DeliverySinkConfig {
     pub endpoint: String,
@@ -122,19 +122,19 @@ pub struct DeliverySettings {
 impl DeliverySettings {
     fn from_config(config: &StoredConfig) -> Self {
         Self {
-            enabled: config.remote_delivery,
-            addressable: config.delivery.is_addressable(),
-            endpoint: config.delivery.endpoint.clone(),
-            vault: config.delivery.vault.clone(),
-            folder: config.delivery.folder.clone(),
+            enabled: config.summary_delivery.enabled,
+            addressable: config.summary_delivery.is_addressable(),
+            endpoint: config.summary_delivery.endpoint.clone(),
+            vault: config.summary_delivery.vault.clone(),
+            folder: config.summary_delivery.folder.clone(),
             credential_source: config
-                .delivery
+                .summary_delivery
                 .credential
                 .as_ref()
                 .map(DeliveryCredentialSource::describe),
-            max_attempts: config.delivery.max_attempts,
-            versioned: config.archive_git_history && config.remote_delivery,
-            provision_history: config.delivery.provision_history,
+            max_attempts: config.summary_delivery.max_attempts,
+            versioned: config.archive_git_history && config.summary_delivery.enabled,
+            provision_history: config.summary_delivery.provision_history,
         }
     }
 
@@ -171,7 +171,7 @@ pub struct DeliveryItem {
     pub last_error_category: Option<String>,
 }
 
-/// The `munshi delivery status` contract.
+/// The `munshi summary-delivery status` contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryStatusReport {
     pub schema_version: u32,
@@ -244,7 +244,7 @@ pub(crate) enum HistoryGate {
     },
 }
 
-/// The `munshi delivery backfill` / `munshi delivery retry` contract.
+/// The `munshi summary-delivery backfill` / `munshi summary-delivery retry` contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryRunReport {
     pub schema_version: u32,
@@ -544,7 +544,7 @@ fn backoff_ms(attempts: u32) -> i64 {
 pub(crate) fn deliver_one(
     state: &mut StateStore,
     sink: &dyn NotesmithSink,
-    delivery: &StoredDelivery,
+    delivery: &StoredSummaryDelivery,
     disabled_projects: &[String],
     output_directory: &Path,
     record: &SessionRecord,
@@ -1340,16 +1340,16 @@ fn sink_http_error(error: HttpError) -> SinkError {
 /// credential store. Returns an error if the sink is not addressable or the credential is missing.
 fn sink_from_config(config: &StoredConfig) -> Result<HttpNotesmithSink, DeliveryError> {
     let endpoint = config
-        .delivery
+        .summary_delivery
         .endpoint
         .as_deref()
         .ok_or(DeliveryError::NotConfigured)?;
     let vault = config
-        .delivery
+        .summary_delivery
         .vault
         .as_deref()
         .ok_or(DeliveryError::NotConfigured)?;
-    let token = match config.delivery.credential.as_ref() {
+    let token = match config.summary_delivery.credential.as_ref() {
         Some(credential) => Some(resolve_credential(credential)?),
         None => None,
     };
@@ -1397,7 +1397,7 @@ pub(crate) fn resolve_history_gate(
 /// Whether versioned delivery is required: local archive Git history is enabled *and* delivery is
 /// enabled. In that mode the remote must preserve correlated revision history (issue #9).
 fn history_required(config: &StoredConfig) -> bool {
-    config.archive_git_history && config.remote_delivery
+    config.archive_git_history && config.summary_delivery.enabled
 }
 
 pub(crate) fn deliver_after_archive(
@@ -1405,7 +1405,7 @@ pub(crate) fn deliver_after_archive(
     config: &StoredConfig,
     session_id: &str,
 ) -> Result<Option<DeliveryOutcome>, DeliveryError> {
-    if !config.remote_delivery || !config.delivery.is_addressable() {
+    if !config.summary_delivery.enabled || !config.summary_delivery.is_addressable() {
         return Ok(None);
     }
     let Some(record) = state.get_session(session_id)? else {
@@ -1415,13 +1415,13 @@ pub(crate) fn deliver_after_archive(
     let gate = resolve_history_gate(
         &sink,
         history_required(config),
-        config.delivery.provision_history,
+        config.summary_delivery.provision_history,
     );
     let output_directory = PathBuf::from(&config.output_directory);
     let outcome = deliver_one(
         state,
         &sink,
-        &config.delivery,
+        &config.summary_delivery,
         &config.policy.disabled_projects,
         &output_directory,
         &record,
@@ -1436,7 +1436,7 @@ pub fn load_settings(state_directory: &Path) -> Result<DeliverySettings, Deliver
     Ok(DeliverySettings::from_config(&config))
 }
 
-/// The `munshi delivery history` contract: reports the remote revision-history capability and,
+/// The `munshi summary-delivery history` contract: reports the remote revision-history capability and,
 /// with `configure`, explicitly enables it when absent.
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryReport {
@@ -1480,11 +1480,11 @@ pub fn verify_history(
 ) -> Result<HistoryReport, DeliveryError> {
     let config = load_stored_config(state_directory)?;
     let settings = DeliverySettings::from_config(&config);
-    if !config.delivery.is_addressable() {
+    if !config.summary_delivery.is_addressable() {
         return Err(DeliveryError::NotConfigured);
     }
     let required = history_required(&config);
-    let provision = configure || config.delivery.provision_history;
+    let provision = configure || config.summary_delivery.provision_history;
     let sink = sink_from_config(&config)?;
     let probe = if provision {
         sink.ensure_history_capability()
@@ -1515,7 +1515,7 @@ pub fn verify_history(
     };
     Ok(HistoryReport {
         schema_version: 1,
-        command: "delivery-history",
+        command: "summary-delivery-history",
         settings,
         required,
         configure_requested: configure,
@@ -1534,19 +1534,19 @@ pub fn configure_sink(
     // Validate the endpoint eagerly so a bad URL is rejected at configure time.
     parse_http_endpoint(&sink.endpoint)?;
     let (config, ()) = update_stored_config(state_directory, |config| {
-        config.delivery.endpoint = Some(sink.endpoint.clone());
-        config.delivery.vault = Some(sink.vault.clone());
-        config.delivery.folder = sink.folder.clone().filter(|value| !value.is_empty());
-        config.delivery.credential = sink
+        config.summary_delivery.endpoint = Some(sink.endpoint.clone());
+        config.summary_delivery.vault = Some(sink.vault.clone());
+        config.summary_delivery.folder = sink.folder.clone().filter(|value| !value.is_empty());
+        config.summary_delivery.credential = sink
             .credential
             .as_ref()
             .map(DeliveryCredentialSource::to_stored);
-        config.delivery.max_attempts = sink
+        config.summary_delivery.max_attempts = sink
             .max_attempts
             .filter(|value| *value >= 1)
             .unwrap_or(DEFAULT_MAX_DELIVERY_ATTEMPTS);
         if let Some(provision) = sink.provision_history {
-            config.delivery.provision_history = provision;
+            config.summary_delivery.provision_history = provision;
         }
         Ok(())
     })?;
@@ -1559,10 +1559,10 @@ pub fn set_enabled(
     enabled: bool,
 ) -> Result<DeliverySettings, DeliveryError> {
     let result = update_stored_config(state_directory, |config| {
-        if enabled && !config.delivery.is_addressable() {
+        if enabled && !config.summary_delivery.is_addressable() {
             return Err(RegistrationError::MalformedOwnedFile);
         }
-        config.remote_delivery = enabled;
+        config.summary_delivery.enabled = enabled;
         Ok(())
     });
     let (config, ()) = match result {
@@ -1585,7 +1585,7 @@ pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryEr
     if !stored_config_exists(state_directory) {
         return Ok(DeliveryStatusReport {
             schema_version: 1,
-            command: "delivery-status",
+            command: "summary-delivery-status",
             settings: DeliverySettings::unregistered(),
             total: 0,
             delivered: 0,
@@ -1626,7 +1626,7 @@ pub fn status(state_directory: &Path) -> Result<DeliveryStatusReport, DeliveryEr
 
     Ok(DeliveryStatusReport {
         schema_version: 1,
-        command: "delivery-status",
+        command: "summary-delivery-status",
         settings,
         total: items.len(),
         delivered,
@@ -1682,7 +1682,7 @@ pub fn backfill(
 ) -> Result<DeliveryRunReport, DeliveryError> {
     run(
         state_directory,
-        "delivery-backfill",
+        "summary-delivery-backfill",
         Selection::Backfill,
         confirm,
         false,
@@ -1707,7 +1707,7 @@ pub fn retry(
     };
     run(
         state_directory,
-        "delivery-retry",
+        "summary-delivery-retry",
         selection,
         true,
         force,
@@ -1725,14 +1725,14 @@ fn run(
 ) -> Result<DeliveryRunReport, DeliveryError> {
     let config = load_stored_config(state_directory)?;
     let settings = DeliverySettings::from_config(&config);
-    if !config.remote_delivery {
+    if !config.summary_delivery.enabled {
         return Err(DeliveryError::NotEnabled);
     }
-    if !config.delivery.is_addressable() {
+    if !config.summary_delivery.is_addressable() {
         return Err(DeliveryError::NotConfigured);
     }
-    let endpoint = config.delivery.endpoint.clone().unwrap();
-    let vault = config.delivery.vault.clone().unwrap();
+    let endpoint = config.summary_delivery.endpoint.clone().unwrap();
+    let vault = config.summary_delivery.vault.clone().unwrap();
     let output_directory = PathBuf::from(&config.output_directory);
 
     let candidates = if StateStore::database_path(state_directory).exists() {
@@ -1770,7 +1770,7 @@ fn run(
         return Ok(report);
     }
 
-    let token = match config.delivery.credential.as_ref() {
+    let token = match config.summary_delivery.credential.as_ref() {
         Some(credential) => Some(resolve_credential(credential)?),
         None => None,
     };
@@ -1781,7 +1781,7 @@ fn run(
     let gate = resolve_history_gate(
         &sink,
         history_required(&config),
-        config.delivery.provision_history,
+        config.summary_delivery.provision_history,
     );
 
     for record in candidates {
@@ -1792,7 +1792,7 @@ fn run(
         let outcome = deliver_one(
             &mut state,
             &sink,
-            &config.delivery,
+            &config.summary_delivery,
             &config.policy.disabled_projects,
             &output_directory,
             &record,
@@ -1911,7 +1911,7 @@ impl DeliveryRunReport {
         print_settings(&self.settings);
         if self.confirmed {
             println!(
-                "delivery run candidates={} created={} replaced={} already-delivered={} skipped={} blocked={} failed={}",
+                "summary delivery run candidates={} created={} replaced={} already-delivered={} skipped={} blocked={} failed={}",
                 self.candidates,
                 self.created,
                 self.replaced,
@@ -1935,7 +1935,7 @@ impl DeliveryRunReport {
 
 fn print_settings(settings: &DeliverySettings) {
     println!(
-        "delivery {} (endpoint {}, vault {}, folder {}, credential {}, max-attempts {}, versioned {}, provision-history {})",
+        "summary delivery {} (endpoint {}, vault {}, folder {}, credential {}, max-attempts {}, versioned {}, provision-history {})",
         if settings.enabled {
             "enabled"
         } else {

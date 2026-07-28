@@ -153,7 +153,9 @@ Registration also sets global cost controls, stored in `$MUNSHI_HOME/config.json
   invocations allowed per project, on a rolling window.
 - `--max-concurrency` (default 2): sessions summarized concurrently across *all* projects.
 
-Re-run `munshi register` with new values to change them.
+Re-run `munshi register` with new values to change them. Every `config.json` setting — these
+budgets, limits, `summary_delivery`, `archive_upload`, and the rest — is documented in
+[`configuration.md`](configuration.md).
 
 ### `.munshi.toml` project overrides
 
@@ -223,17 +225,18 @@ archive tree; there's no built-in sync between them.
 
 ## Remote delivery (Notesmith) in brief
 
-Delivery to a Notesmith vault is disabled by default and, when enabled, is strictly downstream of
-local archival — it never blocks or rolls back a local Markdown write. The essentials:
+Summary delivery to a Notesmith vault is disabled by default and, when enabled, is strictly
+downstream of local archival — it never blocks or rolls back a local Markdown write. The
+essentials (`munshi delivery` still works as a deprecated alias for `munshi summary-delivery`):
 
 ```bash
-munshi delivery configure --endpoint http://127.0.0.1:27183 --vault my-vault
-munshi delivery enable
-munshi delivery status
-munshi delivery backfill              # dry run by default
-munshi delivery backfill --confirm    # actually publish
-munshi delivery retry --all
-munshi delivery retry <session-id> --force
+munshi summary-delivery configure --endpoint http://127.0.0.1:27183 --vault my-vault
+munshi summary-delivery enable
+munshi summary-delivery status
+munshi summary-delivery backfill              # dry run by default
+munshi summary-delivery backfill --confirm    # actually publish
+munshi summary-delivery retry --all
+munshi summary-delivery retry <session-id> --force
 ```
 
 `configure` records the sink without turning it on; `enable` reports how many existing summaries
@@ -256,6 +259,7 @@ munshi archive-upload enable
 munshi archive-upload status
 munshi archive-upload retry --all
 munshi archive-upload retry <session-id> --force
+munshi archive-upload backfill
 ```
 
 `configure` records the server without turning upload on; `enable` requires a configured server and
@@ -263,11 +267,32 @@ turns upload on; `disable` stops future upload while keeping upload history. `st
 configuration and per-session upload state. `retry` re-attempts failed uploads (`--force` revives
 dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
 also retried automatically by the recovery sweep (`munshi hook recover`), so a transient outage
-recovers without a new revision. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
+recovers without a new revision. `backfill` uploads archived sessions the configured server has no
+upload record for — sessions archived while upload was disabled or unconfigured — running each
+through the normal upload path (`--limit` bounds one run, default 200). Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
 claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
 download cap for a deliberately large artifact). Full design and rationale:
 [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and
 [ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md).
+
+### `munshi verify-archive-parse`
+
+The read-time acceptance check ([ADR 0011](adr/0011-interpret-transcripts-at-read-time-through-a-shared-streaming-crate.md)/
+[0012](adr/0012-defer-the-analysis-client-until-a-first-consumer-exists.md)): walks the Patwari
+archive, downloads and hash-verifies each snapshot's transcript, stream-parses it with the shared
+interpreter, and reports per-session accounting — records seen, share typed, deliberately-ignored
+kinds, `Unknown` kinds with bounded samples, and record errors.
+
+```sh
+munshi verify-archive-parse --all
+munshi verify-archive-parse --session <patwari-session-id>
+```
+
+Exit `0` means every transcript downloaded, verified, and parsed with zero unknowns and zero
+errors; distinct non-zero codes separate findings, verification failures, transport failures, and
+configuration problems (see the module docs' table, and `--json` for the machine report). Run it
+manually after a harness format bump or new-adapter support — Unknown kinds are interpretation
+gaps to type, not noise.
 
 ## Unregistering and cleanup
 
@@ -285,6 +310,7 @@ over.
 ## Where to go next
 
 - [`getting-started.md`](getting-started.md) — first-time registration and setup.
+- [`configuration.md`](configuration.md) — every `config.json` setting in one place.
 - [`summarizers.md`](summarizers.md) — choosing and configuring a compatible summarizer.
 - [`troubleshooting.md`](troubleshooting.md) — diagnosing failures beyond what `doctor` and
   `configuration-check` cover.
