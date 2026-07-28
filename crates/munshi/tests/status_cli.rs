@@ -38,7 +38,7 @@ fn configuration_check_json_distinguishes_disabled_and_delivery_states() {
     assert_eq!(disabled["configuration"]["disabled_projects"], 1);
 
     harness.mutate_config(|config| {
-        config["remote_delivery"] = Value::Bool(true);
+        config["summary_delivery"]["enabled"] = Value::Bool(true);
     });
     let delivery = harness.configuration_check_json();
     assert_eq!(

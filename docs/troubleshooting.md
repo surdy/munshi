@@ -33,7 +33,7 @@ of named checks, each `ok`, `warning`, or `error`. The ones worth knowing:
 
 | Check | Failing means |
 | --- | --- |
-| `config-file` / `config-version` | `config.json` missing, unreadable, or the wrong schema version. Re-run `munshi register`. |
+| `config-file` / `config-version` | `config.json` missing, unreadable, or the wrong schema version (current: 2; a version-1 file loads fine and auto-migrates on the next configuration load — see [`configuration.md`](configuration.md)). Otherwise re-run `munshi register`. |
 | `state-directory-match` | `config.json`'s recorded state directory doesn't match the `--state-dir`/`$MUNSHI_HOME` this command is using — usually a copied config or wrong `--state-dir`. |
 | `transcript-disclosure` | Registration never completed acceptance of the disclosure. Re-register with `--accept-transcript-processing`. |
 | `summarizer-path` / `output-path` | The configured summarizer executable or output directory isn't an absolute path. Re-register with absolute paths. |

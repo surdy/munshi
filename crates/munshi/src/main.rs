@@ -139,8 +139,8 @@ enum Command {
     #[command(subcommand)]
     Project(ProjectCommand),
     /// Configure and operate opt-in Notesmith delivery of current summaries.
-    #[command(subcommand)]
-    Delivery(DeliveryCommand),
+    #[command(subcommand, visible_alias = "delivery")]
+    SummaryDelivery(SummaryDeliveryCommand),
     /// Configure and operate opt-in Patwari archive upload of full session snapshots.
     #[command(subcommand)]
     ArchiveUpload(ArchiveUploadCommand),
@@ -335,7 +335,7 @@ enum ProjectCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum DeliveryCommand {
+enum SummaryDeliveryCommand {
     /// Record the Notesmith sink (endpoint, vault, folder, credential source) without enabling it.
     Configure {
         /// Base URL of the Notesmith daemon, for example `http://127.0.0.1:27183`.
@@ -901,7 +901,12 @@ struct RawStoredConfig {
     local_archival_enabled: Option<bool>,
     transcript_processing_accepted: Option<bool>,
     project_origin: Option<String>,
+    /// The unified v2 summary-delivery section (issue #36).
+    #[serde(default)]
+    summary_delivery: Option<RawDelivery>,
+    /// Legacy v1 enablement flag, read so doctor can still describe an unmigrated configuration.
     remote_delivery: Option<bool>,
+    /// Legacy v1 sink section, read so doctor can still describe an unmigrated configuration.
     #[serde(default)]
     delivery: Option<RawDelivery>,
     policy: Option<RawPolicy>,
@@ -918,6 +923,8 @@ struct RawHarnesses {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawDelivery {
+    #[serde(default)]
+    enabled: Option<bool>,
     endpoint: Option<String>,
     vault: Option<String>,
     #[serde(default)]
@@ -1024,7 +1031,7 @@ fn main() -> ExitCode {
         }
         Ok(Outcome::DeliveryEnabled { settings, backfill }) => {
             println!(
-                "delivery enabled (endpoint {}, vault {})",
+                "summary delivery enabled (endpoint {}, vault {})",
                 settings.endpoint.as_deref().unwrap_or("<unset>"),
                 settings.vault.as_deref().unwrap_or("<unset>")
             );
@@ -1035,7 +1042,7 @@ fn main() -> ExitCode {
         }
         Ok(Outcome::DeliveryDisabled { settings }) => {
             let _ = settings;
-            println!("delivery disabled; existing delivery history is retained");
+            println!("summary delivery disabled; existing delivery history is retained");
             ExitCode::SUCCESS
         }
         Ok(Outcome::DeliveryStatus { report, json }) => {
@@ -1399,7 +1406,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 &project_dir,
             )?))
         }
-        Command::Delivery(command) => run_delivery(command),
+        Command::SummaryDelivery(command) => run_summary_delivery(command),
         Command::ArchiveUpload(command) => run_archive_upload(command),
         Command::Status { state_dir, json } => {
             let state_directory = resolve_state_directory(state_dir)?;
@@ -1592,9 +1599,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
     }
 }
 
-fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
+fn run_summary_delivery(command: SummaryDeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
     match command {
-        DeliveryCommand::Configure {
+        SummaryDeliveryCommand::Configure {
             endpoint,
             vault,
             folder,
@@ -1629,7 +1636,7 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 settings: Box::new(settings),
             })
         }
-        DeliveryCommand::Enable { state_dir } => {
+        SummaryDeliveryCommand::Enable { state_dir } => {
             let state_directory = resolve_state_directory(state_dir)?;
             let settings = set_delivery_enabled(&state_directory, true)?;
             // Report the pending backfill as a dry run so existing summaries need confirmation.
@@ -1641,14 +1648,14 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 backfill,
             })
         }
-        DeliveryCommand::Disable { state_dir } => {
+        SummaryDeliveryCommand::Disable { state_dir } => {
             let state_directory = resolve_state_directory(state_dir)?;
             let settings = set_delivery_enabled(&state_directory, false)?;
             Ok(Outcome::DeliveryDisabled {
                 settings: Box::new(settings),
             })
         }
-        DeliveryCommand::History {
+        SummaryDeliveryCommand::History {
             state_dir,
             configure,
             json,
@@ -1659,14 +1666,14 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 json,
             })
         }
-        DeliveryCommand::Status { state_dir, json } => {
+        SummaryDeliveryCommand::Status { state_dir, json } => {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::DeliveryStatus {
                 report: Box::new(delivery_status(&state_directory)?),
                 json,
             })
         }
-        DeliveryCommand::Backfill {
+        SummaryDeliveryCommand::Backfill {
             state_dir,
             confirm,
             limit,
@@ -1678,7 +1685,7 @@ fn run_delivery(command: DeliveryCommand) -> Result<Outcome, Box<dyn Error>> {
                 json,
             })
         }
-        DeliveryCommand::Retry {
+        SummaryDeliveryCommand::Retry {
             session_id,
             source,
             all,
@@ -2333,19 +2340,27 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         CheckStatus::Ok,
                         format!("loaded {}", config_path.display()),
                     );
-                    if config.version == Some(1) {
+                    if config.version == Some(2) {
                         push_check(
                             &mut checks,
                             "config-version",
                             CheckStatus::Ok,
-                            "version 1".to_owned(),
+                            "version 2".to_owned(),
+                        );
+                    } else if config.version == Some(1) {
+                        push_check(
+                            &mut checks,
+                            "config-version",
+                            CheckStatus::Ok,
+                            "version 1 (superseded; migrates to version 2 on the next configuration load)"
+                                .to_owned(),
                         );
                     } else {
                         push_check(
                             &mut checks,
                             "config-version",
                             CheckStatus::Warning,
-                            format!("unsupported version {:?}; expected 1", config.version),
+                            format!("unsupported version {:?}; expected 2", config.version),
                         );
                     }
 
@@ -2381,13 +2396,22 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                     } else {
                         CaptureState::Unknown
                     };
-                    delivery_state = match config.remote_delivery {
+                    // Prefer the unified v2 `summary_delivery` section; fall back to the legacy v1
+                    // `remote_delivery` + `delivery` pair for a not-yet-migrated configuration.
+                    let delivery_enabled = config
+                        .summary_delivery
+                        .as_ref()
+                        .and_then(|section| section.enabled)
+                        .or(config.remote_delivery);
+                    let delivery_section = config
+                        .summary_delivery
+                        .as_ref()
+                        .or(config.delivery.as_ref());
+                    delivery_state = match delivery_enabled {
                         Some(false) => DeliveryState::Disabled,
                         Some(true) => {
-                            let addressable = config
-                                .delivery
-                                .as_ref()
-                                .is_some_and(RawDelivery::is_addressable);
+                            let addressable =
+                                delivery_section.is_some_and(RawDelivery::is_addressable);
                             if addressable {
                                 DeliveryState::Enabled
                             } else {
@@ -2427,25 +2451,27 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                             &mut checks,
                             "delivery-state",
                             CheckStatus::Ok,
-                            "delivery disabled".to_owned(),
+                            "summary delivery disabled".to_owned(),
                         ),
                         DeliveryState::Enabled => push_check(
                             &mut checks,
                             "delivery-state",
                             CheckStatus::Ok,
-                            "delivery enabled with an addressable Notesmith sink".to_owned(),
+                            "summary delivery enabled with an addressable Notesmith sink"
+                                .to_owned(),
                         ),
                         DeliveryState::DeliveryRelated => push_check(
                             &mut checks,
                             "delivery-state",
                             CheckStatus::Warning,
-                            "delivery enabled but the Notesmith sink is not addressable".to_owned(),
+                            "summary delivery enabled but the Notesmith sink is not addressable"
+                                .to_owned(),
                         ),
                         DeliveryState::Unknown => push_check(
                             &mut checks,
                             "delivery-state",
                             CheckStatus::Warning,
-                            "delivery state is unknown".to_owned(),
+                            "summary delivery state is unknown".to_owned(),
                         ),
                     }
 
@@ -2549,22 +2575,20 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
 
                     // Issue #9: when local Git history is enabled alongside delivery, versioned
                     // delivery is required and the Notesmith vault must preserve correlated revision
-                    // history. Doctor reports this statically; `munshi delivery history` probes the
-                    // live capability.
+                    // history. Doctor reports this statically; `munshi summary-delivery history`
+                    // probes the live capability.
                     let versioned =
-                        archive_git_history == Some(true) && config.remote_delivery == Some(true);
-                    let provision = config
-                        .delivery
-                        .as_ref()
+                        archive_git_history == Some(true) && delivery_enabled == Some(true);
+                    let provision = delivery_section
                         .and_then(|delivery| delivery.provision_history)
                         .unwrap_or(false);
                     versioned_delivery = Some(versioned);
                     provision_remote_history = Some(provision);
                     if versioned {
                         let hint = if provision {
-                            "versioned delivery: Munshi will configure the Notesmith vault's revision history; verify with `munshi delivery history --configure`"
+                            "versioned delivery: Munshi will configure the Notesmith vault's revision history; verify with `munshi summary-delivery history --configure`"
                         } else {
-                            "versioned delivery requires remote revision history; verify with `munshi delivery history` (add `--configure` to enable it)"
+                            "versioned delivery requires remote revision history; verify with `munshi summary-delivery history` (add `--configure` to enable it)"
                         };
                         push_check(
                             &mut checks,
@@ -2572,7 +2596,7 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                             CheckStatus::Warning,
                             hint.to_owned(),
                         );
-                    } else if config.remote_delivery == Some(true) {
+                    } else if delivery_enabled == Some(true) {
                         push_check(
                             &mut checks,
                             "delivery-remote-history",
@@ -2618,7 +2642,9 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         );
                     }
 
-                    config_recognized = config.version == Some(1)
+                    // Version 1 remains runtime-compatible: the runtime migrates it forward
+                    // losslessly on load (issue #36).
+                    config_recognized = matches!(config.version, Some(1) | Some(2))
                         && config.local_archival_enabled == Some(true)
                         && matches!(
                             delivery_state,
@@ -3093,7 +3119,7 @@ fn is_executable_file(path: &Path) -> bool {
 fn print_status_human(report: &StatusReport) {
     println!("state directory: {}", report.state_directory);
     println!(
-        "configuration: {} (capture {}, delivery {}, git-history {}, disabled-projects {}, runtime-compatible {})",
+        "configuration: {} (capture {}, summary-delivery {}, git-history {}, disabled-projects {}, runtime-compatible {})",
         report.configuration.status.as_str(),
         report.configuration.capture_state.as_str(),
         report.configuration.delivery_state.as_str(),
@@ -3169,7 +3195,7 @@ fn print_show_human(report: &ShowReport) {
     }
     if let Some(delivery) = session.delivery.as_ref() {
         println!(
-            "delivery: {}{}{}",
+            "summary delivery: {}{}{}",
             delivery.state,
             delivery
                 .note_link
@@ -3236,7 +3262,7 @@ fn print_configuration_check_human(report: &ConfigurationCheckReport) {
         report.configuration.status.as_str()
     );
     println!(
-        "capture: {}, delivery: {}, git-history: {}, disabled-projects: {}, runtime-compatible: {}",
+        "capture: {}, summary-delivery: {}, git-history: {}, disabled-projects: {}, runtime-compatible: {}",
         report.configuration.capture_state.as_str(),
         report.configuration.delivery_state.as_str(),
         report
@@ -3260,7 +3286,7 @@ fn print_configuration_check_human(report: &ConfigurationCheckReport) {
 fn print_doctor_human(report: &DoctorReport) {
     println!("doctor status: {}", report.status.as_str());
     println!(
-        "capture: {}, delivery: {}, git-history: {}, disabled-projects: {}, runtime-compatible: {}",
+        "capture: {}, summary-delivery: {}, git-history: {}, disabled-projects: {}, runtime-compatible: {}",
         report.configuration.capture_state.as_str(),
         report.configuration.delivery_state.as_str(),
         report

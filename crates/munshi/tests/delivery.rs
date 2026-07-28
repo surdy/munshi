@@ -26,8 +26,8 @@ const TOKEN_ENV: &str = "MUNSHI_TEST_DELIVERY_TOKEN";
 const CLAUDE_SESSION: &str = "0c1a0de0-0000-4000-8000-000000000001";
 
 /// A caller that only knows a project directory (e.g. Madari probing before the user has ever run
-/// `munshi register` there) must get a valid, empty `schema_version: 1` contract from `delivery
-/// status --json`, exactly like `sessions`/`status`/`show`/`retry` already do when unregistered —
+/// `munshi register` there) must get a valid, empty `schema_version: 1` contract from
+/// `summary-delivery status --json`, exactly like `sessions`/`status`/`show`/`retry` already do when unregistered —
 /// never a bare, unparseable error string on stdout.
 #[test]
 fn delivery_status_json_on_an_unregistered_state_directory_degrades_to_empty_contract() {
@@ -36,7 +36,7 @@ fn delivery_status_json_on_an_unregistered_state_directory_degrades_to_empty_con
     let status = harness.delivery_status_json();
 
     assert_eq!(status["schema_version"], 1);
-    assert_eq!(status["command"], "delivery-status");
+    assert_eq!(status["command"], "summary-delivery-status");
     assert_eq!(status["settings"]["enabled"], false);
     assert_eq!(status["settings"]["addressable"], false);
     assert_eq!(status["settings"]["endpoint"], Value::Null);
@@ -62,7 +62,7 @@ fn backfill_dry_run_reports_candidates_without_contacting_the_sink() {
     harness.enable();
 
     let dry = harness.delivery_backfill_json(false);
-    assert_eq!(dry["command"], "delivery-backfill");
+    assert_eq!(dry["command"], "summary-delivery-backfill");
     assert_eq!(dry["confirmed"], false);
     assert_eq!(dry["candidates"], 1);
     assert_eq!(dry["created"], 0);
@@ -1453,7 +1453,7 @@ impl Harness {
     fn configure_with_folder(&self, endpoint: &str, folder: &str) {
         let output = self
             .munshi()
-            .args(["delivery", "configure", "--endpoint"])
+            .args(["summary-delivery", "configure", "--endpoint"])
             .arg(endpoint)
             .args(["--vault", VAULT, "--folder", folder])
             .arg("--state-dir")
@@ -1466,7 +1466,7 @@ impl Harness {
     fn configure_with_credential(&self, endpoint: &str) {
         let output = self
             .munshi()
-            .args(["delivery", "configure", "--endpoint"])
+            .args(["summary-delivery", "configure", "--endpoint"])
             .arg(endpoint)
             .args([
                 "--vault",
@@ -1488,7 +1488,7 @@ impl Harness {
     fn configure_with_provision(&self, endpoint: &str) {
         let output = self
             .munshi()
-            .args(["delivery", "configure", "--endpoint"])
+            .args(["summary-delivery", "configure", "--endpoint"])
             .arg(endpoint)
             .args([
                 "--vault",
@@ -1508,7 +1508,7 @@ impl Harness {
     /// and whether the command reported success (exit code zero).
     fn delivery_history(&self, configure: bool) -> (Value, bool) {
         let mut command = self.munshi();
-        command.args(["delivery", "history", "--state-dir"]);
+        command.args(["summary-delivery", "history", "--state-dir"]);
         command.arg(self.state_str());
         command.arg("--json");
         if configure {
@@ -1537,7 +1537,7 @@ impl Harness {
     fn enable(&self) {
         let output = self
             .munshi()
-            .args(["delivery", "enable"])
+            .args(["summary-delivery", "enable"])
             .arg("--state-dir")
             .arg(&self.state)
             .output()
@@ -1567,7 +1567,7 @@ impl Harness {
 
     fn delivery_status_json(&self) -> Value {
         self.json([
-            "delivery",
+            "summary-delivery",
             "status",
             "--state-dir",
             self.state_str(),
@@ -1577,7 +1577,7 @@ impl Harness {
 
     fn delivery_backfill_json(&self, confirm: bool) -> Value {
         let mut args = vec![
-            "delivery".to_owned(),
+            "summary-delivery".to_owned(),
             "backfill".to_owned(),
             "--state-dir".to_owned(),
             self.state.display().to_string(),
@@ -1591,7 +1591,7 @@ impl Harness {
 
     fn delivery_retry_all_json(&self, force: bool) -> Value {
         let mut args = vec![
-            "delivery".to_owned(),
+            "summary-delivery".to_owned(),
             "retry".to_owned(),
             "--all".to_owned(),
             "--state-dir".to_owned(),

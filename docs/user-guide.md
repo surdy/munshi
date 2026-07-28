@@ -153,7 +153,9 @@ Registration also sets global cost controls, stored in `$MUNSHI_HOME/config.json
   invocations allowed per project, on a rolling window.
 - `--max-concurrency` (default 2): sessions summarized concurrently across *all* projects.
 
-Re-run `munshi register` with new values to change them.
+Re-run `munshi register` with new values to change them. Every `config.json` setting — these
+budgets, limits, `summary_delivery`, `archive_upload`, and the rest — is documented in
+[`configuration.md`](configuration.md).
 
 ### `.munshi.toml` project overrides
 
@@ -223,17 +225,18 @@ archive tree; there's no built-in sync between them.
 
 ## Remote delivery (Notesmith) in brief
 
-Delivery to a Notesmith vault is disabled by default and, when enabled, is strictly downstream of
-local archival — it never blocks or rolls back a local Markdown write. The essentials:
+Summary delivery to a Notesmith vault is disabled by default and, when enabled, is strictly
+downstream of local archival — it never blocks or rolls back a local Markdown write. The
+essentials (`munshi delivery` still works as a deprecated alias for `munshi summary-delivery`):
 
 ```bash
-munshi delivery configure --endpoint http://127.0.0.1:27183 --vault my-vault
-munshi delivery enable
-munshi delivery status
-munshi delivery backfill              # dry run by default
-munshi delivery backfill --confirm    # actually publish
-munshi delivery retry --all
-munshi delivery retry <session-id> --force
+munshi summary-delivery configure --endpoint http://127.0.0.1:27183 --vault my-vault
+munshi summary-delivery enable
+munshi summary-delivery status
+munshi summary-delivery backfill              # dry run by default
+munshi summary-delivery backfill --confirm    # actually publish
+munshi summary-delivery retry --all
+munshi summary-delivery retry <session-id> --force
 ```
 
 `configure` records the sink without turning it on; `enable` reports how many existing summaries
@@ -288,6 +291,7 @@ over.
 ## Where to go next
 
 - [`getting-started.md`](getting-started.md) — first-time registration and setup.
+- [`configuration.md`](configuration.md) — every `config.json` setting in one place.
 - [`summarizers.md`](summarizers.md) — choosing and configuring a compatible summarizer.
 - [`troubleshooting.md`](troubleshooting.md) — diagnosing failures beyond what `doctor` and
   `configuration-check` cover.

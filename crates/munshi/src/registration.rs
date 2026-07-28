@@ -17,6 +17,11 @@ use crate::state::{StateStore, migrate_legacy_state};
 
 const HOOK_FILE_NAME: &str = "munshi.json";
 const CONFIG_FILE_NAME: &str = "config.json";
+/// Current `config.json` schema version. Version 2 (issue #36) replaced the scattered v1 pair of a
+/// top-level `remote_delivery` bool plus a `delivery` section with one self-contained
+/// `summary_delivery` section carrying `enabled` inside, mirroring `archive_upload`'s shape.
+/// Version 1 files still load: they are migrated forward losslessly and persisted as version 2.
+pub(crate) const CONFIG_VERSION: u32 = 2;
 /// Dot-prefixed so it can never collide with a `locks/<session_id>.lock` file.
 const REGISTRATION_LOCK_NAME: &str = ".munshi-registration.lock";
 const DEFAULT_MAX_CALLS_PER_HOUR: u32 = 10;
@@ -125,9 +130,8 @@ pub(crate) struct StoredConfig {
     pub transcript_processing_accepted: bool,
     pub project_origin: String,
     pub limits: StoredLimits,
-    pub remote_delivery: bool,
     #[serde(default)]
-    pub delivery: StoredDelivery,
+    pub summary_delivery: StoredSummaryDelivery,
     #[serde(default = "StoredPolicy::defaults")]
     pub policy: StoredPolicy,
     /// Opt-in Patwari archive-upload configuration (ADR 0009). Disabled by default; it holds the
@@ -171,13 +175,18 @@ pub(crate) struct StoredCommand {
     pub args: Vec<String>,
 }
 
-/// The Munshi-owned Notesmith sink configuration. Delivery is opt-in and disabled by default via
-/// `remote_delivery`; this section records only *where* to deliver and *how to find* a credential.
-/// It never stores the credential itself: `credential` names an environment variable or an
-/// operating-system credential-store entry that is read at delivery time (khata-handoff.md).
+/// The Munshi-owned Notesmith summary-delivery configuration. Summary delivery is opt-in and
+/// disabled by default via `enabled`; the section records *where* to deliver and *how to find* a
+/// credential, mirroring `archive_upload`'s self-contained shape (issue #36). It never stores the
+/// credential itself: `credential` names an environment variable or an operating-system
+/// credential-store entry that is read at delivery time (khata-handoff.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StoredDelivery {
+pub(crate) struct StoredSummaryDelivery {
+    /// Whether current summary revisions are delivered after a successful local archive. Opt-in;
+    /// disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
     /// Base URL of the Notesmith daemon, for example `http://127.0.0.1:27183`.
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -204,9 +213,10 @@ fn default_max_delivery_attempts() -> u32 {
     DEFAULT_MAX_DELIVERY_ATTEMPTS
 }
 
-impl Default for StoredDelivery {
+impl Default for StoredSummaryDelivery {
     fn default() -> Self {
         Self {
+            enabled: false,
             endpoint: None,
             vault: None,
             folder: None,
@@ -217,7 +227,7 @@ impl Default for StoredDelivery {
     }
 }
 
-impl StoredDelivery {
+impl StoredSummaryDelivery {
     /// A sink is fully addressable only when both the endpoint and vault are present.
     pub(crate) fn is_addressable(&self) -> bool {
         self.endpoint
@@ -225,6 +235,71 @@ impl StoredDelivery {
             .is_some_and(|value| !value.is_empty())
             && self.vault.as_deref().is_some_and(|value| !value.is_empty())
     }
+}
+
+/// The legacy version-1 `config.json` shape: a top-level `remote_delivery` bool plus a `delivery`
+/// section. Superseded by the self-contained `summary_delivery` section in version 2 (issue #36);
+/// kept only so existing configurations load losslessly and migrate forward.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConfigV1 {
+    #[allow(dead_code)]
+    version: u32,
+    summarizer: StoredCommand,
+    output_directory: String,
+    state_directory: String,
+    #[serde(default)]
+    archive_git_history: bool,
+    local_archival_enabled: bool,
+    transcript_processing_accepted: bool,
+    project_origin: String,
+    limits: StoredLimits,
+    remote_delivery: bool,
+    #[serde(default)]
+    delivery: StoredSummaryDelivery,
+    #[serde(default = "StoredPolicy::defaults")]
+    policy: StoredPolicy,
+    #[serde(default)]
+    archive_upload: StoredArchiveUpload,
+    #[serde(default)]
+    harnesses: StoredHarnesses,
+}
+
+impl From<StoredConfigV1> for StoredConfig {
+    /// The lossless v1 -> v2 migration: `remote_delivery` becomes `summary_delivery.enabled` and
+    /// every `delivery.*` field carries over verbatim.
+    fn from(previous: StoredConfigV1) -> Self {
+        let mut summary_delivery = previous.delivery;
+        summary_delivery.enabled = previous.remote_delivery;
+        Self {
+            version: CONFIG_VERSION,
+            summarizer: previous.summarizer,
+            output_directory: previous.output_directory,
+            state_directory: previous.state_directory,
+            archive_git_history: previous.archive_git_history,
+            local_archival_enabled: previous.local_archival_enabled,
+            transcript_processing_accepted: previous.transcript_processing_accepted,
+            project_origin: previous.project_origin,
+            limits: previous.limits,
+            summary_delivery,
+            policy: previous.policy,
+            archive_upload: previous.archive_upload,
+            harnesses: previous.harnesses,
+        }
+    }
+}
+
+/// The `version` recorded in raw `config.json` bytes, read leniently so version dispatch works on
+/// both the v1 and v2 shapes.
+fn stored_config_version(bytes: &[u8]) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        #[serde(default)]
+        version: Option<u32>,
+    }
+    serde_json::from_slice::<VersionProbe>(bytes)
+        .ok()
+        .and_then(|probe| probe.version)
 }
 
 /// The source of the Notesmith bearer credential. Munshi resolves the actual secret at delivery
@@ -467,15 +542,17 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
 
 /// The existing Munshi-owned configuration at `config_path`, when one is present. Re-registration
 /// reads it so sections owned by other commands survive a config rewrite: the explicit
-/// disabled-projects list, the delivery sink and its enablement, and the archive-upload section
-/// with the persistent client UUID (issue #31). The file was already validated as recognized by
-/// `validate_owned_file` under the registration lock before this runs.
+/// disabled-projects list, the self-contained summary-delivery section, and the archive-upload
+/// section with the persistent client UUID (issue #31). A version-1 file is converted forward
+/// here, so re-registering over an unmigrated configuration also persists it as version 2. The
+/// file was already validated as recognized by `validate_owned_file` under the registration lock
+/// before this runs.
 fn existing_stored_config(config_path: &Path) -> Result<Option<StoredConfig>, RegistrationError> {
     if !config_path.exists() {
         return Ok(None);
     }
     let bytes = fs::read(config_path).map_err(RegistrationError::Io)?;
-    serde_json::from_slice(&bytes)
+    parse_stored_config(&bytes)
         .map(Some)
         .map_err(|_| RegistrationError::MalformedOwnedFile)
 }
@@ -546,24 +623,24 @@ impl StoredConfig {
     ) -> Result<Self, RegistrationError> {
         // Carry sections owned by other commands forward from the existing configuration verbatim
         // (issue #31): a re-register (e.g. to raise policy budgets) must not silently disable a
-        // configured delivery sink or archive upload, and the persistent Patwari client UUID must
-        // survive because it is the durable identity uploads are keyed under (ADR 0004/0009).
-        let (disabled_projects, remote_delivery, delivery, archive_upload) = match existing {
+        // configured summary-delivery sink or archive upload, and the persistent Patwari client
+        // UUID must survive because it is the durable identity uploads are keyed under
+        // (ADR 0004/0009). Each carried section is self-contained (enablement lives inside it), so
+        // nothing else needs to travel with it.
+        let (disabled_projects, summary_delivery, archive_upload) = match existing {
             Some(previous) => (
                 previous.policy.disabled_projects,
-                previous.remote_delivery,
-                previous.delivery,
+                previous.summary_delivery,
                 previous.archive_upload,
             ),
             None => (
                 Vec::new(),
-                false,
-                StoredDelivery::default(),
+                StoredSummaryDelivery::default(),
                 StoredArchiveUpload::default(),
             ),
         };
         Ok(Self {
-            version: 1,
+            version: CONFIG_VERSION,
             summarizer: StoredCommand {
                 executable: utf8(&config.summarizer_binary)?,
                 args: config
@@ -591,8 +668,7 @@ impl StoredConfig {
                 max_stderr_bytes: config.max_stderr_bytes,
                 max_event_text_bytes: crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES,
             },
-            remote_delivery,
-            delivery,
+            summary_delivery,
             archive_upload,
             policy: StoredPolicy {
                 max_calls_per_hour: config.max_calls_per_hour,
@@ -616,18 +692,38 @@ impl StoredConfig {
     }
 }
 
-trait ManagedFile {
+trait ManagedFile: Sized + for<'de> Deserialize<'de> {
+    /// Parses managed-file bytes, accepting every on-disk shape this file type still supports.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+
     fn is_recognized(&self) -> bool;
 }
 
+/// Parses `config.json` bytes as the current in-memory configuration, dispatching on the recorded
+/// schema version: version-1 bytes are converted forward losslessly, everything else must be the
+/// current shape.
+fn parse_stored_config(bytes: &[u8]) -> Result<StoredConfig, serde_json::Error> {
+    if stored_config_version(bytes) == Some(1) {
+        serde_json::from_slice::<StoredConfigV1>(bytes).map(StoredConfig::from)
+    } else {
+        serde_json::from_slice(bytes)
+    }
+}
+
 impl ManagedFile for StoredConfig {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        parse_stored_config(bytes).ok()
+    }
+
     fn is_recognized(&self) -> bool {
-        self.version == 1
+        self.version == CONFIG_VERSION
             && self.local_archival_enabled
             && self.transcript_processing_accepted
             && self.project_origin == "agent_stop_cwd"
             && self.policy.max_concurrency >= 1
-            && (!self.remote_delivery || self.delivery.is_addressable())
+            && (!self.summary_delivery.enabled || self.summary_delivery.is_addressable())
             && (!self.archive_upload.enabled || self.archive_upload.is_addressable())
             && Path::new(&self.output_directory).is_absolute()
             && Path::new(&self.state_directory).is_absolute()
@@ -671,7 +767,7 @@ impl ManagedFile for HookFile {
 }
 
 /// Whether a Munshi-owned `config.json` exists in `state_directory`, without validating its
-/// contents. Lets read-only status queries (e.g. `munshi delivery status`) distinguish "never
+/// contents. Lets read-only status queries (e.g. `munshi summary-delivery status`) distinguish "never
 /// registered here" — which should degrade to empty/default output, like `sessions`/`status`/`show`
 /// already do — from a genuine I/O or malformed-file error while loading it.
 pub(crate) fn stored_config_exists(state_directory: &Path) -> bool {
@@ -683,21 +779,58 @@ pub(crate) fn load_stored_config(
 ) -> Result<StoredConfig, RegistrationError> {
     let path = state_directory.join(CONFIG_FILE_NAME);
     validate_regular_owned_file(&path)?;
-    let bytes = fs::read(path).map_err(RegistrationError::Io)?;
-    let config: StoredConfig = serde_json::from_slice(&bytes).map_err(RegistrationError::Json)?;
-    if config.version != 1
+    let bytes = fs::read(&path).map_err(RegistrationError::Io)?;
+    let config = parse_stored_config(&bytes).map_err(RegistrationError::Json)?;
+    if config.version != CONFIG_VERSION
         || !config.local_archival_enabled
         || !config.transcript_processing_accepted
         || config.project_origin != "agent_stop_cwd"
         || config.policy.max_concurrency < 1
-        || (config.remote_delivery && !config.delivery.is_addressable())
+        || (config.summary_delivery.enabled && !config.summary_delivery.is_addressable())
         || (config.archive_upload.enabled && !config.archive_upload.is_addressable())
         || Path::new(&config.state_directory) != state_directory
         || !config.harnesses.paths_are_absolute()
     {
         return Err(RegistrationError::MalformedOwnedFile);
     }
+    if stored_config_version(&bytes) == Some(1) {
+        // The file still holds the superseded v1 shape: persist the validated migration so the
+        // configuration converges on version 2.
+        persist_migrated_config(state_directory);
+    }
     Ok(config)
+}
+
+/// Best-effort persistence of the v1 -> v2 configuration migration under the registration lock —
+/// the same locking discipline every other `config.json` write uses, so concurrently running hook
+/// workers and the recovery loop only ever observe a complete v1 or v2 file (both loadable).
+///
+/// If the lock is currently held — including by this very process inside `update_stored_config`,
+/// whose own atomic write persists version 2 anyway — the migration is simply skipped; the caller
+/// already holds a valid migrated in-memory view, and the next load tries again.
+fn persist_migrated_config(state_directory: &Path) {
+    let Ok(locks_directory) = ensure_child_directory(state_directory, "locks") else {
+        return;
+    };
+    let Ok(_lock) = acquire_registration_lock(&locks_directory.join(REGISTRATION_LOCK_NAME)) else {
+        return;
+    };
+    // Re-read under the lock: another process may have migrated or rewritten the file since the
+    // caller's read.
+    let config_path = state_directory.join(CONFIG_FILE_NAME);
+    if validate_regular_owned_file(&config_path).is_err() {
+        return;
+    }
+    let Ok(bytes) = fs::read(&config_path) else {
+        return;
+    };
+    if stored_config_version(&bytes) != Some(1) {
+        return;
+    }
+    let Ok(config) = parse_stored_config(&bytes) else {
+        return;
+    };
+    let _ = atomic_json_replace(&config_path, &config);
 }
 
 /// The configured per-event extraction threshold for a registered state directory, or the built-in
@@ -854,19 +987,24 @@ pub(crate) fn atomic_bytes_replace(path: &Path, bytes: &[u8]) -> Result<(), Regi
 
 fn install_or_update_json<T>(path: &Path, value: &T) -> Result<(), RegistrationError>
 where
-    T: Serialize + for<'de> Deserialize<'de> + PartialEq + ManagedFile,
+    T: Serialize + ManagedFile,
 {
     if path.exists() {
         validate_regular_owned_file(path)?;
-        let existing: T = serde_json::from_slice(&fs::read(path).map_err(RegistrationError::Io)?)
-            .map_err(|_| RegistrationError::MalformedOwnedFile)?;
+        let existing_bytes = fs::read(path).map_err(RegistrationError::Io)?;
+        let existing = T::parse(&existing_bytes).ok_or(RegistrationError::MalformedOwnedFile)?;
         if !existing.is_recognized() {
             return Err(RegistrationError::MalformedOwnedFile);
         }
-        if &existing == value {
+        // Byte-level idempotence: an unchanged file keeps its inode, while a semantically equal
+        // file in a superseded on-disk shape (a version-1 config) is still rewritten and thereby
+        // migrated forward.
+        let mut bytes = serde_json::to_vec_pretty(value).map_err(RegistrationError::Json)?;
+        bytes.push(b'\n');
+        if existing_bytes == bytes {
             return Ok(());
         }
-        return atomic_json_replace(path, value);
+        return atomic_bytes_replace(path, &bytes);
     }
     if fs::symlink_metadata(path).is_ok() {
         return Err(RegistrationError::UnsafePath(path.to_path_buf()));
@@ -1106,15 +1244,11 @@ fn validate_regular_file(path: &Path) -> Result<(), RegistrationError> {
     }
 }
 
-fn validate_owned_file<T: for<'de> Deserialize<'de> + ManagedFile>(
-    path: &Path,
-) -> Result<(), RegistrationError> {
+fn validate_owned_file<T: ManagedFile>(path: &Path) -> Result<(), RegistrationError> {
     recognized_owned_file_exists::<T>(path).map(|_| ())
 }
 
-fn recognized_owned_file_exists<T: for<'de> Deserialize<'de> + ManagedFile>(
-    path: &Path,
-) -> Result<bool, RegistrationError> {
+fn recognized_owned_file_exists<T: ManagedFile>(path: &Path) -> Result<bool, RegistrationError> {
     if !path.exists() {
         if fs::symlink_metadata(path).is_ok() {
             return Err(RegistrationError::UnsafePath(path.to_path_buf()));
@@ -1123,8 +1257,7 @@ fn recognized_owned_file_exists<T: for<'de> Deserialize<'de> + ManagedFile>(
     }
     validate_regular_owned_file(path)?;
     let bytes = fs::read(path).map_err(RegistrationError::Io)?;
-    let value =
-        serde_json::from_slice::<T>(&bytes).map_err(|_| RegistrationError::MalformedOwnedFile)?;
+    let value = T::parse(&bytes).ok_or(RegistrationError::MalformedOwnedFile)?;
     if value.is_recognized() {
         Ok(true)
     } else {
