@@ -22,6 +22,12 @@ A version-1 file still loads: `remote_delivery` maps to `summary_delivery.enable
 next configuration load (or write), under the registration lock like every other config write.
 `munshi doctor` reports the recorded version as the `config-version` check.
 
+The migration is one-way and triggered by any configuration read: the first invocation of a v2
+binary rewrites the file, after which a v1 binary rejects it (`MalformedOwnedFile`) and — because
+hooks fail open — capture silently stops for any harness whose hook files still point at the old
+executable. After upgrading, re-run `munshi register` if any hook path changed; downgrading
+requires re-registering with the old binary.
+
 ## Top-level settings
 
 Written by `munshi register` from its flags; re-run `register` to change them.
