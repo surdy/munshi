@@ -176,6 +176,15 @@ restarts the streak so the session gets fresh attempts. Sweeps also scan eligibl
 least-recently-attempted first, and `munshi status` reports currently parked sessions as
 `parked=<n>` on its sessions line.
 
+A session whose origin directory was deleted after the fact no longer parks permanently as
+`project-failed` or `origin-unresolved`. When the directory cannot be resolved on disk, the worker
+derives the project identity from the origin evidence the source records already carry — Claude
+Code's per-record `cwd` and `gitBranch`, Copilot's `workspace.yaml` `cwd` — using the same
+remote-less stable-hash rule, and the recovery sweep hydrates parked `origin-unresolved` rows the
+same way (issue #40). Archive frontmatter flags such records with `project_origin: "recorded"`.
+Quiet-period gating is unchanged, and a transcript with no recorded origin evidence still parks
+as before.
+
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
 summary cache from validated Munshi-owned Markdown. Existing Markdown is never deleted or made

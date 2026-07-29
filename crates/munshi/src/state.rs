@@ -14,7 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::project::ProjectIdentity;
+use crate::project::{ProjectIdentity, ProjectOrigin};
 use crate::registration::{
     RegistrationError, durable_remove, ensure_directory, validate_regular_owned_file,
 };
@@ -652,6 +652,7 @@ impl StateStore {
         }
         ensure_processing_attempts_git_history_column(&self.connection)?;
         ensure_session_failure_streak_columns(&self.connection)?;
+        ensure_session_project_origin_column(&self.connection)?;
         Ok(())
     }
 
@@ -872,7 +873,8 @@ impl StateStore {
                     source_started_at,source_updated_at,source_user_requests,
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                    last_error_category,source_kind,next_retry_at_ms,failure_streak
+                    last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                    origin_project_origin
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -895,7 +897,8 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind,next_retry_at_ms,failure_streak
+                last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                origin_project_origin
              FROM sessions
              ORDER BY updated_at_ms DESC,id DESC",
         )?;
@@ -1631,6 +1634,11 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
             project: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
             repository: row.get(6)?,
             branch: row.get(7)?,
+            // NULL means live: rows written before issue #40 carry no marker.
+            origin: match row.get::<_, Option<String>>(37)?.as_deref() {
+                Some("recorded") => ProjectOrigin::Recorded,
+                _ => ProjectOrigin::Live,
+            },
         }),
         None => None,
     };
@@ -1838,6 +1846,26 @@ fn ensure_session_failure_streak_columns(connection: &Connection) -> Result<(), 
         if !existing.contains(name) {
             connection.execute(&format!("ALTER TABLE sessions ADD COLUMN {definition}"), [])?;
         }
+    }
+    Ok(())
+}
+
+/// Additive column recording how a session's project identity was derived (issue #40):
+/// `'recorded'` when it came from transcript-recorded origin evidence after the origin
+/// directory disappeared, NULL for a live-resolved identity (which keeps every pre-#40 row
+/// meaning "live" without a rewrite). Added the same way as the failure-streak columns so
+/// existing databases upgrade in place without a schema rebuild.
+fn ensure_session_project_origin_column(connection: &Connection) -> Result<(), StateError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let existing: std::collections::BTreeSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    drop(statement);
+    if !existing.contains("origin_project_origin") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN origin_project_origin TEXT",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -2295,7 +2323,8 @@ impl StateStore {
                     source_started_at,source_updated_at,source_user_requests,
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                    last_error_category,source_kind,next_retry_at_ms,failure_streak
+                    last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                    origin_project_origin
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -2505,6 +2534,7 @@ impl StateStore {
                 origin_project_name=COALESCE(origin_project_name,?4),
                 origin_repository=COALESCE(origin_repository,?5),
                 origin_branch=COALESCE(origin_branch,?6),
+                origin_project_origin=COALESCE(origin_project_origin,?27),
                 current_summary_revision=?7,
                 current_summary_json=?8,current_summary_hash=?9,
                 current_markdown_relative_path=?10,current_markdown_hash=?11,
@@ -2548,7 +2578,8 @@ impl StateStore {
                 persisted.completion_reason,
                 persisted.fallback_reason,
                 claim.state_generation,
-                now
+                now,
+                persisted.project.origin.recorded_marker()
             ],
         )?;
         transaction.execute(
@@ -2809,6 +2840,7 @@ impl StateStore {
             "UPDATE sessions SET
                 origin_project_identity=?2,origin_project_component=?3,
                 origin_project_name=?4,origin_repository=?5,origin_branch=?6,
+                origin_project_origin=?23,
                 current_summary_revision=?7,current_summary_json=?8,
                 current_summary_hash=?9,current_markdown_relative_path=?10,
                 current_markdown_hash=?11,normalizer_version=?12,
@@ -2851,7 +2883,8 @@ impl StateStore {
                     .cursor_fallback_reason
                     .as_deref()
                     .or_else(|| (record.archive.schema_version == 1).then_some("legacy-cursor")),
-                now
+                now,
+                record.archive.project.origin.recorded_marker()
             ],
         )?;
         transaction.commit()?;
@@ -2871,7 +2904,8 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind,next_retry_at_ms,failure_streak
+                last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                origin_project_origin
              FROM sessions
              WHERE active=1
                AND last_agent_stop_ms IS NOT NULL
@@ -2899,7 +2933,8 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind,next_retry_at_ms,failure_streak
+                last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                origin_project_origin
              FROM sessions
              WHERE transcript_path IS NULL
                AND lifecycle_state IN (
@@ -3066,7 +3101,8 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind,next_retry_at_ms,failure_streak
+                last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                origin_project_origin
              FROM sessions
              WHERE active=0
                AND lifecycle_state='interrupted'

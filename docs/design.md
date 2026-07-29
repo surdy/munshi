@@ -307,6 +307,14 @@ The first detected Git repository is the session's origin project and remains it
 association. Project identity uses a normalized canonical remote when available so clones and
 worktrees group together, with a locally assigned identity for repositories without a remote.
 
+When the origin directory no longer exists at archive time, identity falls back to the origin
+evidence the source records themselves carry — Claude Code's per-record `cwd` (with `gitBranch`
+carried into provenance) or Copilot's `workspace.yaml` `cwd` — applied to the same remote-less
+rule, a stable hash of the recorded root path, so a deleted directory never parks a session
+forever. Such an identity is flagged `project_origin: "recorded"` in archive frontmatter and
+operational state and as `origin=recorded` in upload capture metadata, keeping it distinguishable
+from a live-resolved one. A transcript with no recorded origin evidence still parks as before.
+
 The SQLite store tracks current operational state per session:
 
 ```text

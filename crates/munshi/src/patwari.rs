@@ -1240,7 +1240,14 @@ fn run_upload(
         captured_at: prep.captured_at.clone(),
         source_cursor: Some(record.current_revision.to_string()),
         source_state_hash: record.current_summary_hash.clone(),
-        source_metadata: BTreeMap::new(),
+        // A recorded-evidence identity (issue #40) is flagged in the capture metadata so a
+        // consumer can distinguish it from a live-resolved one; live identities add nothing.
+        source_metadata: record
+            .project
+            .as_ref()
+            .and_then(|project| project.origin.recorded_marker())
+            .map(|marker| BTreeMap::from([("origin".to_owned(), marker.to_owned())]))
+            .unwrap_or_default(),
         project: record
             .project
             .as_ref()

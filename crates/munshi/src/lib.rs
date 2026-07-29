@@ -42,7 +42,10 @@ pub use patwari::{
     status as archive_upload_status,
 };
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
-pub use project::{ProjectIdentity, ProjectIdentityError, inspect_project, normalize_git_remote};
+pub use project::{
+    ProjectIdentity, ProjectIdentityError, ProjectOrigin, inspect_project, normalize_git_remote,
+    recorded_project_identity,
+};
 pub use registration::{
     ClaudeTarget, CopilotTarget, DisclosureDecision, ProjectStatus, RegisterConfig,
     RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
@@ -57,11 +60,12 @@ pub use retrieve::{
     SearchResults, retrieve, search_content, write_output as write_retrieved_output,
 };
 pub use source::{
-    ArtifactIndexEntry, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES, ExtractedOutput,
-    NormalizedEvent, NormalizedSession, PreviousSource, SnapshotArtifactIndex, SourceError,
-    SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin,
-    copilot_workspace_origin, extract_outputs, load_session, load_session_update,
-    resolve_session_reference, snapshot_artifact_index, validate_transcript_envelope,
+    ArtifactIndexEntry, ClaudeRecordedOrigin, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES,
+    ExtractedOutput, NormalizedEvent, NormalizedSession, PreviousSource, SnapshotArtifactIndex,
+    SourceError, SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin,
+    claude_transcript_recorded_origin, copilot_workspace_origin, extract_outputs, load_session,
+    load_session_update, resolve_session_reference, snapshot_artifact_index,
+    validate_transcript_envelope,
 };
 pub use state::{
     ArchiveUploadRecord, ArchiveUploadSuccess, BudgetOutcome, CapturePrep, ClaimOutcome,

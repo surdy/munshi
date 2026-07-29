@@ -4,6 +4,30 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// How a session's project identity was derived (issue #40): from the live origin directory
+/// (canonicalization plus git inspection) or, when that directory no longer exists, from the
+/// origin evidence the source records themselves carry. The distinction is provenance only —
+/// a recorded identity routes and archives exactly like a live one — but it is preserved in
+/// state, archive frontmatter (`project_origin: "recorded"`), and upload metadata so a
+/// recorded-evidence identity stays distinguishable from a live-resolved one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectOrigin {
+    #[default]
+    Live,
+    Recorded,
+}
+
+impl ProjectOrigin {
+    /// The marker persisted for a recorded identity; a live identity stores nothing, so
+    /// records written before issue #40 keep meaning "live" unchanged.
+    pub fn recorded_marker(self) -> Option<&'static str> {
+        match self {
+            Self::Live => None,
+            Self::Recorded => Some("recorded"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectIdentity {
     pub identity: String,
@@ -11,6 +35,7 @@ pub struct ProjectIdentity {
     pub project: String,
     pub repository: Option<String>,
     pub branch: Option<String>,
+    pub origin: ProjectOrigin,
 }
 
 #[derive(Debug, Error)]
@@ -56,7 +81,37 @@ pub fn inspect_project(directory: &Path) -> Result<ProjectIdentity, ProjectIdent
         project,
         repository,
         branch,
+        origin: ProjectOrigin::Live,
     })
+}
+
+/// Derives a project identity from recorded origin evidence when the origin directory no
+/// longer exists on disk (issue #40). This is munshi's existing remote-less identity rule —
+/// a stable hash of the root path string, with the same slug-and-digest filesystem component —
+/// applied to the recorded path instead of a canonicalized live one, so a session that was
+/// previously archived under a remote-less root keeps the same identity and component after
+/// the directory is deleted. No filesystem or git inspection happens: the recorded path is
+/// taken verbatim (it was recorded canonical by the harness), the branch is the one the
+/// transcript recorded, and the repository stays unknown.
+pub fn recorded_project_identity(recorded_root: &Path, branch: Option<String>) -> ProjectIdentity {
+    let project = recorded_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "project".to_owned());
+    let identity = format!(
+        "local:sha256:{:x}",
+        Sha256::digest(path_bytes(recorded_root))
+    );
+    let component = filesystem_component(&project, &identity);
+    ProjectIdentity {
+        identity,
+        component,
+        project,
+        repository: None,
+        branch,
+        origin: ProjectOrigin::Recorded,
+    }
 }
 
 pub fn normalize_git_remote(remote: &str) -> Option<String> {
@@ -156,4 +211,37 @@ fn filesystem_component(project: &str, identity: &str) -> String {
 fn path_bytes(path: &Path) -> &[u8] {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recorded fallback must reproduce the live remote-less rule byte for byte: a
+    /// remote-less directory inspected live and the same path derived from recorded evidence
+    /// after deletion share one identity and one filesystem component, so the session keeps
+    /// archiving into the same place.
+    #[test]
+    fn recorded_identity_matches_the_live_remote_less_rule_for_the_same_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("scratch-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let live = inspect_project(&root).unwrap();
+        assert_eq!(live.origin, ProjectOrigin::Live);
+
+        let recorded = recorded_project_identity(&root, Some("main".to_owned()));
+        assert_eq!(recorded.origin, ProjectOrigin::Recorded);
+        assert_eq!(recorded.identity, live.identity);
+        assert_eq!(recorded.component, live.component);
+        assert_eq!(recorded.project, live.project);
+        assert_eq!(recorded.repository, None);
+        assert_eq!(recorded.branch.as_deref(), Some("main"));
+
+        // Stability: the same recorded path always yields the same identity, gone or not.
+        std::fs::remove_dir_all(&root).unwrap();
+        let after_delete = recorded_project_identity(&root, None);
+        assert_eq!(after_delete.identity, recorded.identity);
+        assert_eq!(after_delete.component, recorded.component);
+    }
 }

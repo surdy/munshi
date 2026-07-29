@@ -400,6 +400,7 @@ fn renderer_is_deterministic_and_atomic_replace_replaces_existing_file() {
         project: "munshi".to_owned(),
         repository: Some("surdy/munshi".to_owned()),
         branch: Some("main".to_owned()),
+        origin: munshi::ProjectOrigin::Live,
     };
     let summary = StructuredSummary {
         title: "Stable title".to_owned(),

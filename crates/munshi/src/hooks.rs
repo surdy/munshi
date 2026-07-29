@@ -14,7 +14,9 @@ use thiserror::Error;
 
 use crate::archive_git::{ArchiveGitError, commit_archive_revision};
 use crate::policy::resolve_policy;
-use crate::project::{ProjectIdentity, ProjectIdentityError, inspect_project};
+use crate::project::{
+    ProjectIdentity, ProjectIdentityError, inspect_project, recorded_project_identity,
+};
 use crate::registration::{RegistrationError, load_stored_config};
 use crate::render::{
     ArchiveMetadata, RenderError, archive_path, atomic_replace, content_hash,
@@ -22,8 +24,8 @@ use crate::render::{
 };
 use crate::source::{
     PreviousSource, SessionReference, SourceError, SourceKind, TranscriptLoadMode,
-    claude_transcript_origin, copilot_workspace_origin, load_session_update,
-    resolve_session_reference, validate_transcript_envelope,
+    claude_transcript_origin, claude_transcript_recorded_origin, copilot_workspace_origin,
+    load_session_update, resolve_session_reference, validate_transcript_envelope,
 };
 use crate::state::{
     BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlannedArchive,
@@ -379,12 +381,16 @@ pub fn run_recovery(
             // sweep rather than risk capturing a live session.
             continue;
         }
+        // A recorded origin hydrates even when the directory itself is gone (issue #40):
+        // the worker's recorded-evidence fallback derives the project identity from the
+        // same records, so requiring a live directory here would only re-park sessions the
+        // pipeline can now archive. Only a transcript with no origin evidence at all still
+        // parks below.
         let origin = match session.source {
             SourceKind::ClaudeCode => claude_transcript_origin(path),
             SourceKind::Copilot => copilot_workspace_origin(path),
             SourceKind::Codex => None,
-        }
-        .filter(|origin| origin.is_dir());
+        };
         let store = recovery_store(
             &mut state,
             &mut source_stores,
@@ -847,13 +853,22 @@ fn process_claim(
 
     let project = match claim.session.project.clone() {
         Some(project) if !project.component.is_empty() => project,
-        _ => inspect_project(
-            claim
+        _ => {
+            let origin_cwd = claim
                 .session
                 .origin_cwd
                 .as_deref()
-                .ok_or(StateError::InvalidState)?,
-        )?,
+                .ok_or(StateError::InvalidState)?;
+            match inspect_project(origin_cwd) {
+                Ok(project) => project,
+                // The origin directory no longer resolves on disk (issue #40): derive the
+                // identity from the transcript's own recorded evidence instead of parking
+                // the session as project-failed forever. A transcript with no recorded
+                // evidence keeps the original error and parks exactly as before.
+                Err(error) => recorded_project_fallback(source, &resolved.events_path)
+                    .ok_or(HookWorkerError::Project(error))?,
+            }
+        }
     };
     let prior_summary = prior.as_ref().map(|(_, archive)| &archive.summary);
     let cursor_only = claim.session.current_revision > 0
@@ -1207,6 +1222,23 @@ fn load_prior_archive(
         return Err(StateError::InvalidState.into());
     }
     Ok(Some((relative, markdown)))
+}
+
+/// Recorded-evidence project fallback (issue #40): when the origin directory no longer
+/// resolves on disk, derive the project identity from the origin evidence the source records
+/// already carry — Claude Code's per-record `cwd` and `gitBranch`, Copilot's `workspace.yaml`
+/// `cwd` — applied to the remote-less identity rule and flagged `origin=recorded` in
+/// provenance. Returns `None` when the transcript records no origin evidence, in which case
+/// the session parks exactly as before. Codex transcripts record no origin.
+fn recorded_project_fallback(source: SourceKind, events_path: &Path) -> Option<ProjectIdentity> {
+    match source {
+        SourceKind::ClaudeCode => claude_transcript_recorded_origin(events_path)
+            .map(|origin| recorded_project_identity(&origin.cwd, origin.git_branch)),
+        SourceKind::Copilot => {
+            copilot_workspace_origin(events_path).map(|cwd| recorded_project_identity(&cwd, None))
+        }
+        SourceKind::Codex => None,
+    }
 }
 
 /// Determines a session's project identity, preferring the cached identity from a prior

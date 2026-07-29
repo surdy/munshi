@@ -609,6 +609,28 @@ pub fn load_session_update(
 /// discipline; content is never read. Lets the recovery sweep hand `mark_recovery_interrupted` an
 /// origin so swept sessions can compute project identity instead of parking as origin-unresolved.
 pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
+    claude_transcript_recorded_origin(path).map(|origin| origin.cwd)
+}
+
+/// Recorded origin evidence a Claude Code transcript carries in its leading records
+/// (issue #40): the origin `cwd` plus, when present, the recorded `gitBranch` — the branch
+/// that was checked out when the record was written. This is the evidence the
+/// recorded-origin fallback derives a project identity from once the origin directory no
+/// longer exists on disk, so nothing here touches the filesystem beyond the transcript
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeRecordedOrigin {
+    pub cwd: PathBuf,
+    pub git_branch: Option<String>,
+}
+
+/// Bounded read of the recorded origin evidence behind [`claude_transcript_origin`]: the
+/// same I/O discipline (symlink rejection, a bounded number of bounded-size leading lines)
+/// scanning for the pinned [`munshi_transcript::claude_origin_cwd`] and
+/// [`munshi_transcript::claude_git_branch`] keys. The scan stops at the first record
+/// carrying both, and a window that yields a `cwd` but no branch still returns the cwd —
+/// branch evidence is optional provenance, never a gate.
+pub fn claude_transcript_recorded_origin(path: &Path) -> Option<ClaudeRecordedOrigin> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return None;
@@ -616,15 +638,19 @@ pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
     let mut reader = BufReader::new(File::open(path).ok()?);
     let limit = 256 * 1024;
     let mut line = Vec::new();
+    let mut cwd: Option<PathBuf> = None;
+    let mut git_branch: Option<String> = None;
     for _ in 0..32 {
         line.clear();
-        let read = reader
+        let Ok(read) = reader
             .by_ref()
             .take(limit as u64 + 1)
             .read_until(b'\n', &mut line)
-            .ok()?;
+        else {
+            break;
+        };
         if read == 0 || line.len() > limit {
-            return None;
+            break;
         }
         while line
             .last()
@@ -635,13 +661,23 @@ pub fn claude_transcript_origin(path: &Path) -> Option<PathBuf> {
         if line.is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_slice(&line).ok()?;
-        let object = value.as_object()?;
-        if let Some(cwd) = munshi_transcript::claude_origin_cwd(object) {
-            return Some(PathBuf::from(cwd));
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            break;
+        };
+        let Some(object) = value.as_object() else {
+            break;
+        };
+        if cwd.is_none() {
+            cwd = munshi_transcript::claude_origin_cwd(object).map(PathBuf::from);
+        }
+        if git_branch.is_none() {
+            git_branch = munshi_transcript::claude_git_branch(object).map(ToOwned::to_owned);
+        }
+        if cwd.is_some() && git_branch.is_some() {
+            break;
         }
     }
-    None
+    cwd.map(|cwd| ClaudeRecordedOrigin { cwd, git_branch })
 }
 
 /// Bounded, privacy-safe read of a Copilot session's origin project directory: the top-level

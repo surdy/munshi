@@ -45,6 +45,7 @@ fn project() -> ProjectIdentity {
         project: "munshi".to_owned(),
         repository: Some("surdy/munshi".to_owned()),
         branch: None,
+        origin: munshi::ProjectOrigin::Live,
     }
 }
 

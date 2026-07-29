@@ -11,8 +11,8 @@ use std::time::Duration;
 use munshi::{
     ArchiveConfig, ArchiveOutcome, CompletionReason, HookResult, NormalizedSession,
     SessionReference, SourceError, SourceKind, StateStore, archive_session, load_session,
-    parse_archive_markdown, resolve_session_reference, run_archive_worker_for_source,
-    validate_transcript_envelope,
+    parse_archive_markdown, recorded_project_identity, resolve_session_reference,
+    run_archive_worker_for_source, validate_transcript_envelope,
 };
 use tempfile::TempDir;
 
@@ -597,6 +597,58 @@ fn claude_stale_session_recovers_through_the_claude_adapter() {
     // No duplicate Copilot row was created for the same session ID.
     let copilot = StateStore::open(&harness.state).unwrap();
     assert!(copilot.get_session(CLAUDE_NORMAL).unwrap().is_none());
+}
+
+/// Issue #40: a Claude session whose origin directory was deleted must archive from the
+/// transcript's own recorded evidence — the per-record `cwd` decides the identity, the
+/// per-record `gitBranch` is carried into provenance, and the frontmatter flags the
+/// recorded origin.
+#[test]
+fn claude_gone_origin_archives_from_recorded_cwd_and_branch() {
+    let harness = StateHarness::new();
+    let transcript = harness.copy_transcript(
+        &fixture(
+            "claude-code-2.1.44",
+            "normal",
+            &format!("{CLAUDE_NORMAL}.jsonl"),
+        ),
+        CLAUDE_NORMAL,
+    );
+    let gone = harness.directory.path().join("gone-project");
+    fs::create_dir_all(&gone).unwrap();
+    let gone = gone.canonicalize().unwrap();
+    {
+        let mut store =
+            StateStore::open_for_source(&harness.state, SourceKind::ClaudeCode).unwrap();
+        store
+            .ingest_agent_stop(CLAUDE_NORMAL, 100, &gone, &transcript)
+            .unwrap();
+        store
+            .ingest_session_end(
+                CLAUDE_NORMAL,
+                101,
+                &gone,
+                "other",
+                CompletionReason::Complete,
+                None,
+            )
+            .unwrap();
+    }
+    fs::remove_dir_all(&gone).unwrap();
+
+    let result =
+        run_archive_worker_for_source(&harness.state, SourceKind::ClaudeCode, CLAUDE_NORMAL)
+            .unwrap();
+    assert!(matches!(result, HookResult::Archived { .. }), "{result:?}");
+    let markdown = harness.read_archive(SourceKind::ClaudeCode, CLAUDE_NORMAL);
+    // Identity comes from the RECORDED cwd (/work/demo), not the deleted hook-provided origin.
+    let expected = recorded_project_identity(Path::new("/work/demo"), Some("main".to_owned()));
+    assert_eq!(markdown.project.identity, expected.identity);
+    assert_eq!(markdown.project.component, expected.component);
+    assert_eq!(markdown.project.project, "demo");
+    // The recorded gitBranch reaches provenance where the live path would have supplied it.
+    assert_eq!(markdown.project.branch.as_deref(), Some("main"));
+    assert_eq!(markdown.project.repository, None);
 }
 
 /// The same for Codex: recovery must route the stale session to the Codex adapter and
