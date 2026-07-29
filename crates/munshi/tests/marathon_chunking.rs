@@ -81,8 +81,11 @@ fn below_threshold_session_summarizes_one_shot_with_v2_envelope() {
     harness.register(&[]);
     let config: Value =
         serde_json::from_slice(&std::fs::read(harness.state.join("config.json")).unwrap()).unwrap();
-    assert_eq!(config["limits"]["chunk_threshold_bytes"], 6_291_456);
-    assert_eq!(config["limits"]["chunk_size_bytes"], 2_097_152);
+    // The token-calibrated defaults (issue #48 live-calibration comment): the backend boundary is
+    // ~922k tokens, so at byte/token ratios of ~3.2–4.5 the old 6 MiB / 2 MiB byte-calibrated
+    // pair admitted one-shot rejections.
+    assert_eq!(config["limits"]["chunk_threshold_bytes"], 2_621_440);
+    assert_eq!(config["limits"]["chunk_size_bytes"], 1_572_864);
 
     harness.write_marathon_transcript(SESSION, 4, 40);
     harness.drive_hooks_and_wait(SESSION);
@@ -518,6 +521,161 @@ fn copilot_wrapper_passes_a_model_flag_only_when_the_phase_override_is_set() {
 }
 
 // ---------------------------------------------------------------------------
+// Configured summarizer environment (`summarizer.env` / --summarizer-env)
+// ---------------------------------------------------------------------------
+
+/// The `--summarizer-env` map round-trips through `config.json` and is registration-owned like
+/// the other summarizer fields: each re-register rewrites it from its own flags, and a register
+/// without the flag clears it. Values may contain `=`; only the key cannot.
+#[test]
+fn summarizer_env_round_trips_config_and_is_registration_owned() {
+    let harness = Harness::new();
+    harness.register(&[
+        "--summarizer-env",
+        "MUNSHI_TEST_SUMMARIZER_ENV=first",
+        "--summarizer-env",
+        "OTHER_KEY=value=with=equals",
+    ]);
+    let config = harness.config();
+    assert_eq!(
+        config["summarizer"]["env"],
+        json!({
+            "MUNSHI_TEST_SUMMARIZER_ENV": "first",
+            "OTHER_KEY": "value=with=equals",
+        })
+    );
+
+    harness.register(&["--summarizer-env", "MUNSHI_TEST_SUMMARIZER_ENV=second"]);
+    assert_eq!(
+        harness.config()["summarizer"]["env"],
+        json!({"MUNSHI_TEST_SUMMARIZER_ENV": "second"})
+    );
+
+    harness.register(&[]);
+    assert_eq!(harness.config()["summarizer"]["env"], json!({}));
+}
+
+/// Keys Munshi itself owns (the reserved `MUNSHI_SUMMARIZER_*` namespace, carrying
+/// `MUNSHI_SUMMARIZER_PHASE`) and malformed assignments are rejected at register, before any
+/// configuration is written.
+#[test]
+fn register_rejects_reserved_and_malformed_summarizer_env_keys() {
+    let harness = Harness::new();
+    let reserved = harness.try_register(&["--summarizer-env", "MUNSHI_SUMMARIZER_PHASE=chunk"]);
+    assert!(!reserved.status.success());
+    assert!(
+        String::from_utf8_lossy(&reserved.stderr).contains("reserved"),
+        "stderr: {}",
+        String::from_utf8_lossy(&reserved.stderr)
+    );
+
+    let no_equals = harness.try_register(&["--summarizer-env", "NO_EQUALS_SIGN"]);
+    assert!(!no_equals.status.success());
+    assert!(String::from_utf8_lossy(&no_equals.stderr).contains("KEY=VALUE"));
+
+    let empty_key = harness.try_register(&["--summarizer-env", "=value"]);
+    assert!(!empty_key.status.success());
+    assert!(String::from_utf8_lossy(&empty_key.stderr).contains("non-empty"));
+
+    assert!(
+        !harness.state.join("config.json").exists(),
+        "a rejected registration must write no configuration"
+    );
+}
+
+/// The configured environment reaches every child invocation of a chunked summary — each chunk
+/// and the reduce alike — while Munshi's own phase variable still arrives beside it (the fake
+/// fails any invocation whose MUNSHI_SUMMARIZER_PHASE does not match the request's phase).
+#[test]
+fn configured_env_reaches_every_phase_of_a_chunked_summary() {
+    let harness = Harness::new();
+    harness.register(&[
+        "--summarizer-env",
+        "MUNSHI_TEST_SUMMARIZER_ENV=from-config",
+        "--chunk-threshold-bytes",
+        "4000",
+        "--chunk-size-bytes",
+        "1200",
+        "--max-calls-per-hour",
+        "100",
+    ]);
+    harness.write_marathon_transcript(SESSION, 20, 180);
+    harness.drive_hooks_and_wait(SESSION);
+
+    let lines = harness.log_lines();
+    let invocations = lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("chunk ")
+                || line.starts_with("reduce ")
+                || line.starts_with("complete ")
+        })
+        .count();
+    let env_lines = lines
+        .iter()
+        .filter(|line| *line == "env from-config")
+        .count();
+    assert!(invocations >= 3, "expected a chunked run: {lines:?}");
+    assert_eq!(
+        env_lines, invocations,
+        "every invocation must receive the configured environment: {lines:?}"
+    );
+}
+
+/// Merge order: the configured map is exported before Munshi's own per-invocation variables, so
+/// Munshi's win on conflict. `register` refuses reserved keys, so the conflict is planted by
+/// hand-editing `config.json`; the fake summarizer fails any invocation whose
+/// MUNSHI_SUMMARIZER_PHASE does not match the request's phase, so a successful archive proves
+/// Munshi's value overrode the configured one.
+#[test]
+fn munshi_owned_phase_variable_wins_over_a_conflicting_configured_key() {
+    let harness = Harness::new();
+    harness.register(&["--summarizer-env", "MUNSHI_TEST_SUMMARIZER_ENV=alongside"]);
+    let config_path = harness.state.join("config.json");
+    let mut config = harness.config();
+    config["summarizer"]["env"]["MUNSHI_SUMMARIZER_PHASE"] = Value::String("bogus".to_owned());
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    harness.write_marathon_transcript(SESSION, 4, 40);
+    harness.drive_hooks_and_wait(SESSION);
+    assert_eq!(harness.log_lines(), vec!["env alongside", "complete 4"]);
+}
+
+/// `munshi archive` takes the same repeatable `--summarizer-env` flag and passes the configured
+/// environment to its one-shot summarizer invocation.
+#[test]
+fn manual_archive_passes_summarizer_env_to_the_summarizer() {
+    let harness = Harness::new();
+    let events = harness
+        .write_marathon_transcript(SESSION, 4, 40)
+        .canonicalize()
+        .unwrap();
+    let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/manual/fake-summarizer/phase-aware.sh")
+        .canonicalize()
+        .unwrap();
+    std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = harness.munshi(&[
+        "archive",
+        SESSION,
+        "--events",
+        events.to_str().unwrap(),
+        "--project-dir",
+        harness.project.to_str().unwrap(),
+        "--output-dir",
+        harness.output.to_str().unwrap(),
+        "--summarizer",
+        summarizer.to_str().unwrap(),
+        "--summarizer-arg",
+        harness.log.to_str().unwrap(),
+        "--summarizer-env",
+        "MUNSHI_TEST_SUMMARIZER_ENV=manual-env",
+    ]);
+    assert_cli_success(&output);
+    assert_eq!(harness.log_lines(), vec!["env manual-env", "complete 4"]);
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
@@ -578,10 +736,15 @@ impl Harness {
     /// Registers with the phase-aware fake summarizer, passing the invocation-log path as the
     /// summarizer's own argument.
     fn register(&self, extra_args: &[&str]) {
+        assert_cli_success(&self.try_register(extra_args));
+    }
+
+    /// Like [`Harness::register`], but returns the raw output so tests can assert rejections.
+    fn try_register(&self, extra_args: &[&str]) -> Output {
         let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/manual/fake-summarizer/phase-aware.sh");
         std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
             .arg("register")
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
@@ -599,8 +762,12 @@ impl Harness {
             .args(extra_args)
             .stdin(Stdio::null())
             .output()
-            .unwrap();
-        assert_cli_success(&output);
+            .unwrap()
+    }
+
+    /// The current parsed `config.json`.
+    fn config(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.state.join("config.json")).unwrap()).unwrap()
     }
 
     fn munshi(&self, args: &[&str]) -> Output {

@@ -16,10 +16,10 @@ use munshi::{
     VerifyArchiveReport, accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
     archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
     delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
-    lift_stale_source_limit_parks, parse_archive_markdown, project_status, read_last_failure,
-    register, retrieve, run_archive_worker_for_source, run_recovery, set_archive_upload_enabled,
-    set_delivery_enabled, set_project_enabled, unregister, verify_archive_parse,
-    wait_for_hook_result_for_source,
+    lift_stale_source_limit_parks, parse_archive_markdown, parse_summarizer_env, project_status,
+    read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
+    set_archive_upload_enabled, set_delivery_enabled, set_project_enabled, unregister,
+    verify_archive_parse, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,10 @@ enum Command {
         /// Argument forwarded to the summary executable. Transcript content is never forwarded.
         #[arg(long = "summarizer-arg", allow_hyphen_values = true)]
         summarizer_args: Vec<OsString>,
+        /// Environment variable set on the summarizer invocation (KEY=VALUE). Repeatable. Opaque
+        /// to Munshi; `MUNSHI_SUMMARIZER_*` keys are reserved.
+        #[arg(long = "summarizer-env", value_parser = parse_summarizer_env)]
+        summarizer_env: Vec<(String, String)>,
         #[arg(long, default_value_t = 300_000)]
         timeout_ms: u64,
         #[arg(long, default_value_t = 8_388_608)]
@@ -107,6 +111,12 @@ enum Command {
         /// Argument forwarded to the summarizer; transcript content is sent only on stdin.
         #[arg(long = "summarizer-arg", allow_hyphen_values = true)]
         summarizer_args: Vec<OsString>,
+        /// Environment variable set on every summarizer invocation (KEY=VALUE). Repeatable.
+        /// Opaque to Munshi — the summarizer wrapper contract gives keys meaning (for example
+        /// MUNSHI_CHUNK_MODEL / MUNSHI_REDUCE_MODEL for the contrib wrappers). Reserved
+        /// `MUNSHI_SUMMARIZER_*` keys are rejected; Munshi's own variables win on conflict.
+        #[arg(long = "summarizer-env", value_parser = parse_summarizer_env)]
+        summarizer_env: Vec<(String, String)>,
         #[arg(long, default_value_t = 300_000)]
         timeout_ms: u64,
         #[arg(long, default_value_t = 8_388_608)]
@@ -119,10 +129,10 @@ enum Command {
         max_stderr_bytes: usize,
         /// Measured one-shot request size above which a session is summarized in chunks plus a
         /// reduce pass (issue #48), and the cap on any single chunk/reduce request.
-        #[arg(long, default_value_t = 6_291_456)]
+        #[arg(long, default_value_t = 2_621_440)]
         chunk_threshold_bytes: usize,
         /// Approximate serialized-events payload each chunk request targets on the chunked path.
-        #[arg(long, default_value_t = 2_097_152)]
+        #[arg(long, default_value_t = 1_572_864)]
         chunk_size_bytes: usize,
         /// Maximum summarizer invocations allowed per project per rolling hour.
         #[arg(long, default_value_t = 10)]
@@ -1241,6 +1251,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             output_dir,
             summarizer,
             summarizer_args,
+            summarizer_env,
             timeout_ms,
             max_source_bytes,
             max_input_bytes,
@@ -1266,6 +1277,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 output_directory: output_dir,
                 summarizer_binary: summarizer,
                 summarizer_args,
+                summarizer_env,
                 timeout: Duration::from_millis(timeout_ms),
                 max_source_bytes,
                 max_input_bytes,
@@ -1285,6 +1297,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             archive_git_history,
             summarizer,
             summarizer_args,
+            summarizer_env,
             timeout_ms,
             max_source_bytes,
             max_input_bytes,
@@ -1376,6 +1389,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 archive_git_history,
                 summarizer_binary: summarizer,
                 summarizer_args,
+                summarizer_env,
                 timeout: Duration::from_millis(timeout_ms),
                 max_source_bytes,
                 max_input_bytes,

@@ -38,6 +38,10 @@ through the hook pipeline.
 The summary executable is never implicit. Transcript and prompt data are supplied only on stdin.
 Munshi owns a hard timeout, process-group cancellation, and stdout/stderr limits; errors report only
 safe categories and byte counts. Tests use committed fake executables and consume no AI credits.
+The repeatable `--summarizer-env KEY=VALUE` flag sets environment variables on the summarizer
+invocation with the same semantics as the registered `summarizer.env` map (opaque to Munshi,
+merged before Munshi's own `MUNSHI_SUMMARIZER_*` variables, reserved keys rejected); see
+[`summarizers.md`](summarizers.md) for the wrapper contract that consumes them.
 
 Syntactically malformed nonblank JSONL fails the archive rather than silently dropping source
 material. Unknown event types and malformed known-event shapes are ignored and represented only by

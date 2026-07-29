@@ -479,6 +479,7 @@ fn config(
         output_directory: output_directory.to_path_buf(),
         summarizer_binary,
         summarizer_args: Vec::<OsString>::new(),
+        summarizer_env: Vec::new(),
         timeout: Duration::from_secs(2),
         max_source_bytes: 1024 * 1024,
         max_input_bytes: 1024 * 1024,
