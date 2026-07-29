@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -442,8 +442,12 @@ pub fn run_recovery(
     // become eligible again here and flow through the normal reservation below.
     lift_stale_source_limit_parks(state_directory)?;
     reserved_sessions.extend(state.reserve_eligible_workers(force_retry, RECOVERY_SCAN_LIMIT)?);
-    reserved_sessions.sort();
-    reserved_sessions.dedup();
+    // Deduplicate while preserving reservation order: `reserve_eligible_workers` hands back the
+    // least-recently-attempted sessions first, and the lexicographic sort that used to sit here
+    // re-imposed a deterministic head-of-line order that let the same sessions win the bounded
+    // concurrency slots every sweep (issue #38).
+    let mut seen = BTreeSet::new();
+    reserved_sessions.retain(|entry| seen.insert(entry.clone()));
     for (source, session_id) in reserved_sessions {
         if spawn_worker(state_directory, source, &session_id).is_err() {
             let store = recovery_store(&mut state, &mut source_stores, state_directory, source)?;

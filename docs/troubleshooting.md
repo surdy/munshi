@@ -105,8 +105,16 @@ empty lists) before retrying Munshi. Once it's fixed:
 munshi retry <session-id> --source <copilot|claude-code> --force
 ```
 
-`--force` is required here because a `failed` session normally waits out a retry backoff before
-becoming eligible again; `--force` skips that wait.
+`--force` is required here because a `failed` session normally waits out an escalating retry
+backoff before becoming eligible again — 10 minutes after the first failure, then 30 minutes,
+90 minutes, and 4 hours; `--force` skips that wait and restarts the escalation. After 5
+consecutive failures with the same category on unchanged session content, Munshi stops retrying
+entirely and parks the session so a deterministically failing summarizer cannot occupy the
+`--max-concurrency` slots every sweep (issue #38). Parked sessions show up as `parked=<n>` on
+the `munshi status`/`doctor` sessions line (and `munshi show <id>` prints the failure streak and
+park); recovery sweeps skip them until you either fix the cause and run a targeted
+`munshi retry <session-id>` (which lifts the park even without `--force`) or new activity
+arrives in the session.
 
 Related failure categories you may see instead of `summary-failed`, all in the same
 "processing attempt errored, safe to retry" family: `transcript-unresolved` (see below),

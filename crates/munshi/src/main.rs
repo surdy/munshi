@@ -733,6 +733,10 @@ struct SessionStateSummary {
     summary_pending: usize,
     interrupted: usize,
     failed: usize,
+    /// The subset of `failed` parked permanently (`next_retry_at_ms < 0`): repeat deterministic
+    /// failures (issue #38) and non-retryable verdicts. Sweeps skip these until an explicit
+    /// `retry`/`--force` (or, for `source-failed`, a raised source limit) lifts the park.
+    parked: usize,
     delivery_related: usize,
     disabled_project: usize,
     processing: usize,
@@ -793,6 +797,10 @@ struct ShowSessionView {
     summary_title: Option<String>,
     archive_path: Option<String>,
     last_error_code: Option<String>,
+    /// Consecutive same-category failures on the current session content (issue #38).
+    failure_streak: i64,
+    /// `None`: immediately retry-eligible; a timestamp: scheduled backoff; negative: parked.
+    next_retry_at_ms: Option<i64>,
     project: Option<ProjectView>,
     source: Option<SourceProgressView>,
     summary: Option<StructuredSummary>,
@@ -1932,6 +1940,8 @@ fn build_show_report(
             .markdown_relative_path
             .map(|path| path.to_string_lossy().into_owned()),
         last_error_code: record.last_error_category.clone(),
+        failure_streak: record.failure_streak,
+        next_retry_at_ms: record.next_retry_at_ms,
         project,
         source,
         summary,
@@ -1992,6 +2002,11 @@ fn build_retry_report(
 
     if state_database_exists(state_directory) {
         let mut state = StateStore::open_for_source(state_directory, target_source)?;
+        // A targeted retry is an explicit operator action: lift a repeat-failure park
+        // (issue #38) so the worker makes a real attempt with a fresh failure streak instead
+        // of replaying the parked verdict. Plain sweeps and `retry-all` without `--force`
+        // never lift these.
+        let _ = state.lift_failure_park(session_id)?;
         let _ = state.reserve_worker(session_id, force)?;
     }
 
@@ -2923,7 +2938,12 @@ fn summarize_sessions(records: &[SessionRecord]) -> SessionStateSummary {
             "revision-pending" => summary.revision_pending += 1,
             "summary-pending" => summary.summary_pending += 1,
             "interrupted" => summary.interrupted += 1,
-            "failed" => summary.failed += 1,
+            "failed" => {
+                summary.failed += 1;
+                if record.next_retry_at_ms.is_some_and(|next| next < 0) {
+                    summary.parked += 1;
+                }
+            }
             "delivery-related" => summary.delivery_related += 1,
             "disabled-project" => summary.disabled_project += 1,
             "processing" => summary.processing += 1,
@@ -3136,13 +3156,14 @@ fn print_status_human(report: &StatusReport) {
         report.configuration.runtime_compatible
     );
     println!(
-        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
         report.sessions.total,
         report.sessions.archived,
         report.sessions.revision_pending,
         report.sessions.summary_pending,
         report.sessions.interrupted,
         report.sessions.failed,
+        report.sessions.parked,
         report.sessions.delivery_related,
         report.sessions.disabled_project,
         report.sessions.processing,
@@ -3196,6 +3217,17 @@ fn print_show_human(report: &ShowReport) {
     }
     if let Some(path) = session.archive_path.as_deref() {
         println!("archive: {path}");
+    }
+    if let Some(code) = session.last_error_code.as_deref() {
+        let schedule = match session.next_retry_at_ms {
+            Some(next) if next < 0 => " parked".to_owned(),
+            Some(next) => format!(" next-retry-at-ms={next}"),
+            None => String::new(),
+        };
+        println!(
+            "last error: {code} failure-streak={}{schedule}",
+            session.failure_streak
+        );
     }
     if let Some(delivery) = session.delivery.as_ref() {
         println!(
@@ -3310,13 +3342,14 @@ fn print_doctor_human(report: &DoctorReport) {
         );
     }
     println!(
-        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
         report.sessions.total,
         report.sessions.archived,
         report.sessions.revision_pending,
         report.sessions.summary_pending,
         report.sessions.interrupted,
         report.sessions.failed,
+        report.sessions.parked,
         report.sessions.delivery_related,
         report.sessions.disabled_project,
         report.sessions.processing,
