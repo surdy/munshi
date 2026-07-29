@@ -71,6 +71,8 @@ pub struct RegisterConfig {
     pub max_input_bytes: usize,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
+    pub chunk_threshold_bytes: usize,
+    pub chunk_size_bytes: usize,
     pub max_calls_per_hour: u32,
     pub max_calls_per_day: u32,
     pub max_concurrency: usize,
@@ -404,10 +406,38 @@ pub(crate) struct StoredLimits {
     /// so configurations written before issue #20 keep the historical 128 KB cap.
     #[serde(default = "default_max_event_text_bytes")]
     pub max_event_text_bytes: usize,
+    /// Chunked map-reduce trigger (issue #48): a session whose measured one-shot summarizer
+    /// request exceeds this is summarized in per-segment chunks plus a reduce pass, instead of
+    /// one shot (or the input-limit placeholder floor). Also the per-invocation cap on any single
+    /// chunk/reduce request — the empirically calibrated size real summarizer backends reject
+    /// past. Defaulted (additively, no config version bump) so configurations written before
+    /// issue #48 load unchanged.
+    #[serde(default = "default_chunk_threshold_bytes")]
+    pub chunk_threshold_bytes: usize,
+    /// Approximate serialized-events payload each chunk request targets on the chunked path
+    /// (issue #48). Chunks split only on event boundaries, so individual chunks may run over or
+    /// under. Defaulted like `chunk_threshold_bytes`.
+    #[serde(default = "default_chunk_size_bytes")]
+    pub chunk_size_bytes: usize,
 }
 
 fn default_max_event_text_bytes() -> usize {
     crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES
+}
+
+/// Calibrated on a 442-session drive (issue #48): elision-adjusted one-shot inputs started being
+/// rejected by the summarizer backend at roughly 6.2 MiB.
+pub(crate) const DEFAULT_CHUNK_THRESHOLD_BYTES: usize = 6_291_456;
+/// Calibrated chunk payload target (issue #48): 2 MiB sits comfortably inside the accepted-input
+/// cluster observed on the same drive.
+pub(crate) const DEFAULT_CHUNK_SIZE_BYTES: usize = 2_097_152;
+
+fn default_chunk_threshold_bytes() -> usize {
+    DEFAULT_CHUNK_THRESHOLD_BYTES
+}
+
+fn default_chunk_size_bytes() -> usize {
+    DEFAULT_CHUNK_SIZE_BYTES
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -667,6 +697,8 @@ impl StoredConfig {
                 max_stdout_bytes: config.max_stdout_bytes,
                 max_stderr_bytes: config.max_stderr_bytes,
                 max_event_text_bytes: crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES,
+                chunk_threshold_bytes: config.chunk_threshold_bytes,
+                chunk_size_bytes: config.chunk_size_bytes,
             },
             summary_delivery,
             archive_upload,

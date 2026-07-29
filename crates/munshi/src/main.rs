@@ -117,6 +117,13 @@ enum Command {
         max_stdout_bytes: usize,
         #[arg(long, default_value_t = 65_536)]
         max_stderr_bytes: usize,
+        /// Measured one-shot request size above which a session is summarized in chunks plus a
+        /// reduce pass (issue #48), and the cap on any single chunk/reduce request.
+        #[arg(long, default_value_t = 6_291_456)]
+        chunk_threshold_bytes: usize,
+        /// Approximate serialized-events payload each chunk request targets on the chunked path.
+        #[arg(long, default_value_t = 2_097_152)]
+        chunk_size_bytes: usize,
         /// Maximum summarizer invocations allowed per project per rolling hour.
         #[arg(long, default_value_t = 10)]
         max_calls_per_hour: u32,
@@ -1283,6 +1290,8 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_input_bytes,
             max_stdout_bytes,
             max_stderr_bytes,
+            chunk_threshold_bytes,
+            chunk_size_bytes,
             max_calls_per_hour,
             max_calls_per_day,
             max_concurrency,
@@ -1372,6 +1381,8 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 max_input_bytes,
                 max_stdout_bytes,
                 max_stderr_bytes,
+                chunk_threshold_bytes,
+                chunk_size_bytes,
                 max_calls_per_hour,
                 max_calls_per_day,
                 max_concurrency,

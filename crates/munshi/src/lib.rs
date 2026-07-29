@@ -73,8 +73,9 @@ pub use state::{
     StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
-    PLACEHOLDER_SUMMARY_TAG, PlaceholderReason, StructuredSummary, SummaryError,
-    build_revision_summary_input, build_summary_input, placeholder_summary, run_summary,
-    validate_structured_summary,
+    ChunkingLimits, PLACEHOLDER_SUMMARY_TAG, PlaceholderReason, SUMMARIZER_PHASE_ENV,
+    SUMMARY_CONTRACT_VERSION, StructuredSummary, SummaryError, SummaryPhase, SummaryStrategy,
+    build_revision_summary_input, build_summary_input, chunk_event_ranges, placeholder_summary,
+    plan_summary_input, run_chunked_summary, run_summary, validate_structured_summary,
 };
 pub use verify_archive::{VerifyArchiveError, VerifyArchiveReport, verify_archive_parse};

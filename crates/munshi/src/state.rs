@@ -2513,15 +2513,72 @@ impl StateStore {
     /// it, `munshi retry`/`--force` lift it, and the successful re-summary that follows replaces
     /// the placeholder through the ordinary revision path. The attempt itself is recorded as
     /// `failed` (the summarizer did fail) and a `placeholder-archived` diagnostic distinguishes
-    /// the deterministic cause.
+    /// the deterministic cause. When the worker already published the verdict through
+    /// [`record_placeholder_verdict`] before making the archive file visible, `verdict_recorded`
+    /// keeps the diagnostic single; the park columns are still re-asserted here, atomically with
+    /// the archive columns.
+    ///
+    /// [`record_placeholder_verdict`]: StateStore::record_placeholder_verdict
     pub fn complete_placeholder_attempt(
         &mut self,
         claim: &Claim,
         persisted: &PersistedArchive,
         recovered: bool,
         park: &PlaceholderPark<'_>,
+        verdict_recorded: bool,
     ) -> Result<(), StateError> {
-        self.complete_attempt_inner(claim, persisted, recovered, Some(park))
+        self.complete_attempt_inner(claim, persisted, recovered, Some((park, verdict_recorded)))
+    }
+
+    /// Publishes a decided placeholder park verdict (issue #43) *before* the placeholder archive
+    /// file becomes visible: the park columns and the `placeholder-archived` diagnostic commit
+    /// first, so no observer can ever see a placeholder archive on disk whose session does not
+    /// yet carry its park. [`complete_placeholder_attempt`] then re-asserts the same park
+    /// atomically with the archive columns (with `verdict_recorded` keeping the diagnostic
+    /// single), and every failure path after this point overwrites the verdict with its own
+    /// (`fail_attempt`, or lease-expiry reconciliation).
+    ///
+    /// [`complete_placeholder_attempt`]: StateStore::complete_placeholder_attempt
+    pub fn record_placeholder_verdict(
+        &mut self,
+        claim: &Claim,
+        park: &PlaceholderPark<'_>,
+    ) -> Result<(), StateError> {
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_token: Option<String> = transaction.query_row(
+            "SELECT claim_token FROM sessions WHERE id=?1",
+            [claim.session.database_id],
+            |row| row.get(0),
+        )?;
+        if current_token.as_deref() != Some(&claim.token) {
+            return Err(StateError::InvalidState);
+        }
+        transaction.execute(
+            "UPDATE sessions SET
+                lifecycle_state='failed',retry_state='revision-pending',
+                next_retry_at_ms=-1,last_error_category=?2,
+                failure_streak=?3,failure_streak_category=?2,failure_streak_generation=?4,
+                updated_at_ms=?5
+             WHERE id=?1",
+            params![
+                claim.session.database_id,
+                park.category,
+                park.streak.max(RETRY_PARK_THRESHOLD),
+                claim.state_generation,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO diagnostics(
+                session_id,operation,category,cause_category,recorded_at_ms
+             ) VALUES (?1,'archive-worker','placeholder-archived',?2,?3)",
+            params![claim.session.database_id, park.cause, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// The worker's projection of [`fail_attempt`]'s streak bookkeeping: the streak a failure
@@ -2554,7 +2611,7 @@ impl StateStore {
         claim: &Claim,
         persisted: &PersistedArchive,
         recovered: bool,
-        placeholder: Option<&PlaceholderPark<'_>>,
+        placeholder: Option<(&PlaceholderPark<'_>, bool)>,
     ) -> Result<(), StateError> {
         let summary_json = serde_json::to_string(&persisted.summary)?;
         let now = now_ms();
@@ -2683,13 +2740,13 @@ impl StateStore {
             params![
                 claim.attempt_id,
                 outcome,
-                placeholder.map(|park| park.category),
+                placeholder.map(|(park, _)| park.category),
                 recovered,
                 now,
                 claim.token
             ],
         )?;
-        if let Some(park) = placeholder {
+        if let Some((park, verdict_recorded)) = placeholder {
             // Re-park in the same transaction the archive columns advanced in: the session owes a
             // real summary, so it must never surface as cleanly `archived`. The park mirrors
             // `fail_attempt`'s bookkeeping (category, streak, generation) so the issue #38 lift
@@ -2711,12 +2768,14 @@ impl StateStore {
                     now
                 ],
             )?;
-            transaction.execute(
-                "INSERT INTO diagnostics(
-                    session_id,operation,category,cause_category,recorded_at_ms
-                 ) VALUES (?1,'archive-worker','placeholder-archived',?2,?3)",
-                params![claim.session.database_id, park.cause, now],
-            )?;
+            if !verdict_recorded {
+                transaction.execute(
+                    "INSERT INTO diagnostics(
+                        session_id,operation,category,cause_category,recorded_at_ms
+                     ) VALUES (?1,'archive-worker','placeholder-archived',?2,?3)",
+                    params![claim.session.database_id, park.cause, now],
+                )?;
+            }
         }
         if let Some(reason) = persisted.fallback_reason.as_deref() {
             transaction.execute(

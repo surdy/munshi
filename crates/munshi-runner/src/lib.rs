@@ -14,6 +14,10 @@ use thiserror::Error;
 pub struct RunnerConfig {
     pub binary: PathBuf,
     pub args: Vec<OsString>,
+    /// Extra environment variables set on the spawned process, on top of the inherited
+    /// environment. Content-free by contract: callers pass small fixed markers (for example the
+    /// summarizer phase), never transcript content.
+    pub envs: Vec<(OsString, OsString)>,
     pub timeout: Duration,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
@@ -42,6 +46,7 @@ pub fn run_bounded(config: &RunnerConfig, input: Vec<u8>) -> Result<Vec<u8>, Run
     let mut command = Command::new(&config.binary);
     command
         .args(&config.args)
+        .envs(config.envs.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
