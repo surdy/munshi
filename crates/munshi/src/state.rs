@@ -53,6 +53,25 @@ fn retry_backoff_ms(streak: i64) -> i64 {
     RETRY_BACKOFF_SCHEDULE_MS[index]
 }
 
+/// The consecutive-failure streak a failure with `category` would record now (issue #38): prior
+/// failures extend the streak only when both the category and the `state_generation` match;
+/// anything else restarts it at one. Shared by [`StateStore::fail_attempt`] (which records it) and
+/// [`StateStore::projected_failure_streak`] (which lets the worker ask, before recording anything,
+/// whether this failure would reach the park threshold — the issue #43 placeholder trigger).
+fn next_failure_streak(
+    prior_streak: i64,
+    prior_category: Option<&str>,
+    prior_generation: Option<i64>,
+    category: &str,
+    state_generation: i64,
+) -> i64 {
+    if prior_category == Some(category) && prior_generation == Some(state_generation) {
+        prior_streak.saturating_add(1)
+    } else {
+        1
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error(transparent)]
@@ -174,6 +193,20 @@ pub struct PersistedArchive {
     pub archive_git_history: bool,
     pub completion_reason: String,
     pub fallback_reason: Option<String>,
+}
+
+/// How a placeholder-archived session (issue #43) is left owing a real summary: the archive
+/// columns advance exactly as for a real revision, but the session remains `failed` and
+/// permanently parked (`next_retry_at_ms = -1`) under `category`, with the failure streak carried
+/// so the #38 lift machinery (`munshi retry`, `--force`, new session activity) works unchanged.
+/// `cause` distinguishes the deterministic input-capacity class in diagnostics (direction c):
+/// `summarizer-rejected` (the summarizer process refused the input) versus `summary-input-limit`
+/// (Munshi's own `max_input_bytes` cap), or a generic `summary-failed`.
+#[derive(Debug, Clone)]
+pub struct PlaceholderPark<'a> {
+    pub category: &'a str,
+    pub cause: &'a str,
+    pub streak: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2441,6 +2474,59 @@ impl StateStore {
         persisted: &PersistedArchive,
         recovered: bool,
     ) -> Result<(), StateError> {
+        self.complete_attempt_inner(claim, persisted, recovered, None)
+    }
+
+    /// Persists a placeholder archival (issue #43): the archive columns advance exactly like
+    /// [`complete_attempt`] — the placeholder revision is real, uploaded, and delivered — but the
+    /// session stays `failed` and permanently parked under `park.category`, recording that a real
+    /// summary is still owed. The park composes with the issue #38 machinery: plain sweeps skip
+    /// it, `munshi retry`/`--force` lift it, and the successful re-summary that follows replaces
+    /// the placeholder through the ordinary revision path. The attempt itself is recorded as
+    /// `failed` (the summarizer did fail) and a `placeholder-archived` diagnostic distinguishes
+    /// the deterministic cause.
+    pub fn complete_placeholder_attempt(
+        &mut self,
+        claim: &Claim,
+        persisted: &PersistedArchive,
+        recovered: bool,
+        park: &PlaceholderPark<'_>,
+    ) -> Result<(), StateError> {
+        self.complete_attempt_inner(claim, persisted, recovered, Some(park))
+    }
+
+    /// The worker's projection of [`fail_attempt`]'s streak bookkeeping: the streak a failure
+    /// with `category` would record for this claim right now, without recording anything.
+    ///
+    /// [`fail_attempt`]: StateStore::fail_attempt
+    pub fn projected_failure_streak(
+        &self,
+        claim: &Claim,
+        category: &str,
+    ) -> Result<i64, StateError> {
+        let (prior_streak, prior_category, prior_generation): (i64, Option<String>, Option<i64>) =
+            self.connection.query_row(
+                "SELECT failure_streak,failure_streak_category,failure_streak_generation
+                 FROM sessions WHERE id=?1",
+                [claim.session.database_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        Ok(next_failure_streak(
+            prior_streak,
+            prior_category.as_deref(),
+            prior_generation,
+            category,
+            claim.state_generation,
+        ))
+    }
+
+    fn complete_attempt_inner(
+        &mut self,
+        claim: &Claim,
+        persisted: &PersistedArchive,
+        recovered: bool,
+        placeholder: Option<&PlaceholderPark<'_>>,
+    ) -> Result<(), StateError> {
         let summary_json = serde_json::to_string(&persisted.summary)?;
         let now = now_ms();
         let transaction = self
@@ -2551,19 +2637,56 @@ impl StateStore {
                 now
             ],
         )?;
+        let outcome = match placeholder {
+            // The archive advanced, but the summarizer attempt itself failed: record it honestly.
+            Some(_) => "failed",
+            None if recovered => "recovered",
+            None => "succeeded",
+        };
         transaction.execute(
             "UPDATE processing_attempts SET
-                outcome=?2,recovery_reason=CASE WHEN ?3 THEN 'post-persist-recovery' ELSE NULL END,
-                finished_at_ms=?4
-             WHERE id=?1 AND lease_token=?5 AND outcome='processing'",
+                outcome=?2,error_category=?3,
+                recovery_reason=CASE WHEN ?4 THEN 'post-persist-recovery' ELSE NULL END,
+                finished_at_ms=?5
+             WHERE id=?1 AND lease_token=?6 AND outcome='processing'",
             params![
                 claim.attempt_id,
-                if recovered { "recovered" } else { "succeeded" },
+                outcome,
+                placeholder.map(|park| park.category),
                 recovered,
                 now,
                 claim.token
             ],
         )?;
+        if let Some(park) = placeholder {
+            // Re-park in the same transaction the archive columns advanced in: the session owes a
+            // real summary, so it must never surface as cleanly `archived`. The park mirrors
+            // `fail_attempt`'s bookkeeping (category, streak, generation) so the issue #38 lift
+            // paths treat it identically to any other deterministic-failure park.
+            transaction.execute(
+                "UPDATE sessions SET
+                    lifecycle_state='failed',retry_state='revision-pending',
+                    next_retry_at_ms=-1,last_error_category=?2,
+                    failure_streak=?3,failure_streak_category=?2,failure_streak_generation=?4,
+                    updated_at_ms=?5
+                 WHERE id=?1",
+                params![
+                    claim.session.database_id,
+                    park.category,
+                    // At least the park threshold, so `lift_failure_park` recognizes it even when
+                    // the trigger was deterministic on the first attempt (the input cap).
+                    park.streak.max(RETRY_PARK_THRESHOLD),
+                    claim.state_generation,
+                    now
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO diagnostics(
+                    session_id,operation,category,cause_category,recorded_at_ms
+                 ) VALUES (?1,'archive-worker','placeholder-archived',?2,?3)",
+                params![claim.session.database_id, park.cause, now],
+            )?;
+        }
         if let Some(reason) = persisted.fallback_reason.as_deref() {
             transaction.execute(
                 "INSERT INTO diagnostics(
@@ -2659,13 +2782,13 @@ impl StateStore {
                 [claim.session.database_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-        let streak = if prior_category.as_deref() == Some(category)
-            && prior_generation == Some(claim.state_generation)
-        {
-            prior_streak.saturating_add(1)
-        } else {
-            1
-        };
+        let streak = next_failure_streak(
+            prior_streak,
+            prior_category.as_deref(),
+            prior_generation,
+            category,
+            claim.state_generation,
+        );
         let next_retry_at_ms = if !retryable || streak >= RETRY_PARK_THRESHOLD {
             -1
         } else {
@@ -2854,6 +2977,23 @@ impl StateStore {
                 now
             ],
         )?;
+        if record.archive.summary_placeholder {
+            // A placeholder archive (issue #43) records that a real summary is still owed. A
+            // database rebuild must not launder it into a clean `archived` verdict, so restore the
+            // park (the frontmatter does not retain the original failure category; the generic
+            // summarizer verdict keeps `munshi retry` working). A session with newer observations
+            // (`revision-pending`) is left alone — its next real attempt replaces the placeholder
+            // anyway.
+            transaction.execute(
+                "UPDATE sessions SET
+                    lifecycle_state='failed',retry_state='revision-pending',
+                    next_retry_at_ms=-1,last_error_category='summary-failed',
+                    failure_streak=?2,failure_streak_category='summary-failed',
+                    failure_streak_generation=state_generation
+                 WHERE id=?1 AND lifecycle_state='archived'",
+                params![database_id, RETRY_PARK_THRESHOLD],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }

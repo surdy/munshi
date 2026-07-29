@@ -112,6 +112,16 @@ budget-deferred or concurrency-deferred sessions; those clear on their own once 
 deferred them resolves (see below), and a plain `retry`/`retry-all` or the automatic recovery sweep
 picks them up.
 
+A session whose summarizer keeps rejecting its input deterministically — it reached the
+repeat-failure park, or the normalized input exceeds `max_input_bytes` (its own
+`summary-input-limit` category) — does not stay unarchived: Munshi archives it with an explicit
+placeholder summary so the full transcript still reaches the durable archive and uploads to
+Patwari (issue #43). The archive file is flagged `summary_placeholder: true` and tagged
+`munshi-placeholder-summary`, `munshi status` counts these sessions as `placeholder=<n>` on its
+sessions line, and the session stays parked because a real summary is still owed. A plain
+`munshi retry <session-id>` re-attempts a real summary; when it succeeds, the real summary
+replaces the placeholder as the next revision and is re-uploaded and re-delivered automatically.
+
 ## Recovery
 
 Hooks are the normal path, but a force-killed or crashed session emits no `SessionEnd`/`Stop` event

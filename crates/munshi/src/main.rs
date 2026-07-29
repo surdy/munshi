@@ -737,6 +737,11 @@ struct SessionStateSummary {
     /// failures (issue #38) and non-retryable verdicts. Sweeps skip these until an explicit
     /// `retry`/`--force` (or, for `source-failed`, a raised source limit) lifts the park.
     parked: usize,
+    /// Sessions whose current summary is a machine-generated placeholder (issue #43): the
+    /// transcript is archived and uploaded, but a real summary is still owed and a targeted
+    /// `retry` re-attempts it. Counted by the placeholder tag on the stored summary, so the count
+    /// survives lifecycle transitions and state rebuilds.
+    placeholder: usize,
     delivery_related: usize,
     disabled_project: usize,
     processing: usize,
@@ -2933,6 +2938,13 @@ fn summarize_sessions(records: &[SessionRecord]) -> SessionStateSummary {
         ..SessionStateSummary::default()
     };
     for record in records {
+        if record
+            .current_summary
+            .as_ref()
+            .is_some_and(|current| current.is_placeholder())
+        {
+            summary.placeholder += 1;
+        }
         match operational_state(record) {
             "archived" => summary.archived += 1,
             "revision-pending" => summary.revision_pending += 1,
@@ -3156,7 +3168,7 @@ fn print_status_human(report: &StatusReport) {
         report.configuration.runtime_compatible
     );
     println!(
-        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} placeholder={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
         report.sessions.total,
         report.sessions.archived,
         report.sessions.revision_pending,
@@ -3164,6 +3176,7 @@ fn print_status_human(report: &StatusReport) {
         report.sessions.interrupted,
         report.sessions.failed,
         report.sessions.parked,
+        report.sessions.placeholder,
         report.sessions.delivery_related,
         report.sessions.disabled_project,
         report.sessions.processing,
@@ -3342,7 +3355,7 @@ fn print_doctor_human(report: &DoctorReport) {
         );
     }
     println!(
-        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} placeholder={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
         report.sessions.total,
         report.sessions.archived,
         report.sessions.revision_pending,
@@ -3350,6 +3363,7 @@ fn print_doctor_human(report: &DoctorReport) {
         report.sessions.interrupted,
         report.sessions.failed,
         report.sessions.parked,
+        report.sessions.placeholder,
         report.sessions.delivery_related,
         report.sessions.disabled_project,
         report.sessions.processing,

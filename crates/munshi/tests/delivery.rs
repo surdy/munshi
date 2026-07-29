@@ -1329,6 +1329,70 @@ fn simple_hash(content: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Placeholder-summary durability floor (issue #43)
+// ---------------------------------------------------------------------------
+
+const PLACEHOLDER_SESSION: &str = "11111111-1111-4111-8111-111111111143";
+
+/// The placeholder floor's note is delivered like any other summary and self-describes: the body
+/// carries the explicit "summary unavailable" marker. A later successful retry replaces it in
+/// place with the real summary at the next revision, through the ordinary delivery machinery.
+#[test]
+fn placeholder_note_is_delivered_and_replaced_after_a_real_retry() {
+    let harness = Harness::new();
+    let server = FakeNotesmith::start();
+    let summarizer = harness.toggleable_summarizer("delivery-floor-count");
+    harness.register_with_summarizer(&summarizer);
+    harness.configure(&server.endpoint());
+    harness.enable();
+
+    let transcript = harness.write_transcript(PLACEHOLDER_SESSION, "FLOOR_REQUEST", "floor answer");
+    harness.agent_stop(PLACEHOLDER_SESSION, &transcript, 10_000);
+    harness.session_end(PLACEHOLDER_SESSION, 10_001);
+    let waited = harness.wait(PLACEHOLDER_SESSION);
+    assert!(!waited.status.success(), "first summarizer attempt fails");
+    // Drive the deterministic failure to the park threshold (issue #38 technique).
+    for _ in 0..4 {
+        harness.make_retry_due(PLACEHOLDER_SESSION);
+        let _ = harness.run_worker(PLACEHOLDER_SESSION);
+    }
+
+    // The placeholder floor archived and delivered a self-describing note.
+    harness.wait_for_delivered_revision(PLACEHOLDER_SESSION, 1);
+    let note_path = harness.delivery_status_json()["items"][0]["note_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let body = server.note_body(&note_path).expect("note stored");
+    assert!(
+        body.contains("Summary unavailable: summarizer rejected oversized input (munshi#43)."),
+        "delivered placeholder note must self-describe: {body}"
+    );
+    assert!(body.contains("munshi_revision: 1"), "note: {body}");
+
+    // A successful retry replaces the placeholder note with the real summary.
+    std::fs::write(harness.success_flag(), b"").unwrap();
+    let retried = harness.json([
+        "retry",
+        PLACEHOLDER_SESSION,
+        "--state-dir",
+        harness.state_str(),
+        "--json",
+    ]);
+    assert_eq!(retried["result"], "archived", "retry report: {retried}");
+    harness.wait_for_delivered_revision(PLACEHOLDER_SESSION, 2);
+    let replaced = server
+        .note_body(&note_path)
+        .expect("note replaced in place");
+    assert!(
+        !replaced.contains("Summary unavailable"),
+        "real summary must replace the marker: {replaced}"
+    );
+    assert!(replaced.contains("Recovered real summary"), "{replaced}");
+    assert!(replaced.contains("munshi_revision: 2"), "{replaced}");
+}
+
+// ---------------------------------------------------------------------------
 // Test harness (drives the real munshi binary)
 // ---------------------------------------------------------------------------
 
@@ -1421,6 +1485,73 @@ impl Harness {
             .output()
             .unwrap();
         assert_success(&output);
+    }
+
+    /// Registers with an explicit summarizer executable (issue #43 floor tests).
+    fn register_with_summarizer(&self, summarizer: &Path) {
+        let output = self
+            .munshi()
+            .arg("register")
+            .arg("--accept-transcript-processing")
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--output-dir")
+            .arg(&self.output)
+            .arg("--summarizer")
+            .arg(summarizer)
+            .arg("--timeout-ms")
+            .arg("5000")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_success(&output);
+    }
+
+    /// A summarizer that fails (exit 7) until the harness's `allow-success` control file exists,
+    /// after which it emits one valid real summary.
+    fn toggleable_summarizer(&self, count_name: &str) -> PathBuf {
+        let script = self.directory.path().join(format!("{count_name}.sh"));
+        let count = self.directory.path().join(count_name);
+        let flag = self.success_flag();
+        let body = format!(
+            "#!/bin/sh\nset -eu\ncat >/dev/null\nprintf x >> '{}'\n[ -e '{}' ] || exit 7\nprintf '%s' '{}'\n",
+            count.display(),
+            flag.display(),
+            r#"{"title":"Recovered real summary","goal":"Summarize after the placeholder floor.","work_completed":["Produced the real summary on retry."],"decisions":[],"files_changed":[],"commands_and_validation":[],"open_items":[],"tags":["recovered"]}"#,
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.canonicalize().unwrap()
+    }
+
+    fn success_flag(&self) -> PathBuf {
+        self.directory.path().join("allow-success")
+    }
+
+    /// Simulates a session's scheduled backoff having elapsed (issue #38 test technique).
+    fn make_retry_due(&self, session_id: &str) {
+        let changed = rusqlite::Connection::open(self.state.join("munshi.db"))
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET next_retry_at_ms=1
+                 WHERE source_session_id=?1 AND next_retry_at_ms>=0",
+                [session_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "session {session_id} had no pending backoff");
+    }
+
+    fn run_worker(&self, session_id: &str) -> Output {
+        self.munshi()
+            .arg("hook-worker")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--session-id")
+            .arg(session_id)
+            .output()
+            .unwrap()
     }
 
     /// Registers with local archive Git history enabled, so delivery must be versioned (issue #9).
