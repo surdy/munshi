@@ -73,7 +73,8 @@ pub use state::{
     StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
-    StructuredSummary, SummaryError, build_revision_summary_input, build_summary_input,
-    run_summary, validate_structured_summary,
+    PLACEHOLDER_SUMMARY_TAG, PlaceholderReason, StructuredSummary, SummaryError,
+    build_revision_summary_input, build_summary_input, placeholder_summary, run_summary,
+    validate_structured_summary,
 };
 pub use verify_archive::{VerifyArchiveError, VerifyArchiveReport, verify_archive_parse};

@@ -607,6 +607,234 @@ fn backfill_uploads_archived_sessions_without_rows_and_is_idempotent() {
     assert_eq!(server.upload_count(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// Placeholder-summary durability floor (issue #43)
+// ---------------------------------------------------------------------------
+
+const FLOOR_SESSION: &str = "43434343-4343-4343-8343-434343434343";
+const CAP_SESSION: &str = "43434343-4343-4343-8343-434343434344";
+const PLACEHOLDER_TAG: &str = "munshi-placeholder-summary";
+
+/// The durability floor (issue #43): a session whose summarizer fails deterministically must not
+/// stay unarchived forever. Below the park threshold nothing placeholders; at the threshold the
+/// session archives with an explicit machine-generated placeholder summary, stays parked (a real
+/// summary is still owed), and the full transcript uploads byte-identically to Patwari alongside
+/// the flagged `summary.md`. A later successful `munshi retry` replaces the placeholder with a
+/// real summary through the normal revision machinery and re-uploads a new snapshot.
+#[test]
+fn placeholder_floor_archives_and_uploads_at_the_park_threshold_and_retry_replaces_it() {
+    let harness = CliHarness::new();
+    let summarizer = harness.toggleable_summarizer("floor-count");
+    harness.register_with_summarizer(&summarizer, &[]);
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let transcript = harness.write_transcript(FLOOR_SESSION);
+    harness.hook(
+        "agent-stop",
+        &json!({
+            "sessionId": FLOOR_SESSION,
+            "timestamp": 10_000,
+            "cwd": harness.project,
+            "transcriptPath": transcript,
+            "stopReason": "end_turn",
+        }),
+    );
+    harness.hook(
+        "session-end",
+        &json!({
+            "sessionId": FLOOR_SESSION,
+            "timestamp": 10_001,
+            "cwd": harness.project,
+            "reason": "complete",
+        }),
+    );
+    // The hook-spawned worker makes attempt 1 and fails; wait for its verdict to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while harness.session_park(FLOOR_SESSION).1.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first failing attempt never recorded a backoff"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Attempts 2-4: still below the park threshold, so no placeholder engages — no archive
+    // Markdown exists and Patwari never sees an upload.
+    for _ in 0..3 {
+        harness.make_retry_due(FLOOR_SESSION);
+        let _ = harness.run_worker(FLOOR_SESSION);
+    }
+    assert_eq!(harness.summarizer_calls("floor-count"), 4);
+    assert!(
+        !harness.archive_file(FLOOR_SESSION).exists(),
+        "below the park threshold nothing may placeholder-archive"
+    );
+    assert_eq!(server.upload_count(), 0);
+    assert!(harness.status_text().contains("placeholder=0"));
+
+    // Attempt 5 reaches the park threshold: the placeholder floor archives and uploads.
+    harness.make_retry_due(FLOOR_SESSION);
+    let _ = harness.run_worker(FLOOR_SESSION);
+    assert_eq!(harness.summarizer_calls("floor-count"), 5);
+    let markdown = std::fs::read_to_string(harness.archive_file(FLOOR_SESSION))
+        .expect("placeholder floor wrote the archive Markdown");
+    assert!(
+        markdown.contains("summary_placeholder: true"),
+        "archive must be visibly flagged: {markdown}"
+    );
+    assert!(markdown.contains(PLACEHOLDER_TAG), "markdown: {markdown}");
+    assert!(
+        markdown.contains("Summary unavailable: summarizer rejected oversized input (munshi#43)."),
+        "markdown: {markdown}"
+    );
+    assert!(markdown.contains("summary_revision: 1"));
+
+    // The session still owes a real summary: parked under its real category, streak intact.
+    let (category, next_retry, streak) = harness.session_park(FLOOR_SESSION);
+    assert_eq!(category.as_deref(), Some("summary-failed"));
+    assert_eq!(next_retry, Some(-1));
+    assert_eq!(streak, 5);
+    let status = harness.status_text();
+    assert!(status.contains("placeholder=1"), "status: {status}");
+    assert!(status.contains("parked=1"), "status: {status}");
+
+    // The snapshot uploaded: the transcript byte-identical to the source, the summary the exact
+    // flagged Markdown. Manifest digests are the client's own sha256 declarations, which the fake
+    // (like the real server) verified chunk-by-chunk during the upload.
+    assert_eq!(server.completed_count(), 1);
+    let manifest = server.manifest(0);
+    let digest_of = |path: &str| {
+        manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["logical_path"] == path)
+            .unwrap_or_else(|| panic!("manifest missing {path}"))["original_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let transcript_bytes = std::fs::read(&transcript).unwrap();
+    assert_eq!(
+        digest_of("transcript.jsonl"),
+        format!("sha256:{}", sha256_hex(&transcript_bytes)),
+        "uploaded transcript must be byte-identical to the source"
+    );
+    assert_eq!(
+        digest_of("summary.md"),
+        format!("sha256:{}", sha256_hex(markdown.as_bytes())),
+        "uploaded summary.md must be the flagged placeholder document"
+    );
+    let uploads = harness.archive_upload_status();
+    assert_eq!(uploads["items"][0]["state"], "uploaded");
+
+    // A later successful retry replaces the placeholder with a real summary (a new revision
+    // through the existing revision machinery) and re-uploads a new snapshot.
+    std::fs::write(harness.success_flag(), b"").unwrap();
+    let retried = harness.json(&["retry", FLOOR_SESSION, "--json"]);
+    assert_eq!(retried["result"], "archived", "retry report: {retried}");
+    assert_eq!(harness.summarizer_calls("floor-count"), 6);
+    let replaced = std::fs::read_to_string(harness.archive_file(FLOOR_SESSION)).unwrap();
+    assert!(replaced.contains("summary_revision: 2"), "{replaced}");
+    assert!(
+        !replaced.contains("summary_placeholder"),
+        "real summary must drop the placeholder flag: {replaced}"
+    );
+    assert!(!replaced.contains(PLACEHOLDER_TAG));
+    assert!(replaced.contains("Recovered real summary"));
+    assert_eq!(server.completed_count(), 2);
+    let second = server.manifest(1);
+    assert_eq!(second["capture"]["source_cursor"], "2");
+    let status = harness.status_text();
+    assert!(status.contains("placeholder=0"), "status: {status}");
+    assert!(status.contains("archived=1"), "status: {status}");
+}
+
+/// Munshi's own input cap is deterministic on the first attempt, so the floor engages immediately
+/// with a distinct category — no summarizer invocation is ever attempted or billed.
+#[test]
+fn input_cap_violation_placeholders_immediately_with_a_distinct_category() {
+    let harness = CliHarness::new();
+    let summarizer = harness.toggleable_summarizer("cap-count");
+    harness.register_with_summarizer(&summarizer, &["--max-input-bytes", "128"]);
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let transcript = harness.write_transcript(CAP_SESSION);
+    harness.hook(
+        "agent-stop",
+        &json!({
+            "sessionId": CAP_SESSION,
+            "timestamp": 10_000,
+            "cwd": harness.project,
+            "transcriptPath": transcript,
+            "stopReason": "end_turn",
+        }),
+    );
+    harness.hook(
+        "session-end",
+        &json!({
+            "sessionId": CAP_SESSION,
+            "timestamp": 10_001,
+            "cwd": harness.project,
+            "reason": "complete",
+        }),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !harness.archive_file(CAP_SESSION).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "input-cap violation never placeholder-archived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let markdown = std::fs::read_to_string(harness.archive_file(CAP_SESSION))
+        .expect("input-cap placeholder floor wrote the archive Markdown");
+    assert!(markdown.contains("summary_placeholder: true"), "{markdown}");
+    assert!(markdown.contains(PLACEHOLDER_TAG));
+    assert!(
+        markdown.contains(
+            "Summary unavailable: normalized input exceeds the configured summarizer input limit (munshi#43)."
+        ),
+        "markdown: {markdown}"
+    );
+    assert_eq!(
+        harness.summarizer_calls("cap-count"),
+        0,
+        "the cap violation is detected before the summarizer runs"
+    );
+
+    // Distinct category (issue #43 direction c): the park records the input-cap class, not the
+    // generic summarizer verdict, and the diagnostic distinguishes the cause.
+    let (category, next_retry, _) = harness.session_park(CAP_SESSION);
+    assert_eq!(category.as_deref(), Some("summary-input-limit"));
+    assert_eq!(next_retry, Some(-1));
+    let diagnostic: (String, Option<String>) =
+        rusqlite::Connection::open(harness.state.join("munshi.db"))
+            .unwrap()
+            .query_row(
+                "SELECT category,cause_category FROM diagnostics
+                 WHERE category='placeholder-archived' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("placeholder diagnostic recorded");
+    assert_eq!(diagnostic.1.as_deref(), Some("summary-input-limit"));
+
+    // The transcript still made it into the durable archive (the detached worker uploads
+    // downstream of the placeholder archive, so poll briefly).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while server.completed_count() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "placeholder snapshot was never uploaded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(harness.status_text().contains("placeholder=1"));
+}
+
 /// With upload disabled (or never configured) backfill refuses up front with the same clear
 /// guard message the retry path uses, uploading nothing.
 #[test]
@@ -682,6 +910,10 @@ impl CliHarness {
         let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/manual/fake-summarizer/status-contract.sh");
         std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.register_with_summarizer(&summarizer.canonicalize().unwrap(), &[]);
+    }
+
+    fn register_with_summarizer(&self, summarizer: &Path, extra_args: &[&str]) {
         let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
             .arg("register")
             .arg("--accept-transcript-processing")
@@ -692,13 +924,85 @@ impl CliHarness {
             .arg("--output-dir")
             .arg(&self.output)
             .arg("--summarizer")
-            .arg(summarizer.canonicalize().unwrap())
+            .arg(summarizer)
             .arg("--timeout-ms")
             .arg("5000")
+            .args(extra_args)
             .stdin(Stdio::null())
             .output()
             .unwrap();
         assert_cli_success(&output);
+    }
+
+    /// A summarizer that counts every invocation and fails (exit 7) until the harness's
+    /// `allow-success` control file exists, after which it emits one valid real summary.
+    fn toggleable_summarizer(&self, count_name: &str) -> PathBuf {
+        let script = self.directory.path().join(format!("{count_name}.sh"));
+        let count = self.directory.path().join(count_name);
+        let flag = self.success_flag();
+        let body = format!(
+            "#!/bin/sh\nset -eu\ncat >/dev/null\nprintf x >> '{}'\n[ -e '{}' ] || exit 7\nprintf '%s' '{}'\n",
+            count.display(),
+            flag.display(),
+            r#"{"title":"Recovered real summary","goal":"Summarize after the placeholder floor.","work_completed":["Produced the real summary on retry."],"decisions":[],"files_changed":[],"commands_and_validation":[],"open_items":[],"tags":["recovered"]}"#,
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.canonicalize().unwrap()
+    }
+
+    fn success_flag(&self) -> PathBuf {
+        self.directory.path().join("allow-success")
+    }
+
+    fn summarizer_calls(&self, count_name: &str) -> usize {
+        std::fs::read(self.directory.path().join(count_name))
+            .map(|marks| marks.len())
+            .unwrap_or(0)
+    }
+
+    /// Simulates a session's scheduled backoff having elapsed (issue #38 test technique) so
+    /// escalation can be driven without waiting out real delays.
+    fn make_retry_due(&self, session_id: &str) {
+        let changed = rusqlite::Connection::open(self.state.join("munshi.db"))
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET next_retry_at_ms=1
+                 WHERE source_session_id=?1 AND next_retry_at_ms>=0",
+                [session_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "session {session_id} had no pending backoff");
+    }
+
+    fn session_park(&self, session_id: &str) -> (Option<String>, Option<i64>, i64) {
+        rusqlite::Connection::open(self.state.join("munshi.db"))
+            .unwrap()
+            .query_row(
+                "SELECT last_error_category,next_retry_at_ms,failure_streak
+                 FROM sessions WHERE source_session_id=?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn run_worker(&self, session_id: &str) -> Output {
+        self.munshi(&["hook-worker", "--session-id", session_id])
+    }
+
+    fn status_text(&self) -> String {
+        String::from_utf8_lossy(&self.munshi(&["status"]).stdout).into_owned()
+    }
+
+    fn archive_file(&self, session_id: &str) -> PathBuf {
+        let component = std::fs::read_dir(&self.output)
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(Result::ok)
+            .map(|entry| entry.path())
+            .unwrap_or_else(|| self.output.join("project"));
+        component.join(format!("{session_id}.md"))
     }
 
     fn configure_and_enable(&self, endpoint: &str) {
@@ -993,6 +1297,9 @@ fn manifest_for(artifacts: &[munshi::PreparedArtifact], session_id: &str) -> Val
 struct Upload {
     capture_id: String,
     manifest_sig: u64,
+    /// The full manifest as received, so tests can assert the exact per-artifact digests the
+    /// client declared (e.g. byte-identity of an uploaded transcript, issue #43).
+    manifest: Value,
     session_id: String,
     /// Accepted chunk indexes per artifact index, in the server's canonical (path-sorted) order —
     /// like the real Patwari, NOT the manifest's order (issue #33).
@@ -1059,6 +1366,11 @@ impl FakePatwari {
 
     fn upload_count(&self) -> usize {
         self.state.lock().unwrap().uploads.len()
+    }
+
+    /// The manifest the client declared for upload `index`, as received at create time.
+    fn manifest(&self, index: usize) -> Value {
+        self.state.lock().unwrap().uploads[index].manifest.clone()
     }
 
     fn create_status_codes(&self) -> Vec<u16> {
@@ -1195,6 +1507,7 @@ fn create_upload(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
     state.uploads.push(Upload {
         capture_id: capture_id.clone(),
         manifest_sig,
+        manifest: manifest.clone(),
         session_id,
         artifacts,
         completed: false,

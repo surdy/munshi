@@ -185,6 +185,22 @@ same way (issue #40). Archive frontmatter flags such records with `project_origi
 Quiet-period gating is unchanged, and a transcript with no recorded origin evidence still parks
 as before.
 
+Two failure classes get a durability floor instead of staying unarchived forever (issue #43): a
+summarizer process rejection (nonzero exit, typically oversized input beyond the model's real
+capacity) that reaches the park threshold above, and Munshi's own `max_input_bytes` cap, which is
+deterministic on the first attempt and carries its own `summary-input-limit` category. In both
+cases the session archives anyway with a machine-generated placeholder summary: the Markdown is
+flagged `summary_placeholder: true` in its frontmatter, tagged `munshi-placeholder-summary`, and
+its body states plainly that the summary is unavailable and why. That unlocks the normal
+downstream pipeline — the verbatim transcript uploads to Patwari and the placeholder note is
+delivered to Notesmith, both self-describing — so the durable archive never silently misses
+exactly the biggest sessions. The session itself stays `failed` and parked, recording that a real
+summary is still owed: `munshi status` counts these as `placeholder=<n>`, and a targeted
+`munshi retry <id>` (or new session activity) re-attempts a real summary, which replaces the
+placeholder as the next revision through the ordinary revision machinery and re-uploads. A
+placeholder never overwrites an existing real summary: once a session has a real revision, a
+failed re-summary keeps that revision and the ordinary backoff/park verdict applies.
+
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
 summary cache from validated Munshi-owned Markdown. Existing Markdown is never deleted or made

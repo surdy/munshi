@@ -74,6 +74,11 @@ pub struct ArchivedMarkdown {
     pub source_hash: String,
     pub started_at: Option<String>,
     pub updated_at: Option<String>,
+    /// Whether this revision's summary is a machine-generated placeholder (issue #43): a real
+    /// summary is still owed and a later retry replaces it. Read from the explicit
+    /// `summary_placeholder` frontmatter flag, falling back to the placeholder tag so the verdict
+    /// survives even a hand-stripped frontmatter line. `false` for every real summary.
+    pub summary_placeholder: bool,
     /// This revision's snapshot artifact-set version, when the archive carries the index (issue #21).
     /// `None` for pre-#21 archives written before the frontmatter index existed.
     pub artifact_set_version: Option<u16>,
@@ -184,6 +189,12 @@ fn render_markdown_version(
     line_string(&mut output, "source_hash", &metadata.session.source_hash);
     if version.schema_version >= 2 {
         render_artifact_index(&mut output, metadata);
+    }
+    // The visible durability-floor flag (issue #43): derived from the summary itself (its
+    // placeholder tag) so renderer callers cannot disagree with the summary content. Written only
+    // when true, keeping every real summary's frontmatter byte-identical to pre-#43 output.
+    if summary.is_placeholder() {
+        output.push_str("summary_placeholder: true\n");
     }
     if summary.tags.is_empty() {
         output.push_str("tags: []\n");
@@ -346,9 +357,20 @@ pub fn parse_archive_markdown(markdown: &str) -> Result<ArchivedMarkdown, Render
         return Err(RenderError::InvalidArchive);
     }
 
+    let summary_placeholder_field = fields
+        .get("summary_placeholder")
+        .map(|value| match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(RenderError::InvalidArchive),
+        })
+        .transpose()?;
+
     let summary = parse_summary_body(body, tags).and_then(|summary| {
         validate_structured_summary(summary).map_err(|_| RenderError::InvalidSummary)
     })?;
+    let summary_placeholder =
+        summary_placeholder_field.unwrap_or(false) || summary.is_placeholder();
     Ok(ArchivedMarkdown {
         schema_version,
         source,
@@ -378,6 +400,7 @@ pub fn parse_archive_markdown(markdown: &str) -> Result<ArchivedMarkdown, Render
         artifact_set_version,
         transcript_sha256,
         extracted_outputs,
+        summary_placeholder,
         summary,
     })
 }

@@ -28,13 +28,15 @@ use crate::source::{
     load_session_update, resolve_session_reference, validate_transcript_envelope,
 };
 use crate::state::{
-    BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlannedArchive,
-    SessionRecord, StateError, StateStore, WaitState, migrate_legacy_state, now_ms,
-    try_acquire_session_lock,
+    BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlaceholderPark,
+    PlannedArchive, RETRY_PARK_THRESHOLD, SessionRecord, StateError, StateStore, WaitState,
+    migrate_legacy_state, now_ms, try_acquire_session_lock,
 };
 use crate::summary::{
-    SummarizerConfig, SummaryError, build_revision_summary_input, build_summary_input, run_summary,
+    PlaceholderReason, StructuredSummary, SummarizerConfig, SummaryError,
+    build_revision_summary_input, build_summary_input, placeholder_summary, run_summary,
 };
+use munshi_runner::RunnerError;
 
 const MAX_HOOK_PAYLOAD_BYTES: u64 = 64 * 1024;
 const DEFAULT_RECOVERY_STALE_MS: u64 = 30 * 60 * 1_000;
@@ -792,7 +794,18 @@ fn process_claim(
     })?;
     let output_directory = PathBuf::from(&stored.output_directory);
     let prior = load_prior_archive(&output_directory, claim)?;
-    let previous_source = prior.as_ref().map(|(_, archive)| {
+    // A placeholder prior (issue #43) carries no revisable content, so the cursor it archived must
+    // not gate a delta or an unchanged-shortcut: dropping the previous source forces a full reload
+    // and a full real re-summary, which replaces the placeholder at the next revision.
+    let prior_is_placeholder = prior
+        .as_ref()
+        .is_some_and(|(_, archive)| archive.summary_placeholder);
+    let previous_source = if prior_is_placeholder {
+        None
+    } else {
+        prior.as_ref()
+    }
+    .map(|(_, archive)| {
         let cursor = archive.cursor.as_ref();
         PreviousSource {
             normalizer_version: cursor.map_or(0, |cursor| cursor.normalizer_version),
@@ -874,6 +887,7 @@ fn process_claim(
     let cursor_only = claim.session.current_revision > 0
         && update.mode == TranscriptLoadMode::Delta
         && update.session.events.is_empty();
+    let mut placeholder_trigger: Option<PlaceholderTrigger> = None;
     let summary = if cursor_only {
         prior_summary.cloned().ok_or(StateError::InvalidState)?
     } else {
@@ -894,45 +908,70 @@ fn process_claim(
             .max_input_bytes
             .unwrap_or(stored.limits.max_input_bytes);
         let timeout_ms = policy.timeout_ms.unwrap_or(stored.limits.timeout_ms);
-        let input = if update.mode == TranscriptLoadMode::Delta {
-            build_revision_summary_input(
-                &update.session,
-                &project,
-                prior_summary.ok_or(StateError::InvalidState)?,
-                max_input_bytes,
-            )?
-        } else {
-            build_summary_input(&update.session, &project, max_input_bytes)?
-        };
-        // Checking the budget and recording the call happen in one atomic transaction (see
-        // `reserve_summarizer_call`), so two processes racing on the same project's budget
-        // cannot both observe capacity and both proceed. This runs only once `input` has been
-        // built successfully, so a call that will never reach the summarizer (for example
-        // oversized input rejected above) is never charged against the budget.
-        match state.reserve_summarizer_call(
-            &project.identity,
-            now_ms(),
-            policy.max_calls_per_hour,
-            policy.max_calls_per_day,
-        )? {
-            BudgetOutcome::HourlyExceeded => {
-                return Err(HookWorkerError::Deferred("budget-hourly-exceeded"));
+        let attempt = (|| -> Result<StructuredSummary, HookWorkerError> {
+            let input = if update.mode == TranscriptLoadMode::Delta {
+                build_revision_summary_input(
+                    &update.session,
+                    &project,
+                    prior_summary.ok_or(StateError::InvalidState)?,
+                    max_input_bytes,
+                )?
+            } else {
+                build_summary_input(&update.session, &project, max_input_bytes)?
+            };
+            // Checking the budget and recording the call happen in one atomic transaction (see
+            // `reserve_summarizer_call`), so two processes racing on the same project's budget
+            // cannot both observe capacity and both proceed. This runs only once `input` has been
+            // built successfully, so a call that will never reach the summarizer (for example
+            // oversized input rejected above) is never charged against the budget.
+            match state.reserve_summarizer_call(
+                &project.identity,
+                now_ms(),
+                policy.max_calls_per_hour,
+                policy.max_calls_per_day,
+            )? {
+                BudgetOutcome::HourlyExceeded => {
+                    return Err(HookWorkerError::Deferred("budget-hourly-exceeded"));
+                }
+                BudgetOutcome::DailyExceeded => {
+                    return Err(HookWorkerError::Deferred("budget-daily-exceeded"));
+                }
+                BudgetOutcome::Reserved => {}
             }
-            BudgetOutcome::DailyExceeded => {
-                return Err(HookWorkerError::Deferred("budget-daily-exceeded"));
+            Ok(run_summary(
+                &SummarizerConfig {
+                    binary: PathBuf::from(&stored.summarizer.executable),
+                    args: stored.summarizer.args.iter().map(Into::into).collect(),
+                    timeout: Duration::from_millis(timeout_ms),
+                    stdout_limit: stored.limits.max_stdout_bytes,
+                    stderr_limit: stored.limits.max_stderr_bytes,
+                },
+                input,
+            )?)
+        })();
+        match attempt {
+            Ok(summary) => summary,
+            Err(HookWorkerError::Summary(error)) => {
+                // The durability floor (issue #43): when the failure class is deterministic —
+                // Munshi's own input cap, or a summarizer rejection that would park under the
+                // issue #38 streak threshold — archive with an explicit placeholder summary so the
+                // immutable transcript still reaches the durable archive. Everything else keeps
+                // the normal fail/backoff/park verdict.
+                match decide_placeholder(state, claim, prior_is_placeholder, &error)? {
+                    Some(trigger) => {
+                        let summary = placeholder_summary(
+                            update.session.source.agent_label(),
+                            &claim.session.session_id,
+                            trigger.reason,
+                        );
+                        placeholder_trigger = Some(trigger);
+                        summary
+                    }
+                    None => return Err(HookWorkerError::Summary(error)),
+                }
             }
-            BudgetOutcome::Reserved => {}
+            Err(error) => return Err(error),
         }
-        run_summary(
-            &SummarizerConfig {
-                binary: PathBuf::from(&stored.summarizer.executable),
-                args: stored.summarizer.args.iter().map(Into::into).collect(),
-                timeout: Duration::from_millis(timeout_ms),
-                stdout_limit: stored.limits.max_stdout_bytes,
-                stderr_limit: stored.limits.max_stderr_bytes,
-            },
-            input,
-        )?
     };
     update.snapshot.verify_unchanged()?;
 
@@ -1008,34 +1047,45 @@ fn process_claim(
         }
     }
     let summary_json = serde_json::to_vec(&summary)?;
-    state
-        .complete_attempt(
-            claim,
-            &PersistedArchive {
-                revision,
-                summary,
-                summary_hash: content_hash(&summary_json),
-                markdown_relative_path: relative_path.clone(),
-                markdown_hash,
-                project,
-                normalizer_version: crate::source::NORMALIZER_VERSION,
-                record_count: update.session.source_cursor,
-                byte_offset: update.session.source_byte_cursor,
-                prefix_hash: update.session.source_prefix_hash,
-                source_hash: update.session.source_hash,
-                source_bytes: update.session.source_bytes,
-                started_at: update.session.started_at,
-                updated_at: update.session.updated_at,
-                user_requests: update.session.user_requests,
-                assistant_messages: update.session.assistant_messages,
-                tool_activities: update.session.tool_activities,
-                archive_git_history,
-                completion_reason: completion.to_owned(),
-                fallback_reason: fallback_reason.map(ToOwned::to_owned),
-            },
-            false,
-        )
-        .map_err(HookWorkerError::PostPersist)?;
+    let persisted = PersistedArchive {
+        revision,
+        summary,
+        summary_hash: content_hash(&summary_json),
+        markdown_relative_path: relative_path.clone(),
+        markdown_hash,
+        project,
+        normalizer_version: crate::source::NORMALIZER_VERSION,
+        record_count: update.session.source_cursor,
+        byte_offset: update.session.source_byte_cursor,
+        prefix_hash: update.session.source_prefix_hash,
+        source_hash: update.session.source_hash,
+        source_bytes: update.session.source_bytes,
+        started_at: update.session.started_at,
+        updated_at: update.session.updated_at,
+        user_requests: update.session.user_requests,
+        assistant_messages: update.session.assistant_messages,
+        tool_activities: update.session.tool_activities,
+        archive_git_history,
+        completion_reason: completion.to_owned(),
+        fallback_reason: fallback_reason.map(ToOwned::to_owned),
+    };
+    match placeholder_trigger.as_ref() {
+        Some(trigger) => state
+            .complete_placeholder_attempt(
+                claim,
+                &persisted,
+                false,
+                &PlaceholderPark {
+                    category: trigger.category,
+                    cause: trigger.cause,
+                    streak: trigger.streak,
+                },
+            )
+            .map_err(HookWorkerError::PostPersist)?,
+        None => state
+            .complete_attempt(claim, &persisted, false)
+            .map_err(HookWorkerError::PostPersist)?,
+    }
     // Delivery is strictly downstream of the successful local archive above: a Notesmith outage
     // or credential error is recorded as a bounded retry or a safe diagnostic and never changes
     // the archived result the worker returns.
@@ -1067,6 +1117,58 @@ fn process_claim(
     Ok(HookResult::Archived {
         relative_path: relative_path.to_string_lossy().into_owned(),
     })
+}
+
+/// A decided placeholder archival (issue #43): the park bookkeeping the completion records and the
+/// marker class the placeholder summary self-describes with.
+struct PlaceholderTrigger {
+    category: &'static str,
+    cause: &'static str,
+    streak: i64,
+    reason: PlaceholderReason,
+}
+
+/// Decides whether a failed summarizer attempt engages the placeholder durability floor
+/// (issue #43). The floor never overwrites a real summary — only sessions with no summary yet, or
+/// whose current summary is itself a placeholder, qualify — and it never triggers on a first
+/// transient failure: Munshi's own input cap is deterministic immediately, while a summarizer
+/// process rejection (nonzero exit, e.g. oversized input beyond the model's real capacity) must
+/// first reach the issue #38 park threshold. Every other summary failure keeps the ordinary
+/// backoff-then-park verdict with no placeholder.
+fn decide_placeholder(
+    state: &StateStore,
+    claim: &Claim,
+    prior_is_placeholder: bool,
+    error: &SummaryError,
+) -> Result<Option<PlaceholderTrigger>, HookWorkerError> {
+    if claim.session.current_revision > 0 && !prior_is_placeholder {
+        return Ok(None);
+    }
+    let (category, cause, reason, immediate) = match error {
+        SummaryError::InputLimit { .. } => (
+            "summary-input-limit",
+            "summary-input-limit",
+            PlaceholderReason::InputCapExceeded,
+            true,
+        ),
+        SummaryError::Runner(RunnerError::NonZeroExit { .. }) => (
+            "summary-failed",
+            "summarizer-rejected",
+            PlaceholderReason::SummarizerRejected,
+            false,
+        ),
+        _ => return Ok(None),
+    };
+    let streak = state.projected_failure_streak(claim, category)?;
+    if !immediate && streak < RETRY_PARK_THRESHOLD {
+        return Ok(None);
+    }
+    Ok(Some(PlaceholderTrigger {
+        category,
+        cause,
+        streak,
+        reason,
+    }))
 }
 
 fn reconcile_persisted_attempt(
@@ -1126,44 +1228,59 @@ fn reconcile_persisted_attempt(
         session,
     };
     let summary_json = serde_json::to_vec(&markdown.summary)?;
-    state.complete_attempt(
-        &claim,
-        &PersistedArchive {
-            revision: markdown.summary_revision,
-            summary: markdown.summary,
-            summary_hash: content_hash(&summary_json),
-            markdown_relative_path: plan.plan.markdown_relative_path.clone(),
-            markdown_hash: plan.plan.markdown_hash.clone(),
-            project: markdown.project,
-            normalizer_version: cursor.normalizer_version,
-            record_count: cursor.record_count,
-            byte_offset: cursor.byte_offset,
-            prefix_hash: cursor.prefix_hash.clone(),
-            source_hash: cursor.source_hash.clone(),
-            source_bytes: cursor.source_bytes,
-            started_at: markdown.started_at,
-            updated_at: markdown.updated_at,
-            user_requests: claim
-                .session
-                .previous_source
-                .as_ref()
-                .map_or(0, |source| source.user_requests),
-            assistant_messages: claim
-                .session
-                .previous_source
-                .as_ref()
-                .map_or(0, |source| source.assistant_messages),
-            tool_activities: claim
-                .session
-                .previous_source
-                .as_ref()
-                .map_or(0, |source| source.tool_activities),
-            archive_git_history: plan.plan.archive_git_history,
-            completion_reason: markdown.completion_reason,
-            fallback_reason: markdown.cursor_fallback_reason,
-        },
-        true,
-    )?;
+    let summary_placeholder = markdown.summary_placeholder;
+    let persisted = PersistedArchive {
+        revision: markdown.summary_revision,
+        summary: markdown.summary,
+        summary_hash: content_hash(&summary_json),
+        markdown_relative_path: plan.plan.markdown_relative_path.clone(),
+        markdown_hash: plan.plan.markdown_hash.clone(),
+        project: markdown.project,
+        normalizer_version: cursor.normalizer_version,
+        record_count: cursor.record_count,
+        byte_offset: cursor.byte_offset,
+        prefix_hash: cursor.prefix_hash.clone(),
+        source_hash: cursor.source_hash.clone(),
+        source_bytes: cursor.source_bytes,
+        started_at: markdown.started_at,
+        updated_at: markdown.updated_at,
+        user_requests: claim
+            .session
+            .previous_source
+            .as_ref()
+            .map_or(0, |source| source.user_requests),
+        assistant_messages: claim
+            .session
+            .previous_source
+            .as_ref()
+            .map_or(0, |source| source.assistant_messages),
+        tool_activities: claim
+            .session
+            .previous_source
+            .as_ref()
+            .map_or(0, |source| source.tool_activities),
+        archive_git_history: plan.plan.archive_git_history,
+        completion_reason: markdown.completion_reason,
+        fallback_reason: markdown.cursor_fallback_reason,
+    };
+    if summary_placeholder {
+        // A crash between persisting a placeholder archive and committing its state must not
+        // launder the session into a clean `archived`: reconcile back into the parked
+        // owes-a-real-summary verdict (issue #43). The original failure class is not recorded in
+        // the plan, so the generic summarizer category keeps the retry machinery working.
+        state.complete_placeholder_attempt(
+            &claim,
+            &persisted,
+            true,
+            &PlaceholderPark {
+                category: "summary-failed",
+                cause: "summary-failed",
+                streak: claim.session.failure_streak.max(1),
+            },
+        )?;
+    } else {
+        state.complete_attempt(&claim, &persisted, true)?;
+    }
     Ok(Some(HookResult::Archived {
         relative_path: plan
             .plan
@@ -1696,6 +1813,9 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
             "archive-git-source-repo"
         }
         HookWorkerError::ArchiveGit(_) => "archive-git-failed",
+        // Munshi's own input cap is its own category (issue #43 direction c), distinguishable
+        // from a summarizer that ran and rejected the input.
+        HookWorkerError::Summary(SummaryError::InputLimit { .. }) => "summary-input-limit",
         HookWorkerError::Summary(_) => "summary-failed",
         HookWorkerError::Render(_) => "archive-write-failed",
         HookWorkerError::Io(_) => "io-failed",

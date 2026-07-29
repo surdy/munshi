@@ -24,6 +24,11 @@ pub struct SummarizerConfig {
     pub stderr_limit: usize,
 }
 
+/// Tag carried by every machine-generated placeholder summary (issue #43), so a placeholder is
+/// recognizable from the summary alone — in the archive frontmatter, the state database, and any
+/// delivered note — without consulting operational state.
+pub const PLACEHOLDER_SUMMARY_TAG: &str = "munshi-placeholder-summary";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredSummary {
@@ -35,6 +40,63 @@ pub struct StructuredSummary {
     pub commands_and_validation: Vec<String>,
     pub open_items: Vec<String>,
     pub tags: Vec<String>,
+}
+
+impl StructuredSummary {
+    /// Whether this is a machine-generated placeholder (issue #43) rather than a real summary.
+    pub fn is_placeholder(&self) -> bool {
+        self.tags.iter().any(|tag| tag == PLACEHOLDER_SUMMARY_TAG)
+    }
+}
+
+/// The deterministic input-capacity class that triggered a placeholder archival (issue #43):
+/// either the summarizer process itself rejected the input (a repeat-failure park, issue #38) or
+/// Munshi's own `max_input_bytes` cap refused to build the input at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderReason {
+    SummarizerRejected,
+    InputCapExceeded,
+}
+
+impl PlaceholderReason {
+    /// The human marker line carried in the placeholder's goal and work list.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::SummarizerRejected => {
+                "Summary unavailable: summarizer rejected oversized input (munshi#43)."
+            }
+            Self::InputCapExceeded => concat!(
+                "Summary unavailable: normalized input exceeds the configured summarizer ",
+                "input limit (munshi#43)."
+            ),
+        }
+    }
+}
+
+/// Builds the machine-generated placeholder summary the durability floor archives (issue #43).
+/// The title comes from session metadata only, the lists carry an explicit self-describing
+/// marker, and the [`PLACEHOLDER_SUMMARY_TAG`] makes the placeholder recognizable everywhere the
+/// summary travels. Always passes [`validate_structured_summary`] so it renders, re-parses, and
+/// delivers exactly like a real summary.
+pub fn placeholder_summary(
+    agent_label: &str,
+    session_id: &str,
+    reason: PlaceholderReason,
+) -> StructuredSummary {
+    let marker = reason.marker();
+    StructuredSummary {
+        title: format!("{agent_label} session {session_id} (summary unavailable)"),
+        goal: format!(
+            "{marker} The full transcript is archived unchanged; run `munshi retry {session_id}` \
+             to attempt a real summary, which replaces this placeholder."
+        ),
+        work_completed: vec![marker.to_owned()],
+        decisions: Vec::new(),
+        files_changed: Vec::new(),
+        commands_and_validation: Vec::new(),
+        open_items: Vec::new(),
+        tags: vec![PLACEHOLDER_SUMMARY_TAG.to_owned()],
+    }
 }
 
 #[derive(Debug, Serialize)]
