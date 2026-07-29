@@ -14,6 +14,10 @@
 # where markers are `event-NNNN` sequence tags embedded in fixture event content (for chunk
 # boundary coverage checks) and <prev> is 1 when chunk.previous_chunk_summary is present.
 #
+# Environment probe: when MUNSHI_TEST_SUMMARIZER_ENV is set on the invocation (for example via
+# a configured `--summarizer-env`), an extra `env <value>` line is logged first, so tests can
+# assert exactly which configured environment reached each child process.
+#
 # Failure injection (controlled by sibling files of the log):
 #   <log>.fail-all            every invocation exits 9 without responding
 #   <log>.fail-chunk-<index>  the chunk invocation with that 1-based index exits 9
@@ -50,6 +54,11 @@ for field in ("instruction", "required_schema", "session", "events"):
 
 if os.path.exists(log + ".fail-all"):
     sys.exit(9)
+
+probe = os.environ.get("MUNSHI_TEST_SUMMARIZER_ENV")
+if probe is not None:
+    with open(log, "a") as handle:
+        handle.write("env %s\n" % probe)
 
 def markers(events):
     found = []

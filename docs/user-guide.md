@@ -122,12 +122,61 @@ sessions line, and the session stays parked because a real summary is still owed
 `munshi retry <session-id>` re-attempts a real summary; when it succeeds, the real summary
 replaces the placeholder as the next revision and is re-uploaded and re-delivered automatically.
 
-Very long "marathon" sessions rarely need the placeholder anymore: when a session's summarizer
-input exceeds `chunk_threshold_bytes` (default 6 MiB), Munshi automatically summarizes it in
-chunks — one summarizer call per segment plus a reduce pass that merges the segment summaries
-into the one archived summary (issue #48). This is invisible day to day apart from the extra
-budgeted summarizer calls; see [`summarizers.md`](summarizers.md) for the contract and
+## Marathon sessions and chunked summaries
+
+Very long "marathon" sessions rarely need the placeholder above: they are summarized in chunks
+instead (issue #48). This section describes what actually happens, what it costs, and how to
+steer it — all of it automatic, with nothing to enable.
+
+**When it triggers.** Before summarizing, Munshi builds the real one-shot summarizer request and
+measures it. If the measured request exceeds `chunk_threshold_bytes` (default 2.5 MiB,
+calibrated against real summarizer-backend rejections), the session takes the chunked path
+instead of one shot.
+
+**What happens.** Munshi splits the session's normalized events — only ever on event boundaries,
+never mid-event — into segments of roughly `chunk_size_bytes` (default 1.5 MiB) each. It then
+makes one summarizer call per segment, in order, giving each call the previous segment's summary
+as running continuity context, and finally one *reduce* call that merges the segment summaries
+into the single summary that gets archived. In the rare case where even the merged segment
+summaries are too large for one reduce call, Munshi condenses them through intermediate reduce
+calls and reduces again — recursion, bounded by the same threshold.
+
+**What it costs.** Every chunk and reduce call is charged against the per-project budget
+individually, exactly like a normal summary call: a marathon session costs about
+`ceil(input / chunk_size_bytes) + 1` calls. If you archive marathons routinely, size
+`--max-calls-per-hour`/`--max-calls-per-day` with that multiplier in mind.
+
+**When it fails.** A failure in any chunk or reduce call abandons the whole attempt — partial
+summaries are never archived — and the session goes through the completely normal
+backoff/retry/park machinery described above. The placeholder floor remains the last resort for
+what chunking genuinely cannot fix: a request no split can bring under the threshold (for
+example one enormous un-elided event) floors immediately under `summary-input-limit`.
+
+**How to see that it happened.** The extra calls show up in the per-project budget, and that is
+all: the archived file is a completely normal summary, and nothing user-visible marks it as
+having been produced in chunks — deliberately, since the chunking is an implementation detail of
+*how* the summary was produced, not part of the durable record. See
+[`summarizers.md`](summarizers.md) for the request contract and
 [`configuration.md`](configuration.md) for the two `chunk_*` limits.
+
+### Per-phase summarizer models
+
+Chunk passes are numerous and mechanical; the final reduce is where quality matters most. Both
+contrib wrappers therefore let you pay for a cheaper model on chunk passes and a better one on
+the reduce, selected by two wrapper-contract variables — and you can set those in Munshi's own
+configuration at registration, without touching the ambient environment:
+
+```bash
+munshi register ... \
+  --summarizer-env MUNSHI_CHUNK_MODEL=<model> \
+  --summarizer-env MUNSHI_REDUCE_MODEL=<model>
+```
+
+`--summarizer-env KEY=VALUE` (repeatable) is stored as `summarizer.env` in `config.json` and
+exported on every summarizer invocation. Munshi itself treats the map as opaque — the *wrapper*
+consumes these particular keys (see [`summarizers.md`](summarizers.md)). Copilot CLI accepts
+model names and `auto` for its `--model` flag; when neither variable is set, both phases use
+your account's default model.
 
 ## Recovery
 

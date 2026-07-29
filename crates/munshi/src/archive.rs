@@ -19,6 +19,10 @@ pub struct ArchiveConfig {
     pub output_directory: PathBuf,
     pub summarizer_binary: PathBuf,
     pub summarizer_args: Vec<OsString>,
+    /// Environment variables set on the summarizer invocation (repeatable `--summarizer-env
+    /// KEY=VALUE`), matching the hook path's `summarizer.env` semantics: opaque to Munshi and
+    /// merged before Munshi's own per-invocation variables, which win on conflict.
+    pub summarizer_env: Vec<(String, String)>,
     pub timeout: Duration,
     pub max_source_bytes: usize,
     pub max_input_bytes: usize,
@@ -69,6 +73,7 @@ pub fn archive_session(config: &ArchiveConfig) -> Result<ArchiveOutcome, Archive
         &SummarizerConfig {
             binary: config.summarizer_binary.clone(),
             args: config.summarizer_args.clone(),
+            env: config.summarizer_env.clone(),
             timeout: config.timeout,
             stdout_limit: config.max_stdout_bytes,
             stderr_limit: config.max_stderr_bytes,

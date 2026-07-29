@@ -117,10 +117,11 @@ the caller will merge fields for you — nothing downstream stitches old and new
 
 ### Chunked marathon sessions (contract v2)
 
-A session whose one-shot request would exceed `limits.chunk_threshold_bytes` (default 6 MiB;
-issue #48) is summarized as a **map-reduce** instead of one shot. Munshi splits the normalized
-event stream on event boundaries into segments of roughly `limits.chunk_size_bytes` (default
-2 MiB) and invokes your summarizer several times:
+A session whose one-shot request would exceed `limits.chunk_threshold_bytes` (default 2.5 MiB,
+token-calibrated against real backend rejections; issue #48) is summarized as a **map-reduce**
+instead of one shot. Munshi splits the normalized event stream on event boundaries into segments
+of roughly `limits.chunk_size_bytes` (default 1.5 MiB) and invokes your summarizer several
+times:
 
 1. One `phase: "chunk"` request per segment, in order. Each carries only that segment's
    `events`, a `chunk` object with the segment's `index`/`count`, and — from the second segment
@@ -145,6 +146,14 @@ wrappers honor two optional environment variables, defaulting to their current b
 unset: `MUNSHI_CHUNK_MODEL` and `MUNSHI_REDUCE_MODEL` select the model for chunk / reduce
 invocations (Claude Code via `--model` over `CLAUDE_MODEL`; Copilot CLI via its `--model` flag,
 passed only when the override is set). Model policy stays outside Munshi itself.
+
+Your summarizer's environment on each invocation is the inherited environment, plus any
+operator-configured `summarizer.env` entries (repeatable `munshi register --summarizer-env
+KEY=VALUE` — the way to set `MUNSHI_CHUNK_MODEL`/`MUNSHI_REDUCE_MODEL` from Munshi's own
+configuration instead of the ambient environment), plus Munshi's own `MUNSHI_SUMMARIZER_PHASE`,
+in that order — Munshi's own variables always win on conflict, and configured keys in the
+reserved `MUNSHI_SUMMARIZER_*` namespace are rejected at registration. Munshi passes the
+configured map through opaquely; it is this wrapper contract that gives the keys meaning.
 
 **Backward compatibility:** the v2 envelope is strictly additive. Old wrappers keep working for
 every below-threshold session (the request only gained the two marker fields), and requests from
@@ -239,7 +248,8 @@ Before using it:
   overridable via environment) to match your local install (`which claude`, and whichever
   Claude Code model you want to pay for summarization with — a small/cheap model is usually
   enough). The optional `MUNSHI_CHUNK_MODEL`/`MUNSHI_REDUCE_MODEL` variables select a different
-  model per phase for chunked marathon sessions (contract v2 above).
+  model per phase for chunked marathon sessions (contract v2 above); set them persistently with
+  `munshi register --summarizer-env` rather than the ambient environment.
 - Make it executable: `chmod +x contrib/claude-summarizer.sh`.
 - Point `--summarizer` at its **absolute** path:
 
@@ -300,7 +310,7 @@ automatic capture, using [`munshi archive`](manual-archive.md).
   `--max-concurrency` (default 2) across all projects. Once a budget is hit, further summaries
   for that project defer until the window rolls over rather than being dropped. A chunked
   marathon session (contract v2 above) makes one budgeted call **per chunk plus the reduce
-  pass(es)**, so a single 20 MiB session can consume around a dozen calls; size the budgets
+  pass(es)**, so a single 20 MiB session can consume around fifteen calls; size the budgets
   accordingly if you archive marathons routinely.
 - **v1 does not redact secrets.** If a transcript contains credentials, tokens, or other
   sensitive text, that text is sent to your summarizer verbatim like everything else. Choose a

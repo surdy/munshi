@@ -934,6 +934,12 @@ fn process_claim(
             let summarizer = SummarizerConfig {
                 binary: PathBuf::from(&stored.summarizer.executable),
                 args: stored.summarizer.args.iter().map(Into::into).collect(),
+                env: stored
+                    .summarizer
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
                 timeout: Duration::from_millis(timeout_ms),
                 stdout_limit: stored.limits.max_stdout_bytes,
                 stderr_limit: stored.limits.max_stderr_bytes,

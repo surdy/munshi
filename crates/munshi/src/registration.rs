@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -66,6 +67,9 @@ pub struct RegisterConfig {
     pub archive_git_history: bool,
     pub summarizer_binary: PathBuf,
     pub summarizer_args: Vec<OsString>,
+    /// Environment variables set on every summarizer invocation (repeatable `--summarizer-env
+    /// KEY=VALUE`, validated by [`crate::summary::parse_summarizer_env`]). Opaque to Munshi.
+    pub summarizer_env: Vec<(String, String)>,
     pub timeout: Duration,
     pub max_source_bytes: usize,
     pub max_input_bytes: usize,
@@ -175,6 +179,14 @@ impl StoredHarnesses {
 pub(crate) struct StoredCommand {
     pub executable: String,
     pub args: Vec<String>,
+    /// Environment variables set on every summarizer invocation, on top of the inherited
+    /// environment. Opaque to Munshi — the wrapper contract (docs/summarizers.md) gives the keys
+    /// meaning — and always merged before Munshi's own per-invocation variables, which win on
+    /// conflict. Additive with a serde default (no config version bump), so configurations
+    /// written before this field load unchanged. Registration-owned like `executable`/`args`:
+    /// each `munshi register` rewrites it from its `--summarizer-env` flags.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The Munshi-owned Notesmith summary-delivery configuration. Summary delivery is opt-in and
@@ -425,12 +437,14 @@ fn default_max_event_text_bytes() -> usize {
     crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES
 }
 
-/// Calibrated on a 442-session drive (issue #48): elision-adjusted one-shot inputs started being
-/// rejected by the summarizer backend at roughly 6.2 MiB.
-pub(crate) const DEFAULT_CHUNK_THRESHOLD_BYTES: usize = 6_291_456;
-/// Calibrated chunk payload target (issue #48): 2 MiB sits comfortably inside the accepted-input
-/// cluster observed on the same drive.
-pub(crate) const DEFAULT_CHUNK_SIZE_BYTES: usize = 2_097_152;
+/// Token-calibrated threshold (issue #48 live-calibration comment): the summarizer backend's real
+/// boundary is tokens (~922k), not bytes, and observed byte/token ratios of ~3.2–4.5 mean the
+/// byte-calibrated 6 MiB threshold still admitted one-shot rejections. 2.5 MiB stays under the
+/// token limit even at the densest observed ratio (2,621,440 / 3.2 ≈ 819k tokens).
+pub(crate) const DEFAULT_CHUNK_THRESHOLD_BYTES: usize = 2_621_440;
+/// Chunk payload target sized against the token-calibrated threshold above (issue #48): 1.5 MiB
+/// keeps every chunk request comfortably inside the accepted-input range.
+pub(crate) const DEFAULT_CHUNK_SIZE_BYTES: usize = 1_572_864;
 
 fn default_chunk_threshold_bytes() -> usize {
     DEFAULT_CHUNK_THRESHOLD_BYTES
@@ -683,6 +697,7 @@ impl StoredConfig {
                             .ok_or(RegistrationError::NonUtf8Configuration)
                     })
                     .collect::<Result<_, _>>()?,
+                env: config.summarizer_env.iter().cloned().collect(),
             },
             output_directory: utf8(&config.output_directory)?,
             state_directory: utf8(&config.state_directory)?,

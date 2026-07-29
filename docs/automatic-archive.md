@@ -203,9 +203,9 @@ failed re-summary keeps that revision and the ordinary backoff/park verdict appl
 
 Marathon sessions no longer need the floor at all in the common case (issue #48): when the
 measured size of a session's normalized summarizer request exceeds `limits.chunk_threshold_bytes`
-(default 6 MiB, calibrated on real rejection data), the worker summarizes it in chunks instead of
-one shot. The normalized event stream is split on record boundaries into segments of roughly
-`limits.chunk_size_bytes` (default 2 MiB), the summarizer is invoked once per segment with a
+(default 2.5 MiB, token-calibrated on real rejection data), the worker summarizes it in chunks
+instead of one shot. The normalized event stream is split on record boundaries into segments of
+roughly `limits.chunk_size_bytes` (default 1.5 MiB), the summarizer is invoked once per segment with a
 `phase: "chunk"` request (carrying the previous segment's summary for continuity), and once with a
 `phase: "reduce"` request that synthesizes the segment summaries into the one archived session
 summary — recursing through intermediate reduces in the rare case the reduce input itself exceeds

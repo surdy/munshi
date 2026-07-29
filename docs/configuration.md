@@ -36,6 +36,7 @@ Written by `munshi register` from its flags; re-run `register` to change them.
 | --- | --- |
 | `summarizer.executable` | Absolute path of the summary executable transcripts are piped to. `--summarizer`. |
 | `summarizer.args` | Arguments forwarded to the summarizer. Transcript content is only ever sent on stdin. Repeatable `--summarizer-arg`. |
+| `summarizer.env` | Environment variables set on every summarizer invocation, on top of the inherited environment. Opaque to Munshi — it defines no keys itself; the wrapper contract ([`summarizers.md`](summarizers.md)) gives them meaning, for example `MUNSHI_CHUNK_MODEL`/`MUNSHI_REDUCE_MODEL` for the contrib wrappers' per-phase models. Merged before Munshi's own per-invocation variables (`MUNSHI_SUMMARIZER_PHASE`), which win on conflict; keys in the reserved `MUNSHI_SUMMARIZER_*` namespace are rejected at register. Additive with a serde default (no version bump). Repeatable `--summarizer-env KEY=VALUE`. |
 | `output_directory` | Absolute root of the Munshi-owned Markdown archives. `--output-dir`. |
 | `state_directory` | Absolute state home this registration owns; must match the `--state-dir`/`$MUNSHI_HOME` commands run against. |
 | `archive_git_history` | `true` when the output directory is a dedicated Git repository with one commit per summary revision. `--archive-git-history` (default `false`). When enabled alongside summary delivery, delivery must be versioned (issue #9). |
@@ -55,8 +56,8 @@ Defaults in parentheses; set at registration time by the matching `--…` flag.
 | `max_stdout_bytes` | Cap on summarizer stdout (`262144`). |
 | `max_stderr_bytes` | Cap on captured summarizer stderr (`65536`). |
 | `max_event_text_bytes` | Per-event extraction threshold (`131072`): content larger than this is extracted as an `outputs/<sha256>` snapshot artifact and elided from summarizer input (ADR 0010). Manual archival uses the same threshold. |
-| `chunk_threshold_bytes` | Chunked map-reduce trigger (`6291456`, issue #48): a session whose measured one-shot request exceeds this is summarized in per-segment chunks plus a reduce pass instead of one shot (or the input-limit placeholder floor). Also the hard cap on any single chunk/reduce request. Additive with a serde default — configurations written before issue #48 load unchanged, no version bump. `--chunk-threshold-bytes`. |
-| `chunk_size_bytes` | Approximate serialized-events payload each chunk request targets on the chunked path (`2097152`, issue #48). Chunks split only on event boundaries, so individual chunks may run over or under. Additive with a serde default, like `chunk_threshold_bytes`. `--chunk-size-bytes`. |
+| `chunk_threshold_bytes` | Chunked map-reduce trigger (`2621440`, issue #48): a session whose measured one-shot request exceeds this is summarized in per-segment chunks plus a reduce pass instead of one shot (or the input-limit placeholder floor). Also the hard cap on any single chunk/reduce request. The default is token-calibrated (issue #48 live calibration): the backend boundary is ~922k tokens, and at observed byte/token ratios of ~3.2–4.5 the earlier 6 MiB byte-calibrated default still admitted one-shot rejections; 2.5 MiB stays under the token limit at the densest observed ratio. Additive with a serde default — configurations written before issue #48 load unchanged, no version bump. `--chunk-threshold-bytes`. |
+| `chunk_size_bytes` | Approximate serialized-events payload each chunk request targets on the chunked path (`1572864`, issue #48; sized against the token-calibrated threshold above). Chunks split only on event boundaries, so individual chunks may run over or under. Additive with a serde default, like `chunk_threshold_bytes`. `--chunk-size-bytes`. |
 
 ## `policy` — cost and scope controls
 

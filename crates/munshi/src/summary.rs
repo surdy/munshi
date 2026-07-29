@@ -27,10 +27,41 @@ pub const SUMMARY_CONTRACT_VERSION: u32 = 2;
 /// one-shot behavior when unset.
 pub const SUMMARIZER_PHASE_ENV: &str = "MUNSHI_SUMMARIZER_PHASE";
 
+/// Environment-variable namespace reserved for Munshi's own per-invocation markers (currently
+/// [`SUMMARIZER_PHASE_ENV`]). Operator-configured summarizer environment must stay outside it so
+/// a configured value can never shadow — or appear to shadow — a variable Munshi itself exports.
+pub const RESERVED_SUMMARIZER_ENV_PREFIX: &str = "MUNSHI_SUMMARIZER_";
+
+/// Parses one repeatable `--summarizer-env KEY=VALUE` assignment into a `(key, value)` pair.
+/// The key must be non-empty and everything after the first `=` is the value verbatim (so values
+/// may contain `=`, keys cannot). Keys in Munshi's own reserved namespace
+/// ([`RESERVED_SUMMARIZER_ENV_PREFIX`]) are rejected: Munshi's per-invocation variables always
+/// win, so accepting them would only record configuration that can never take effect.
+pub fn parse_summarizer_env(assignment: &str) -> Result<(String, String), String> {
+    let (key, value) = assignment
+        .split_once('=')
+        .ok_or_else(|| "expected KEY=VALUE".to_owned())?;
+    if key.is_empty() {
+        return Err("the key before `=` must be non-empty".to_owned());
+    }
+    if key.starts_with(RESERVED_SUMMARIZER_ENV_PREFIX) {
+        return Err(format!(
+            "`{RESERVED_SUMMARIZER_ENV_PREFIX}*` keys are reserved for Munshi's own \
+             per-invocation variables (such as {SUMMARIZER_PHASE_ENV})"
+        ));
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
 #[derive(Debug, Clone)]
 pub struct SummarizerConfig {
     pub binary: PathBuf,
     pub args: Vec<OsString>,
+    /// Operator-configured environment set on every summarizer invocation (`summarizer.env` /
+    /// `--summarizer-env`). Opaque to Munshi — it defines no keys itself; the wrapper contract
+    /// (docs/summarizers.md) gives them meaning. Munshi's own per-invocation variables are merged
+    /// after these and win on any conflict.
+    pub env: Vec<(String, String)>,
     pub timeout: Duration,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
@@ -577,11 +608,20 @@ pub fn run_summary(
     phase: SummaryPhase,
     input: Vec<u8>,
 ) -> Result<StructuredSummary, SummaryError> {
+    // Configured environment first, Munshi's own per-invocation variables after: later duplicate
+    // keys override earlier ones in the spawned process's environment, so Munshi's variables win
+    // on any conflict (defense in depth on top of the reserved-prefix rejection at registration).
+    let mut envs: Vec<(OsString, OsString)> = config
+        .env
+        .iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+    envs.push((SUMMARIZER_PHASE_ENV.into(), OsString::from(phase.as_str())));
     let stdout = run_bounded(
         &RunnerConfig {
             binary: config.binary.clone(),
             args: config.args.clone(),
-            envs: vec![(SUMMARIZER_PHASE_ENV.into(), OsString::from(phase.as_str()))],
+            envs,
             timeout: config.timeout,
             stdout_limit: config.stdout_limit,
             stderr_limit: config.stderr_limit,
