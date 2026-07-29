@@ -201,6 +201,23 @@ placeholder as the next revision through the ordinary revision machinery and re-
 placeholder never overwrites an existing real summary: once a session has a real revision, a
 failed re-summary keeps that revision and the ordinary backoff/park verdict applies.
 
+Marathon sessions no longer need the floor at all in the common case (issue #48): when the
+measured size of a session's normalized summarizer request exceeds `limits.chunk_threshold_bytes`
+(default 6 MiB, calibrated on real rejection data), the worker summarizes it in chunks instead of
+one shot. The normalized event stream is split on record boundaries into segments of roughly
+`limits.chunk_size_bytes` (default 2 MiB), the summarizer is invoked once per segment with a
+`phase: "chunk"` request (carrying the previous segment's summary for continuity), and once with a
+`phase: "reduce"` request that synthesizes the segment summaries into the one archived session
+summary — recursing through intermediate reduces in the rare case the reduce input itself exceeds
+the threshold (see [`summarizers.md`](summarizers.md) for the contract). Every invocation is
+separately bounded by `timeout_ms` and separately charged against the per-project budget, and a
+failure mid-chunk abandons the whole attempt into the ordinary backoff above — partial summaries
+are never archived. The floor still catches what chunking genuinely cannot fix: a request no
+split can bring under the threshold (for example one enormous un-elided event, or an irreducible
+reduce input) floors immediately under `summary-input-limit`, and repeated chunk-phase summarizer
+rejections floor at the park threshold exactly like one-shot rejections. Below the threshold,
+`max_input_bytes` governs the one-shot request exactly as before.
+
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
 summary cache from validated Munshi-owned Markdown. Existing Markdown is never deleted or made

@@ -33,8 +33,9 @@ use crate::state::{
     migrate_legacy_state, now_ms, try_acquire_session_lock,
 };
 use crate::summary::{
-    PlaceholderReason, StructuredSummary, SummarizerConfig, SummaryError,
-    build_revision_summary_input, build_summary_input, placeholder_summary, run_summary,
+    ChunkingLimits, PlaceholderReason, StructuredSummary, SummarizerConfig, SummaryError,
+    SummaryPhase, SummaryStrategy, placeholder_summary, plan_summary_input, run_chunked_summary,
+    run_summary,
 };
 use munshi_runner::RunnerError;
 
@@ -909,45 +910,70 @@ fn process_claim(
             .unwrap_or(stored.limits.max_input_bytes);
         let timeout_ms = policy.timeout_ms.unwrap_or(stored.limits.timeout_ms);
         let attempt = (|| -> Result<StructuredSummary, HookWorkerError> {
-            let input = if update.mode == TranscriptLoadMode::Delta {
-                build_revision_summary_input(
-                    &update.session,
-                    &project,
-                    prior_summary.ok_or(StateError::InvalidState)?,
-                    max_input_bytes,
-                )?
+            let previous_summary = if update.mode == TranscriptLoadMode::Delta {
+                Some(prior_summary.ok_or(StateError::InvalidState)?)
             } else {
-                build_summary_input(&update.session, &project, max_input_bytes)?
+                None
+            };
+            let chunking = ChunkingLimits {
+                chunk_threshold_bytes: stored.limits.chunk_threshold_bytes,
+                chunk_size_bytes: stored.limits.chunk_size_bytes,
+            };
+            // The strategy is decided from the measured size of the real one-shot request
+            // (issue #48): below the chunk threshold the one-shot contract runs exactly as
+            // before (including the deterministic `InputLimit` verdict over `max_input_bytes`
+            // that the issue #43 floor archives under); above it the session is summarized in
+            // chunks instead of flooring.
+            let strategy = plan_summary_input(
+                &update.session,
+                &project,
+                previous_summary,
+                max_input_bytes,
+                &chunking,
+            )?;
+            let summarizer = SummarizerConfig {
+                binary: PathBuf::from(&stored.summarizer.executable),
+                args: stored.summarizer.args.iter().map(Into::into).collect(),
+                timeout: Duration::from_millis(timeout_ms),
+                stdout_limit: stored.limits.max_stdout_bytes,
+                stderr_limit: stored.limits.max_stderr_bytes,
             };
             // Checking the budget and recording the call happen in one atomic transaction (see
             // `reserve_summarizer_call`), so two processes racing on the same project's budget
-            // cannot both observe capacity and both proceed. This runs only once `input` has been
-            // built successfully, so a call that will never reach the summarizer (for example
-            // oversized input rejected above) is never charged against the budget.
-            match state.reserve_summarizer_call(
-                &project.identity,
-                now_ms(),
-                policy.max_calls_per_hour,
-                policy.max_calls_per_day,
-            )? {
-                BudgetOutcome::HourlyExceeded => {
-                    return Err(HookWorkerError::Deferred("budget-hourly-exceeded"));
+            // cannot both observe capacity and both proceed. This runs before every summarizer
+            // invocation — once for a one-shot session, once per chunk/reduce invocation for a
+            // chunked one — and only after the input was built successfully, so a call that will
+            // never reach the summarizer is never charged against the budget.
+            let mut reserve_call = || -> Result<(), HookWorkerError> {
+                match state.reserve_summarizer_call(
+                    &project.identity,
+                    now_ms(),
+                    policy.max_calls_per_hour,
+                    policy.max_calls_per_day,
+                )? {
+                    BudgetOutcome::HourlyExceeded => {
+                        Err(HookWorkerError::Deferred("budget-hourly-exceeded"))
+                    }
+                    BudgetOutcome::DailyExceeded => {
+                        Err(HookWorkerError::Deferred("budget-daily-exceeded"))
+                    }
+                    BudgetOutcome::Reserved => Ok(()),
                 }
-                BudgetOutcome::DailyExceeded => {
-                    return Err(HookWorkerError::Deferred("budget-daily-exceeded"));
+            };
+            match strategy {
+                SummaryStrategy::OneShot(input) => {
+                    reserve_call()?;
+                    Ok(run_summary(&summarizer, SummaryPhase::Complete, input)?)
                 }
-                BudgetOutcome::Reserved => {}
+                SummaryStrategy::Chunked => run_chunked_summary(
+                    &summarizer,
+                    &update.session,
+                    &project,
+                    previous_summary,
+                    &chunking,
+                    &mut reserve_call,
+                ),
             }
-            Ok(run_summary(
-                &SummarizerConfig {
-                    binary: PathBuf::from(&stored.summarizer.executable),
-                    args: stored.summarizer.args.iter().map(Into::into).collect(),
-                    timeout: Duration::from_millis(timeout_ms),
-                    stdout_limit: stored.limits.max_stdout_bytes,
-                    stderr_limit: stored.limits.max_stderr_bytes,
-                },
-                input,
-            )?)
         })();
         match attempt {
             Ok(summary) => summary,
@@ -1019,6 +1045,21 @@ fn process_claim(
         fallback_reason: fallback_reason.map(ToOwned::to_owned),
     };
     state.store_plan(claim, &plan)?;
+    // A placeholder's park verdict is published before its archive file becomes visible
+    // (issue #43): an observer that can already see the placeholder Markdown must also see the
+    // parked, owes-a-real-summary session state. The completion below re-asserts the same park
+    // atomically with the archive columns, and every failure path from here overwrites the
+    // verdict with its own.
+    if let Some(trigger) = placeholder_trigger.as_ref() {
+        state.record_placeholder_verdict(
+            claim,
+            &PlaceholderPark {
+                category: trigger.category,
+                cause: trigger.cause,
+                streak: trigger.streak,
+            },
+        )?;
+    }
     if let Err(error) = atomic_replace(&output, markdown.as_bytes()) {
         if fs::read(&output)
             .ok()
@@ -1080,6 +1121,7 @@ fn process_claim(
                     cause: trigger.cause,
                     streak: trigger.streak,
                 },
+                true,
             )
             .map_err(HookWorkerError::PostPersist)?,
         None => state
@@ -1131,10 +1173,13 @@ struct PlaceholderTrigger {
 /// Decides whether a failed summarizer attempt engages the placeholder durability floor
 /// (issue #43). The floor never overwrites a real summary — only sessions with no summary yet, or
 /// whose current summary is itself a placeholder, qualify — and it never triggers on a first
-/// transient failure: Munshi's own input cap is deterministic immediately, while a summarizer
-/// process rejection (nonzero exit, e.g. oversized input beyond the model's real capacity) must
-/// first reach the issue #38 park threshold. Every other summary failure keeps the ordinary
-/// backoff-then-park verdict with no placeholder.
+/// transient failure: a deterministic input-limit verdict floors immediately, while a summarizer
+/// process rejection (nonzero exit, e.g. oversized input beyond the model's real capacity, in any
+/// phase of a chunked run) must first reach the issue #38 park threshold. Since issue #48 the
+/// chunked path replaces the floor for most oversized sessions; `InputLimit` here means either a
+/// below-threshold request over Munshi's own `max_input_bytes` cap, or a genuinely unchunkable
+/// request no split can bring under `chunk_threshold_bytes`. Every other summary failure keeps
+/// the ordinary backoff-then-park verdict with no placeholder.
 fn decide_placeholder(
     state: &StateStore,
     claim: &Claim,
@@ -1277,6 +1322,7 @@ fn reconcile_persisted_attempt(
                 cause: "summary-failed",
                 streak: claim.session.failure_streak.max(1),
             },
+            false,
         )?;
     } else {
         state.complete_attempt(&claim, &persisted, true)?;

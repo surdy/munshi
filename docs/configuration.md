@@ -55,6 +55,8 @@ Defaults in parentheses; set at registration time by the matching `--…` flag.
 | `max_stdout_bytes` | Cap on summarizer stdout (`262144`). |
 | `max_stderr_bytes` | Cap on captured summarizer stderr (`65536`). |
 | `max_event_text_bytes` | Per-event extraction threshold (`131072`): content larger than this is extracted as an `outputs/<sha256>` snapshot artifact and elided from summarizer input (ADR 0010). Manual archival uses the same threshold. |
+| `chunk_threshold_bytes` | Chunked map-reduce trigger (`6291456`, issue #48): a session whose measured one-shot request exceeds this is summarized in per-segment chunks plus a reduce pass instead of one shot (or the input-limit placeholder floor). Also the hard cap on any single chunk/reduce request. Additive with a serde default — configurations written before issue #48 load unchanged, no version bump. `--chunk-threshold-bytes`. |
+| `chunk_size_bytes` | Approximate serialized-events payload each chunk request targets on the chunked path (`2097152`, issue #48). Chunks split only on event boundaries, so individual chunks may run over or under. Additive with a serde default, like `chunk_threshold_bytes`. `--chunk-size-bytes`. |
 
 ## `policy` — cost and scope controls
 

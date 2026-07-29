@@ -122,6 +122,13 @@ sessions line, and the session stays parked because a real summary is still owed
 `munshi retry <session-id>` re-attempts a real summary; when it succeeds, the real summary
 replaces the placeholder as the next revision and is re-uploaded and re-delivered automatically.
 
+Very long "marathon" sessions rarely need the placeholder anymore: when a session's summarizer
+input exceeds `chunk_threshold_bytes` (default 6 MiB), Munshi automatically summarizes it in
+chunks — one summarizer call per segment plus a reduce pass that merges the segment summaries
+into the one archived summary (issue #48). This is invisible day to day apart from the extra
+budgeted summarizer calls; see [`summarizers.md`](summarizers.md) for the contract and
+[`configuration.md`](configuration.md) for the two `chunk_*` limits.
+
 ## Recovery
 
 Hooks are the normal path, but a force-killed or crashed session emits no `SessionEnd`/`Stop` event

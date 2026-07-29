@@ -36,6 +36,8 @@ Munshi writes one JSON object like this to your summarizer's stdin:
 
 ```json
 {
+  "contract_version": 2,
+  "phase": "complete",
   "instruction": "Summarize this coding session as exactly one JSON object matching required_schema. Return every required field. Capture goals, meaningful completed work, decisions, files changed, commands and validation, and open items. Do not quote prompts, raw tool output, secrets, or substantial code. Use concise strings and arrays of strings. Return JSON only, with no Markdown fence or commentary.",
   "required_schema": {
     "title": "non-empty string",
@@ -67,7 +69,9 @@ Field reference:
 
 | Field | Meaning |
 |---|---|
-| `instruction` | Fixed natural-language instruction for the model. Wording differs slightly for fresh vs. revision requests, but the field is always present. |
+| `contract_version` | Request-envelope version, currently `2` (issue #48). Version 2 added `contract_version`, `phase`, and the chunked-session fields below as a strictly additive change: a request from a pre-v2 Munshi simply lacks these fields, and a below-threshold session's v2 request differs from v1 only by the two marker fields. |
+| `phase` | `"complete"` (the ordinary one-shot request — treat an absent `phase` from an older Munshi the same way), `"chunk"`, or `"reduce"`. The same value is exported as the `MUNSHI_SUMMARIZER_PHASE` environment variable on every invocation, so shell wrappers can branch without parsing the JSON. See [Chunked marathon sessions](#chunked-marathon-sessions-contract-v2) below. |
+| `instruction` | Fixed natural-language instruction for the model. Wording differs per phase and for fresh vs. revision requests, but the field is always present. |
 | `required_schema` | Output field names and expected shape, spelled out for the model. Mirrors `StructuredSummary` exactly — use it, don't hardcode a copy that could drift. |
 | `session.id` | Munshi's globally unique ID, `<source>:<session_id>`. |
 | `session.source_agent` | Harness that captured the session: `copilot-cli`, `claude-code`, or `codex-cli`. |
@@ -75,7 +79,9 @@ Field reference:
 | `session.project_identity` | Canonical project identity Munshi resolved the session to: the normalized Git remote (for example `github.com/you/your-repo`) or `local:sha256:<digest>` for repositories without one. |
 | `session.repository` | Best-effort repository name, or `null` if none was resolved. |
 | `previous_summary` | Present only when revising an already-archived summary (a resumed/updated session): the last accepted `StructuredSummary`, same shape as the required output. Field is omitted entirely on a first-time summary. |
-| `events` | Normalized transcript: an ordered array of `{ "kind": "user" \| "assistant" \| "tool", "content": string }`. This is the full material you have — there is no separate raw transcript to fetch. An event's `content` may be a *claim ticket* rather than the original text (see below). |
+| `events` | Normalized transcript: an ordered array of `{ "kind": "user" \| "assistant" \| "tool", "content": string }`. This is the full material you have — there is no separate raw transcript to fetch. An event's `content` may be a *claim ticket* rather than the original text (see below). On a `"chunk"` request this holds only the current segment's events; on a `"reduce"` request it is empty. |
+| `chunk` | Present only on `phase: "chunk"` requests: `{ "index": n, "count": m, "previous_chunk_summary": … }`. `index` is this segment's 1-based ordinal among `count` segments; `previous_chunk_summary` (present from the second segment on) is the accepted summary of the immediately preceding segment, carried for continuity. |
+| `chunk_summaries` | Present only on `phase: "reduce"` requests: the per-segment summaries to synthesize, in segment order, each shaped exactly like the required output. |
 | `ignored_unknown_event_count` | Count of transcript records Munshi couldn't normalize into an event. Usually 0; nonzero just means some records were dropped before reaching you. |
 
 ### Claim tickets (elided oversized events)
@@ -108,6 +114,42 @@ When `previous_summary` is set, the instruction asks for a **complete replacemen
 not a diff or an append: read the prior summary, read the new events, and return a full
 `StructuredSummary` that still covers everything still true plus what changed. Do not assume
 the caller will merge fields for you — nothing downstream stitches old and new together.
+
+### Chunked marathon sessions (contract v2)
+
+A session whose one-shot request would exceed `limits.chunk_threshold_bytes` (default 6 MiB;
+issue #48) is summarized as a **map-reduce** instead of one shot. Munshi splits the normalized
+event stream on event boundaries into segments of roughly `limits.chunk_size_bytes` (default
+2 MiB) and invokes your summarizer several times:
+
+1. One `phase: "chunk"` request per segment, in order. Each carries only that segment's
+   `events`, a `chunk` object with the segment's `index`/`count`, and — from the second segment
+   on — `chunk.previous_chunk_summary`, the summary you returned for the preceding segment, as
+   continuity context. The instruction asks for a summary of **this segment only**.
+2. One `phase: "reduce"` request over the collected segment summaries (`chunk_summaries`,
+   with `events` empty), whose instruction asks for one summary of the **entire session**. In
+   the rare case the reduce input itself exceeds the threshold, Munshi first condenses groups
+   of segment summaries through intermediate `"reduce"` requests and reduces again over the
+   results. When the session is a revision, `previous_summary` rides on the final reduce
+   request and the instruction asks for a complete replacement, as usual.
+
+Every invocation uses the **same response schema** ([section 3](#3-the-required-output)) and the
+same timeout/stdout/stderr bounds, and each one is charged against the per-project call budget
+individually. A summarizer that simply forwards the request and instruction to its model —
+which is what both contrib wrappers do — needs no code changes for chunking to work.
+
+Munshi also exports the phase as the `MUNSHI_SUMMARIZER_PHASE` environment variable
+(`complete` | `chunk` | `reduce`) on every invocation, so a shell wrapper can branch — for
+example to pick a cheaper model for chunk passes — without parsing the request. Both contrib
+wrappers honor two optional environment variables, defaulting to their current behavior when
+unset: `MUNSHI_CHUNK_MODEL` and `MUNSHI_REDUCE_MODEL` select the model for chunk / reduce
+invocations (Claude Code via `--model` over `CLAUDE_MODEL`; Copilot CLI via its `--model` flag,
+passed only when the override is set). Model policy stays outside Munshi itself.
+
+**Backward compatibility:** the v2 envelope is strictly additive. Old wrappers keep working for
+every below-threshold session (the request only gained the two marker fields), and requests from
+a pre-v2 Munshi — no `contract_version`, no `phase`, no phase environment variable — should be
+treated as `phase: "complete"`.
 
 ## 3. The required output
 
@@ -193,9 +235,11 @@ end-to-end against real sessions.
 
 Before using it:
 
-- Edit the hardcoded `claude` binary path and `--model` flag at the top of the script to match
-  your local install (`which claude`, and whichever Claude Code model you want to pay for
-  summarization with — a small/cheap model is usually enough).
+- Edit the `CLAUDE_BIN` and `CLAUDE_MODEL` defaults at the top of the script (both also
+  overridable via environment) to match your local install (`which claude`, and whichever
+  Claude Code model you want to pay for summarization with — a small/cheap model is usually
+  enough). The optional `MUNSHI_CHUNK_MODEL`/`MUNSHI_REDUCE_MODEL` variables select a different
+  model per phase for chunked marathon sessions (contract v2 above).
 - Make it executable: `chmod +x contrib/claude-summarizer.sh`.
 - Point `--summarizer` at its **absolute** path:
 
@@ -254,7 +298,10 @@ automatic capture, using [`munshi archive`](manual-archive.md).
 - Invocations are bounded by per-project budgets so a busy project can't cause unbounded spend:
   `--max-calls-per-hour` (default 10) and `--max-calls-per-day` (default 50), plus
   `--max-concurrency` (default 2) across all projects. Once a budget is hit, further summaries
-  for that project defer until the window rolls over rather than being dropped.
+  for that project defer until the window rolls over rather than being dropped. A chunked
+  marathon session (contract v2 above) makes one budgeted call **per chunk plus the reduce
+  pass(es)**, so a single 20 MiB session can consume around a dozen calls; size the budgets
+  accordingly if you archive marathons routinely.
 - **v1 does not redact secrets.** If a transcript contains credentials, tokens, or other
   sensitive text, that text is sent to your summarizer verbatim like everything else. Choose a
   summarizer backend you're comfortable sending session content to, and keep that in mind for

@@ -324,6 +324,7 @@ fn run_git(directory: &Path, args: Vec<OsString>, input: Vec<u8>) -> Result<Vec<
         &RunnerConfig {
             binary: PathBuf::from("git"),
             args: full_args,
+            envs: Vec::new(),
             timeout: GIT_TIMEOUT,
             stdout_limit: GIT_STDOUT_LIMIT,
             stderr_limit: GIT_STDERR_LIMIT,

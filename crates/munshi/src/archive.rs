@@ -8,7 +8,9 @@ use crate::project::{ProjectIdentityError, inspect_project};
 use crate::render::{ArchiveMetadata, RenderError, archive_path, atomic_replace, render_markdown};
 pub use crate::source::SessionReference;
 use crate::source::{SourceError, load_session_update, resolve_session_reference};
-use crate::summary::{SummarizerConfig, SummaryError, build_summary_input, run_summary};
+use crate::summary::{
+    SummarizerConfig, SummaryError, SummaryPhase, build_summary_input, run_summary,
+};
 
 #[derive(Debug, Clone)]
 pub struct ArchiveConfig {
@@ -71,6 +73,7 @@ pub fn archive_session(config: &ArchiveConfig) -> Result<ArchiveOutcome, Archive
             stdout_limit: config.max_stdout_bytes,
             stderr_limit: config.max_stderr_bytes,
         },
+        SummaryPhase::Complete,
         input,
     )?;
     let metadata = ArchiveMetadata {

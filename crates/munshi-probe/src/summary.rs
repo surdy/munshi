@@ -56,6 +56,7 @@ pub fn run_summary_probe(
         &RunnerConfig {
             binary: config.binary.clone(),
             args: config.args.clone(),
+            envs: Vec::new(),
             timeout: config.timeout,
             stdout_limit: config.stdout_limit,
             stderr_limit: config.stderr_limit,
