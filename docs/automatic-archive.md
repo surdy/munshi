@@ -163,6 +163,19 @@ configuration that produced it: `retry`, `retry-all`, and the recovery sweep re-
 transcripts against the currently configured limit and make sessions that now fit eligible again,
 so raising `max_source_bytes` is enough — no `--force` needed (issue #44).
 
+A retryable failure schedules the session's next attempt with an escalating per-session backoff
+derived from its consecutive-failure streak — 10 minutes after the first failure, then 30 minutes,
+90 minutes, 4 hours, capped at 24 hours — and any successful attempt resets the streak. After 5
+consecutive failures with the same category against the same session content, the failure is
+treated as deterministic and the session is parked (like the `source-failed` park above, with the
+real category retained), so one broken session can no longer win the `max_concurrency` slots every
+sweep and starve the rest of the queue (issue #38). Plain sweeps and `retry-all` never touch such a
+park; a targeted `munshi retry <id>` lifts it explicitly, and `--force` (or `--force-retry` below)
+lifts it for bulk retries — every lift, including the automatic `source-failed` re-measurement,
+restarts the streak so the session gets fresh attempts. Sweeps also scan eligible work
+least-recently-attempted first, and `munshi status` reports currently parked sessions as
+`parked=<n>` on its sessions line.
+
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
 summary cache from validated Munshi-owned Markdown. Existing Markdown is never deleted or made

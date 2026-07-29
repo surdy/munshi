@@ -2031,6 +2031,8 @@ mod tests {
             last_agent_stop_ms: Some(10_000),
             last_session_end_ms: None,
             last_error_category: None,
+            next_retry_at_ms: None,
+            failure_streak: 0,
         };
 
         // Tamper the live transcript after archival: it grows under the upload.

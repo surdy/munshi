@@ -26,6 +26,33 @@ const DATABASE_FILE: &str = "munshi.db";
 const SCHEMA_VERSION: i64 = 5;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
+/// Consecutive failures with the same error category on the same `state_generation` after which
+/// [`StateStore::fail_attempt`] parks the session permanently (`next_retry_at_ms = -1`) instead
+/// of scheduling another retry (issue #38). A parked session keeps its real failure category and
+/// is skipped by every plain sweep; only an explicit targeted `retry`, a `--force` retry, or new
+/// session activity (which bumps the generation) makes it eligible again.
+pub const RETRY_PARK_THRESHOLD: i64 = 5;
+
+/// Escalating per-session retry backoff (issue #38), indexed by the consecutive-failure streak:
+/// 10 minutes after the first failure, then 30 minutes, 90 minutes, 4 hours, and a 24-hour cap
+/// for any longer streak. With [`RETRY_PARK_THRESHOLD`] at 5 the cap only applies if the
+/// threshold is ever raised.
+const RETRY_BACKOFF_SCHEDULE_MS: [i64; 5] = [
+    10 * 60 * 1_000,
+    30 * 60 * 1_000,
+    90 * 60 * 1_000,
+    4 * 60 * 60 * 1_000,
+    24 * 60 * 60 * 1_000,
+];
+
+/// The scheduled delay before the next retry after `streak` consecutive failures (issue #38).
+fn retry_backoff_ms(streak: i64) -> i64 {
+    let index = usize::try_from(streak.saturating_sub(1))
+        .unwrap_or(0)
+        .min(RETRY_BACKOFF_SCHEDULE_MS.len() - 1);
+    RETRY_BACKOFF_SCHEDULE_MS[index]
+}
+
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error(transparent)]
@@ -84,6 +111,12 @@ pub struct SessionRecord {
     pub last_agent_stop_ms: Option<i64>,
     pub last_session_end_ms: Option<i64>,
     pub last_error_category: Option<String>,
+    /// When the failed session becomes retry-eligible again: `None` is immediately eligible, a
+    /// timestamp is a scheduled backoff, and a negative value is a permanent park (issues #38/#44).
+    pub next_retry_at_ms: Option<i64>,
+    /// Consecutive failed attempts with the same error category on the same `state_generation`
+    /// (issue #38). Reset by any successful attempt, a `--force` retry, or a lifted park.
+    pub failure_streak: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +651,7 @@ impl StateStore {
             return Err(StateError::NewerSchema);
         }
         ensure_processing_attempts_git_history_column(&self.connection)?;
+        ensure_session_failure_streak_columns(&self.connection)?;
         Ok(())
     }
 
@@ -838,7 +872,7 @@ impl StateStore {
                     source_started_at,source_updated_at,source_user_requests,
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                    last_error_category,source_kind
+                    last_error_category,source_kind,next_retry_at_ms,failure_streak
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -861,7 +895,7 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind
+                last_error_category,source_kind,next_retry_at_ms,failure_streak
              FROM sessions
              ORDER BY updated_at_ms DESC,id DESC",
         )?;
@@ -1669,6 +1703,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         last_agent_stop_ms: row.get(31)?,
         last_session_end_ms: row.get(32)?,
         last_error_category: row.get(33)?,
+        next_retry_at_ms: row.get(35)?,
+        failure_streak: row.get(36)?,
     })
 }
 
@@ -1779,6 +1815,33 @@ fn ensure_processing_attempts_git_history_column(
     Ok(())
 }
 
+/// Additive columns tracking the per-session consecutive-failure streak that drives the
+/// escalating retry backoff and the repeat-failure park (issue #38), added the same way as the
+/// git-history column above so existing databases upgrade in place without a schema rebuild.
+fn ensure_session_failure_streak_columns(connection: &Connection) -> Result<(), StateError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let existing: std::collections::BTreeSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    drop(statement);
+    for (name, definition) in [
+        (
+            "failure_streak",
+            "failure_streak INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("failure_streak_category", "failure_streak_category TEXT"),
+        (
+            "failure_streak_generation",
+            "failure_streak_generation INTEGER",
+        ),
+    ] {
+        if !existing.contains(name) {
+            connection.execute(&format!("ALTER TABLE sessions ADD COLUMN {definition}"), [])?;
+        }
+    }
+    Ok(())
+}
+
 fn dedupe_key(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
@@ -1839,8 +1902,11 @@ impl StateStore {
         };
         if force {
             if let Some(database_id) = reserved_database_id {
+                // A forced retry clears any park or scheduled backoff and restarts the
+                // consecutive-failure escalation from scratch (issue #38).
                 transaction.execute(
-                    "UPDATE sessions SET next_retry_at_ms=NULL
+                    "UPDATE sessions SET next_retry_at_ms=NULL,failure_streak=0,
+                        failure_streak_category=NULL,failure_streak_generation=NULL
                      WHERE id=?1 AND lifecycle_state='failed'",
                     [database_id],
                 )?;
@@ -1890,11 +1956,14 @@ impl StateStore {
     /// Lifts a permanent `source-failed` park so the normal claim gates re-evaluate the session.
     /// The caller must first verify the transcript fits the currently configured source limit;
     /// this only clears the frozen verdict (`next_retry_at_ms < 0`) recorded under a superseded
-    /// configuration (issue #44) and never touches sessions failed for other reasons.
+    /// configuration (issue #44) and never touches sessions failed for other reasons. The
+    /// failure streak resets with the park (issue #38) so a lifted session gets a fresh
+    /// escalation window rather than inheriting the failed-era streak.
     pub fn lift_source_limit_park(&mut self, session_id: &str) -> Result<bool, StateError> {
         validate_session_id(session_id)?;
         let changed = self.connection.execute(
-            "UPDATE sessions SET next_retry_at_ms=NULL,updated_at_ms=?3
+            "UPDATE sessions SET next_retry_at_ms=NULL,failure_streak=0,
+                failure_streak_category=NULL,failure_streak_generation=NULL,updated_at_ms=?3
              WHERE source_kind=?2 AND source_session_id=?1
                AND lifecycle_state='failed'
                AND next_retry_at_ms<0
@@ -1904,6 +1973,36 @@ impl StateStore {
         Ok(changed == 1)
     }
 
+    /// Lifts a repeat-failure park (issue #38): [`fail_attempt`] parks a session permanently
+    /// once [`RETRY_PARK_THRESHOLD`] consecutive same-category failures prove the failure
+    /// deterministic. A plain sweep never retries such a park; this lift is reserved for an
+    /// explicit, targeted operator action (`munshi retry <id>`, with `--force` covered by
+    /// [`reserve_worker`]). Lifting resets the streak so the session gets a fresh escalation
+    /// window, and leaves every other kind of park (for example `source-failed`, which
+    /// [`lift_source_limit_park`] re-measures) untouched.
+    ///
+    /// [`fail_attempt`]: StateStore::fail_attempt
+    /// [`reserve_worker`]: StateStore::reserve_worker
+    /// [`lift_source_limit_park`]: StateStore::lift_source_limit_park
+    pub fn lift_failure_park(&mut self, session_id: &str) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let changed = self.connection.execute(
+            "UPDATE sessions SET next_retry_at_ms=NULL,failure_streak=0,
+                failure_streak_category=NULL,failure_streak_generation=NULL,updated_at_ms=?3
+             WHERE source_kind=?2 AND source_session_id=?1
+               AND lifecycle_state='failed'
+               AND next_retry_at_ms<0
+               AND failure_streak>=?4",
+            params![session_id, self.source_kind, now_ms(), RETRY_PARK_THRESHOLD],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Reserves up to `limit` eligible sessions for worker spawns, least-recently-attempted
+    /// first: never-attempted work leads, then sessions whose scheduled retry came due longest
+    /// ago, breaking ties by the last attempt start. The previous insertion-order scan let the
+    /// same head-of-line failures win the bounded concurrency slots every sweep and starve the
+    /// rest of the queue (issue #38).
     pub fn reserve_eligible_workers(
         &mut self,
         force: bool,
@@ -1932,7 +2031,10 @@ impl StateStore {
                     OR ?3
                     OR next_retry_at_ms IS NULL
                     OR (next_retry_at_ms >= 0 AND next_retry_at_ms <= ?2))
-             ORDER BY updated_at_ms,id
+             ORDER BY COALESCE(next_retry_at_ms,0),
+                      COALESCE((SELECT MAX(a.started_at_ms) FROM processing_attempts a
+                                WHERE a.session_id=sessions.id),0),
+                      id
              LIMIT ?4",
         )?;
         let rows = statement
@@ -1956,8 +2058,11 @@ impl StateStore {
             };
             if reserve_worker_in_transaction(&transaction, database_id, now, force)? {
                 if force {
+                    // Forced retries clear parks and scheduled backoff and restart the
+                    // consecutive-failure escalation from scratch (issue #38).
                     transaction.execute(
-                        "UPDATE sessions SET next_retry_at_ms=NULL
+                        "UPDATE sessions SET next_retry_at_ms=NULL,failure_streak=0,
+                            failure_streak_category=NULL,failure_streak_generation=NULL
                          WHERE id=?1 AND lifecycle_state='failed'",
                         [database_id],
                     )?;
@@ -2190,7 +2295,7 @@ impl StateStore {
                     source_started_at,source_updated_at,source_user_requests,
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                    last_error_category,source_kind
+                    last_error_category,source_kind,next_retry_at_ms,failure_streak
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -2412,6 +2517,7 @@ impl StateStore {
                 lifecycle_state=CASE WHEN state_generation=?25
                     THEN 'archived' ELSE 'revision-pending' END,
                 retry_state=NULL,next_retry_at_ms=NULL,
+                failure_streak=0,failure_streak_category=NULL,failure_streak_generation=NULL,
                 claim_token=NULL,claim_started_at_ms=NULL,
                 worker_generation=NULL,worker_spawned_at_ms=NULL,
                 updated_at_ms=?26
@@ -2488,6 +2594,7 @@ impl StateStore {
                     ELSE CASE WHEN current_summary_revision > 0
                         THEN 'revision-pending' ELSE 'summary-pending' END END,
                 retry_state=NULL,next_retry_at_ms=NULL,
+                failure_streak=0,failure_streak_category=NULL,failure_streak_generation=NULL,
                 claim_token=NULL,claim_started_at_ms=NULL,
                 worker_generation=NULL,worker_spawned_at_ms=NULL,
                 last_error_category=NULL,updated_at_ms=?3
@@ -2516,6 +2623,7 @@ impl StateStore {
         transaction.execute(
             "UPDATE sessions SET lifecycle_state='observed',
                 retry_state=NULL,next_retry_at_ms=NULL,
+                failure_streak=0,failure_streak_category=NULL,failure_streak_generation=NULL,
                 claim_token=NULL,claim_started_at_ms=NULL,
                 worker_generation=NULL,worker_spawned_at_ms=NULL,
                 last_error_category=NULL,updated_at_ms=?2
@@ -2526,6 +2634,14 @@ impl StateStore {
         Ok(())
     }
 
+    /// Records a failed attempt. A retryable failure schedules the next retry with the
+    /// escalating per-session backoff of [`RETRY_BACKOFF_SCHEDULE_MS`], derived from the
+    /// session's consecutive-failure streak — failures of the same category against the same
+    /// `state_generation` extend the streak, anything else restarts it at one. Once the streak
+    /// reaches [`RETRY_PARK_THRESHOLD`] the failure is treated as deterministic and the session
+    /// is parked permanently (`next_retry_at_ms = -1`) with its real category retained, so it
+    /// can no longer monopolize the concurrency slots every sweep (issue #38). Non-retryable
+    /// failures park immediately, exactly as before.
     pub fn fail_attempt(
         &mut self,
         claim: &Claim,
@@ -2536,13 +2652,25 @@ impl StateStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let attempt_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM processing_attempts WHERE session_id=?1",
-            [claim.session.database_id],
-            |row| row.get(0),
-        )?;
-        let exponent: u32 = attempt_count.clamp(0, 6).try_into().unwrap_or(6);
-        let delay = 1_000_i64.saturating_mul(2_i64.saturating_pow(exponent));
+        let (prior_streak, prior_category, prior_generation): (i64, Option<String>, Option<i64>) =
+            transaction.query_row(
+                "SELECT failure_streak,failure_streak_category,failure_streak_generation
+                 FROM sessions WHERE id=?1",
+                [claim.session.database_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let streak = if prior_category.as_deref() == Some(category)
+            && prior_generation == Some(claim.state_generation)
+        {
+            prior_streak.saturating_add(1)
+        } else {
+            1
+        };
+        let next_retry_at_ms = if !retryable || streak >= RETRY_PARK_THRESHOLD {
+            -1
+        } else {
+            now.saturating_add(retry_backoff_ms(streak))
+        };
         transaction.execute(
             "UPDATE processing_attempts SET
                 outcome='failed',error_category=?2,finished_at_ms=?3
@@ -2553,19 +2681,18 @@ impl StateStore {
             "UPDATE sessions SET
                 lifecycle_state='failed',retry_state=?2,
                 next_retry_at_ms=?3,last_error_category=?4,
+                failure_streak=?5,failure_streak_category=?4,failure_streak_generation=?6,
                 claim_token=NULL,claim_started_at_ms=NULL,
                 worker_generation=NULL,worker_spawned_at_ms=NULL,
-                updated_at_ms=?5
-             WHERE id=?1 AND claim_token=?6",
+                updated_at_ms=?7
+             WHERE id=?1 AND claim_token=?8",
             params![
                 claim.session.database_id,
                 claim.retry_state,
-                if retryable {
-                    now.saturating_add(delay)
-                } else {
-                    -1
-                },
+                next_retry_at_ms,
                 category,
+                streak,
+                claim.state_generation,
                 now,
                 claim.token
             ],
@@ -2744,7 +2871,7 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind
+                last_error_category,source_kind,next_retry_at_ms,failure_streak
              FROM sessions
              WHERE active=1
                AND last_agent_stop_ms IS NOT NULL
@@ -2772,7 +2899,7 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind
+                last_error_category,source_kind,next_retry_at_ms,failure_streak
              FROM sessions
              WHERE transcript_path IS NULL
                AND lifecycle_state IN (
@@ -2939,7 +3066,7 @@ impl StateStore {
                 source_started_at,source_updated_at,source_user_requests,
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
-                last_error_category,source_kind
+                last_error_category,source_kind,next_retry_at_ms,failure_streak
              FROM sessions
              WHERE active=0
                AND lifecycle_state='interrupted'

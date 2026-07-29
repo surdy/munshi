@@ -368,6 +368,159 @@ fn recovery_sweep_revives_parked_sessions_after_source_limit_raise() {
 }
 
 #[test]
+fn repeated_deterministic_failure_escalates_backoff_then_parks_and_sweeps_skip_it() {
+    let harness = Harness::new();
+    let summarizer = harness.failing_summarizer("deterministic-fail-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    let waited = harness.wait(SESSION_A, 15_000);
+    assert!(!waited.status.success());
+    assert_eq!(harness.summarizer_calls("deterministic-fail-count"), 1);
+
+    // Each consecutive same-category failure escalates the per-session backoff:
+    // 10 minutes, then 30, 90, and 240 minutes (asserted against generous lower bounds).
+    let minute = 60_000_i64;
+    let minimum_delays = [9 * minute, 29 * minute, 89 * minute, 239 * minute];
+    for (index, minimum) in minimum_delays.iter().enumerate() {
+        let attempt = index + 1;
+        let (category, next_retry) = session_retry_park(&harness, SESSION_A);
+        assert_eq!(category.as_deref(), Some("summary-failed"));
+        let next_retry = next_retry.unwrap_or_default();
+        let delay = next_retry - wall_clock_ms();
+        assert!(
+            delay >= *minimum,
+            "attempt {attempt}: backoff {delay}ms did not reach {minimum}ms"
+        );
+        assert_eq!(session_failure_streak(&harness, SESSION_A), attempt as i64);
+        // Simulate the backoff having elapsed, without touching the streak.
+        make_retry_due(&harness, SESSION_A);
+        let _ = harness.worker(SESSION_A);
+        assert_eq!(
+            harness.summarizer_calls("deterministic-fail-count"),
+            attempt + 1
+        );
+    }
+
+    // The fifth consecutive failure parks the session with the real category retained.
+    let (category, next_retry) = session_retry_park(&harness, SESSION_A);
+    assert_eq!(category.as_deref(), Some("summary-failed"));
+    assert_eq!(next_retry, Some(-1));
+    assert_eq!(session_failure_streak(&harness, SESSION_A), 5);
+
+    // A plain sweep must skip the park: no summarizer invocation, park intact.
+    assert_success(&harness.recover(0, false, false));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(harness.summarizer_calls("deterministic-fail-count"), 5);
+    assert_eq!(session_retry_park(&harness, SESSION_A).1, Some(-1));
+
+    // Operators can see the park on the status surface.
+    let status = harness.status_text();
+    assert!(status.contains("parked=1"), "status output: {status}");
+}
+
+#[test]
+fn starved_sessions_get_slots_while_the_clogger_is_backed_off() {
+    let harness = Harness::new();
+    let summarizer = harness.clogging_summarizer("clog-fail-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+
+    // The clogger fails its (billed) summarizer call deterministically.
+    let clog = harness.write_transcript(SESSION_A, "CLOG_REQUEST", "clog answer");
+    harness.complete_lifecycle(SESSION_A, &clog, 10, 11);
+    let waited = harness.wait(SESSION_A, 15_000);
+    assert!(!waited.status.success());
+    assert_eq!(harness.summarizer_calls("clog-fail-count"), 1);
+
+    // A healthy session is queued behind it, waiting for a recovery sweep. `queue_direct`
+    // reserves a worker nobody spawns; clear that reservation (exactly what the stale-claim
+    // test does) so the sweep below is the first party to hand out the slot.
+    let starved = harness.write_transcript(SESSION_B, "GOOD_REQUEST", "good answer");
+    harness.queue_direct(SESSION_B, &starved, 20, 21);
+    Connection::open(harness.state.join("munshi.db"))
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET worker_generation=NULL,worker_spawned_at_ms=NULL
+             WHERE source_session_id=?1",
+            [SESSION_B],
+        )
+        .unwrap();
+
+    // Give any sub-minute legacy backoff time to lapse: the sweep must still skip the
+    // clogger (its escalating backoff holds) and hand the slot to the starved session.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_success(&harness.recover(0, false, false));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waited = harness.wait(SESSION_B, 5_000);
+        if waited.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "starved session was never archived: {} {}",
+            String::from_utf8_lossy(&waited.stdout),
+            String::from_utf8_lossy(&waited.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(harness.archive_path(SESSION_B).exists());
+    assert_eq!(
+        harness.summarizer_calls("clog-fail-count"),
+        1,
+        "the backed-off clogger must not be retried by the sweep"
+    );
+}
+
+#[test]
+fn targeted_retry_lifts_failure_park_and_force_resets_the_streak() {
+    let harness = Harness::new();
+    let summarizer = harness.failing_summarizer("park-lift-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    let waited = harness.wait(SESSION_A, 15_000);
+    assert!(!waited.status.success());
+    for _ in 0..4 {
+        make_retry_due(&harness, SESSION_A);
+        let _ = harness.worker(SESSION_A);
+    }
+    assert_eq!(session_retry_park(&harness, SESSION_A).1, Some(-1));
+    assert_eq!(session_failure_streak(&harness, SESSION_A), 5);
+    assert_eq!(harness.summarizer_calls("park-lift-count"), 5);
+
+    // A plain targeted retry is an explicit operator action: it lifts the park, resets the
+    // streak, and makes a real (failing) attempt rather than replaying the stored verdict.
+    let retried = harness.retry(SESSION_A);
+    let stdout = String::from_utf8_lossy(&retried.stdout);
+    assert!(
+        stdout.contains("\"result\": \"failed\""),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("summary-failed"), "stdout: {stdout}");
+    assert_eq!(harness.summarizer_calls("park-lift-count"), 6);
+    let (_, next_retry) = session_retry_park(&harness, SESSION_A);
+    let next_retry = next_retry.unwrap_or_default();
+    assert!(
+        next_retry >= 0,
+        "lifted session must be backed off, not re-parked: {next_retry}"
+    );
+    assert_eq!(session_failure_streak(&harness, SESSION_A), 1);
+
+    // `retry --force` bypasses the fresh backoff and also restarts the escalation window.
+    let forced = harness.retry_force(SESSION_A);
+    let stdout = String::from_utf8_lossy(&forced.stdout);
+    assert!(
+        stdout.contains("\"result\": \"failed\""),
+        "stdout: {stdout}"
+    );
+    assert_eq!(harness.summarizer_calls("park-lift-count"), 7);
+    let (_, next_retry) = session_retry_park(&harness, SESSION_A);
+    assert!(next_retry.unwrap_or_default() >= 0);
+    assert_eq!(session_failure_streak(&harness, SESSION_A), 1);
+}
+
+#[test]
 fn unworthy_full_fallback_preserves_archive_with_a_distinct_failure() {
     let harness = Harness::new();
     let summarizer = harness.revision_summarizer("unworthy-rewrite-count");
@@ -1566,6 +1719,28 @@ impl Harness {
             .unwrap()
     }
 
+    fn retry_force(&self, session_id: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("retry")
+            .arg(session_id)
+            .arg("--force")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--json")
+            .output()
+            .unwrap()
+    }
+
+    fn status_text(&self) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("status")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     fn commit_count(&self, repository: &Path) -> usize {
         let output = Command::new("git")
             .arg("-C")
@@ -1947,6 +2122,54 @@ esac
         script.canonicalize().unwrap()
     }
 
+    /// A summarizer that records every invocation and then always exits nonzero: a
+    /// deterministic `summary-failed` on every attempt.
+    fn failing_summarizer(&self, count_name: &str) -> PathBuf {
+        let script = self.root().join(format!("{count_name}.sh"));
+        let count = self.root().join(count_name);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\ncat >/dev/null\nprintf x >> '{}'\nexit 7\n",
+                count.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.canonicalize().unwrap()
+    }
+
+    /// A summarizer that fails deterministically for `CLOG_REQUEST` transcripts (counting each
+    /// failing call) and succeeds for everything else.
+    fn clogging_summarizer(&self, count_name: &str) -> PathBuf {
+        let script = self.root().join(format!("{count_name}.sh"));
+        let count = self.root().join(count_name);
+        let body = format!(
+            r#"#!/bin/sh
+set -eu
+input=$(cat)
+case "$input" in
+  *CLOG_REQUEST*)
+    printf x >> '{}'
+    exit 7
+    ;;
+esac
+printf '%s' '{{"title":"Starved session archive","goal":"Archive the healthy session.","work_completed":["Archived the starved session."],"decisions":[],"files_changed":[],"commands_and_validation":[],"open_items":[],"tags":["fairness"]}}'
+"#,
+            count.display()
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.canonicalize().unwrap()
+    }
+
+    /// How many times a counting summarizer script has been invoked.
+    fn summarizer_calls(&self, count_name: &str) -> usize {
+        fs::read(self.root().join(count_name))
+            .map(|marks| marks.len())
+            .unwrap_or(0)
+    }
+
     fn sleeping_summarizer(&self, count_name: &str, seconds: u64) -> PathBuf {
         let script = self.root().join(format!("{count_name}.sh"));
         let count = self.root().join(count_name);
@@ -2021,6 +2244,38 @@ fn session_retry_park(harness: &Harness, session_id: &str) -> (Option<String>, O
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
+}
+
+fn session_failure_streak(harness: &Harness, session_id: &str) -> i64 {
+    Connection::open(harness.state.join("munshi.db"))
+        .unwrap()
+        .query_row(
+            "SELECT failure_streak FROM sessions WHERE source_session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Simulates a session's scheduled backoff having elapsed without touching the failure streak,
+/// so escalation across attempts can be exercised without waiting out real wall-clock delays.
+fn make_retry_due(harness: &Harness, session_id: &str) {
+    let changed = Connection::open(harness.state.join("munshi.db"))
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET next_retry_at_ms=1
+             WHERE source_session_id=?1 AND next_retry_at_ms>=0",
+            [session_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "session {session_id} had no pending backoff");
+}
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn set_old_mtime(path: &Path) {
