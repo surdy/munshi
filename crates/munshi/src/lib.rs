@@ -27,8 +27,9 @@ pub use delivery::{
     verify_history as delivery_verify_history,
 };
 pub use hooks::{
-    HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook, read_last_failure,
-    run_archive_worker, run_archive_worker_for_source, run_recovery, wait_for_hook_result,
+    HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook,
+    lift_stale_source_limit_parks, read_last_failure, run_archive_worker,
+    run_archive_worker_for_source, run_recovery, wait_for_hook_result,
     wait_for_hook_result_for_source,
 };
 pub use patwari::{

@@ -1850,6 +1850,60 @@ impl StateStore {
         Ok(reserved_database_id.is_some())
     }
 
+    /// Failed sessions parked permanently (`next_retry_at_ms < 0`) under the `source-failed`
+    /// verdict, across every source scope. That verdict is config-dependent — it records that the
+    /// transcript exceeded the source limit configured at failure time — so callers re-check the
+    /// listed transcripts against the currently configured limit and lift stale parks
+    /// (issue #44). Sessions without a recorded transcript path are omitted: there is nothing to
+    /// re-measure.
+    pub fn parked_source_limit_sessions(
+        &self,
+    ) -> Result<Vec<(SourceKind, String, PathBuf)>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_kind,source_session_id,transcript_path
+             FROM sessions
+             WHERE lifecycle_state='failed'
+               AND next_retry_at_ms<0
+               AND last_error_category='source-failed'
+               AND transcript_path IS NOT NULL
+             ORDER BY updated_at_ms,id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(source_kind, session_id, path)| {
+                // Skip any row with an unrecognized source label rather than mis-routing it.
+                SourceKind::from_agent_label(&source_kind)
+                    .map(|source| (source, session_id, PathBuf::from(path)))
+            })
+            .collect())
+    }
+
+    /// Lifts a permanent `source-failed` park so the normal claim gates re-evaluate the session.
+    /// The caller must first verify the transcript fits the currently configured source limit;
+    /// this only clears the frozen verdict (`next_retry_at_ms < 0`) recorded under a superseded
+    /// configuration (issue #44) and never touches sessions failed for other reasons.
+    pub fn lift_source_limit_park(&mut self, session_id: &str) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let changed = self.connection.execute(
+            "UPDATE sessions SET next_retry_at_ms=NULL,updated_at_ms=?3
+             WHERE source_kind=?2 AND source_session_id=?1
+               AND lifecycle_state='failed'
+               AND next_retry_at_ms<0
+               AND last_error_category='source-failed'",
+            params![session_id, self.source_kind, now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn reserve_eligible_workers(
         &mut self,
         force: bool,

@@ -222,6 +222,7 @@ fn run_archive_worker_inner(
     {
         state.abandon_processing(session_id, "worker-interrupted")?;
     }
+    lift_stale_source_limit_park(&mut state, &stored, session_id)?;
     if let Some(result) = policy_gate(&mut state, &stored, session_id)? {
         return Ok(result);
     }
@@ -436,6 +437,10 @@ pub fn run_recovery(
                 .map(|session_id| (SourceKind::ClaudeCode, session_id)),
         );
     }
+    // Parks recorded under a superseded source limit are re-evaluated against the current
+    // configuration (issue #44): once `limits.max_source_bytes` is raised, the affected sessions
+    // become eligible again here and flow through the normal reservation below.
+    lift_stale_source_limit_parks(state_directory)?;
     reserved_sessions.extend(state.reserve_eligible_workers(force_retry, RECOVERY_SCAN_LIMIT)?);
     reserved_sessions.sort();
     reserved_sessions.dedup();
@@ -1250,6 +1255,61 @@ fn policy_gate(
         return Ok(Some(current_result(state, session_id)?));
     }
     Ok(None)
+}
+
+/// A permanent `source-failed` park freezes a verdict reached under the source limit configured
+/// at failure time. The currently configured limit always wins on retry (issue #44): when the
+/// parked transcript now fits within `stored.limits.max_source_bytes`, the park is lifted so the
+/// normal claim gates re-evaluate the session against today's configuration instead of replaying
+/// the stale verdict. A transcript that still exceeds the current limit (or one that failed for a
+/// size-independent reason and still fails) simply re-parks on the next attempt.
+fn lift_stale_source_limit_park(
+    state: &mut StateStore,
+    stored: &crate::registration::StoredConfig,
+    session_id: &str,
+) -> Result<(), HookWorkerError> {
+    let Some(session) = state.get_session(session_id)? else {
+        return Ok(());
+    };
+    if session.lifecycle_state != "failed"
+        || session.last_error_category.as_deref() != Some("source-failed")
+    {
+        return Ok(());
+    }
+    let Some(path) = session.transcript_path.as_deref() else {
+        return Ok(());
+    };
+    if transcript_fits_current_limit(path, stored.limits.max_source_bytes) {
+        let _ = state.lift_source_limit_park(session_id)?;
+    }
+    Ok(())
+}
+
+/// Whether `path`'s current size fits the configured source limit — exactly the size condition
+/// `read_stable_source` enforces, checked from metadata so a park can be re-evaluated without
+/// reading the transcript.
+fn transcript_fits_current_limit(path: &Path, max_source_bytes: usize) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.len() <= max_source_bytes as u64)
+}
+
+/// Sweeps every permanently parked `source-failed` session across all sources and lifts the
+/// parks whose transcripts fit the currently configured source limit (issue #44), making them
+/// eligible for the normal reservation gates again. Best-effort by design: an unregistered state
+/// directory leaves every park untouched.
+pub fn lift_stale_source_limit_parks(state_directory: &Path) -> Result<(), HookWorkerError> {
+    let Ok(stored) = load_stored_config(state_directory) else {
+        return Ok(());
+    };
+    let mut state = StateStore::open(state_directory)?;
+    let mut source_stores: BTreeMap<SourceKind, StateStore> = BTreeMap::new();
+    for (source, session_id, path) in state.parked_source_limit_sessions()? {
+        if !transcript_fits_current_limit(&path, stored.limits.max_source_bytes) {
+            continue;
+        }
+        let store = recovery_store(&mut state, &mut source_stores, state_directory, source)?;
+        let _ = store.lift_source_limit_park(&session_id)?;
+    }
+    Ok(())
 }
 
 fn current_result(state: &StateStore, session_id: &str) -> Result<HookResult, HookWorkerError> {

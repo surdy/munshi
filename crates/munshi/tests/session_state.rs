@@ -295,6 +295,79 @@ fn unterminated_trailing_record_is_retryable_without_cursor_advancement() {
 }
 
 #[test]
+fn retry_honors_raised_source_limit_after_source_failed_park() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("raised-limit-count");
+    assert_success(&harness.register_with_source_limit(&summarizer, 10_000, 2_048));
+    let transcript = harness.write_transcript(
+        SESSION_A,
+        "INITIAL_REQUEST",
+        &"oversized answer ".repeat(400),
+    );
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    let waited = harness.wait(SESSION_A, 5_000);
+    assert!(!waited.status.success());
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("source-failed"));
+    // The failed-era verdict is a permanent park recorded against the old limit.
+    let (category, next_retry) = session_retry_park(&harness, SESSION_A);
+    assert_eq!(category.as_deref(), Some("source-failed"));
+    assert_eq!(next_retry, Some(-1));
+
+    // Raise the configured limit the way a user would: re-register over the same state.
+    assert_success(&harness.register_with_source_limit(&summarizer, 10_000, 8_388_608));
+
+    // A plain retry (no --force) must re-evaluate against the current configured limit.
+    let retried = harness.retry(SESSION_A);
+    assert_success(&retried);
+    assert!(String::from_utf8_lossy(&retried.stdout).contains("\"result\": \"archived\""));
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(harness.archive_path(SESSION_A)).unwrap())
+            .unwrap();
+    assert_eq!(archived.summary_revision, 1);
+}
+
+#[test]
+fn recovery_sweep_revives_parked_sessions_after_source_limit_raise() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("raised-limit-recovery-count");
+    assert_success(&harness.register_with_source_limit(&summarizer, 10_000, 2_048));
+    let transcript = harness.write_transcript(
+        SESSION_B,
+        "INITIAL_REQUEST",
+        &"oversized answer ".repeat(400),
+    );
+    harness.complete_lifecycle(SESSION_B, &transcript, 10, 11);
+    let waited = harness.wait(SESSION_B, 5_000);
+    assert!(!waited.status.success());
+    let (category, next_retry) = session_retry_park(&harness, SESSION_B);
+    assert_eq!(category.as_deref(), Some("source-failed"));
+    assert_eq!(next_retry, Some(-1));
+
+    assert_success(&harness.register_with_source_limit(&summarizer, 10_000, 8_388_608));
+
+    // The recovery sweep must lift the stale park and archive through the normal worker path.
+    // `hook wait` treats `failed` as terminal, so poll until the spawned worker flips the state.
+    assert_success(&harness.recover(60_000, false, false));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waited = harness.wait(SESSION_B, 5_000);
+        if waited.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session was not archived after recovery: {}",
+            String::from_utf8_lossy(&waited.stdout)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(harness.archive_path(SESSION_B)).unwrap())
+            .unwrap();
+    assert_eq!(archived.summary_revision, 1);
+}
+
+#[test]
 fn unworthy_full_fallback_preserves_archive_with_a_distinct_failure() {
     let harness = Harness::new();
     let summarizer = harness.revision_summarizer("unworthy-rewrite-count");
@@ -1456,6 +1529,43 @@ impl Harness {
         command.output().unwrap()
     }
 
+    fn register_with_source_limit(
+        &self,
+        summarizer: &Path,
+        timeout_ms: u64,
+        max_source_bytes: usize,
+    ) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("register")
+            .arg("--accept-transcript-processing")
+            .arg("--copilot-home")
+            .arg(&self.copilot_home)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--output-dir")
+            .arg(&self.output)
+            .arg("--summarizer")
+            .arg(summarizer)
+            .arg("--timeout-ms")
+            .arg(timeout_ms.to_string())
+            .arg("--max-source-bytes")
+            .arg(max_source_bytes.to_string())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn retry(&self, session_id: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("retry")
+            .arg(session_id)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--json")
+            .output()
+            .unwrap()
+    }
+
     fn commit_count(&self, repository: &Path) -> usize {
         let output = Command::new("git")
             .arg("-C")
@@ -1897,6 +2007,18 @@ fn session_cursor(harness: &Harness, session_id: &str) -> (i64, i64, String) {
              FROM sessions WHERE source_session_id=?1",
             [session_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn session_retry_park(harness: &Harness, session_id: &str) -> (Option<String>, Option<i64>) {
+    Connection::open(harness.state.join("munshi.db"))
+        .unwrap()
+        .query_row(
+            "SELECT last_error_category,next_retry_at_ms
+             FROM sessions WHERE source_session_id=?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
 }

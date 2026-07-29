@@ -157,6 +157,12 @@ munshi hook recover --state-dir /absolute/copilot-home/munshi \
   --stale-after-ms 1800000
 ```
 
+A transcript larger than the configured `max_source_bytes` fails as `source-failed` and is parked
+rather than retried, since the same limit would reject it again. That verdict is tied to the
+configuration that produced it: `retry`, `retry-all`, and the recovery sweep re-measure parked
+transcripts against the currently configured limit and make sessions that now fit eligible again,
+so raising `max_source_bytes` is enough — no `--force` needed (issue #44).
+
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
 summary cache from validated Munshi-owned Markdown. Existing Markdown is never deleted or made
