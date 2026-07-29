@@ -16,9 +16,10 @@ use munshi::{
     VerifyArchiveReport, accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
     archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
     delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
-    parse_archive_markdown, project_status, read_last_failure, register, retrieve,
-    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
-    set_project_enabled, unregister, verify_archive_parse, wait_for_hook_result_for_source,
+    lift_stale_source_limit_parks, parse_archive_markdown, project_status, read_last_failure,
+    register, retrieve, run_archive_worker_for_source, run_recovery, set_archive_upload_enabled,
+    set_delivery_enabled, set_project_enabled, unregister, verify_archive_parse,
+    wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2053,6 +2054,9 @@ fn build_retry_all_report(
         });
     }
 
+    // Re-evaluate permanent `source-failed` parks against the currently configured source limit
+    // (issue #44) so sessions that failed under a since-raised limit are eligible again below.
+    lift_stale_source_limit_parks(state_directory)?;
     let mut state = StateStore::open(state_directory)?;
     let reserved = state.reserve_eligible_workers(force, limit)?;
     drop(state);
