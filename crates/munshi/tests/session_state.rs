@@ -9,7 +9,8 @@ use std::process::{Child, Command, Output, Stdio};
 use munshi::{
     ArchiveMetadata, CompletionReason, SessionReference, StateStore, StructuredSummary,
     atomic_replace, content_hash, inspect_project, load_session, parse_archive_markdown,
-    render_markdown, render_revision_markdown, resolve_session_reference,
+    recorded_project_identity, render_markdown, render_revision_markdown,
+    resolve_session_reference,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -1484,6 +1485,114 @@ fn unhydratable_sessions_stay_queued_until_an_origin_appears() {
     assert_eq!(archived.completion_reason, "unknown");
 }
 
+/// Issue #40: a session whose origin directory was deleted after the fact used to park as
+/// `project-failed` forever. The worker must now derive the project identity from the
+/// recorded evidence (the `workspace.yaml` cwd), flag the provenance as recorded, and keep
+/// the derived component stable across revisions.
+#[test]
+fn deleted_origin_archives_via_recorded_evidence_with_flagged_provenance() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("recorded-origin-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "INITIAL_REQUEST", "initial answer");
+    let gone = harness.root().join("gone-project");
+    fs::create_dir_all(&gone).unwrap();
+    let gone = gone.canonicalize().unwrap();
+    harness.write_workspace_with_cwd(SESSION_A, &gone);
+    harness.queue_direct_with_origin(SESSION_A, &transcript, &gone, 10, 11);
+    fs::remove_dir_all(&gone).unwrap();
+
+    assert_success(&harness.worker(SESSION_A));
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    let expected = recorded_project_identity(&gone, None);
+    assert!(expected.component.starts_with("gone-project-"));
+    let archive_path = harness
+        .output
+        .join(&expected.component)
+        .join(format!("{SESSION_A}.md"));
+    let markdown = fs::read_to_string(&archive_path).unwrap();
+    assert!(
+        markdown.contains("project_origin: \"recorded\""),
+        "frontmatter must flag the recorded provenance: {markdown}"
+    );
+    let parsed = parse_archive_markdown(&markdown).unwrap();
+    assert_eq!(parsed.project.identity, expected.identity);
+    assert_eq!(parsed.project.project, "gone-project");
+    assert_eq!(parsed.project.repository, None);
+    assert_eq!(parsed.summary_revision, 1);
+
+    // A later revision reuses the same recorded identity: same component, same file.
+    harness.append_turn(&transcript, "DELTA_REQUEST", "delta answer");
+    harness.queue_direct_with_origin(SESSION_A, &transcript, &gone, 20, 21);
+    assert_success(&harness.worker(SESSION_A));
+    assert_success(&harness.wait(SESSION_A, 5_000));
+    let revised_markdown = fs::read_to_string(&archive_path).unwrap();
+    // Revision 2 renders from the state-cached identity, so the recorded provenance must
+    // survive the database round-trip, not just the first derivation.
+    assert!(revised_markdown.contains("project_origin: \"recorded\""));
+    let revised = parse_archive_markdown(&revised_markdown).unwrap();
+    assert_eq!(revised.summary_revision, 2);
+    assert_eq!(revised.project.identity, expected.identity);
+}
+
+/// Issue #40: a parked `origin-unresolved` recovery row whose transcript evidence records a
+/// since-deleted directory must hydrate through the recorded-evidence fallback instead of
+/// parking forever. The quiet-period gate stays in force.
+#[test]
+fn parked_origin_unresolved_hydrates_from_recorded_evidence_of_a_deleted_directory() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("recorded-hydrate-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "STUCK_REQUEST", "stuck answer");
+    let gone = harness.root().join("gone-project");
+    fs::create_dir_all(&gone).unwrap();
+    let gone = gone.canonicalize().unwrap();
+    harness.write_workspace_with_cwd(SESSION_A, &gone);
+    fs::remove_dir_all(&gone).unwrap();
+    // The parked row shape issue #39's sweep leaves when the origin cannot be resolved.
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,last_error_category,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                       'interrupted',0,1,'origin-unresolved',1,1)",
+            params![SESSION_A, transcript.to_str().unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+
+    set_old_mtime(&transcript);
+    assert_success(&harness.recover(600_000, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let hydrated: (String, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT lifecycle_state,origin_cwd,last_error_category
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(hydrated.0, "archived");
+    assert_eq!(hydrated.1.as_deref(), gone.to_str());
+    assert_eq!(hydrated.2, None);
+    let expected = recorded_project_identity(&gone, None);
+    let markdown = fs::read_to_string(
+        harness
+            .output
+            .join(&expected.component)
+            .join(format!("{SESSION_A}.md")),
+    )
+    .unwrap();
+    assert!(markdown.contains("project_origin: \"recorded\""));
+    let parsed = parse_archive_markdown(&markdown).unwrap();
+    assert_eq!(parsed.project.identity, expected.identity);
+    assert_eq!(parsed.completion_reason, "unknown");
+}
+
 #[test]
 fn stale_issue_three_files_migrate_to_retryable_sqlite_work() {
     let harness = Harness::new();
@@ -1978,6 +2087,12 @@ impl Harness {
     /// Stage the version-pinned `session-state/<id>/workspace.yaml` sibling record that
     /// carries a Copilot session's origin project directory.
     fn write_workspace(&self, session_id: &str) {
+        self.write_workspace_with_cwd(session_id, &self.project.clone());
+    }
+
+    /// Like [`Self::write_workspace`], recording an arbitrary origin directory — used to
+    /// stage recorded evidence for a directory that is then deleted (issue #40).
+    fn write_workspace_with_cwd(&self, session_id: &str, cwd: &Path) {
         let path = self
             .copilot_home
             .join("session-state")
@@ -1988,7 +2103,7 @@ impl Harness {
             &path,
             format!(
                 "id: {session_id}\ncwd: {}\nclient_name: github/cli\n",
-                self.project.display()
+                cwd.display()
             ),
         )
         .unwrap();
@@ -2064,15 +2179,32 @@ impl Harness {
         stop_timestamp: i64,
         end_timestamp: i64,
     ) {
+        self.queue_direct_with_origin(
+            session_id,
+            transcript,
+            &self.project.clone(),
+            stop_timestamp,
+            end_timestamp,
+        );
+    }
+
+    fn queue_direct_with_origin(
+        &self,
+        session_id: &str,
+        transcript: &Path,
+        origin: &Path,
+        stop_timestamp: i64,
+        end_timestamp: i64,
+    ) {
         let mut state = StateStore::open(&self.state).unwrap();
         state
-            .ingest_agent_stop(session_id, stop_timestamp, &self.project, transcript)
+            .ingest_agent_stop(session_id, stop_timestamp, origin, transcript)
             .unwrap();
         state
             .ingest_session_end(
                 session_id,
                 end_timestamp,
-                &self.project,
+                origin,
                 "complete",
                 CompletionReason::Complete,
                 None,

@@ -50,6 +50,16 @@ pub fn claude_origin_cwd(object: &Map<String, Value>) -> Option<&str> {
     Path::new(cwd).is_absolute().then_some(cwd)
 }
 
+/// The git branch a Claude Code transcript record declares: its top-level `gitBranch`
+/// value, when present and non-empty. Same read discipline as [`claude_origin_cwd`] —
+/// only the pinned key is inspected, record content is never read. Recorded alongside
+/// `cwd` on every turn record, it is the branch evidence the recorded-origin fallback
+/// (issue #40) carries into provenance when the origin directory no longer exists.
+pub fn claude_git_branch(object: &Map<String, Value>) -> Option<&str> {
+    let branch = object.get("gitBranch")?.as_str()?;
+    (!branch.is_empty()).then_some(branch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +104,16 @@ mod tests {
         );
         assert_eq!(claude_origin_cwd(&object(r#"{"cwd":7}"#)), None);
         assert_eq!(claude_origin_cwd(&object(r#"{"type":"user"}"#)), None);
+    }
+
+    #[test]
+    fn claude_git_branch_requires_a_non_empty_string() {
+        assert_eq!(
+            claude_git_branch(&object(r#"{"gitBranch":"main"}"#)),
+            Some("main")
+        );
+        assert_eq!(claude_git_branch(&object(r#"{"gitBranch":""}"#)), None);
+        assert_eq!(claude_git_branch(&object(r#"{"gitBranch":7}"#)), None);
+        assert_eq!(claude_git_branch(&object(r#"{"type":"user"}"#)), None);
     }
 }

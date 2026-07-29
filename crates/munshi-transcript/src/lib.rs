@@ -28,9 +28,9 @@
 //! [`Classification::Unknown`] records (matching the historical lumped count), and
 //! `started_at` / `updated_at` are the minimum/maximum top-level record `timestamp`.
 //!
-//! [`envelope_matches`] and [`claude_origin_cwd`] expose the pure, privacy-safe envelope
-//! predicates behind `munshi`'s transcript validation and Claude Code origin recovery
-//! (issue #27); the bounded-I/O wrappers around them stay in `munshi`.
+//! [`envelope_matches`], [`claude_origin_cwd`], and [`claude_git_branch`] expose the pure,
+//! privacy-safe envelope predicates behind `munshi`'s transcript validation and Claude Code
+//! origin recovery (issues #27, #40); the bounded-I/O wrappers around them stay in `munshi`.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead};
@@ -43,7 +43,7 @@ use thiserror::Error;
 mod classify;
 mod envelope;
 
-pub use envelope::{claude_origin_cwd, envelope_matches};
+pub use envelope::{claude_git_branch, claude_origin_cwd, envelope_matches};
 
 /// The only artifact-set version any source supports today. [`TranscriptStream::new`]
 /// rejects other versions so future artifact sets fail loudly instead of being

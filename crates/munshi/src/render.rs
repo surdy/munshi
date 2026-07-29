@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tempfile::Builder;
 use thiserror::Error;
 
-use crate::project::ProjectIdentity;
+use crate::project::{ProjectIdentity, ProjectOrigin};
 use crate::source::{ArtifactIndexEntry, NormalizedSession, SourceKind};
 use crate::summary::{StructuredSummary, validate_structured_summary};
 
@@ -133,6 +133,11 @@ fn render_markdown_version(
             &metadata.project.component,
         );
     }
+    // Written only for recorded-evidence identities (issue #40), so every archive rendered
+    // from a live origin stays byte-identical to what pre-#40 builds produced.
+    if let Some(marker) = metadata.project.origin.recorded_marker() {
+        line_string(&mut output, "project_origin", marker);
+    }
     if let Some(repository) = &metadata.project.repository {
         line_string(&mut output, "repository", repository);
     }
@@ -246,6 +251,17 @@ pub fn parse_archive_markdown(markdown: &str) -> Result<ArchivedMarkdown, Render
         .get("branch")
         .map(|value| parse_string(value))
         .transpose()?;
+    // Absent means live: archives written before issue #40 carry no `project_origin` key.
+    let project_origin = match fields
+        .get("project_origin")
+        .map(|value| parse_string(value))
+        .transpose()?
+        .as_deref()
+    {
+        None | Some("live") => ProjectOrigin::Live,
+        Some("recorded") => ProjectOrigin::Recorded,
+        Some(_) => return Err(RenderError::InvalidArchive),
+    };
     let summary_revision = parse_u64(field(&fields, "summary_revision")?)?;
     if summary_revision == 0 {
         return Err(RenderError::InvalidArchive);
@@ -343,6 +359,7 @@ pub fn parse_archive_markdown(markdown: &str) -> Result<ArchivedMarkdown, Render
             project: project_name,
             repository,
             branch,
+            origin: project_origin,
         },
         summary_revision,
         completion_reason,
@@ -714,7 +731,59 @@ mod tests {
             project: "munshi".to_owned(),
             repository: Some("surdy/munshi".to_owned()),
             branch: None,
+            origin: ProjectOrigin::Live,
         }
+    }
+
+    #[test]
+    fn recorded_project_origin_round_trips_and_live_stays_unmarked() {
+        let session = session_with_outputs(Vec::new());
+        // A live identity writes no project_origin key, so pre-#40 archives stay byte-stable.
+        let live = render_revision_markdown(
+            &ArchiveMetadata {
+                session: &session,
+                project: &project(),
+            },
+            &summary(),
+            1,
+            "complete",
+            None,
+        );
+        assert!(!live.contains("project_origin:"));
+        assert_eq!(
+            parse_archive_markdown(&live).unwrap().project.origin,
+            ProjectOrigin::Live
+        );
+
+        // A recorded identity is flagged and the flag survives the re-parse (the DB-rebuild
+        // and post-persist reconcile paths both read provenance back from the frontmatter).
+        let recorded_project = ProjectIdentity {
+            origin: ProjectOrigin::Recorded,
+            repository: None,
+            branch: Some("main".to_owned()),
+            ..project()
+        };
+        let recorded = render_revision_markdown(
+            &ArchiveMetadata {
+                session: &session,
+                project: &recorded_project,
+            },
+            &summary(),
+            1,
+            "complete",
+            None,
+        );
+        assert!(recorded.contains("project_origin: \"recorded\"\n"));
+        let parsed = parse_archive_markdown(&recorded).unwrap();
+        assert_eq!(parsed.project.origin, ProjectOrigin::Recorded);
+        assert_eq!(parsed.project.branch.as_deref(), Some("main"));
+
+        // An unknown marker is rejected rather than silently coerced.
+        let corrupted = recorded.replace(
+            "project_origin: \"recorded\"",
+            "project_origin: \"guessed\"",
+        );
+        assert!(parse_archive_markdown(&corrupted).is_err());
     }
 
     #[test]
