@@ -10,6 +10,14 @@
 //! Munshi is fully synchronous: this speaks the Patwari HTTP API over the shared blocking
 //! [`crate::http`] client with no async or TLS dependency, exactly as delivery does.
 //!
+//! ## Self-containment
+//! Every snapshot is *full*: `summary.md`, the verbatim `transcript.jsonl`, and every re-derived
+//! `outputs/<sha256>` extracted output. There is one artifact-assembly path ([`collect_artifacts`])
+//! and it refuses to assemble a reduced set, so no upload path can publish a snapshot that is not
+//! self-contained; a session whose transcript is not readable is skipped instead (issue #47). The
+//! upload ledger records the artifact set each snapshot carried, which is what lets
+//! `archive-upload backfill` find and re-upload snapshots that predate this guarantee.
+//!
 //! ## Idempotency
 //! Patwari keys capture idempotency on `(owner, client, capture_id)` and rejects a reused
 //! `capture_id` whose canonical manifest changed. Munshi therefore mints a fresh `capture_id` (and
@@ -89,6 +97,11 @@ pub enum PatwariError {
         "transcript changed under the upload; its hash no longer matches the archived revision"
     )]
     TranscriptChanged,
+    /// A required artifact is not readable locally, so the assembled set would not be a
+    /// self-contained snapshot (ADR 0009, issue #47). Carries the missing artifact's logical path.
+    /// Never uploaded as a partial snapshot: the upload is skipped until the artifact is readable.
+    #[error("the snapshot is not self-contained: {0} is unavailable locally")]
+    SnapshotIncomplete(&'static str),
 }
 
 impl PatwariError {
@@ -107,6 +120,7 @@ impl PatwariError {
             Self::CaptureConflict => "capture-conflict",
             Self::ChunkConflict => "chunk-conflict",
             Self::TranscriptChanged => "transcript-changed",
+            Self::SnapshotIncomplete(_) => "snapshot-incomplete",
         }
     }
 }
@@ -126,6 +140,15 @@ fn from_http(error: HttpError) -> PatwariError {
 /// The zstd compression level. Level 3 is zstd's default: a strong size/speed balance, and
 /// deterministic for a given input so a retry produces byte-identical stored bytes.
 const ZSTD_LEVEL: i32 = 3;
+
+/// The rendered summary's reserved logical path.
+pub const SUMMARY_LOGICAL_PATH: &str = "summary.md";
+/// The verbatim transcript's reserved logical path.
+pub const TRANSCRIPT_LOGICAL_PATH: &str = "transcript.jsonl";
+/// The artifacts every snapshot must contain to be self-contained (ADR 0009, issue #47). Extracted
+/// `outputs/<sha256>` artifacts are re-derived from the transcript, so requiring these two requires
+/// the whole set: a snapshot carrying both is complete by construction.
+const REQUIRED_LOGICAL_PATHS: [&str; 2] = [SUMMARY_LOGICAL_PATH, TRANSCRIPT_LOGICAL_PATH];
 
 /// One artifact to include in a snapshot, identified by its reserved logical path (ADR 0009). The
 /// artifact list is deliberately open so issue #20 can extend the set without changing this API.
@@ -923,8 +946,16 @@ fn hostname() -> Option<String> {
 }
 
 /// Reads an archived session's snapshot artifacts from disk and assembles the artifact-set-v1
-/// sources (see [`assemble_artifact_sources`]). The rendered `summary.md` is required-when-present;
-/// the transcript is best-effort and, when readable, also seeds the re-derived extracted outputs.
+/// sources (see [`assemble_artifact_sources`]). Both the rendered `summary.md` and the verbatim
+/// `transcript.jsonl` are required: every snapshot ADR 0009 archives is self-contained, and the
+/// transcript additionally seeds the re-derived extracted outputs.
+///
+/// An unreadable required artifact — a session with no recorded transcript path (a session
+/// reconstructed by `rebuild-state` from its archive Markdown alone, which never learns one), or a
+/// transcript the harness has since removed — yields [`PatwariError::SnapshotIncomplete`] rather
+/// than a reduced artifact set. Uploading the reduced set is what produced summary-only snapshots
+/// (issue #47): the summary stays durable locally and in Notesmith, so refusing the partial
+/// snapshot loses nothing and keeps the archive's artifact-set contract intact.
 fn collect_artifacts(
     output_directory: &Path,
     record: &SessionRecord,
@@ -934,12 +965,15 @@ fn collect_artifacts(
         Some(relative) => {
             Some(std::fs::read(output_directory.join(relative)).map_err(PatwariError::Io)?)
         }
-        None => None,
+        None => return Err(PatwariError::SnapshotIncomplete(SUMMARY_LOGICAL_PATH)),
     };
     let transcript = record
         .transcript_path
         .as_ref()
         .and_then(|path| std::fs::read(path).ok());
+    if transcript.is_none() {
+        return Err(PatwariError::SnapshotIncomplete(TRANSCRIPT_LOGICAL_PATH));
+    }
     // Guard the upload against a transcript that changed under it (ADR 0009). The transcript is
     // re-read live here, after the archived revision was normalized; an append between the
     // summarizer's `verify_unchanged` and this read would upload bytes whose sha256 no longer
@@ -980,6 +1014,10 @@ fn collect_artifacts(
 /// to one artifact and one blob server-side. Chunk routing during upload matches artifacts by
 /// logical path and never relies on this order agreement. Pure and I/O-free so the exact set the
 /// upload path builds is unit-testable.
+///
+/// Both inputs are optional only so the assembly stays pure over whatever a caller has read; the
+/// upload path never omits either. [`collect_artifacts`] is the single I/O boundary that supplies
+/// them, and it refuses to assemble anything but the complete set (issue #47).
 pub fn assemble_artifact_sources(
     summary_md: Option<Vec<u8>>,
     transcript_jsonl: Option<Vec<u8>>,
@@ -1139,11 +1177,14 @@ pub(crate) fn upload_one(
             reason: "retry-not-due".to_owned(),
         });
     }
-    // Already uploaded this exact revision: idempotent no-op that never contacts the server.
+    // Already uploaded this exact revision as a self-contained snapshot: idempotent no-op that never
+    // contacts the server. A recorded snapshot that is not known self-contained (issue #47) falls
+    // through and re-uploads the complete set even though the revision and summary hash match.
     if existing.upload_state == "uploaded"
         && existing.uploaded_revision == Some(record.current_revision)
         && existing.uploaded_summary_hash == record.current_summary_hash
         && record.current_summary_hash.is_some()
+        && records_full_snapshot(&existing)
     {
         return Ok(UploadOutcome::AlreadyUploaded {
             snapshot_id: existing.snapshot_id,
@@ -1154,10 +1195,17 @@ pub(crate) fn upload_one(
     // Assemble the artifact set. A transcript that changed under the upload (ADR 0009) surfaces here
     // as a distinct retryable failure recorded against this row, not a propagated error, so the
     // recovery driver retries it; other collection errors (a genuine I/O fault) still propagate.
+    // A required artifact that is not readable at all is neither a failure nor an upload: no
+    // bounded attempt is burned, and the session uploads as soon as the artifact is readable.
     let sources = match collect_artifacts(output_directory, record, max_event_text_bytes) {
         Ok(sources) => sources,
         Err(error @ PatwariError::TranscriptChanged) => {
             return record_upload_failure(state, settings, endpoint, record, &existing, error);
+        }
+        Err(PatwariError::SnapshotIncomplete(missing)) => {
+            return Ok(UploadOutcome::Skipped {
+                reason: format!("missing-{missing}"),
+            });
         }
         Err(error) => return Err(error),
     };
@@ -1177,6 +1225,10 @@ pub(crate) fn upload_one(
                     uploaded_revision: record.current_revision,
                     uploaded_summary_hash: record.current_summary_hash.clone().unwrap_or_default(),
                     snapshot_id: receipt.snapshot_id.clone(),
+                    uploaded_artifact_paths: artifacts
+                        .iter()
+                        .map(|artifact| artifact.logical_path.clone())
+                        .collect(),
                 },
             )?;
             Ok(UploadOutcome::Uploaded {
@@ -1186,6 +1238,25 @@ pub(crate) fn upload_one(
         }
         Err(error) => record_upload_failure(state, settings, endpoint, record, &existing, error),
     }
+}
+
+/// Whether the ledger proves this row's uploaded snapshot was self-contained (issue #47): it
+/// recorded an artifact set, and that set carries every required logical path.
+///
+/// A row written before the ledger recorded artifact paths has none, and is therefore *not* proven
+/// self-contained — the summary-only snapshots this issue fixes are exactly such rows. Treating
+/// unrecorded as unproven re-verifies each pre-existing row once (the re-upload is cheap: Patwari
+/// deduplicates blobs by content hash and coalesces an identical snapshot fingerprint), after which
+/// the row records its set and is never re-uploaded again.
+fn records_full_snapshot(record: &ArchiveUploadRecord) -> bool {
+    record
+        .uploaded_artifact_paths
+        .as_ref()
+        .is_some_and(|paths| {
+            REQUIRED_LOGICAL_PATHS
+                .iter()
+                .all(|required| paths.iter().any(|path| path == required))
+        })
 }
 
 /// Records a failed upload attempt against the session's row (bounded backoff, then a dead letter
@@ -1627,17 +1698,29 @@ pub fn retry(
     Ok(report)
 }
 
-/// Uploads every archived session the configured server has no recorded row for (issue #32).
+/// Uploads every archived session the configured server holds no self-contained snapshot for
+/// (issues #32 and #47).
 ///
 /// `upload_after_archive` runs only in the worker downstream of a fresh archive, and the retry
 /// paths operate on existing `archive_uploads` rows, so a session archived while upload was
 /// disabled (or before configuration) is otherwise never uploaded. Backfill scans archived
-/// sessions across every source, keeps those with no row for the currently configured endpoint,
-/// and runs each through the normal `upload_one` path — row creation, capture-id minting, bounded
-/// attempts, and failure recording behave exactly like a post-archive upload. Requires archive
-/// upload to be enabled and addressable; candidates are bounded by `limit`; a session whose
-/// advisory lock is held (an archive worker is on it) is reported skipped this run. Never mutates
-/// the session's archival lifecycle.
+/// sessions across every source and keeps two kinds of candidate for the currently configured
+/// endpoint:
+///
+/// - sessions with no upload row at all (issue #32); and
+/// - sessions whose `uploaded` row does not record a self-contained snapshot (issue #47) — an
+///   older client uploaded a summary-only snapshot for a session whose transcript it could not
+///   read, or the row predates the ledger recording its artifact set at all.
+///
+/// Both run through the normal `upload_one` path — row creation, capture-id minting, bounded
+/// attempts, and failure recording behave exactly like a post-archive upload — so a re-upload
+/// candidate whose transcript is still unreadable is reported skipped rather than re-uploaded
+/// incomplete. The old summary-only snapshot stays in the archive as historical provenance
+/// (Patwari snapshots are immutable); the fresh capture adds the complete one beside it.
+///
+/// Requires archive upload to be enabled and addressable; candidates are bounded by `limit`; a
+/// session whose advisory lock is held (an archive worker is on it) is reported skipped this run.
+/// Never mutates the session's archival lifecycle.
 pub fn backfill(
     state_directory: &Path,
     limit: usize,
@@ -1660,18 +1743,26 @@ pub fn backfill(
     } else {
         (Vec::new(), Vec::new())
     };
-    // Sessions already holding a row for this endpoint — whatever its state — belong to the worker
-    // and retry paths; a row recorded for a different endpoint (e.g. before reconfiguration) does
-    // not count as uploaded here, matching `retry`'s endpoint scoping.
-    let recorded: BTreeSet<(SourceKind, &str)> = uploads
+    // Sessions already holding a row for this endpoint belong to the worker and retry paths, with
+    // one exception: an `uploaded` row whose snapshot is not proven self-contained is this run's
+    // to re-upload (issue #47). A row recorded for a different endpoint (e.g. before
+    // reconfiguration) does not count here at all, matching `retry`'s endpoint scoping.
+    let recorded: BTreeMap<(SourceKind, &str), &ArchiveUploadRecord> = uploads
         .iter()
         .filter(|record| record.endpoint == endpoint)
-        .map(|record| (record.source, record.session_id.as_str()))
+        .map(|record| ((record.source, record.session_id.as_str()), record))
         .collect();
     let mut candidates: Vec<&SessionRecord> = sessions
         .iter()
         .filter(|session| session.lifecycle_state == "archived")
-        .filter(|session| !recorded.contains(&(session.source, session.session_id.as_str())))
+        .filter(|session| {
+            match recorded.get(&(session.source, session.session_id.as_str())) {
+                None => true,
+                // Only a terminal `uploaded` row is re-verified here: `pending`, `failed`, and
+                // `dead-letter` rows are the retry paths' business and are left untouched.
+                Some(record) => record.upload_state == "uploaded" && !records_full_snapshot(record),
+            }
+        })
         .collect();
     candidates.truncate(limit);
 
@@ -1749,6 +1840,7 @@ fn locked_upload_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::PreviousSource;
 
     #[test]
     fn prepare_artifact_records_both_representations() {
@@ -1975,9 +2067,48 @@ mod tests {
     }
 
     #[test]
-    fn upload_one_fails_retryably_when_transcript_changes_under_it() {
+    fn records_full_snapshot_requires_every_required_path_to_be_recorded() {
+        let row = |paths: Option<Vec<&str>>| ArchiveUploadRecord {
+            session_database_id: 1,
+            source: SourceKind::Copilot,
+            session_id: "s".to_owned(),
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            capture_id: None,
+            capture_revision: None,
+            captured_at: None,
+            upload_id: None,
+            uploaded_revision: Some(1),
+            uploaded_summary_hash: Some("hash".to_owned()),
+            snapshot_id: Some("snap-1".to_owned()),
+            uploaded_artifact_paths: paths
+                .map(|paths| paths.into_iter().map(ToOwned::to_owned).collect()),
+            upload_state: "uploaded".to_owned(),
+            attempts: 0,
+            next_attempt_at_ms: None,
+            last_error_category: None,
+            updated_at_ms: 0,
+        };
+        // A row written before the ledger recorded artifact sets proves nothing.
+        assert!(!records_full_snapshot(&row(None)));
+        // The summary-only snapshots issue #47 fixes.
+        assert!(!records_full_snapshot(&row(Some(vec!["summary.md"]))));
+        assert!(!records_full_snapshot(&row(Some(vec!["transcript.jsonl"]))));
+        assert!(records_full_snapshot(&row(Some(vec![
+            "summary.md",
+            "transcript.jsonl"
+        ]))));
+        // Extracted outputs ride along with the transcript and never change the verdict.
+        assert!(records_full_snapshot(&row(Some(vec![
+            "outputs/abc",
+            "summary.md",
+            "transcript.jsonl"
+        ]))));
+    }
+
+    #[test]
+    fn upload_one_skips_rather_than_uploading_a_snapshot_without_its_transcript() {
         use crate::registration::StoredArchiveUpload;
-        use crate::source::{DEFAULT_MAX_EVENT_TEXT_BYTES, PreviousSource};
+        use crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES;
         use tempfile::TempDir;
 
         let directory = TempDir::new().unwrap();
@@ -1986,14 +2117,9 @@ mod tests {
         std::fs::create_dir_all(&output_dir).unwrap();
         std::fs::write(output_dir.join("summary.md"), b"# Title\n\nBody.\n").unwrap();
 
-        let transcript_path = directory.path().join("transcript.jsonl");
-        let original = b"{\"type\":\"user\",\"data\":{\"text\":\"hello\"}}\n";
-        std::fs::write(&transcript_path, original).unwrap();
-        // The archived revision's `source_hash` is the normalization-time hash of these exact bytes.
-        let archived_source_hash = prefixed_digest(&sha256_hex(original));
-
-        let session_id = "44444444-4444-4444-8444-444444444444";
+        let session_id = "44444444-4444-4444-8444-444444444445";
         let endpoint = "http://127.0.0.1:1";
+        let transcript_path = directory.path().join("transcript.jsonl");
         let mut store = StateStore::open(&state_dir).unwrap();
         store
             .ingest_agent_stop(
@@ -2003,14 +2129,56 @@ mod tests {
                 &transcript_path,
             )
             .unwrap();
+        let settings = StoredArchiveUpload {
+            enabled: true,
+            endpoint: Some(endpoint.to_owned()),
+            client_id: Some("client".to_owned()),
+            max_attempts: 5,
+        };
 
-        let record = SessionRecord {
+        // A `rebuild-state` row knows its summary but never learns a transcript path; a session
+        // whose transcript the harness has since removed reads the same way. Both must skip rather
+        // than upload the summary alone — nothing below ever reaches the (dead) endpoint.
+        for transcript in [None, Some(transcript_path.clone())] {
+            let mut record = archived_record(session_id, &transcript_path);
+            record.transcript_path = transcript;
+            let outcome = upload_one(
+                &mut store,
+                &settings,
+                "client",
+                endpoint,
+                &output_dir,
+                &record,
+                DEFAULT_MAX_EVENT_TEXT_BYTES,
+            )
+            .unwrap();
+            assert!(
+                matches!(&outcome, UploadOutcome::Skipped { reason }
+                    if reason == "missing-transcript.jsonl"),
+                "got {outcome:?}"
+            );
+        }
+        // The skip is not an attempt: no bounded retry budget is spent and nothing dead-letters.
+        let recorded = store
+            .get_archive_upload(session_id, endpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.upload_state, "pending");
+        assert_eq!(recorded.attempts, 0);
+    }
+
+    /// An archived revision-1 record whose summary is `summary.md` under the output directory and
+    /// whose archived source identity is the transcript at `transcript_path` as it reads right now.
+    fn archived_record(session_id: &str, transcript_path: &Path) -> SessionRecord {
+        let bytes = std::fs::read(transcript_path).unwrap_or_default();
+        let source_hash = prefixed_digest(&sha256_hex(&bytes));
+        SessionRecord {
             database_id: 0,
             source: SourceKind::Copilot,
             session_id: session_id.to_owned(),
             origin_cwd: Some(PathBuf::from("/tmp/project")),
             project: None,
-            transcript_path: Some(transcript_path.clone()),
+            transcript_path: Some(transcript_path.to_path_buf()),
             lifecycle_state: "archived".to_owned(),
             completion_reason: Some("complete".to_owned()),
             source_end_reason: None,
@@ -2022,10 +2190,10 @@ mod tests {
             previous_source: Some(PreviousSource {
                 normalizer_version: crate::source::NORMALIZER_VERSION,
                 record_count: 1,
-                byte_offset: original.len() as u64,
-                prefix_hash: archived_source_hash.clone(),
-                source_hash: archived_source_hash.clone(),
-                source_bytes: original.len() as u64,
+                byte_offset: bytes.len() as u64,
+                prefix_hash: source_hash.clone(),
+                source_hash,
+                source_bytes: bytes.len() as u64,
                 started_at: None,
                 updated_at: None,
                 user_requests: 1,
@@ -2041,7 +2209,38 @@ mod tests {
             last_error_category: None,
             next_retry_at_ms: None,
             failure_streak: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn upload_one_fails_retryably_when_transcript_changes_under_it() {
+        use crate::registration::StoredArchiveUpload;
+        use crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES;
+        use tempfile::TempDir;
+
+        let directory = TempDir::new().unwrap();
+        let state_dir = directory.path().join("home");
+        let output_dir = directory.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("summary.md"), b"# Title\n\nBody.\n").unwrap();
+
+        let transcript_path = directory.path().join("transcript.jsonl");
+        let original = b"{\"type\":\"user\",\"data\":{\"text\":\"hello\"}}\n";
+        std::fs::write(&transcript_path, original).unwrap();
+
+        let session_id = "44444444-4444-4444-8444-444444444444";
+        let endpoint = "http://127.0.0.1:1";
+        let mut store = StateStore::open(&state_dir).unwrap();
+        store
+            .ingest_agent_stop(
+                session_id,
+                10_000,
+                Path::new("/tmp/project"),
+                &transcript_path,
+            )
+            .unwrap();
+        // The archived revision's `source_hash` is the normalization-time hash of these exact bytes.
+        let record = archived_record(session_id, &transcript_path);
 
         // Tamper the live transcript after archival: it grows under the upload.
         std::fs::write(

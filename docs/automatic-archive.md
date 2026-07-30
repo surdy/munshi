@@ -306,10 +306,11 @@ deprecated alias) and disabled by default. See
 [ADR 0006](adr/0006-deliver-to-notesmith-downstream-of-local-archival.md). Opt-in archive upload
 to Patwari runs in the same position — downstream of local archival, in parallel with delivery,
 never blocking either — and uploads each successful summary revision as a full snapshot (verbatim
-transcript, rendered summary, extracted outputs). It is operated with the `munshi archive-upload`
-commands, is disabled by default, and failed uploads are retried with backoff by later hooks and
-`munshi hook recover`; see [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and the
-[user guide](user-guide.md). Operational inspection
+transcript, rendered summary, extracted outputs). Every snapshot is self-contained: a session whose
+transcript munshi cannot read is skipped rather than uploaded as a summary-only snapshot. It is
+operated with the `munshi archive-upload` commands, is disabled by default, and failed uploads are
+retried with backoff by later hooks and `munshi hook recover`; see
+[ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and the [user guide](user-guide.md). Operational inspection
 and repair use stable `status`, `sessions`, `show`, `retry`, `retry-all`, `doctor`,
 `configuration-check`, `summary-delivery status`/`backfill`/`retry`, and `archive-upload
 status`/`retry` commands (with `--json` machine contracts).

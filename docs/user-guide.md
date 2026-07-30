@@ -338,9 +338,20 @@ turns upload on; `disable` stops future upload while keeping upload history. `st
 configuration and per-session upload state. `retry` re-attempts failed uploads (`--force` revives
 dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
 also retried automatically by the recovery sweep (`munshi hook recover`), so a transient outage
-recovers without a new revision. `backfill` uploads archived sessions the configured server has no
-upload record for — sessions archived while upload was disabled or unconfigured — running each
-through the normal upload path (`--limit` bounds one run, default 200). Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
+recovers without a new revision. `backfill` uploads archived sessions the configured server holds
+no self-contained snapshot for — sessions archived while upload was disabled or unconfigured, and
+sessions whose recorded snapshot is not known to carry both `summary.md` and `transcript.jsonl` —
+running each through the normal upload path (`--limit` bounds one run, default 200).
+
+Every snapshot is self-contained by contract, so a session whose transcript munshi cannot read (one
+reconstructed by `rebuild-state` from its Markdown alone, or one whose harness transcript has been
+removed) is reported `skipped` rather than uploaded as a summary-only snapshot; it uploads normally
+once the transcript is readable. Snapshots recorded before munshi tracked which artifacts it
+uploaded are re-verified by the first `backfill` after upgrading: re-uploading an identical set
+transfers nothing (Patwari deduplicates blobs by content hash and coalesces the identical snapshot
+fingerprint), and a snapshot that really was summary-only gains a complete sibling. The incomplete
+snapshot itself is never rewritten — Patwari snapshots are immutable, so it stays as historical
+provenance of what was captured then. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
 claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
 download cap for a deliberately large artifact). Full design and rationale:
 [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and

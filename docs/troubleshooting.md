@@ -240,7 +240,15 @@ exists, even if no snapshot reached Patwari. Check in order:
    archived before upload was enabled — that is what `backfill` scans for.
 3. A `transcript-changed` failure means the live transcript gained events between archival and
    upload; the next revision re-archives and uploads the grown transcript, converging on its own.
-4. `munshi retrieve <sha256>` failing with "not found" for a hash a summary references usually
+4. A `skipped` outcome with reason `missing-transcript.jsonl` means munshi has no readable
+   transcript for that session — typically one `rebuild-state` reconstructed from its archive
+   Markdown alone, or one whose harness transcript has since been removed. Every snapshot is
+   self-contained (ADR 0009), so munshi refuses to upload the summary on its own; the summary stays
+   durable locally and in Notesmith, and the session uploads in full the moment its transcript is
+   readable again. `backfill` also re-uploads sessions whose recorded snapshot is not known to
+   carry both `summary.md` and `transcript.jsonl`, so a summary-only snapshot from an older munshi
+   gains a complete sibling — the original stays, because Patwari snapshots are immutable.
+5. `munshi retrieve <sha256>` failing with "not found" for a hash a summary references usually
    means that session's snapshot has not been uploaded yet — same checks as above. Manually
    archived sessions (`munshi archive`) never upload; only the hook pipeline does.
 
