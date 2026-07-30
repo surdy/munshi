@@ -86,6 +86,11 @@ fn below_threshold_session_summarizes_one_shot_with_v2_envelope() {
     // pair admitted one-shot rejections.
     assert_eq!(config["limits"]["chunk_threshold_bytes"], 2_621_440);
     assert_eq!(config["limits"]["chunk_size_bytes"], 1_572_864);
+    // Field-calibrated size caps (issue #41): 64 MiB raw / 8 MiB normalized cover real agentic
+    // sessions. `max_input_bytes` sits above the chunk threshold by design — chunking engages
+    // first, the input cap is only a hard safety bound.
+    assert_eq!(config["limits"]["max_source_bytes"], 67_108_864);
+    assert_eq!(config["limits"]["max_input_bytes"], 8_388_608);
 
     harness.write_marathon_transcript(SESSION, 4, 40);
     harness.drive_hooks_and_wait(SESSION);

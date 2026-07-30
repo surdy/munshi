@@ -360,6 +360,61 @@ fn doctor_checks_archive_git_repository_when_enabled() {
     assert_eq!(git_check["status"], "error");
 }
 
+/// Sessions parked permanently on a size cap (issue #41) surface a dedicated `size-cap-parked`
+/// doctor warning naming the limit flag whose raise lifts them, instead of hiding inside the
+/// generic failed/parked counters.
+#[test]
+fn doctor_hints_sessions_parked_on_a_size_cap() {
+    let harness = Harness::new();
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+
+    let healthy = harness.doctor_json();
+    assert!(
+        healthy["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["code"] != "size-cap-parked"),
+        "a healthy report carries no size-cap hint"
+    );
+
+    let source_parked = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let input_parked = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    for (session_id, stop) in [(source_parked, 40_000), (input_parked, 41_000)] {
+        let events = harness.write_transcript(session_id, "FAIL_REQUEST", "fails");
+        harness.complete_lifecycle(session_id, &events, stop, stop + 1);
+        assert!(!harness.wait(session_id, 5_000).status.success());
+    }
+    // Parked after both lifecycles: a later hook run sweeps stale source-limit parks (issue #44)
+    // whose transcripts fit the configured limit, and these fabricated ones would qualify.
+    harness.park_on_size_cap(source_parked, "source-failed");
+    harness.park_on_size_cap(input_parked, "summary-input-limit");
+
+    let report = harness.doctor_json();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["code"] == "size-cap-parked")
+        .cloned()
+        .expect("size-cap-parked check exists");
+    assert_eq!(check["status"], "warning");
+    let message = check["message"].as_str().unwrap();
+    assert!(
+        message.contains("2 session(s) parked on a size cap"),
+        "{message}"
+    );
+    assert!(
+        message.contains("1 source-failed (raise --max-source-bytes)"),
+        "{message}"
+    );
+    assert!(
+        message.contains("1 summary-input-limit (raise --max-input-bytes)"),
+        "{message}"
+    );
+    assert_eq!(report["sessions"]["parked"], 2);
+}
+
 struct Harness {
     directory: TempDir,
     copilot_home: PathBuf,
@@ -573,6 +628,19 @@ impl Harness {
                 "UPDATE sessions SET next_retry_at_ms=?2
                  WHERE source_kind='copilot-cli' AND source_session_id=?1",
                 rusqlite::params![session_id, next_retry],
+            )
+            .unwrap();
+    }
+
+    /// Fabricates the permanent size-cap park of issues #38/#44: a deterministic
+    /// `source-failed`/`summary-input-limit` verdict with a negative retry marker.
+    fn park_on_size_cap(&self, session_id: &str, category: &str) {
+        let connection = Connection::open(self.state.join("munshi.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET next_retry_at_ms=-1, last_error_category=?2
+                 WHERE source_kind='copilot-cli' AND source_session_id=?1",
+                rusqlite::params![session_id, category],
             )
             .unwrap();
     }

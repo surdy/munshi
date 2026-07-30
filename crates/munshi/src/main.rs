@@ -65,9 +65,13 @@ enum Command {
         summarizer_env: Vec<(String, String)>,
         #[arg(long, default_value_t = 300_000)]
         timeout_ms: u64,
-        #[arg(long, default_value_t = 8_388_608)]
+        /// Largest raw transcript read, in bytes. Default sized for real agentic sessions
+        /// (issue #41): 64 MiB covers the 10–60 MiB transcripts long sessions produce.
+        #[arg(long, default_value_t = 67_108_864)]
         max_source_bytes: usize,
-        #[arg(long, default_value_t = 1_048_576)]
+        /// Hard cap on normalized summarizer input, in bytes. Default 8 MiB (issue #41) keeps
+        /// the ~8x raw:normalized ratio; chunking engages well below it.
+        #[arg(long, default_value_t = 8_388_608)]
         max_input_bytes: usize,
         #[arg(long, default_value_t = 262_144)]
         max_stdout_bytes: usize,
@@ -119,9 +123,13 @@ enum Command {
         summarizer_env: Vec<(String, String)>,
         #[arg(long, default_value_t = 300_000)]
         timeout_ms: u64,
-        #[arg(long, default_value_t = 8_388_608)]
+        /// Largest raw transcript read, in bytes. Default sized for real agentic sessions
+        /// (issue #41): 64 MiB covers the 10–60 MiB transcripts long sessions produce.
+        #[arg(long, default_value_t = 67_108_864)]
         max_source_bytes: usize,
-        #[arg(long, default_value_t = 1_048_576)]
+        /// Hard cap on normalized summarizer input, in bytes. Default 8 MiB (issue #41) keeps
+        /// the ~8x raw:normalized ratio; chunking engages well below it.
+        #[arg(long, default_value_t = 8_388_608)]
         max_input_bytes: usize,
         #[arg(long, default_value_t = 262_144)]
         max_stdout_bytes: usize,
@@ -2340,6 +2348,7 @@ fn build_doctor_report(state_directory: &Path) -> Result<DoctorReport, Box<dyn E
     }
 
     let sessions = load_sessions(state_directory)?;
+    push_size_cap_park_check(&mut checks, &sessions);
     let status = overall_status(&checks);
 
     Ok(DoctorReport {
@@ -2955,6 +2964,50 @@ fn build_session_item(record: &SessionRecord) -> SessionListItem {
 
 fn session_record_to_item(record: &SessionRecord) -> SessionListItem {
     build_session_item(record)
+}
+
+/// Doctor hint for sessions parked permanently on a size cap (issue #41). A deterministic
+/// `source-failed` or `summary-input-limit` verdict parks a session (`next_retry_at_ms < 0`,
+/// issues #38/#44), where it is indistinguishable from any other permanent failure in the session
+/// counters; this check names the limit flag whose raise lifts the park, so an undersized limit is
+/// visible instead of looking like a generic failure.
+fn push_size_cap_park_check(checks: &mut Vec<CheckResult>, records: &[SessionRecord]) {
+    let parked_on = |category: &str| {
+        records
+            .iter()
+            .filter(|record| {
+                record.lifecycle_state == "failed"
+                    && record.next_retry_at_ms.is_some_and(|next| next < 0)
+                    && record.last_error_category.as_deref() == Some(category)
+            })
+            .count()
+    };
+    let source_failed = parked_on("source-failed");
+    let input_limited = parked_on("summary-input-limit");
+    if source_failed == 0 && input_limited == 0 {
+        return;
+    }
+    let mut parts = Vec::new();
+    if source_failed > 0 {
+        parts.push(format!(
+            "{source_failed} source-failed (raise --max-source-bytes)"
+        ));
+    }
+    if input_limited > 0 {
+        parts.push(format!(
+            "{input_limited} summary-input-limit (raise --max-input-bytes)"
+        ));
+    }
+    push_check(
+        checks,
+        "size-cap-parked",
+        CheckStatus::Warning,
+        format!(
+            "{} session(s) parked on a size cap: {}; re-register with a larger limit, then `munshi retry-all --force`",
+            source_failed + input_limited,
+            parts.join(", ")
+        ),
+    );
 }
 
 fn summarize_sessions(records: &[SessionRecord]) -> SessionStateSummary {

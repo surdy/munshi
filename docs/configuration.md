@@ -46,13 +46,15 @@ Written by `munshi register` from its flags; re-run `register` to change them.
 
 ## `limits` — summarizer run bounds
 
-Defaults in parentheses; set at registration time by the matching `--…` flag.
+Defaults in parentheses; set at registration time by the matching `--…` flag. Sessions that fail
+deterministically on a size cap park permanently; `munshi doctor` surfaces them as the
+`size-cap-parked` check, naming the limit flag to raise (issue #41).
 
 | Setting | Meaning |
 | --- | --- |
 | `timeout_ms` | Summarizer wall-clock timeout per invocation (`300000`). |
-| `max_source_bytes` | Largest raw transcript Munshi will read (`8388608`). |
-| `max_input_bytes` | Largest normalized input piped to the summarizer (`1048576`). |
+| `max_source_bytes` | Largest raw transcript Munshi will read (`67108864`, 64 MiB). Sized for real agentic sessions (issue #41): long sessions routinely produce 10–60 MiB transcripts, and ~9% of the first full backlog exceeded the old 8 MiB default and parked as deterministic `source-failed`. |
+| `max_input_bytes` | Hard safety bound on the normalized input piped to the summarizer (`8388608`, 8 MiB; issue #41 raised it from 1 MiB, keeping the ~8× raw:normalized ratio with `max_source_bytes`). Deliberately sits *above* `chunk_threshold_bytes`: chunked map-reduce engages well below this cap, so chunking is the operative mechanism for large sessions and this cap only stops pathological input from reaching the summarizer at all. |
 | `max_stdout_bytes` | Cap on summarizer stdout (`262144`). |
 | `max_stderr_bytes` | Cap on captured summarizer stderr (`65536`). |
 | `max_event_text_bytes` | Per-event extraction threshold (`131072`): content larger than this is extracted as an `outputs/<sha256>` snapshot artifact and elided from summarizer input (ADR 0010). Manual archival uses the same threshold. |
