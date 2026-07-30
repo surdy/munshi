@@ -39,6 +39,13 @@ use crate::summary::{
 };
 use munshi_runner::RunnerError;
 
+/// Diagnostic category recorded when the archive worker settles a session as a summarizer's own
+/// exhaust (issue #37): a harness session whose first user message is one of Munshi's own
+/// summary-request envelopes. Distinct from the plain not-archive-worthy settlement it shares a
+/// verdict with, so the operator sees *why* the session was refused — and, in bulk, that a
+/// summarizer wrapper is missing its harness-home isolation (docs/summarizers.md).
+pub const SUMMARIZER_EXHAUST_DIAGNOSTIC: &str = "summarizer-exhaust";
+
 const MAX_HOOK_PAYLOAD_BYTES: u64 = 64 * 1024;
 const DEFAULT_RECOVERY_STALE_MS: u64 = 30 * 60 * 1_000;
 const RECOVERY_SCAN_LIMIT: usize = 32;
@@ -946,6 +953,31 @@ fn process_claim(
                 .to_string_lossy()
                 .into_owned(),
         });
+    }
+    // Issue #37, defense in depth. A summarizer that is itself a session-recording harness
+    // (Copilot CLI, Claude Code) opens a brand-new session of its own for every summary Munshi
+    // asks for, whose first user message is Munshi's request envelope. If those sessions land in
+    // a registered harness home, discovery treats each one as fresh archive-worthy work and
+    // archiving N sessions creates N more — the self-feeding loop the contrib wrappers prevent by
+    // isolating their harness homes (docs/summarizers.md). This guard is the backstop for a
+    // wrapper that was never isolated or was misconfigured: exhaust settles as the issue #50
+    // not-archive-worthy verdict under its own `summarizer-exhaust` diagnostic, so it reads
+    // truthfully in `status` and `doctor` instead of masquerading as an ordinary refusal. The
+    // summarizer is never invoked, so the loop costs one wasted discovery and no billed call.
+    //
+    // Checked before the worthiness tests below because exhaust normally *is* archive-worthy — it
+    // has a user request and an assistant reply — and because the diagnostic should name the real
+    // reason. Restricted to full loads, the only mode whose batch begins at the transcript's
+    // first record.
+    if update.mode == TranscriptLoadMode::Full && update.session.is_summarizer_exhaust() {
+        let _ = state.record_diagnostic(
+            "archive-worker",
+            SUMMARIZER_EXHAUST_DIAGNOSTIC,
+            None,
+            Some(&claim.session.session_id),
+        );
+        state.complete_not_archive_worthy(claim)?;
+        return Ok(HookResult::NotArchiveWorthy);
     }
     if claim.session.current_revision == 0 && !update.session.is_archive_worthy() {
         state.complete_not_archive_worthy(claim)?;

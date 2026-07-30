@@ -527,17 +527,48 @@ fn doctor_check_codes(report: &Value) -> Vec<String> {
 
 const WRAPPER_RESPONSE: &str = r#"{"title":"t","goal":"g","work_completed":["w"],"decisions":["d"],"files_changed":["f"],"commands_and_validation":["c"],"open_items":["o"],"tags":["x"]}"#;
 
-/// Runs a contrib wrapper with the backing CLI replaced by a stub that records its argv, and
-/// returns the recorded argv line.
-fn run_wrapper(wrapper: &str, bin_env: &str, envs: &[(&str, &str)]) -> String {
+/// One recorded wrapper invocation: what the wrapper passed to the backing CLI, the environment
+/// it handed it, and the isolated `HOME` it ran against — kept alive so a test can inspect
+/// whatever the wrapper seeded there.
+struct WrapperRun {
+    argv: String,
+    env: String,
+    home: TempDir,
+}
+
+impl WrapperRun {
+    fn home(&self) -> &Path {
+        self.home.path()
+    }
+
+    /// The value the wrapper exported for `key`, or `None` when it exported nothing.
+    fn env_value(&self, key: &str) -> Option<String> {
+        self.env
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .map(ToOwned::to_owned)
+    }
+}
+
+/// Runs a contrib wrapper with the backing CLI replaced by a stub that records its argv and
+/// environment, after `seed` has prepared the isolated `HOME` the wrapper will run against.
+fn run_wrapper_seeded(
+    wrapper: &str,
+    bin_env: &str,
+    envs: &[(&str, &str)],
+    seed: impl FnOnce(&Path),
+) -> WrapperRun {
     let directory = TempDir::new().unwrap();
+    seed(directory.path());
     let argv_log = directory.path().join("argv");
+    let env_log = directory.path().join("env");
     let stub = directory.path().join("stub.sh");
     std::fs::write(
         &stub,
         format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s' '{}'\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"$*\" > '{}'\nenv > '{}'\nprintf '%s' '{}'\n",
             argv_log.display(),
+            env_log.display(),
             WRAPPER_RESPONSE,
         ),
     )
@@ -576,10 +607,19 @@ fn run_wrapper(wrapper: &str, bin_env: &str, envs: &[(&str, &str)]) -> String {
         "wrapper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    std::fs::read_to_string(&argv_log)
-        .unwrap()
-        .trim()
-        .to_owned()
+    WrapperRun {
+        argv: std::fs::read_to_string(&argv_log)
+            .unwrap()
+            .trim()
+            .to_owned(),
+        env: std::fs::read_to_string(&env_log).unwrap(),
+        home: directory,
+    }
+}
+
+/// [`run_wrapper_seeded`] against an untouched `HOME`.
+fn run_wrapper(wrapper: &str, bin_env: &str, envs: &[(&str, &str)]) -> WrapperRun {
+    run_wrapper_seeded(wrapper, bin_env, envs, |_| {})
 }
 
 #[test]
@@ -593,8 +633,9 @@ fn claude_wrapper_selects_the_model_from_the_phase_env() {
         ],
     );
     assert!(
-        base.contains("--model base-model"),
-        "no phase => base model: {base}"
+        base.argv.contains("--model base-model"),
+        "no phase => base model: {}",
+        base.argv
     );
 
     let chunk = run_wrapper(
@@ -606,7 +647,7 @@ fn claude_wrapper_selects_the_model_from_the_phase_env() {
             ("MUNSHI_CHUNK_MODEL", "chunk-model"),
         ],
     );
-    assert!(chunk.contains("--model chunk-model"), "{chunk}");
+    assert!(chunk.argv.contains("--model chunk-model"), "{}", chunk.argv);
 
     let reduce = run_wrapper(
         "claude-summarizer.sh",
@@ -617,7 +658,11 @@ fn claude_wrapper_selects_the_model_from_the_phase_env() {
             ("MUNSHI_REDUCE_MODEL", "reduce-model"),
         ],
     );
-    assert!(reduce.contains("--model reduce-model"), "{reduce}");
+    assert!(
+        reduce.argv.contains("--model reduce-model"),
+        "{}",
+        reduce.argv
+    );
 
     // A phase without a matching override keeps the base model.
     let fallback = run_wrapper(
@@ -628,15 +673,20 @@ fn claude_wrapper_selects_the_model_from_the_phase_env() {
             ("MUNSHI_SUMMARIZER_PHASE", "chunk"),
         ],
     );
-    assert!(fallback.contains("--model base-model"), "{fallback}");
+    assert!(
+        fallback.argv.contains("--model base-model"),
+        "{}",
+        fallback.argv
+    );
 }
 
 #[test]
 fn copilot_wrapper_passes_a_model_flag_only_when_the_phase_override_is_set() {
     let base = run_wrapper("copilot-summarizer.sh", "COPILOT_BIN", &[]);
     assert!(
-        !base.contains("--model"),
-        "without overrides no --model flag is passed (current behavior): {base}"
+        !base.argv.contains("--model"),
+        "without overrides no --model flag is passed (current behavior): {}",
+        base.argv
     );
 
     let chunk = run_wrapper(
@@ -647,7 +697,7 @@ fn copilot_wrapper_passes_a_model_flag_only_when_the_phase_override_is_set() {
             ("MUNSHI_CHUNK_MODEL", "chunk-model"),
         ],
     );
-    assert!(chunk.contains("--model chunk-model"), "{chunk}");
+    assert!(chunk.argv.contains("--model chunk-model"), "{}", chunk.argv);
 
     let reduce = run_wrapper(
         "copilot-summarizer.sh",
@@ -657,7 +707,11 @@ fn copilot_wrapper_passes_a_model_flag_only_when_the_phase_override_is_set() {
             ("MUNSHI_REDUCE_MODEL", "reduce-model"),
         ],
     );
-    assert!(reduce.contains("--model reduce-model"), "{reduce}");
+    assert!(
+        reduce.argv.contains("--model reduce-model"),
+        "{}",
+        reduce.argv
+    );
 
     // The override is phase-scoped: a chunk override alone never leaks into other phases.
     let complete = run_wrapper(
@@ -668,7 +722,98 @@ fn copilot_wrapper_passes_a_model_flag_only_when_the_phase_override_is_set() {
             ("MUNSHI_CHUNK_MODEL", "chunk-model"),
         ],
     );
-    assert!(!complete.contains("--model"), "{complete}");
+    assert!(!complete.argv.contains("--model"), "{}", complete.argv);
+}
+
+// ---------------------------------------------------------------------------
+// Contrib wrapper harness-home isolation (issue #37)
+// ---------------------------------------------------------------------------
+
+/// Issue #37: `claude -p` is itself a Claude Code session, so an un-isolated wrapper feeds its own
+/// exhaust back into discovery. Whatever else the wrapper does, every invocation must refuse to
+/// record a transcript and refuse to load the settings file Munshi registered its hooks in.
+#[test]
+fn claude_wrapper_never_records_a_session_or_loads_munshi_hooks() {
+    let run = run_wrapper("claude-summarizer.sh", "CLAUDE_BIN", &[]);
+    assert!(
+        run.argv.contains("--no-session-persistence"),
+        "no transcript may be written: {}",
+        run.argv
+    );
+    assert!(
+        run.argv.contains("--setting-sources"),
+        "settings — and so Munshi's Stop/SessionEnd hooks — must not load: {}",
+        run.argv
+    );
+}
+
+/// The wrapper's third measure: relocate the whole Claude home, but only once the isolated home
+/// can authenticate. With an on-disk credential to symlink (Linux, or a home logged in under its
+/// own config dir) it relocates; the seeded home carries the account config and the credential,
+/// and deliberately no `settings.json` — that is where Munshi's hooks live.
+#[test]
+fn claude_wrapper_isolates_the_home_once_the_credential_can_be_seeded() {
+    let run = run_wrapper_seeded("claude-summarizer.sh", "CLAUDE_BIN", &[], |home| {
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        // The registered home's hooks: present, and never to be inherited.
+        std::fs::write(home.join(".claude/settings.json"), "{\"hooks\":{}}").unwrap();
+    });
+
+    let isolated = run.home().join(".claude-summarizer");
+    assert_eq!(
+        run.env_value("CLAUDE_CONFIG_DIR"),
+        Some(isolated.display().to_string()),
+        "the summarizer's home must sit outside the registered one"
+    );
+    assert!(isolated.join(".credentials.json").is_symlink());
+    assert!(isolated.join(".claude.json").is_symlink());
+    assert!(
+        !isolated.join("settings.json").exists(),
+        "seeding must never carry Munshi's hooks into the summarizer's home"
+    );
+}
+
+/// Where the credential lives only in the macOS Keychain there is nothing to symlink, and
+/// relocating the home would break authentication instead of isolating it. The wrapper leaves the
+/// config dir alone; the unconditional flags still guarantee no transcript and no hooks.
+#[test]
+fn claude_wrapper_keeps_the_real_home_when_no_credential_can_be_seeded() {
+    let run = run_wrapper("claude-summarizer.sh", "CLAUDE_BIN", &[]);
+    assert_eq!(run.env_value("CLAUDE_CONFIG_DIR"), None);
+    assert!(run.argv.contains("--no-session-persistence"));
+
+    // An explicit token is the documented way to get the isolated home without a `/login`.
+    let tokened = run_wrapper(
+        "claude-summarizer.sh",
+        "CLAUDE_BIN",
+        &[("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-example")],
+    );
+    assert_eq!(
+        tokened.env_value("CLAUDE_CONFIG_DIR"),
+        Some(
+            tokened
+                .home()
+                .join(".claude-summarizer")
+                .display()
+                .to_string()
+        )
+    );
+}
+
+/// The Copilot wrapper's own isolation (the fix issue #37 started from) stays in force: its
+/// harness home is relocated away from the registered one and carries no hooks directory.
+#[test]
+fn copilot_wrapper_isolates_its_harness_home_without_a_hooks_directory() {
+    let run = run_wrapper("copilot-summarizer.sh", "COPILOT_BIN", &[]);
+    let isolated = run.home().join(".copilot-summarizer");
+    assert_eq!(
+        run.env_value("COPILOT_HOME"),
+        Some(isolated.display().to_string())
+    );
+    assert!(isolated.join("session-state").is_dir());
+    assert!(!isolated.join("hooks").exists());
 }
 
 // ---------------------------------------------------------------------------

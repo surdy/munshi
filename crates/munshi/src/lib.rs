@@ -28,8 +28,8 @@ pub use delivery::{
     verify_history as delivery_verify_history,
 };
 pub use hooks::{
-    HookEvent, HookFailure, HookResult, HookWorkerError, handle_hook,
-    lift_stale_source_limit_parks, read_last_failure, run_archive_worker,
+    HookEvent, HookFailure, HookResult, HookWorkerError, SUMMARIZER_EXHAUST_DIAGNOSTIC,
+    handle_hook, lift_stale_source_limit_parks, read_last_failure, run_archive_worker,
     run_archive_worker_for_source, run_recovery, wait_for_hook_result,
     wait_for_hook_result_for_source,
 };
@@ -78,7 +78,7 @@ pub use summary::{
     ChunkingLimits, PLACEHOLDER_SUMMARY_TAG, PlaceholderReason, RESERVED_SUMMARIZER_ENV_PREFIX,
     SUMMARIZER_PHASE_ENV, SUMMARY_CONTRACT_VERSION, StructuredSummary, SummaryError, SummaryPhase,
     SummaryStrategy, build_revision_summary_input, build_summary_input, chunk_event_ranges,
-    parse_summarizer_env, placeholder_summary, plan_summary_input, run_chunked_summary,
-    run_summary, validate_input_cap_relation, validate_structured_summary,
+    is_summary_request_envelope, parse_summarizer_env, placeholder_summary, plan_summary_input,
+    run_chunked_summary, run_summary, validate_input_cap_relation, validate_structured_summary,
 };
 pub use verify_archive::{VerifyArchiveError, VerifyArchiveReport, verify_archive_parse};

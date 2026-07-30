@@ -55,7 +55,9 @@ Work through these in order:
 2. **Trivial sessions are correctly skipped.** A session only archives if it has at least one
    user request *and* at least one assistant message or tool activity. A session that never got
    a real reply is filed as `not-archive-worthy` in `munshi sessions` — this is expected
-   behavior, not a bug, and there is nothing to retry.
+   behavior, not a bug, and there is nothing to retry. A session refused under the
+   `summarizer-exhaust` diagnostic is a different matter — see
+   ["Sessions I never started"](#sessions-i-never-started-with-a-summarizer-exhaust-diagnostic).
 3. **Force-killed sessions arrive later, not never.** `SIGKILL` (or any hard crash) during an
    active turn emits no hook at all — there's no event to fail open from. Every hook invocation
    opportunistically kicks off a background recovery sweep that, after a quiet period, finds
@@ -134,6 +136,36 @@ Related failure categories you may see instead of `summary-failed`, all in the s
 retry), `archive-write-failed` (couldn't write the Markdown file — check disk space and output
 directory permissions), and `archive-git-*` (only relevant if you registered with
 `--archive-git-history`; a busy or misconfigured archive Git repository).
+
+## "Sessions I never started", with a `summarizer-exhaust` diagnostic
+
+Your summarizer is a coding-agent CLI (Copilot CLI, Claude Code, or similar) that records a
+session of its own for every summary Munshi asks for, and those sessions are landing in the
+harness home you registered. Munshi then discovers them as new work, so archiving N sessions
+creates N more — a self-feeding loop that has, in the field, produced several hundred archived
+and uploaded exhaust sessions before anyone noticed (issue #37).
+
+Munshi recognizes a session whose first user message is one of its own summary-request envelopes
+and settles it as `not-archive-worthy` with the `summarizer-exhaust` diagnostic, so it is never
+summarized, uploaded, or delivered — no billed model calls, no loop. But the guard is a backstop:
+the exhaust sessions still accumulate in the harness's own session directory, and seeing this
+diagnostic at all means **your summarizer wrapper's isolation is missing or broken**.
+
+```bash
+munshi status                                  # last failure: operation=archive-worker code=summarizer-exhaust ...
+munshi sessions --state not-archive-worthy     # the refused sessions themselves
+```
+
+The tell-tale sign is a `not-archive-worthy` count climbing in step with how many sessions you
+archive, with `summarizer-exhaust` as the recorded diagnostic.
+
+The fix is on the wrapper, not on Munshi: point `--summarizer` at
+[`contrib/copilot-summarizer.sh`](../contrib/copilot-summarizer.sh) or
+[`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh) instead of a bare `copilot` or
+`claude` binary, or apply the same isolation to your own wrapper — see
+[Summarizers that are themselves session-recording harnesses](summarizers.md#4-hazard-summarizers-that-are-themselves-session-recording-harnesses).
+Afterwards, delete the accumulated exhaust sessions from the harness home. Nothing needs
+retrying: these sessions were correctly refused.
 
 ## "Session deferred"
 

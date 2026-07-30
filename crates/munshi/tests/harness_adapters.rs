@@ -9,11 +9,14 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use munshi::{
-    ArchiveConfig, ArchiveOutcome, CompletionReason, HookResult, NormalizedSession,
-    SessionReference, SourceError, SourceKind, StateStore, archive_session, load_session,
-    parse_archive_markdown, recorded_project_identity, resolve_session_reference,
+    ArchiveConfig, ArchiveOutcome, CompletionReason, HookResult, NormalizedEvent,
+    NormalizedSession, ProjectIdentity, SUMMARIZER_EXHAUST_DIAGNOSTIC, SessionReference,
+    SourceError, SourceKind, StateStore, archive_session, build_summary_input, inspect_project,
+    load_session, parse_archive_markdown, recorded_project_identity, resolve_session_reference,
     run_archive_worker_for_source, validate_transcript_envelope,
 };
+use rusqlite::{Connection, params};
+use serde_json::json;
 use tempfile::TempDir;
 
 const CLAUDE_NORMAL: &str = "0c1a0de0-0000-4000-8000-000000000001";
@@ -684,6 +687,118 @@ fn codex_stale_session_recovers_through_the_codex_adapter() {
     assert!(copilot.get_session(CODEX_NORMAL).unwrap().is_none());
 }
 
+// ---------------------------------------------------------------------------
+// Summarizer-exhaust guard (issue #37)
+// ---------------------------------------------------------------------------
+
+const EXHAUST_COPILOT: &str = "e0000000-0000-4000-8000-000000000037";
+const EXHAUST_CLAUDE: &str = "e0000000-0000-4000-8000-000000000038";
+const EXHAUST_LATE: &str = "e0000000-0000-4000-8000-000000000039";
+
+/// A summarizer that is itself a session-recording harness writes a fresh session for every
+/// summary Munshi requests, and its first user message is Munshi's own request envelope. Such a
+/// session must settle as not-archive-worthy with the `summarizer-exhaust` diagnostic and must
+/// never reach the summarizer — otherwise archiving N sessions creates N more.
+///
+/// The Copilot case deliberately uses an envelope larger than the default 128 KiB per-event cap,
+/// the size a real backlog session produces: recognition has to happen on the original content,
+/// before elision replaces the event with a claim-ticket marker that carries none of its text.
+#[test]
+fn copilot_summarizer_exhaust_settles_without_invoking_the_summarizer() {
+    let harness = StateHarness::new();
+    let envelope = harness.summary_request_envelope(400, 512);
+    assert!(
+        envelope.len() > munshi::DEFAULT_MAX_EVENT_TEXT_BYTES,
+        "the oversize case needs an envelope past the elision threshold: {} bytes",
+        envelope.len()
+    );
+    let transcript = harness.write_copilot_session(EXHAUST_COPILOT, &[&envelope]);
+
+    let result = harness.archive(
+        SourceKind::Copilot,
+        EXHAUST_COPILOT,
+        &transcript,
+        "complete",
+    );
+
+    assert_eq!(result, HookResult::NotArchiveWorthy, "{result:?}");
+    assert_eq!(
+        harness.summarizer_calls(),
+        0,
+        "exhaust must cost no summarizer call"
+    );
+    assert!(
+        harness
+            .diagnostic_categories(SourceKind::Copilot, EXHAUST_COPILOT)
+            .contains(&SUMMARIZER_EXHAUST_DIAGNOSTIC.to_owned()),
+        "the verdict must name its real reason"
+    );
+    harness.assert_settled_unarchived(SourceKind::Copilot, EXHAUST_COPILOT);
+}
+
+/// The same for Claude Code: the guard reads the normalized model, so it holds across every
+/// transcript shape, not just the one whose wrapper first hit the loop.
+#[test]
+fn claude_summarizer_exhaust_settles_without_invoking_the_summarizer() {
+    let harness = StateHarness::new();
+    let envelope = harness.summary_request_envelope(2, 32);
+    let transcript = harness.write_claude_session(EXHAUST_CLAUDE, &[&envelope]);
+
+    let result = harness.archive(
+        SourceKind::ClaudeCode,
+        EXHAUST_CLAUDE,
+        &transcript,
+        "complete",
+    );
+
+    assert_eq!(result, HookResult::NotArchiveWorthy, "{result:?}");
+    assert_eq!(harness.summarizer_calls(), 0);
+    assert!(
+        harness
+            .diagnostic_categories(SourceKind::ClaudeCode, EXHAUST_CLAUDE)
+            .contains(&SUMMARIZER_EXHAUST_DIAGNOSTIC.to_owned())
+    );
+    harness.assert_settled_unarchived(SourceKind::ClaudeCode, EXHAUST_CLAUDE);
+}
+
+/// The guard keys on the session's *first* user message. A genuine working session that merely
+/// quotes a request envelope later — debugging a summarizer wrapper is exactly that session —
+/// archives normally, and so does an ordinary session with no envelope anywhere.
+#[test]
+fn only_a_sessions_first_message_can_make_it_summarizer_exhaust() {
+    let harness = StateHarness::new();
+    let envelope = harness.summary_request_envelope(2, 32);
+    let transcript = harness.write_claude_session(
+        EXHAUST_LATE,
+        &["Why does the summarizer wrapper reject this?", &envelope],
+    );
+
+    let result = harness.archive(
+        SourceKind::ClaudeCode,
+        EXHAUST_LATE,
+        &transcript,
+        "complete",
+    );
+
+    assert!(matches!(result, HookResult::Archived { .. }), "{result:?}");
+    assert_eq!(
+        harness.summarizer_calls(),
+        1,
+        "an ordinary session still gets summarized exactly once"
+    );
+    assert!(
+        harness
+            .diagnostic_categories(SourceKind::ClaudeCode, EXHAUST_LATE)
+            .is_empty()
+    );
+    assert_eq!(
+        harness
+            .read_archive(SourceKind::ClaudeCode, EXHAUST_LATE)
+            .session_id,
+        EXHAUST_LATE
+    );
+}
+
 /// Archive Git commit subjects must carry each source's durable identity (matching the
 /// Markdown frontmatter `id`), and same-ID cross-source archives must produce distinct,
 /// idempotent commits.
@@ -1073,6 +1188,163 @@ impl StateHarness {
         run_archive_worker_for_source(&self.state, source, session_id).unwrap()
     }
 
+    /// Builds one of Munshi's real summary-request envelopes — byte for byte what a summarizer
+    /// reads on stdin — over a synthetic session of `event_count` events of `event_bytes` each.
+    /// Produced through [`build_summary_input`] rather than hand-written JSON so the fixture can
+    /// never drift from the envelope Munshi actually emits, which is the whole basis of the guard.
+    fn summary_request_envelope(&self, event_count: usize, event_bytes: usize) -> String {
+        let session = NormalizedSession {
+            source: SourceKind::Copilot,
+            session_id: "5ea0f0ed-0000-4000-8000-000000000001".to_owned(),
+            events: (0..event_count)
+                .map(|index| NormalizedEvent {
+                    kind: if index % 2 == 0 { "user" } else { "assistant" },
+                    content: "summarized event ".repeat(event_bytes.div_ceil(17)),
+                })
+                .collect(),
+            user_requests: event_count.div_ceil(2),
+            assistant_messages: event_count / 2,
+            tool_activities: 0,
+            ignored_events: 0,
+            source_cursor: event_count as u64,
+            source_byte_cursor: 0,
+            source_prefix_hash: String::new(),
+            source_hash: String::new(),
+            source_bytes: 0,
+            started_at: None,
+            updated_at: None,
+            artifact_index: Default::default(),
+            opening_summary_request: false,
+        };
+        let project: ProjectIdentity = inspect_project(&self.project).unwrap();
+        let bytes = build_summary_input(&session, &project, 16 * 1024 * 1024).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Writes a Copilot transcript with one user/assistant turn per entry in `requests` — the
+    /// shape Copilot CLI records when it answers a Munshi summary request.
+    fn write_copilot_session(&self, session_id: &str, requests: &[&str]) -> PathBuf {
+        let mut records = vec![json!({
+            "id": "r0",
+            "timestamp": "2026-07-29T00:00:00.000Z",
+            "parentId": null,
+            "type": "session.start",
+            "data": {"sessionId": session_id},
+        })];
+        for (index, request) in requests.iter().enumerate() {
+            records.push(json!({
+                "id": format!("r{}u", index + 1),
+                "timestamp": "2026-07-29T00:00:01.000Z",
+                "parentId": format!("r{index}"),
+                "type": "user.message",
+                "data": {"content": request},
+            }));
+            records.push(json!({
+                "id": format!("r{}", index + 1),
+                "timestamp": "2026-07-29T00:00:02.000Z",
+                "parentId": format!("r{}u", index + 1),
+                "type": "assistant.message",
+                "data": {
+                    "content": "{\"title\":\"A summary the summarizer produced\"}",
+                    "messageId": format!("m{index}"),
+                },
+            }));
+        }
+        // Copilot resolution keys on the `<session-id>/events.jsonl` layout of its session state.
+        self.write_transcript_records(&Path::new(session_id).join("events.jsonl"), &records)
+    }
+
+    /// The same session shape in Claude Code's transcript format.
+    fn write_claude_session(&self, session_id: &str, requests: &[&str]) -> PathBuf {
+        let mut records = Vec::new();
+        for (index, request) in requests.iter().enumerate() {
+            records.push(json!({
+                "type": "user",
+                "uuid": format!("u{index}"),
+                "parentUuid": if index == 0 { None } else { Some(format!("a{}", index - 1)) },
+                "sessionId": session_id,
+                "timestamp": "2026-07-29T00:00:01.000Z",
+                "cwd": self.project.to_string_lossy(),
+                "version": "2.1.44",
+                "gitBranch": "main",
+                "isSidechain": false,
+                "userType": "external",
+                "message": {"role": "user", "content": request},
+            }));
+            records.push(json!({
+                "type": "assistant",
+                "uuid": format!("a{index}"),
+                "parentUuid": format!("u{index}"),
+                "sessionId": session_id,
+                "timestamp": "2026-07-29T00:00:02.000Z",
+                "cwd": self.project.to_string_lossy(),
+                "version": "2.1.44",
+                "gitBranch": "main",
+                "isSidechain": false,
+                "userType": "external",
+                "message": {
+                    "role": "assistant",
+                    "id": format!("msg_a{index}"),
+                    "model": "claude-synthetic",
+                    "content": [{"type": "text", "text": "{\"title\":\"A summary the summarizer produced\"}"}],
+                    "stop_reason": "end_turn",
+                },
+            }));
+        }
+        self.write_transcript_records(Path::new(&format!("{session_id}.jsonl")), &records)
+    }
+
+    fn write_transcript_records(&self, relative: &Path, records: &[serde_json::Value]) -> PathBuf {
+        let target = self.directory.path().join("transcripts").join(relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut body = String::new();
+        for record in records {
+            body.push_str(&record.to_string());
+            body.push('\n');
+        }
+        fs::write(&target, body).unwrap();
+        target
+    }
+
+    /// Asserts the issue #50 settled shape a refused session leaves behind: back to `observed`,
+    /// stamped with the verdict, and with no archive on disk.
+    fn assert_settled_unarchived(&self, source: SourceKind, session_id: &str) {
+        let store = StateStore::open_for_source(&self.state, source).unwrap();
+        let record = store.get_session(session_id).unwrap().unwrap();
+        assert_eq!(record.lifecycle_state, "observed");
+        assert!(record.not_archive_worthy_at_ms.is_some());
+        assert!(record.markdown_relative_path.is_none());
+        assert_eq!(record.current_revision, 0);
+    }
+
+    /// How many times the fake summarizer has been invoked in this harness. The exhaust guard's
+    /// whole point is that a refused session costs no summarizer call at all, so the tests assert
+    /// on this rather than only on the verdict.
+    fn summarizer_calls(&self) -> usize {
+        fs::read(self.directory.path().join(SUMMARIZER_CALL_TALLY))
+            .map(|bytes| bytes.len())
+            .unwrap_or(0)
+    }
+
+    /// Diagnostic categories recorded against one session, newest last.
+    fn diagnostic_categories(&self, source: SourceKind, session_id: &str) -> Vec<String> {
+        let connection = Connection::open(self.state.join("munshi.db")).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT d.category FROM diagnostics d
+                 JOIN sessions s ON s.id = d.session_id
+                 WHERE s.source_session_id = ?1 AND s.source_kind = ?2
+                 ORDER BY d.id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map(params![session_id, source.agent_label()], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
     fn read_archive(&self, source: SourceKind, session_id: &str) -> munshi::ArchivedMarkdown {
         let store = StateStore::open_for_source(&self.state, source).unwrap();
         let record = store.get_session(session_id).unwrap().unwrap();
@@ -1118,12 +1390,21 @@ impl StateHarness {
     }
 }
 
+/// Name of the tally file [`adapter_summarizer`] appends one byte to per invocation, read back by
+/// [`StateHarness::summarizer_calls`]. Each harness owns a temporary directory, so the count is
+/// per-test.
+const SUMMARIZER_CALL_TALLY: &str = "summarizer-calls";
+
 fn adapter_summarizer(root: &Path) -> PathBuf {
     let script = root.join("adapter-summarizer.sh");
-    let body = r#"#!/bin/sh
+    let body = format!(
+        r#"#!/bin/sh
 set -eu
+printf 'x' >> "{tally}"
 input=$(cat)
-case "$input" in
+case "$input" in{rest}"#,
+        tally = root.join(SUMMARIZER_CALL_TALLY).display(),
+        rest = r#"
   *'"previous_summary"'*)
     printf '%s' '{"title":"Revised adapter session","goal":"Preserve prior work and add the resumed delta.","work_completed":["Preserved prior work.","Added resumed work."],"decisions":[],"files_changed":[],"commands_and_validation":[],"open_items":[],"tags":["resume"]}'
     ;;
@@ -1131,7 +1412,8 @@ case "$input" in
     printf '%s' '{"title":"Adapter session","goal":"Archive a vendor-neutral session.","work_completed":["Normalized the harness transcript.","Rendered a durable record."],"decisions":[],"files_changed":[],"commands_and_validation":[],"open_items":[],"tags":["adapter"]}'
     ;;
 esac
-"#;
+"#,
+    );
     fs::write(&script, body).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     script.canonicalize().unwrap()

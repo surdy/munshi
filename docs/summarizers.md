@@ -212,7 +212,58 @@ the model adds an extra field (like `summary` or `notes`) alongside the required
 process writes progress/log lines to stdout instead of stderr, corrupting the single JSON
 object Munshi expects; or the process exceeds `--timeout-ms` or `--max-stdout-bytes`.
 
-## 4. Example: Copilot CLI as summarizer
+## 4. Hazard: summarizers that are themselves session-recording harnesses
+
+**Read this before pointing Munshi at a coding-agent CLI.** Copilot CLI and Claude Code — the
+two summarizers Munshi ships wrappers for, and the obvious choices if you already have one
+installed — record a session of their own for every invocation. That is a feedback loop waiting
+to happen, and it has happened in the field.
+
+**The loop.** Munshi asks the summarizer for a summary. The harness answering that request opens
+a brand-new session in *its* home directory, whose first user message is Munshi's request
+envelope and whose reply is the summary. If that home is the one you registered with Munshi,
+that session is indistinguishable from real work: it has a user request and an assistant reply,
+so it is archive-worthy. Munshi's `Stop`/`SessionEnd` hooks fire on it and the recovery sweep
+discovers it, so archiving N sessions creates N new sessions to archive — each of which creates
+another. Observed live during a backlog drive: Copilot's session state grew from 576 to 1,438
+directories, and several hundred of those exhaust sessions were summarized, archived, and
+uploaded before anyone noticed (issue #37). Every one of them cost a billed model call.
+
+**The requirement.** Any summarizer that records sessions must be isolated so that (a) the
+sessions it records land **outside** the harness home you registered with Munshi, and (b) the
+hooks `munshi register` installed **do not fire** for summarizer runs. Doing only one is not
+enough: hooks that still fire will observe sessions whose transcripts Munshi cannot resolve, and
+relocated sessions that still trigger hooks re-enter the pipeline anyway. Both shipped wrappers
+do this, by different means, because the two harnesses expose different levers:
+
+- [`contrib/copilot-summarizer.sh`](../contrib/copilot-summarizer.sh) points `COPILOT_HOME` at
+  `~/.copilot-summarizer`, seeded once with symlinks to the real home's config and auth, with its
+  own `session-state` and — deliberately — no `hooks` directory.
+- [`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh) passes
+  `--no-session-persistence` (no transcript is written at all) and `--setting-sources ''` (the
+  settings file holding Munshi's hooks is never loaded), and additionally relocates
+  `CLAUDE_CONFIG_DIR` to `~/.claude-summarizer` once that home can authenticate. See the script's
+  header for why the third measure is conditional: with a custom `CLAUDE_CONFIG_DIR`, Claude Code
+  reads its credential from `$CLAUDE_CONFIG_DIR/.credentials.json` and does *not* fall back to the
+  macOS Keychain, so on a Keychain-backed install the isolated home needs a one-time
+  `CLAUDE_CONFIG_DIR="$HOME/.claude-summarizer" claude /login` (or an exported
+  `CLAUDE_CODE_OAUTH_TOKEN`) before it can be used.
+
+If you write your own wrapper around a session-recording backend, do the equivalent — and verify
+it: run one summary by hand, then confirm no new session appeared in the registered home.
+
+**The built-in guard is a backstop, not the fix.** Munshi recognizes a session whose *first* user
+message is one of its own summary-request envelopes and settles it as **not-archive-worthy** with
+the `summarizer-exhaust` diagnostic (surfacing on the `last failure:` line of `munshi status` /
+`munshi doctor`, with the sessions themselves under `munshi sessions --state
+not-archive-worthy`). Such a session is never summarized, uploaded, or delivered, so a
+misconfigured wrapper costs one wasted discovery and no billed call. But the exhaust sessions
+still pile up on disk in the harness's own home, and the guard only recognizes what Munshi itself
+emitted — a wrapper that rewrites or re-wraps the request before handing it to its harness
+defeats it. Seeing `summarizer-exhaust` at all means **your wrapper's isolation is missing or
+broken**; fix the wrapper.
+
+## 5. Example: Copilot CLI as summarizer
 
 Copilot CLI can act as a summarizer directly, since its noninteractive mode reads a prompt
 and can be told to answer without a fence:
@@ -229,7 +280,7 @@ munshi register --accept-transcript-processing \
 pausing to ask clarifying questions (there's no user to answer). See
 [`docs/automatic-archive.md`](automatic-archive.md) for the full registration walkthrough.
 
-## 5. Example: Claude Code via `contrib/claude-summarizer.sh`
+## 6. Example: Claude Code via `contrib/claude-summarizer.sh`
 
 Bare `claude -p` is not directly usable as a summarizer: it tends to wrap its JSON answer in a
 ` ```json ``` ` Markdown fence, and for small/trivial sessions it sometimes returns empty
@@ -262,7 +313,7 @@ munshi register --accept-transcript-processing \
 The script takes no `--summarizer-arg`s of its own; all Claude Code flags are baked in so the
 wrapper's stdin contract (whole request in, whole `StructuredSummary` out) stays exact.
 
-## 6. Writing your own
+## 7. Writing your own
 
 A summarizer can be written in any language, as a script or a compiled binary — Munshi only
 cares that it is executable and speaks the stdin/stdout contract above. At minimum it must:
@@ -298,7 +349,7 @@ report, to confirm your placeholder-backfill logic covers empty lists.
 You can also exercise a registered summarizer against one real session without registering
 automatic capture, using [`munshi archive`](manual-archive.md).
 
-## 7. Cost/privacy notes
+## 8. Cost/privacy notes
 
 - Munshi sends the **full normalized transcript** (`events`) of a session to your summarizer on
   every invocation — and by extension to whatever backend your summarizer calls (a hosted model
@@ -320,7 +371,7 @@ automatic capture, using [`munshi archive`](manual-archive.md).
   summarizer backend you're comfortable sending session content to, and keep that in mind for
   any project where transcripts might contain secrets.
 
-## 8. Cross-links
+## 9. Cross-links
 
 - [`docs/getting-started.md`](getting-started.md) — installing and registering Munshi for the
   first time.
