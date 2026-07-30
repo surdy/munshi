@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceKind};
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 /// Consecutive failures with the same error category on the same `state_generation` after which
@@ -286,6 +286,10 @@ pub struct ArchiveUploadRecord {
     pub uploaded_revision: Option<u64>,
     pub uploaded_summary_hash: Option<String>,
     pub snapshot_id: Option<String>,
+    /// The artifact logical paths the recorded snapshot contained, in the canonical order they
+    /// were uploaded in (issue #47). `None` on a row written before the ledger recorded them: what
+    /// that snapshot contained is unknown, not known-complete.
+    pub uploaded_artifact_paths: Option<Vec<String>>,
     pub upload_state: String,
     pub attempts: u32,
     pub next_attempt_at_ms: Option<i64>,
@@ -309,6 +313,9 @@ pub struct ArchiveUploadSuccess {
     pub uploaded_revision: u64,
     pub uploaded_summary_hash: String,
     pub snapshot_id: String,
+    /// Every artifact logical path the uploaded snapshot contained (issue #47), so a later run can
+    /// tell a self-contained snapshot from one that predates the full-snapshot guarantee.
+    pub uploaded_artifact_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,6 +687,26 @@ impl StateStore {
                 params![5, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 5)?;
+            transaction.commit()?;
+        }
+        if current < 6 {
+            // Issue #47: record which artifact logical paths the uploaded snapshot actually
+            // contained, so the client can tell a self-contained snapshot (ADR 0009 — `summary.md`
+            // plus `transcript.jsonl` plus any extracted outputs) from the summary-only snapshots
+            // an earlier client produced for sessions whose transcript it could not read. A row
+            // written before this migration carries NULL: what it uploaded is unknown, which
+            // `archive-upload backfill` treats as "not proven self-contained" and re-verifies once.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE archive_uploads ADD COLUMN uploaded_artifact_paths TEXT;",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![6, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 6)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -1226,6 +1253,7 @@ impl StateStore {
                     au.session_id,s.source_kind,s.source_session_id,au.endpoint,
                     au.capture_id,au.capture_revision,au.captured_at,au.upload_id,
                     au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
+                    au.uploaded_artifact_paths,
                     au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                     au.updated_at_ms
                  FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
@@ -1244,6 +1272,7 @@ impl StateStore {
                 au.session_id,s.source_kind,s.source_session_id,au.endpoint,
                 au.capture_id,au.capture_revision,au.captured_at,au.upload_id,
                 au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
+                au.uploaded_artifact_paths,
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                 au.updated_at_ms
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
@@ -1271,6 +1300,7 @@ impl StateStore {
                 au.session_id,s.source_kind,s.source_session_id,au.endpoint,
                 au.capture_id,au.capture_revision,au.captured_at,au.upload_id,
                 au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
+                au.uploaded_artifact_paths,
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                 au.updated_at_ms
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
@@ -1390,8 +1420,9 @@ impl StateStore {
         Ok(())
     }
 
-    /// Records a successful archive upload: stores the uploaded revision, its summary hash, and the
-    /// server snapshot id, clears retry bookkeeping, and marks the row `uploaded`.
+    /// Records a successful archive upload: stores the uploaded revision, its summary hash, the
+    /// server snapshot id, and the artifact set the snapshot contained (issue #47), clears retry
+    /// bookkeeping, and marks the row `uploaded`.
     pub fn record_archive_upload_success(
         &mut self,
         session_id: &str,
@@ -1404,8 +1435,9 @@ impl StateStore {
         self.connection.execute(
             "UPDATE archive_uploads SET
                 uploaded_revision=?3,uploaded_summary_hash=?4,snapshot_id=?5,
+                uploaded_artifact_paths=?6,
                 upload_state='uploaded',attempts=0,next_attempt_at_ms=NULL,
-                last_error_category=NULL,updated_at_ms=?6
+                last_error_category=NULL,updated_at_ms=?7
              WHERE session_id=?1 AND endpoint=?2",
             params![
                 database_id,
@@ -1413,6 +1445,7 @@ impl StateStore {
                 i64::try_from(success.uploaded_revision).unwrap_or(i64::MAX),
                 success.uploaded_summary_hash,
                 success.snapshot_id,
+                join_artifact_paths(&success.uploaded_artifact_paths),
                 now_ms(),
             ],
         )?;
@@ -1817,12 +1850,34 @@ fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveU
         uploaded_revision: revision(8)?,
         uploaded_summary_hash: row.get(9)?,
         snapshot_id: row.get(10)?,
-        upload_state: row.get(11)?,
-        attempts: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
-        next_attempt_at_ms: row.get(13)?,
-        last_error_category: row.get(14)?,
-        updated_at_ms: row.get(15)?,
+        uploaded_artifact_paths: row
+            .get::<_, Option<String>>(11)?
+            .map(|joined| split_artifact_paths(&joined)),
+        upload_state: row.get(12)?,
+        attempts: row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
+        next_attempt_at_ms: row.get(14)?,
+        last_error_category: row.get(15)?,
+        updated_at_ms: row.get(16)?,
     })
+}
+
+/// The stored artifact-path list separator. Logical paths are reserved names or content-addressed
+/// `outputs/<sha256>` paths (ADR 0009), so none can contain a newline.
+const ARTIFACT_PATH_SEPARATOR: &str = "\n";
+
+/// Joins an uploaded snapshot's artifact logical paths into the single ledger column.
+fn join_artifact_paths(paths: &[String]) -> String {
+    paths.join(ARTIFACT_PATH_SEPARATOR)
+}
+
+/// Splits a stored artifact-path list back into logical paths. An empty stored value yields an
+/// empty list — a recorded snapshot with no artifacts, which is distinct from an unrecorded one.
+fn split_artifact_paths(joined: &str) -> Vec<String> {
+    joined
+        .split(ARTIFACT_PATH_SEPARATOR)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn safe_source_reason(reason: &str) -> &'static str {

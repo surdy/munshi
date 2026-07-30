@@ -536,6 +536,10 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
                 uploaded_revision: 2,
                 uploaded_summary_hash: "hash2".to_owned(),
                 snapshot_id: "snap-2".to_owned(),
+                uploaded_artifact_paths: vec![
+                    "summary.md".to_owned(),
+                    "transcript.jsonl".to_owned(),
+                ],
             },
         )
         .unwrap();
@@ -597,14 +601,158 @@ fn backfill_uploads_archived_sessions_without_rows_and_is_idempotent() {
     assert_eq!(status["items"][0]["state"], "uploaded");
     assert!(status["items"][0]["snapshot_id"].is_string());
 
-    // Idempotent: the recorded row excludes the session, so a second run finds no candidates and
-    // performs no further server work.
+    // The uploaded snapshot is self-contained (ADR 0009, issue #47): the summary and the verbatim
+    // transcript are both in the manifest, and the ledger records the set that was uploaded.
+    assert_eq!(
+        manifest_paths(&server.manifest(0)),
+        vec!["summary.md", "transcript.jsonl"],
+    );
+    assert_eq!(
+        harness.recorded_artifact_paths(BACKFILL_SESSION).as_deref(),
+        Some("summary.md\ntranscript.jsonl"),
+    );
+
+    // Idempotent: the recorded row is a self-contained snapshot of the current revision, so a
+    // second run finds no candidates and performs no further server work.
     let (again, success) = harness.backfill();
     assert!(success);
     assert_eq!(again["candidates"], 0);
     assert_eq!(again["uploaded"], 0);
     assert_eq!(server.completed_count(), 1, "no second upload happened");
     assert_eq!(server.upload_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Full-snapshot self-containment (issue #47)
+// ---------------------------------------------------------------------------
+
+const NO_TRANSCRIPT_SESSION: &str = "47474747-4747-4747-8747-474747474741";
+const SUMMARY_ONLY_SESSION: &str = "47474747-4747-4747-8747-474747474742";
+const LEGACY_LEDGER_SESSION: &str = "47474747-4747-4747-8747-474747474743";
+
+/// ADR 0009 archives *full* snapshots, so a session whose transcript munshi cannot read must not
+/// upload a summary-only one. `rebuild-state` reconstructs a session from its archive Markdown
+/// alone and never learns a transcript path; the upload path used to read the transcript
+/// best-effort and silently uploaded `artifacts: ['summary.md']` for exactly those sessions
+/// (issue #47). Now the incomplete snapshot is skipped, no server work happens, and the session
+/// uploads the complete set as soon as its transcript is readable again.
+#[test]
+fn a_session_without_a_readable_transcript_never_uploads_a_summary_only_snapshot() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(NO_TRANSCRIPT_SESSION);
+    // Exactly what a `rebuild-state` row looks like: archived, summarized, no transcript path.
+    let transcript = harness.forget_transcript_path(NO_TRANSCRIPT_SESSION);
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let (report, success) = harness.backfill();
+    assert!(success, "an unassemblable snapshot is not a failure");
+    assert_eq!(report["candidates"], 1);
+    assert_eq!(report["uploaded"], 0);
+    assert_eq!(report["skipped"], 1);
+    assert_eq!(report["failed"], 0);
+    assert_eq!(report["items"][0]["outcome"]["result"], "skipped");
+    assert_eq!(
+        report["items"][0]["outcome"]["reason"], "missing-transcript.jsonl",
+        "report: {report}"
+    );
+    assert_eq!(
+        server.upload_count(),
+        0,
+        "no summary-only snapshot may reach the archive"
+    );
+
+    // The skip costs no bounded attempt and is not terminal: the row is pending, and once the
+    // transcript is readable the ordinary retry path uploads the complete set.
+    let status = harness.archive_upload_status();
+    assert_eq!(status["items"][0]["state"], "pending");
+    assert_eq!(status["items"][0]["attempts"], 0);
+
+    harness.restore_transcript_path(NO_TRANSCRIPT_SESSION, &transcript);
+    let retried = harness.json(&["archive-upload", "retry", NO_TRANSCRIPT_SESSION, "--json"]);
+    assert_eq!(retried["items"][0]["outcome"]["result"], "uploaded");
+    assert_eq!(
+        manifest_paths(&server.manifest(0)),
+        vec!["summary.md", "transcript.jsonl"],
+        "the recovered upload carries the full artifact set"
+    );
+}
+
+/// The backfill mechanism for snapshots already in the archive (issue #47): a session whose latest
+/// uploaded snapshot lacks `transcript.jsonl` is a backfill candidate even though its ledger row is
+/// `uploaded` at the current revision. The re-upload mints a fresh capture carrying the complete
+/// set; the old summary-only snapshot stays in the archive as historical provenance (Patwari
+/// snapshots are immutable). A third run has nothing left to converge.
+#[test]
+fn backfill_reuploads_a_recorded_summary_only_snapshot_as_a_full_one() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(SUMMARY_ONLY_SESSION);
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let (report, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(report["uploaded"], 1);
+
+    // Rewrite the ledger to what an older client left behind for a session whose transcript it
+    // could not read: an `uploaded` row for this exact revision whose snapshot was summary-only.
+    harness.record_artifact_paths(SUMMARY_ONLY_SESSION, Some("summary.md"));
+
+    let (report, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(report["candidates"], 1, "report: {report}");
+    assert_eq!(report["uploaded"], 1);
+    assert_eq!(report["already_uploaded"], 0);
+    assert_eq!(report["items"][0]["session_id"], SUMMARY_ONLY_SESSION);
+    assert_eq!(server.completed_count(), 2, "the full snapshot re-uploaded");
+    assert_eq!(
+        manifest_paths(&server.manifest(1)),
+        vec!["summary.md", "transcript.jsonl"],
+    );
+    // A distinct capture: reusing the summary-only snapshot's capture id with a changed manifest
+    // would be an idempotency violation the server rejects.
+    assert_ne!(
+        server.manifest(0)["capture"]["captured_at"],
+        Value::Null,
+        "both captures are recorded"
+    );
+
+    let (again, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(again["candidates"], 0);
+    assert_eq!(server.completed_count(), 2, "convergence is a fixed point");
+}
+
+/// A row written before the ledger recorded artifact sets carries no set at all, so what it
+/// uploaded is unknown — not known-complete. Backfill re-verifies it exactly once; the re-upload
+/// is cheap (Patwari deduplicates blobs by content hash and coalesces an identical snapshot
+/// fingerprint) and afterwards the row records its set and is never a candidate again.
+#[test]
+fn backfill_reverifies_a_row_that_predates_the_recorded_artifact_set_exactly_once() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(LEGACY_LEDGER_SESSION);
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+    let (report, _) = harness.backfill();
+    assert_eq!(report["uploaded"], 1);
+
+    harness.record_artifact_paths(LEGACY_LEDGER_SESSION, None);
+    let (report, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(report["candidates"], 1, "report: {report}");
+    assert_eq!(report["uploaded"], 1);
+    assert_eq!(
+        manifest_paths(&server.manifest(1)),
+        vec!["summary.md", "transcript.jsonl"],
+    );
+
+    let (again, _) = harness.backfill();
+    assert_eq!(again["candidates"], 0);
+    assert_eq!(server.completed_count(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +894,11 @@ fn placeholder_floor_archives_and_uploads_at_the_park_threshold_and_retry_replac
     assert_eq!(server.completed_count(), 2);
     let second = server.manifest(1);
     assert_eq!(second["capture"]["source_cursor"], "2");
+    // The replacement revision is a full snapshot too, not a summary-only re-upload (issue #47).
+    assert_eq!(
+        manifest_paths(&second),
+        vec!["summary.md", "transcript.jsonl"],
+    );
     let status = harness.status_text();
     assert!(status.contains("placeholder=0"), "status: {status}");
     assert!(status.contains("archived=1"), "status: {status}");
@@ -1023,6 +1176,69 @@ impl CliHarness {
         self.json(&["archive-upload", "status", "--json"])
     }
 
+    fn database(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.state.join("munshi.db")).unwrap()
+    }
+
+    /// Drops a session's recorded transcript path, reproducing a `rebuild-state` row (issue #47):
+    /// archived and summarized from its Markdown alone, with no transcript munshi can read.
+    /// Returns the path it forgot.
+    fn forget_transcript_path(&self, session_id: &str) -> String {
+        let connection = self.database();
+        let path: String = connection
+            .query_row(
+                "SELECT transcript_path FROM sessions WHERE source_session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let changed = connection
+            .execute(
+                "UPDATE sessions SET transcript_path=NULL WHERE source_session_id=?1",
+                [session_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        path
+    }
+
+    fn restore_transcript_path(&self, session_id: &str, path: &str) {
+        let changed = self
+            .database()
+            .execute(
+                "UPDATE sessions SET transcript_path=?2 WHERE source_session_id=?1",
+                rusqlite::params![session_id, path],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    /// Rewrites the artifact set an upload row records: `Some` for a snapshot known to have
+    /// carried exactly those logical paths, `None` for a row written before the ledger recorded
+    /// them at all.
+    fn record_artifact_paths(&self, session_id: &str, paths: Option<&str>) {
+        let changed = self
+            .database()
+            .execute(
+                "UPDATE archive_uploads SET uploaded_artifact_paths=?2
+                 WHERE session_id=(SELECT id FROM sessions WHERE source_session_id=?1)",
+                rusqlite::params![session_id, paths],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    fn recorded_artifact_paths(&self, session_id: &str) -> Option<String> {
+        self.database()
+            .query_row(
+                "SELECT uploaded_artifact_paths FROM archive_uploads
+                 WHERE session_id=(SELECT id FROM sessions WHERE source_session_id=?1)",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn backfill(&self) -> (Value, bool) {
         let output = self.munshi(&["archive-upload", "backfill", "--json"]);
         assert!(
@@ -1123,6 +1339,16 @@ impl CliHarness {
         std::fs::write(&path, content).unwrap();
         path.canonicalize().unwrap()
     }
+}
+
+/// The logical paths a recorded manifest lists, in the manifest's own (canonical) order.
+fn manifest_paths(manifest: &Value) -> Vec<String> {
+    manifest["artifacts"]
+        .as_array()
+        .expect("manifest lists artifacts")
+        .iter()
+        .map(|artifact| artifact["logical_path"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn assert_cli_success(output: &Output) {
