@@ -304,7 +304,10 @@ automatic capture, using [`munshi archive`](manual-archive.md).
   every invocation — and by extension to whatever backend your summarizer calls (a hosted model
   API, a local model, etc.). Treat your summarizer choice as the actual data-handling boundary:
   Munshi does not filter, sample, or truncate transcript content for privacy before handing it
-  over, only for size (`--max-input-bytes`, default 8388608).
+  over — only for size, and there the operative bound is `--chunk-threshold-bytes` (default
+  2621440), which splits an oversized session across invocations rather than dropping content.
+  `--max-input-bytes` (default 8388608) is only a never-exceed backstop above it; see
+  [`configuration.md`](configuration.md#the-size-knob-relation).
 - Invocations are bounded by per-project budgets so a busy project can't cause unbounded spend:
   `--max-calls-per-hour` (default 10) and `--max-calls-per-day` (default 50), plus
   `--max-concurrency` (default 2) across all projects. Once a budget is hit, further summaries

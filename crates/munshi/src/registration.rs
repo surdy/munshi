@@ -441,7 +441,7 @@ fn default_max_event_text_bytes() -> usize {
 /// boundary is tokens (~922k), not bytes, and observed byte/token ratios of ~3.2–4.5 mean the
 /// byte-calibrated 6 MiB threshold still admitted one-shot rejections. 2.5 MiB stays under the
 /// token limit even at the densest observed ratio (2,621,440 / 3.2 ≈ 819k tokens).
-pub(crate) const DEFAULT_CHUNK_THRESHOLD_BYTES: usize = 2_621_440;
+pub const DEFAULT_CHUNK_THRESHOLD_BYTES: usize = 2_621_440;
 /// Chunk payload target sized against the token-calibrated threshold above (issue #48): 1.5 MiB
 /// keeps every chunk request comfortably inside the accepted-input range.
 pub(crate) const DEFAULT_CHUNK_SIZE_BYTES: usize = 1_572_864;
@@ -887,6 +887,16 @@ pub fn configured_max_event_text_bytes(state_directory: &Path) -> usize {
     load_stored_config(state_directory)
         .map(|config| config.limits.max_event_text_bytes)
         .unwrap_or(crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES)
+}
+
+/// The configured chunked map-reduce threshold for a registered state directory, or the built-in
+/// default when the directory holds no readable Munshi registration. Manual archival reads this to
+/// validate its own `--max-input-bytes` against the same never-exceed-backstop relation the hook
+/// path is registered under (issue #52).
+pub fn configured_chunk_threshold_bytes(state_directory: &Path) -> usize {
+    load_stored_config(state_directory)
+        .map(|config| config.limits.chunk_threshold_bytes)
+        .unwrap_or(DEFAULT_CHUNK_THRESHOLD_BYTES)
 }
 
 /// The effective enable/disable state and budgets for one project directory, combining an explicit

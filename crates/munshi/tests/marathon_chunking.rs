@@ -376,6 +376,152 @@ fn v2_config_without_chunk_fields_loads_and_archives_with_defaults() {
 }
 
 // ---------------------------------------------------------------------------
+// The input cap / chunk threshold relation (issue #52)
+// ---------------------------------------------------------------------------
+
+/// `max_input_bytes` is a never-exceed backstop *above* the chunk threshold, never below it: a cap
+/// under the threshold recreates the pre-issue-#48 band in which requests between the two values
+/// floor to placeholder summaries instead of being chunked or summarized. `register` rejects the
+/// inverted relation before writing any configuration; an equal (or larger) cap is accepted.
+#[test]
+fn register_rejects_an_input_cap_below_the_chunk_threshold() {
+    let harness = Harness::new();
+    // Against the default threshold (2.5 MiB).
+    let inverted = harness.try_register(&["--max-input-bytes", "1000"]);
+    assert!(!inverted.status.success());
+    let stderr = String::from_utf8_lossy(&inverted.stderr).into_owned();
+    assert!(stderr.contains("--max-input-bytes"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--chunk-threshold-bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("placeholder"), "stderr: {stderr}");
+    assert!(
+        !harness.state.join("config.json").exists(),
+        "a rejected registration must write no configuration"
+    );
+
+    // Also inverted against an explicit threshold.
+    let explicit = harness.try_register(&[
+        "--chunk-threshold-bytes",
+        "8000",
+        "--max-input-bytes",
+        "4000",
+    ]);
+    assert!(!explicit.status.success());
+    assert!(!harness.state.join("config.json").exists());
+
+    // Equal is the tightest valid relation, and it registers.
+    harness.register(&[
+        "--chunk-threshold-bytes",
+        "4000",
+        "--max-input-bytes",
+        "4000",
+    ]);
+    assert_eq!(harness.config()["limits"]["max_input_bytes"], 4000);
+    assert_eq!(harness.config()["limits"]["chunk_threshold_bytes"], 4000);
+}
+
+/// Manual `munshi archive` validates its `--max-input-bytes` against the registered threshold —
+/// the same relation the hook path is registered under — so a one-shot manual run cannot be given
+/// a cap that would fail the session on size instead of summarizing it.
+#[test]
+fn manual_archive_rejects_an_input_cap_below_the_chunk_threshold() {
+    let harness = Harness::new();
+    harness.register(&["--chunk-threshold-bytes", "500000"]);
+    let events = harness
+        .write_marathon_transcript(SESSION, 4, 40)
+        .canonicalize()
+        .unwrap();
+    let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/manual/fake-summarizer/phase-aware.sh")
+        .canonicalize()
+        .unwrap();
+    std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let archive = |max_input_bytes: &str| {
+        harness.munshi(&[
+            "archive",
+            SESSION,
+            "--events",
+            events.to_str().unwrap(),
+            "--project-dir",
+            harness.project.to_str().unwrap(),
+            "--output-dir",
+            harness.output.to_str().unwrap(),
+            "--summarizer",
+            summarizer.to_str().unwrap(),
+            "--summarizer-arg",
+            harness.log.to_str().unwrap(),
+            "--max-input-bytes",
+            max_input_bytes,
+        ])
+    };
+
+    let rejected = archive("1000");
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr).into_owned();
+    assert!(stderr.contains("--max-input-bytes"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--chunk-threshold-bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("500000"), "stderr: {stderr}");
+    assert!(
+        harness.log_lines().is_empty(),
+        "a rejected manual archive must never invoke the summarizer"
+    );
+
+    // A cap at or above the registered threshold archives normally.
+    assert_cli_success(&archive("500000"));
+    assert_eq!(harness.log_lines(), vec!["complete 4"]);
+}
+
+/// The relation is only enforceable at the CLI, so a hand-edited `config.json` can still violate
+/// it. `munshi doctor` names the violation rather than leaving it to be discovered as unexplained
+/// `summary-input-limit` parks.
+#[test]
+fn doctor_warns_on_a_hand_edited_inverted_input_cap() {
+    let harness = Harness::new();
+    harness.register(&[]);
+    let healthy = harness.json(&["doctor", "--json"]);
+    assert!(
+        !doctor_check_codes(&healthy).contains(&"input-cap-relation".to_owned()),
+        "a valid relation must not warn: {healthy}"
+    );
+
+    let config_path = harness.state.join("config.json");
+    let mut config = harness.config();
+    config["limits"]["max_input_bytes"] = json!(1000);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let report = harness.json(&["doctor", "--json"]);
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["code"] == "input-cap-relation")
+        .unwrap_or_else(|| panic!("doctor reports the inverted relation: {report}"));
+    assert_eq!(check["status"], "warning", "check: {check}");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains("1000"), "message: {message}");
+    assert!(message.contains("2621440"), "message: {message}");
+    assert!(message.contains("max_input_bytes"), "message: {message}");
+    assert!(
+        message.contains("chunk_threshold_bytes"),
+        "message: {message}"
+    );
+}
+
+fn doctor_check_codes(report: &Value) -> Vec<String> {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["code"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Contrib wrapper phase/model env plumbing
 // ---------------------------------------------------------------------------
 

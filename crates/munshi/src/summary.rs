@@ -53,6 +53,35 @@ pub fn parse_summarizer_env(assignment: &str) -> Result<(String, String), String
     Ok((key.to_owned(), value.to_owned()))
 }
 
+/// Rejects an inverted summarizer-size relation (issue #52): `max_input_bytes` must be at least
+/// `chunk_threshold_bytes`.
+///
+/// The two knobs are not peers. Since issue #48 the threshold is the *operative* bound — the
+/// measured one-shot request size above which a session is chunked, and the ceiling on every
+/// single chunk/reduce request — while the input cap is an absolute never-exceed backstop that
+/// only stops pathological input from reaching the summarizer at all. Above the threshold the cap
+/// is unreachable by construction (over-threshold requests chunk), so a cap *below* the threshold
+/// is the only way it binds, and it binds destructively: it silently recreates the pre-issue-#48
+/// band in which every request between the two values fails deterministically on
+/// `SummaryError::InputLimit` and floors to a placeholder summary instead of being chunked or
+/// summarized. Validated on both configuring surfaces (`munshi register`, `munshi archive`) before
+/// any work or config write; `munshi doctor` re-checks a hand-edited configuration.
+pub fn validate_input_cap_relation(
+    max_input_bytes: usize,
+    chunk_threshold_bytes: usize,
+) -> Result<(), String> {
+    if max_input_bytes >= chunk_threshold_bytes {
+        return Ok(());
+    }
+    Err(format!(
+        "--max-input-bytes ({max_input_bytes}) must be at least chunk_threshold_bytes \
+         ({chunk_threshold_bytes}, set by --chunk-threshold-bytes at registration): the input cap \
+         is an absolute never-exceed backstop that sits above the chunking threshold, and a \
+         smaller cap would needlessly floor every request between the two values to a placeholder \
+         summary instead of chunking or summarizing it"
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct SummarizerConfig {
     pub binary: PathBuf,
