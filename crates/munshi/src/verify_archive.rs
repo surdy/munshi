@@ -1004,10 +1004,13 @@ fn from_read(error: ReadError) -> VerifyArchiveError {
 fn from_http(error: HttpError) -> VerifyArchiveError {
     match error {
         HttpError::UnsupportedEndpoint(endpoint) => {
-            VerifyArchiveError::Unreachable(format!("{endpoint} is not a supported http URL"))
+            VerifyArchiveError::Unreachable(format!("{endpoint} is not a supported http(s) URL"))
         }
         HttpError::Transport(message) => VerifyArchiveError::Unreachable(message),
         HttpError::Protocol(message) => VerifyArchiveError::Protocol(message),
+        HttpError::Tls(message) => {
+            VerifyArchiveError::Unreachable(format!("tls setup failed: {message}"))
+        }
     }
 }
 

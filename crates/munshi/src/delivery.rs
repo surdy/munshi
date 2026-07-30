@@ -944,11 +944,11 @@ fn resolve_credential(credential: &StoredCredential) -> Result<String, DeliveryE
 // HTTP Notesmith sink
 // ---------------------------------------------------------------------------
 
-/// A minimal blocking HTTP/1.1 Notesmith sink. Notesmith runs on localhost, so this deliberately
-/// speaks plain HTTP over `std::net` and adds no async or TLS dependency.
+/// A minimal blocking HTTP/1.1 Notesmith sink over the shared [`crate::http`] client:
+/// plain HTTP for localhost/LAN daemons, TLS for Caddy-published `https://` endpoints
+/// (ADR 0013).
 pub struct HttpNotesmithSink {
-    host: String,
-    port: u16,
+    endpoint: http::HttpEndpoint,
     vault: String,
     token: Option<String>,
     timeout: Duration,
@@ -960,10 +960,9 @@ impl HttpNotesmithSink {
         vault: &str,
         token: Option<String>,
     ) -> Result<Self, DeliveryError> {
-        let (host, port) = parse_http_endpoint(endpoint)?;
+        let endpoint = parse_http_endpoint(endpoint)?;
         Ok(Self {
-            host,
-            port,
+            endpoint,
             vault: vault.to_owned(),
             token,
             timeout: REQUEST_TIMEOUT,
@@ -1015,8 +1014,7 @@ impl HttpNotesmithSink {
             });
         }
         http::send(
-            &self.host,
-            self.port,
+            &self.endpoint,
             self.timeout,
             &http::HttpRequest {
                 method,
@@ -1329,6 +1327,7 @@ fn sink_http_error(error: HttpError) -> SinkError {
         HttpError::Transport(message) | HttpError::UnsupportedEndpoint(message) => {
             SinkError::Transport(message)
         }
+        HttpError::Tls(message) => SinkError::Transport(format!("tls setup failed: {message}")),
     }
 }
 
