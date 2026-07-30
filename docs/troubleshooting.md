@@ -88,8 +88,10 @@ contract; the common causes are:
 - The process ran past `--timeout-ms` (default 300000ms) and was killed.
 - stdout exceeded `--max-stdout-bytes` (default 262144) or stderr exceeded `--max-stderr-bytes`
   (default 65536).
-- The normalized transcript itself exceeded `--max-input-bytes` (default 8388608) — this
-  produces a summary failure before your summarizer is even invoked.
+- No split could bring a request under `--chunk-threshold-bytes` (default 2621440) — for example
+  one enormous un-elided event. This produces a summary failure before your summarizer is even
+  invoked. (`--max-input-bytes` sits at or above the threshold and is only a never-exceed
+  backstop; see [`configuration.md`](configuration.md#the-size-knob-relation).)
 
 Test the summarizer standalone before blaming Munshi:
 
@@ -118,12 +120,12 @@ arrives in the session.
 
 Two deterministic cases additionally trigger the placeholder durability floor (issue #43) instead
 of leaving the session unarchived forever: a summarizer rejection (nonzero exit) that reaches the
-5-failure park, and an input over `--max-input-bytes`, which fails immediately under its own
+5-failure park, and a genuinely unchunkable request, which fails immediately under its own
 `summary-input-limit` category. Both archive the session with a machine-generated placeholder
 summary (frontmatter `summary_placeholder: true`, tag `munshi-placeholder-summary`) so the
 transcript still uploads and delivers; the session stays parked and is counted as
-`placeholder=<n>` on the `munshi status` sessions line. Fix the summarizer (or raise the input
-limit) and run a plain `munshi retry <session-id>` — the successful real summary replaces the
+`placeholder=<n>` on the `munshi status` sessions line. Fix the summarizer (or raise the size
+limits) and run a plain `munshi retry <session-id>` — the successful real summary replaces the
 placeholder as the next revision.
 
 Related failure categories you may see instead of `summary-failed`, all in the same

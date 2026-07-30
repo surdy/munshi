@@ -950,7 +950,18 @@ struct RawStoredConfig {
     delivery: Option<RawDelivery>,
     policy: Option<RawPolicy>,
     #[serde(default)]
+    limits: Option<RawLimits>,
+    #[serde(default)]
     harnesses: Option<RawHarnesses>,
+}
+
+/// The subset of the `limits` section doctor re-checks: the two knobs whose relation `register`
+/// and `archive` enforce but a hand-edited `config.json` can still violate (issue #52).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawLimits {
+    max_input_bytes: Option<usize>,
+    /// Absent in configurations written before issue #48; those load on the built-in default.
+    chunk_threshold_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1271,9 +1282,18 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 .ok_or_else(|| format!("unsupported source: {source}"))?;
             // Elide oversized events on the registered threshold so manual archival matches the hook
             // path; fall back to the built-in default when the directory is not a registration.
-            let max_event_text_bytes = resolve_state_directory(state_dir)
-                .map(|dir| munshi::configured_max_event_text_bytes(&dir))
+            let state_directory = resolve_state_directory(state_dir);
+            let registered = state_directory.as_deref().ok();
+            let max_event_text_bytes = registered
+                .map(munshi::configured_max_event_text_bytes)
                 .unwrap_or(munshi::DEFAULT_MAX_EVENT_TEXT_BYTES);
+            // Manual archival is one-shot, so its input cap is the only bound in play — but it
+            // must still respect the registered relation (issue #52), or a manual run would fail
+            // deterministically on size exactly where the hook path would chunk.
+            let chunk_threshold_bytes = registered
+                .map(munshi::configured_chunk_threshold_bytes)
+                .unwrap_or(munshi::DEFAULT_CHUNK_THRESHOLD_BYTES);
+            munshi::validate_input_cap_relation(max_input_bytes, chunk_threshold_bytes)?;
             Ok(Outcome::Archive(archive_session(&ArchiveConfig {
                 reference: SessionReference {
                     source,
@@ -1317,6 +1337,9 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_calls_per_day,
             max_concurrency,
         } => {
+            // Cross-flag validation runs before the disclosure prompt and any file write, so a
+            // rejected registration leaves nothing behind (issue #52).
+            munshi::validate_input_cap_relation(max_input_bytes, chunk_threshold_bytes)?;
             eprintln!(
                 "Configured local output directory: {}",
                 output_dir.display()
@@ -2422,6 +2445,8 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         );
                     }
 
+                    push_input_cap_relation_check(&mut checks, config.limits.as_ref());
+
                     summarizer_executable =
                         config.summarizer.and_then(|command| command.executable);
                     output_directory = config.output_directory;
@@ -3006,6 +3031,36 @@ fn push_size_cap_park_check(checks: &mut Vec<CheckResult>, records: &[SessionRec
             "{} session(s) parked on a size cap: {}; re-register with a larger limit, then `munshi retry-all --force`",
             source_failed + input_limited,
             parts.join(", ")
+        ),
+    );
+}
+
+/// Doctor check for the summarizer-size knob relation (issue #52). `register` and `archive` reject
+/// `max_input_bytes < chunk_threshold_bytes` at the flag, but a hand-edited `config.json` can still
+/// hold the inverted relation, where it is invisible: sessions between the two values floor to
+/// placeholder summaries under `summary-input-limit` and park, looking like genuine capacity
+/// failures rather than a misconfiguration. This names the relation so the fix is a re-register,
+/// not a chase.
+fn push_input_cap_relation_check(checks: &mut Vec<CheckResult>, limits: Option<&RawLimits>) {
+    let Some(max_input_bytes) = limits.and_then(|limits| limits.max_input_bytes) else {
+        return;
+    };
+    let chunk_threshold_bytes = limits
+        .and_then(|limits| limits.chunk_threshold_bytes)
+        .unwrap_or(munshi::DEFAULT_CHUNK_THRESHOLD_BYTES);
+    if max_input_bytes >= chunk_threshold_bytes {
+        return;
+    }
+    push_check(
+        checks,
+        "input-cap-relation",
+        CheckStatus::Warning,
+        format!(
+            "max_input_bytes ({max_input_bytes}) is below chunk_threshold_bytes \
+             ({chunk_threshold_bytes}): requests between the two floor to placeholder summaries \
+             under `summary-input-limit` instead of chunking; re-register with \
+             `--max-input-bytes` at or above `--chunk-threshold-bytes`, then \
+             `munshi retry-all --force`"
         ),
     );
 }

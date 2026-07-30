@@ -751,13 +751,16 @@ fn placeholder_floor_archives_and_uploads_at_the_park_threshold_and_retry_replac
     assert!(status.contains("archived=1"), "status: {status}");
 }
 
-/// Munshi's own input cap is deterministic on the first attempt, so the floor engages immediately
-/// with a distinct category — no summarizer invocation is ever attempted or billed.
+/// An input-capacity verdict is deterministic on the first attempt, so the floor engages
+/// immediately with a distinct category — no summarizer invocation is ever attempted or billed.
+/// Since issue #52 the input cap must stay at or above the chunk threshold, so the reachable
+/// deterministic verdict is the genuinely unchunkable one: a threshold no split can bring a
+/// request under, which fails before the first chunk invocation.
 #[test]
 fn input_cap_violation_placeholders_immediately_with_a_distinct_category() {
     let harness = CliHarness::new();
     let summarizer = harness.toggleable_summarizer("cap-count");
-    harness.register_with_summarizer(&summarizer, &["--max-input-bytes", "128"]);
+    harness.register_with_summarizer(&summarizer, &["--chunk-threshold-bytes", "128"]);
     let server = FakePatwari::start();
     harness.configure_and_enable(&server.endpoint());
 

@@ -48,18 +48,46 @@ Written by `munshi register` from its flags; re-run `register` to change them.
 
 Defaults in parentheses; set at registration time by the matching `--…` flag. Sessions that fail
 deterministically on a size cap park permanently; `munshi doctor` surfaces them as the
-`size-cap-parked` check, naming the limit flag to raise (issue #41).
+`size-cap-parked` check, naming the limit flag to raise (issue #41). The two size knobs that
+constrain each other, `max_input_bytes` and `chunk_threshold_bytes`, are covered together under
+[the size-knob relation](#the-size-knob-relation) below.
 
 | Setting | Meaning |
 | --- | --- |
 | `timeout_ms` | Summarizer wall-clock timeout per invocation (`300000`). |
 | `max_source_bytes` | Largest raw transcript Munshi will read (`67108864`, 64 MiB). Sized for real agentic sessions (issue #41): long sessions routinely produce 10–60 MiB transcripts, and ~9% of the first full backlog exceeded the old 8 MiB default and parked as deterministic `source-failed`. |
-| `max_input_bytes` | Hard safety bound on the normalized input piped to the summarizer (`8388608`, 8 MiB; issue #41 raised it from 1 MiB, keeping the ~8× raw:normalized ratio with `max_source_bytes`). Deliberately sits *above* `chunk_threshold_bytes`: chunked map-reduce engages well below this cap, so chunking is the operative mechanism for large sessions and this cap only stops pathological input from reaching the summarizer at all. |
+| `max_input_bytes` | Absolute never-exceed backstop on the normalized input piped to the summarizer (`8388608`, 8 MiB; issue #41 raised it from 1 MiB, keeping the ~8× raw:normalized ratio with `max_source_bytes`). Must be **at least** `chunk_threshold_bytes` — see [the size-knob relation](#the-size-knob-relation) below. `--max-input-bytes`. |
 | `max_stdout_bytes` | Cap on summarizer stdout (`262144`). |
 | `max_stderr_bytes` | Cap on captured summarizer stderr (`65536`). |
 | `max_event_text_bytes` | Per-event extraction threshold (`131072`): content larger than this is extracted as an `outputs/<sha256>` snapshot artifact and elided from summarizer input (ADR 0010). Manual archival uses the same threshold. |
-| `chunk_threshold_bytes` | Chunked map-reduce trigger (`2621440`, issue #48): a session whose measured one-shot request exceeds this is summarized in per-segment chunks plus a reduce pass instead of one shot (or the input-limit placeholder floor). Also the hard cap on any single chunk/reduce request. The default is token-calibrated (issue #48 live calibration): the backend boundary is ~922k tokens, and at observed byte/token ratios of ~3.2–4.5 the earlier 6 MiB byte-calibrated default still admitted one-shot rejections; 2.5 MiB stays under the token limit at the densest observed ratio. Additive with a serde default — configurations written before issue #48 load unchanged, no version bump. `--chunk-threshold-bytes`. |
+| `chunk_threshold_bytes` | Chunked map-reduce trigger (`2621440`, issue #48): a session whose measured one-shot request exceeds this is summarized in per-segment chunks plus a reduce pass instead of one shot. Also the hard cap on any single chunk/reduce request. The default is token-calibrated (issue #48 live calibration): the backend boundary is ~922k tokens, and at observed byte/token ratios of ~3.2–4.5 the earlier 6 MiB byte-calibrated default still admitted one-shot rejections; 2.5 MiB stays under the token limit at the densest observed ratio. Additive with a serde default — configurations written before issue #48 load unchanged, no version bump. `--chunk-threshold-bytes`. |
 | `chunk_size_bytes` | Approximate serialized-events payload each chunk request targets on the chunked path (`1572864`, issue #48; sized against the token-calibrated threshold above). Chunks split only on event boundaries, so individual chunks may run over or under. Additive with a serde default, like `chunk_threshold_bytes`. `--chunk-size-bytes`. |
+
+### The size-knob relation
+
+`chunk_threshold_bytes` and `max_input_bytes` are not peers, and the invariant between them is
+`max_input_bytes >= chunk_threshold_bytes`.
+
+- **`chunk_threshold_bytes` is the operative bound.** It routes every session — over it the
+  request is chunked, at or under it the request runs one-shot — and it is simultaneously the
+  ceiling on each individual chunk and reduce request. It is the knob to tune against what your
+  summarizer backend actually accepts.
+- **`max_input_bytes` is an absolute never-exceed backstop.** Since chunking landed (issue #48) it
+  can only bind on the one-shot path, which the threshold already bounds, so on a correctly
+  configured Munshi it never fires: it exists to stop pathological input from reaching the
+  summarizer at all, not to size normal work.
+
+Setting the cap *below* the threshold is therefore never useful and is actively harmful: it
+recreates the pre-issue-#48 band in which every request between the two values fails
+deterministically under `summary-input-limit` and floors to a placeholder summary instead of being
+chunked or summarized. `munshi register` and `munshi archive` reject the inverted relation at the
+flag, before writing configuration or invoking anything (issue #52), and `munshi doctor` re-checks
+a hand-edited `config.json` as the `input-cap-relation` warning. Keep the same relation in mind for
+a `.munshi.toml` project override of `max_input_bytes`, which narrows the cap for one project
+without changing the global threshold.
+
+A future config version may fold the backstop away entirely and leave a single size knob; until
+then, raise the threshold — not the cap — when large sessions need more room.
 
 ## `policy` — cost and scope controls
 

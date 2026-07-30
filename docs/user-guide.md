@@ -113,7 +113,7 @@ deferred them resolves (see below), and a plain `retry`/`retry-all` or the autom
 picks them up.
 
 A session whose summarizer keeps rejecting its input deterministically — it reached the
-repeat-failure park, or the normalized input exceeds `max_input_bytes` (its own
+repeat-failure park, or no split can bring its request under `chunk_threshold_bytes` (its own
 `summary-input-limit` category) — does not stay unarchived: Munshi archives it with an explicit
 placeholder summary so the full transcript still reaches the durable archive and uploads to
 Patwari (issue #43). The archive file is flagged `summary_placeholder: true` and tagged
@@ -234,9 +234,14 @@ way `.editorconfig` or `.git` are discovered:
 enabled = false
 max_calls_per_hour = 2
 max_calls_per_day = 10
-max_input_bytes = 500000
+max_input_bytes = 4000000
 timeout_ms = 120000
 ```
+
+An overridden `max_input_bytes` should stay at or above the global `chunk_threshold_bytes` for the
+same reason `register` enforces that relation
+([`configuration.md`](configuration.md#the-size-knob-relation)); the override file is read at hook
+time and is not validated for you.
 
 Every field is optional and falls back to global configuration when absent. Precedence is: nearest
 `.munshi.toml`, then global config, then built-in defaults. `enabled = false` here disables the

@@ -187,8 +187,8 @@ as before.
 
 Two failure classes get a durability floor instead of staying unarchived forever (issue #43): a
 summarizer process rejection (nonzero exit, typically oversized input beyond the model's real
-capacity) that reaches the park threshold above, and Munshi's own `max_input_bytes` cap, which is
-deterministic on the first attempt and carries its own `summary-input-limit` category. In both
+capacity) that reaches the park threshold above, and a deterministic input-capacity verdict, which
+fires on the first attempt and carries its own `summary-input-limit` category. In both
 cases the session archives anyway with a machine-generated placeholder summary: the Markdown is
 flagged `summary_placeholder: true` in its frontmatter, tagged `munshi-placeholder-summary`, and
 its body states plainly that the summary is unavailable and why. That unlocks the normal
@@ -215,8 +215,10 @@ failure mid-chunk abandons the whole attempt into the ordinary backoff above —
 are never archived. The floor still catches what chunking genuinely cannot fix: a request no
 split can bring under the threshold (for example one enormous un-elided event, or an irreducible
 reduce input) floors immediately under `summary-input-limit`, and repeated chunk-phase summarizer
-rejections floor at the park threshold exactly like one-shot rejections. Below the threshold,
-`max_input_bytes` governs the one-shot request exactly as before.
+rejections floor at the park threshold exactly like one-shot rejections. `max_input_bytes` is no
+longer an operative bound at all: it must sit at or above the threshold (issue #52, enforced by
+`register`/`archive` and re-checked by `munshi doctor`), which leaves it a never-exceed backstop
+against pathological input — see [`configuration.md`](configuration.md#the-size-knob-relation).
 
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
@@ -255,9 +257,13 @@ analogous to how `.editorconfig` or `.git` are discovered:
 enabled = false
 max_calls_per_hour = 2
 max_calls_per_day = 10
-max_input_bytes = 500000
+max_input_bytes = 4000000
 timeout_ms = 120000
 ```
+
+An overridden `max_input_bytes` is expected to stay at or above the global
+`chunk_threshold_bytes`, like the global cap; the override file is read at hook time and is not
+validated for that relation.
 
 Every field is optional; an absent field falls back to global configuration. Precedence is nearest
 project override, then global configuration, then built-in defaults. A present but unparsable or
@@ -276,7 +282,7 @@ of discarding it:
 - Reaching a project's effective hourly or daily summarizer-call budget defers the session
   (`budget-hourly-exceeded` or `budget-daily-exceeded`) before invoking the summarizer, so the
   budget check itself never spends a Copilot call.
-- `max_input_bytes` and `timeout_ms` remain enforced per call; an oversized or slow attempt is a
+- The size and `timeout_ms` bounds remain enforced per call; an oversized or slow attempt is a
   retryable summary failure rather than a silent drop.
 
 The concurrency check and the session claim happen inside one `BEGIN IMMEDIATE` SQLite

@@ -47,9 +47,10 @@ pub use project::{
     recorded_project_identity,
 };
 pub use registration::{
-    ClaudeTarget, CopilotTarget, DisclosureDecision, ProjectStatus, RegisterConfig,
-    RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
-    configured_max_event_text_bytes, project_status, register, set_project_enabled, unregister,
+    ClaudeTarget, CopilotTarget, DEFAULT_CHUNK_THRESHOLD_BYTES, DisclosureDecision, ProjectStatus,
+    RegisterConfig, RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
+    configured_chunk_threshold_bytes, configured_max_event_text_bytes, project_status, register,
+    set_project_enabled, unregister,
 };
 pub use render::{
     ArchiveMetadata, ArchiveVersion, ArchivedCursor, ArchivedMarkdown, atomic_replace,
@@ -77,6 +78,6 @@ pub use summary::{
     SUMMARIZER_PHASE_ENV, SUMMARY_CONTRACT_VERSION, StructuredSummary, SummaryError, SummaryPhase,
     SummaryStrategy, build_revision_summary_input, build_summary_input, chunk_event_ranges,
     parse_summarizer_env, placeholder_summary, plan_summary_input, run_chunked_summary,
-    run_summary, validate_structured_summary,
+    run_summary, validate_input_cap_relation, validate_structured_summary,
 };
 pub use verify_archive::{VerifyArchiveError, VerifyArchiveReport, verify_archive_parse};
