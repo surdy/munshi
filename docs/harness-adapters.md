@@ -92,7 +92,11 @@ existence-validated fallback, not a public contract. Archived 1.0.5x snapshots a
 carry a `session.usage_checkpoint` bookkeeping record (issue #34); it is typed ignored metadata
 alongside the pinned lifecycle/bookkeeping events (`session.start`, `session.resume`,
 `session.shutdown`, `session.model_change`, `assistant.turn_start`, `assistant.turn_end`,
-`hook.start`, `hook.end`, `system.message`).
+`hook.start`, `hook.end`, `system.message`). The full-archive census (issue #45) surfaced nine
+more historical bookkeeping kinds across pre-1.0.70 CLI versions — `permission.requested`,
+`permission.completed`, `session.binary_asset`, `subagent.started`, `subagent.completed`,
+`system.notification`, `session.permissions_changed`, `session.mode_changed`, and
+`session.compaction_start` — all typed ignored metadata as well.
 
 ## Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 
@@ -106,7 +110,8 @@ envelope is unchanged and that the record types added since 2.1.44 (`ai-title`, 
 `last-prompt`, `mode`, `queue-operation`) degrade to ignored metadata. Live-archive verification
 (issue #30) surfaced four newer session-bookkeeping kinds the pinned schema predates —
 `permission-mode`, `pr-link`, `file-history-delta` (sibling of `file-history-snapshot`), and
-`frame-link` — all typed ignored metadata as well.
+`frame-link` — all typed ignored metadata as well, and the full-archive census (issue #46) added
+`agent-name` to the same class.
 
 **Envelope.** Each line is a JSON object with a string `type` and (for turns) a `message` object,
 plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `cwd`, `version`,
@@ -121,7 +126,7 @@ plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `c
 | `type: "assistant"`, `text` blocks | `assistant` event |
 | `type: "assistant"`, `tool_use` blocks | `tool` event (`event=tool_use`) |
 | `type: "summary"` (compaction), `type: "system"`, queue bookkeeping | ignored metadata |
-| `type: "permission-mode"` / `"pr-link"` / `"file-history-delta"` / `"frame-link"` (archive-observed session bookkeeping) | ignored metadata |
+| `type: "permission-mode"` / `"pr-link"` / `"file-history-delta"` / `"frame-link"` / `"agent-name"` (archive-observed session bookkeeping) | ignored metadata |
 
 **Lifecycles.**
 
@@ -176,8 +181,8 @@ Synthetic/sanitized conformance fixtures live under `fixtures/claude-code-2.1.44
 `fixtures/codex-rollout-0.x/`. They are hand-authored from the public schemas above — **no private
 transcript content is copied** — and cover missing fields, truncated (incomplete trailing record)
 transcripts, concurrent sessions, and source-specific metadata. The archive-observed bookkeeping
-kinds (issues #30/#34) are exercised by hand-authored sessions under
-`fixtures/claude-code-2.1.2xx-bookkeeping/` and `fixtures/copilot-1.0.5x-bookkeeping/`. `crates/munshi/tests/harness_adapters.rs`
+kinds (issues #30/#34 and the full-archive census #45/#46) are exercised by hand-authored sessions
+under `fixtures/claude-code-2.1.2xx-bookkeeping/` and `fixtures/copilot-1.0.5x-bookkeeping/`. `crates/munshi/tests/harness_adapters.rs`
 exercises normalization, foreign-envelope rejection, the one-shot archive pipeline, and the shared
 archive/state worker pipeline (resumed revisions, interrupted completion reason, source isolation).
 
