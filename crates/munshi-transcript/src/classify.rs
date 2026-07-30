@@ -53,8 +53,13 @@ pub(crate) fn classify(source: crate::Source, object: &Map<String, Value>) -> Cl
 /// full-archive census (issue #45: `permission.requested`,
 /// `permission.completed`, `session.binary_asset`, `subagent.started`,
 /// `subagent.completed`, `system.notification`, `session.permissions_changed`,
-/// `session.mode_changed`, `session.compaction_start`).
+/// `session.mode_changed`, `session.compaction_start`), and the census's
+/// second wave surfaced once the chunked-marathon giants uploaded (issue #45:
+/// `abort`, `session.compaction_complete`, `session.context_changed`,
+/// `session.error`, `session.info`, `session.plan_changed`,
+/// `session.task_complete`, `session.workspace_file_changed`).
 const COPILOT_BOOKKEEPING: &[&str] = &[
+    "abort",
     "assistant.turn_end",
     "assistant.turn_start",
     "hook.end",
@@ -62,14 +67,21 @@ const COPILOT_BOOKKEEPING: &[&str] = &[
     "permission.completed",
     "permission.requested",
     "session.binary_asset",
+    "session.compaction_complete",
     "session.compaction_start",
+    "session.context_changed",
+    "session.error",
+    "session.info",
     "session.mode_changed",
     "session.model_change",
     "session.permissions_changed",
+    "session.plan_changed",
     "session.resume",
     "session.shutdown",
     "session.start",
+    "session.task_complete",
     "session.usage_checkpoint",
+    "session.workspace_file_changed",
     "subagent.completed",
     "subagent.started",
     "system.message",
@@ -689,6 +701,14 @@ mod tests {
             "session.permissions_changed",
             "session.mode_changed",
             "session.compaction_start",
+            "abort",
+            "session.compaction_complete",
+            "session.context_changed",
+            "session.error",
+            "session.info",
+            "session.plan_changed",
+            "session.task_complete",
+            "session.workspace_file_changed",
         ] {
             let json = format!(r#"{{"type":"{kind}","data":{{}}}}"#);
             assert!(matches!(

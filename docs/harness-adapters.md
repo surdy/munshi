@@ -96,7 +96,11 @@ alongside the pinned lifecycle/bookkeeping events (`session.start`, `session.res
 more historical bookkeeping kinds across pre-1.0.70 CLI versions — `permission.requested`,
 `permission.completed`, `session.binary_asset`, `subagent.started`, `subagent.completed`,
 `system.notification`, `session.permissions_changed`, `session.mode_changed`, and
-`session.compaction_start` — all typed ignored metadata as well.
+`session.compaction_start` — all typed ignored metadata as well. A second census wave, surfaced
+once the chunked-marathon giants uploaded (issue #45), added eight more: `abort`,
+`session.compaction_complete`, `session.context_changed`, `session.error`, `session.info`,
+`session.plan_changed`, `session.task_complete`, and `session.workspace_file_changed` — same
+treatment.
 
 ## Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 

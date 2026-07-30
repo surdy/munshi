@@ -394,6 +394,14 @@ fn census_typed_bookkeeping_kinds_classify_as_typed_ignored_not_unknown() {
             "system.notification",
             "session.binary_asset",
             "session.compaction_start",
+            "session.compaction_complete",
+            "session.workspace_file_changed",
+            "session.task_complete",
+            "session.context_changed",
+            "session.info",
+            "session.plan_changed",
+            "session.error",
+            "abort",
             "session.shutdown",
         ]
     );
@@ -410,7 +418,7 @@ fn census_typed_bookkeeping_kinds_classify_as_typed_ignored_not_unknown() {
         .collect();
     assert_eq!(content_kinds, ["user", "assistant"]);
     let summary = SessionSummary::summarize(&items);
-    assert_eq!(summary.ignored_events, 11);
+    assert_eq!(summary.ignored_events, 19);
 
     // Issue #46: the Claude Code `agent-name` bookkeeping kind, the census's only
     // remaining claude-code Unknown.
