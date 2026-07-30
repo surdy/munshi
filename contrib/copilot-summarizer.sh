@@ -21,9 +21,13 @@
 # absent, under a pre-v2 Munshi) no `--model` flag is passed and Copilot's configured default
 # model applies, exactly as before.
 #
-# Adjust this default for your machine (must be the resolved binary, not a symlink; overridable
-# via environment), then pass this script's absolute path to `munshi register --summarizer`:
-COPILOT_BIN="${COPILOT_BIN:-/opt/homebrew/Caskroom/copilot-cli/1.0.59/copilot}"
+# Adjust this default for your machine (overridable via environment), then pass this script's
+# absolute path to `munshi register --summarizer`. The brew symlink is deliberately preferred
+# over a Caskroom-versioned path: Copilot CLI self-updates in place regardless of the path's
+# version label, and a `brew upgrade` deletes old Caskroom version directories, which would
+# silently break a versioned pin. Munshi's no-symlink rule applies to the configured summarizer
+# executable (this script), not to the binary it invokes.
+COPILOT_BIN="${COPILOT_BIN:-/opt/homebrew/bin/copilot}"
 REAL_HOME="${COPILOT_HOME:-$HOME/.copilot}"
 ISOLATED_HOME="$HOME/.copilot-summarizer"
 
