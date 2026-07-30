@@ -273,9 +273,15 @@ exists, even if no snapshot reached Patwari. Check in order:
 3. A `transcript-changed` failure means the live transcript gained events between archival and
    upload; the next revision re-archives and uploads the grown transcript, converging on its own.
 4. A `skipped` outcome with reason `missing-transcript.jsonl` means munshi has no readable
-   transcript for that session — typically one `rebuild-state` reconstructed from its archive
-   Markdown alone, or one whose harness transcript has since been removed. Every snapshot is
-   self-contained (ADR 0009), so munshi refuses to upload the summary on its own; the summary stays
+   transcript for that session and could not find one. A row that records no transcript path (one
+   `rebuild-state` reconstructed from its archive Markdown alone) or records one that no longer
+   reads is not skipped on that basis alone: munshi first re-derives the path inside the
+   *registered* harness home — Copilot's `session-state/<id>/events.jsonl`, Claude Code's
+   `projects/*/<session-id>.jsonl` — checks the transcript against its pinned envelope, records the
+   recovered path on the session, and uploads the full snapshot in that same run. So the skip means
+   the transcript is genuinely gone, its harness home is not registered, or the session is a Codex
+   one (rollout files are not named after the session, so there is no safe lookup). Every snapshot
+   is self-contained (ADR 0009), so munshi refuses to upload the summary on its own; the summary stays
    durable locally and in Notesmith, and the session uploads in full the moment its transcript is
    readable again. `backfill` also re-uploads sessions whose recorded snapshot is not known to
    carry both `summary.md` and `transcript.jsonl`, so a summary-only snapshot from an older munshi

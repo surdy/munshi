@@ -11,9 +11,9 @@ use std::time::Duration;
 use munshi::{
     ArchiveConfig, ArchiveOutcome, CompletionReason, HookResult, NormalizedEvent,
     NormalizedSession, ProjectIdentity, SUMMARIZER_EXHAUST_DIAGNOSTIC, SessionReference,
-    SourceError, SourceKind, StateStore, archive_session, build_summary_input, inspect_project,
-    load_session, parse_archive_markdown, recorded_project_identity, resolve_session_reference,
-    run_archive_worker_for_source, validate_transcript_envelope,
+    SourceError, SourceHomes, SourceKind, StateStore, archive_session, build_summary_input,
+    inspect_project, load_session, parse_archive_markdown, recorded_project_identity,
+    resolve_session_reference, run_archive_worker_for_source, validate_transcript_envelope,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -465,7 +465,9 @@ fn rebuild_retains_both_sources_and_never_cross_imports() {
 
     let state = shared.dir.path().join("state");
     let mut store = StateStore::open(&state).unwrap();
-    let count = store.rebuild_from_archives(&shared.output).unwrap();
+    let count = store
+        .rebuild_from_archives(&shared.output, &SourceHomes::default())
+        .unwrap();
     assert_eq!(
         count, 2,
         "both same-ID cross-source archives must be retained"
@@ -487,6 +489,84 @@ fn rebuild_retains_both_sources_and_never_cross_imports() {
     );
 }
 
+/// A rebuilt row is born knowing where its transcript lives, wherever that is derivable (issue
+/// #53). An archive Markdown file records everything about a session except its transcript path, so
+/// rebuilt rows used to be unreadable — and, since issue #47, unable to upload a self-contained
+/// snapshot — even with the transcript still on disk. The rebuild now searches the *registered*
+/// harness home the same way the recovery sweep does. Codex has no safe session-ID-only lookup, so
+/// its row keeps the NULL it had rather than guessing, and the rebuild itself never fails either
+/// way.
+#[test]
+fn rebuild_rederives_transcript_paths_from_the_registered_claude_home() {
+    let shared = SharedArchives::new();
+    shared.archive(SourceKind::ClaudeCode);
+    shared.archive(SourceKind::Codex);
+
+    // A Claude home holding this session's transcript exactly where the harness keeps it, plus a
+    // decoy project directory that must not be mistaken for it.
+    let claude_home = shared.dir.path().join("claude-home");
+    let project_directory = claude_home.join("projects/-work-demo");
+    fs::create_dir_all(&project_directory).unwrap();
+    fs::create_dir_all(claude_home.join("projects/-work-other")).unwrap();
+    let transcript = project_directory.join(format!("{SHARED_ID}.jsonl"));
+    fs::copy(
+        fixture(
+            "claude-code-2.1.44",
+            "normal",
+            &format!("{CLAUDE_NORMAL}.jsonl"),
+        ),
+        &transcript,
+    )
+    .unwrap();
+    let homes = SourceHomes {
+        copilot_home: None,
+        claude_home: Some(claude_home),
+    };
+
+    let state = shared.dir.path().join("state");
+    let mut store = StateStore::open(&state).unwrap();
+    assert_eq!(
+        store.rebuild_from_archives(&shared.output, &homes).unwrap(),
+        2
+    );
+    drop(store);
+
+    let claude_store = StateStore::open_for_source(&state, SourceKind::ClaudeCode).unwrap();
+    let claude = claude_store.get_session(SHARED_ID).unwrap().unwrap();
+    assert_eq!(
+        claude.transcript_path,
+        Some(transcript.canonicalize().unwrap()),
+        "the rebuilt Claude row learned its transcript from the registered home"
+    );
+    let codex_store = StateStore::open_for_source(&state, SourceKind::Codex).unwrap();
+    let codex = codex_store.get_session(SHARED_ID).unwrap().unwrap();
+    assert_eq!(
+        codex.transcript_path, None,
+        "Codex has no safe session-ID lookup, so its rebuilt row stays honest about knowing nothing"
+    );
+
+    // Without a registered home there is nowhere derivation is permitted to look, and the rebuild
+    // still succeeds — a derivation that finds nothing leaves the NULL exactly as before.
+    let bare = shared.dir.path().join("bare-state");
+    let mut bare_store = StateStore::open(&bare).unwrap();
+    assert_eq!(
+        bare_store
+            .rebuild_from_archives(&shared.output, &SourceHomes::default())
+            .unwrap(),
+        2
+    );
+    drop(bare_store);
+    let bare_claude = StateStore::open_for_source(&bare, SourceKind::ClaudeCode).unwrap();
+    assert_eq!(
+        bare_claude
+            .get_session(SHARED_ID)
+            .unwrap()
+            .unwrap()
+            .transcript_path,
+        None
+    );
+}
+
 /// Hydrating a single session scopes to the store's source, so it never pulls in a
 /// different source's archive that happens to share the session ID.
 #[test]
@@ -499,7 +579,7 @@ fn hydrate_scopes_to_the_store_source_only() {
     let mut claude_store = StateStore::open_for_source(&state, SourceKind::ClaudeCode).unwrap();
     assert!(
         claude_store
-            .hydrate_session_from_archives(&shared.output, SHARED_ID)
+            .hydrate_session_from_archives(&shared.output, SHARED_ID, &SourceHomes::default())
             .unwrap()
     );
     let claude = claude_store.get_session(SHARED_ID).unwrap().unwrap();

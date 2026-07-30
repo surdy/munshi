@@ -64,10 +64,10 @@ pub use retrieve::{
 pub use source::{
     ArtifactIndexEntry, ClaudeRecordedOrigin, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES,
     ExtractedOutput, NormalizedEvent, NormalizedSession, PreviousSource, SnapshotArtifactIndex,
-    SourceError, SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin,
-    claude_transcript_recorded_origin, copilot_workspace_origin, extract_outputs, load_session,
-    load_session_update, resolve_session_reference, snapshot_artifact_index,
-    validate_transcript_envelope,
+    SourceError, SourceHomes, SourceKind, TranscriptLoadMode, TranscriptUpdate,
+    claude_transcript_origin, claude_transcript_recorded_origin, copilot_workspace_origin,
+    derive_transcript_path, extract_outputs, load_session, load_session_update,
+    resolve_session_reference, snapshot_artifact_index, validate_transcript_envelope,
 };
 pub use state::{
     ArchiveUploadRecord, ArchiveUploadSuccess, BudgetOutcome, CapturePrep, ClaimOutcome,

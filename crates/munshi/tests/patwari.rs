@@ -631,18 +631,22 @@ const SUMMARY_ONLY_SESSION: &str = "47474747-4747-4747-8747-474747474742";
 const LEGACY_LEDGER_SESSION: &str = "47474747-4747-4747-8747-474747474743";
 
 /// ADR 0009 archives *full* snapshots, so a session whose transcript munshi cannot read must not
-/// upload a summary-only one. `rebuild-state` reconstructs a session from its archive Markdown
-/// alone and never learns a transcript path; the upload path used to read the transcript
-/// best-effort and silently uploaded `artifacts: ['summary.md']` for exactly those sessions
-/// (issue #47). Now the incomplete snapshot is skipped, no server work happens, and the session
-/// uploads the complete set as soon as its transcript is readable again.
+/// upload a summary-only one. The upload path used to read the transcript best-effort and silently
+/// uploaded `artifacts: ['summary.md']` for such sessions (issue #47). Now the incomplete snapshot
+/// is skipped, no server work happens, and the session uploads the complete set as soon as its
+/// transcript is readable again.
+///
+/// The transcript here is *genuinely* gone — removed from the source home, not merely forgotten by
+/// the row — which is the case re-derivation (issue #53) cannot rescue: nothing on disk holds the
+/// bytes, so the honest skip stands.
 #[test]
 fn a_session_without_a_readable_transcript_never_uploads_a_summary_only_snapshot() {
     let harness = CliHarness::new();
     harness.register();
     harness.archive_session(NO_TRANSCRIPT_SESSION);
-    // Exactly what a `rebuild-state` row looks like: archived, summarized, no transcript path.
     let transcript = harness.forget_transcript_path(NO_TRANSCRIPT_SESSION);
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
 
     let server = FakePatwari::start();
     harness.configure_and_enable(&server.endpoint());
@@ -663,6 +667,11 @@ fn a_session_without_a_readable_transcript_never_uploads_a_summary_only_snapshot
         0,
         "no summary-only snapshot may reach the archive"
     );
+    assert_eq!(
+        harness.recorded_transcript(NO_TRANSCRIPT_SESSION).0,
+        None,
+        "a transcript that is not on disk is never invented onto the row"
+    );
 
     // The skip costs no bounded attempt and is not terminal: the row is pending, and once the
     // transcript is readable the ordinary retry path uploads the complete set.
@@ -670,6 +679,7 @@ fn a_session_without_a_readable_transcript_never_uploads_a_summary_only_snapshot
     assert_eq!(status["items"][0]["state"], "pending");
     assert_eq!(status["items"][0]["attempts"], 0);
 
+    std::fs::write(&transcript, &bytes).unwrap();
     harness.restore_transcript_path(NO_TRANSCRIPT_SESSION, &transcript);
     let retried = harness.json(&["archive-upload", "retry", NO_TRANSCRIPT_SESSION, "--json"]);
     assert_eq!(retried["items"][0]["outcome"]["result"], "uploaded");
@@ -678,6 +688,81 @@ fn a_session_without_a_readable_transcript_never_uploads_a_summary_only_snapshot
         vec!["summary.md", "transcript.jsonl"],
         "the recovered upload carries the full artifact set"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Transcript-path re-derivation at upload time (issue #53)
+// ---------------------------------------------------------------------------
+
+const REDERIVE_COPILOT_SESSION: &str = "53535353-5353-4353-8353-535353535341";
+const REDERIVE_CLAUDE_SESSION: &str = "53535353-5353-4353-8353-535353535342";
+
+/// The shape issue #53 exists for: a row rebuilt from its archive Markdown holds no transcript
+/// path, but the transcript is still sitting in the registered Copilot home. Skipping it honestly
+/// (issue #47) is not enough — nothing would ever re-teach the row where its transcript lives — so
+/// the upload path re-derives the path through the version-pinned `session-state/<id>/events.jsonl`
+/// fallback, uploads the *full* snapshot in that same run, and writes the recovered path back so no
+/// later read has to derive it again.
+#[test]
+fn a_rebuilt_copilot_row_rederives_its_transcript_and_uploads_a_full_snapshot() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(REDERIVE_COPILOT_SESSION);
+    // Exactly what a `rebuild-state` row looks like: archived, summarized, no transcript path.
+    let transcript = harness.forget_transcript_path(REDERIVE_COPILOT_SESSION);
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let (report, success) = harness.backfill();
+    assert!(success, "report: {report}");
+    assert_eq!(report["candidates"], 1);
+    assert_eq!(report["uploaded"], 1, "report: {report}");
+    assert_eq!(report["skipped"], 0);
+    assert_eq!(
+        manifest_paths(&server.manifest(0)),
+        vec!["summary.md", "transcript.jsonl"],
+        "the re-derived transcript makes the snapshot self-contained"
+    );
+
+    // The recovered path is persisted with its own provenance, and a second run is a no-op: the
+    // row now records a self-contained snapshot.
+    let (path, source) = harness.recorded_transcript(REDERIVE_COPILOT_SESSION);
+    assert_eq!(path.as_deref(), Some(transcript.as_str()));
+    assert_eq!(source.as_deref(), Some("version-pinned-rederived"));
+    let (again, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(again["candidates"], 0);
+    assert_eq!(server.completed_count(), 1);
+}
+
+/// The same repair for Claude Code, whose transcripts are found by scanning the *registered* home's
+/// `projects/*/` for `<session-id>.jsonl` — the recovery sweep's own scan — and validating the
+/// pinned envelope before the path is trusted. Claude Code has no session-ID-only lookup outside a
+/// registered home, so this is the only place derivation is allowed to look.
+#[test]
+fn a_rebuilt_claude_row_rederives_its_transcript_from_the_registered_home() {
+    let harness = CliHarness::new();
+    harness.register_with_claude();
+    let transcript = harness.archive_claude_session(REDERIVE_CLAUDE_SESSION);
+    harness.forget_transcript_path(REDERIVE_CLAUDE_SESSION);
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    let (report, success) = harness.backfill();
+    assert!(success, "report: {report}");
+    assert_eq!(report["candidates"], 1, "report: {report}");
+    assert_eq!(report["uploaded"], 1, "report: {report}");
+    assert_eq!(report["items"][0]["source"], "claude-code");
+    assert_eq!(
+        manifest_paths(&server.manifest(0)),
+        vec!["summary.md", "transcript.jsonl"],
+    );
+
+    let (path, source) = harness.recorded_transcript(REDERIVE_CLAUDE_SESSION);
+    assert_eq!(path.map(PathBuf::from), Some(transcript));
+    assert_eq!(source.as_deref(), Some("version-pinned-rederived"));
 }
 
 /// The backfill mechanism for snapshots already in the archive (issue #47): a session whose latest
@@ -1016,6 +1101,7 @@ struct CliHarness {
     #[allow(dead_code)]
     directory: TempDir,
     copilot_home: PathBuf,
+    claude_home: PathBuf,
     state: PathBuf,
     output: PathBuf,
     project: PathBuf,
@@ -1034,6 +1120,7 @@ impl CliHarness {
         std::fs::create_dir_all(&project).unwrap();
         Self {
             copilot_home: directory.path().join("copilot-home"),
+            claude_home: directory.path().join("claude-home"),
             state: directory.path().join("munshi-home"),
             output: directory.path().join("archives"),
             project,
@@ -1067,6 +1154,26 @@ impl CliHarness {
             .join("../../fixtures/manual/fake-summarizer/status-contract.sh");
         std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
         self.register_with_summarizer(&summarizer.canonicalize().unwrap(), &[]);
+    }
+
+    /// Registers both managed harnesses, so the recorded configuration names a Claude home whose
+    /// `projects/*/` layout transcript re-derivation may search (issue #53).
+    fn register_with_claude(&self) {
+        let summarizer = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/manual/fake-summarizer/status-contract.sh");
+        std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude_home = self.claude_home.to_string_lossy().into_owned();
+        self.register_with_summarizer(
+            &summarizer.canonicalize().unwrap(),
+            &[
+                "--harness",
+                "copilot",
+                "--harness",
+                "claude-code",
+                "--claude-home",
+                &claude_home,
+            ],
+        );
     }
 
     fn register_with_summarizer(&self, summarizer: &Path, extra_args: &[&str]) {
@@ -1205,6 +1312,17 @@ impl CliHarness {
         path
     }
 
+    /// The transcript path and provenance label a session row records.
+    fn recorded_transcript(&self, session_id: &str) -> (Option<String>, Option<String>) {
+        self.database()
+            .query_row(
+                "SELECT transcript_path,transcript_source FROM sessions WHERE source_session_id=?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     fn restore_transcript_path(&self, session_id: &str, path: &str) {
         let changed = self
             .database()
@@ -1283,6 +1401,117 @@ impl CliHarness {
             "--timeout-ms",
             "10000",
         ]));
+    }
+
+    /// Writes a Claude Code transcript into the registered home's `projects/<project>/` layout and
+    /// drives one full hook-driven archive lifecycle for it.
+    fn archive_claude_session(&self, session_id: &str) -> PathBuf {
+        let transcript = self.write_claude_transcript(session_id);
+        self.claude_hook(
+            "agent-stop",
+            &json!({
+                "session_id": session_id,
+                "transcript_path": transcript,
+                "cwd": self.project,
+                "hook_event_name": "Stop",
+            }),
+        );
+        self.claude_hook(
+            "session-end",
+            &json!({
+                "session_id": session_id,
+                "transcript_path": transcript,
+                "cwd": self.project,
+                "hook_event_name": "SessionEnd",
+                "reason": "clear",
+            }),
+        );
+        assert_cli_success(&self.munshi(&[
+            "hook",
+            "wait",
+            "--source",
+            "claude-code",
+            "--session-id",
+            session_id,
+            "--timeout-ms",
+            "10000",
+        ]));
+        transcript
+    }
+
+    /// A minimal pinned-envelope Claude Code transcript, filed exactly where the harness keeps
+    /// them: `<claude home>/projects/<slugified project>/<session-id>.jsonl`.
+    fn write_claude_transcript(&self, session_id: &str) -> PathBuf {
+        let slug = self.project.to_string_lossy().replace(['/', '.', '_'], "-");
+        let path = self
+            .claude_home
+            .join("projects")
+            .join(slug)
+            .join(format!("{session_id}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = [
+            json!({
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": null,
+                "sessionId": session_id,
+                "timestamp": "2026-07-12T00:00:00.000Z",
+                "cwd": self.project,
+                "version": "2.1.44",
+                "gitBranch": "main",
+                "isSidechain": false,
+                "userType": "external",
+                "message": {"role": "user", "content": "please summarize the build"},
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "sessionId": session_id,
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "cwd": self.project,
+                "version": "2.1.44",
+                "gitBranch": "main",
+                "isSidechain": false,
+                "userType": "external",
+                "message": {
+                    "role": "assistant",
+                    "id": "msg_a1",
+                    "model": "claude-synthetic",
+                    "content": [{"type": "text", "text": "done"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, content).unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    fn claude_hook(&self, event: &str, payload: &Value) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .arg("hook")
+            .arg(event)
+            .arg("--source")
+            .arg("claude-code")
+            .env("MUNSHI_HOME", &self.state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        assert_cli_success(&child.wait_with_output().unwrap());
     }
 
     fn hook(&self, event: &str, payload: &Value) {
