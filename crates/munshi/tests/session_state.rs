@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
 use munshi::{
-    ArchiveMetadata, CompletionReason, SessionReference, StateStore, StructuredSummary,
+    ArchiveMetadata, CompletionReason, SessionReference, SourceKind, StateStore, StructuredSummary,
     atomic_replace, content_hash, inspect_project, load_session, parse_archive_markdown,
     recorded_project_identity, render_markdown, render_revision_markdown,
     resolve_session_reference,
@@ -1483,6 +1483,75 @@ fn unhydratable_sessions_stay_queued_until_an_origin_appears() {
         parse_archive_markdown(&fs::read_to_string(harness.archive_path(SESSION_A)).unwrap())
             .unwrap();
     assert_eq!(archived.completion_reason, "unknown");
+}
+
+/// Issue #42: the sweep derives its park verdict outside any transaction, so a session a
+/// concurrent hook claimed or archived in the meantime must not be labelled
+/// `origin-unresolved` on the way past. Parking re-checks the recovery-held shape inside its
+/// own transaction, exactly as hydration does, and leaves a row that has moved on alone.
+#[test]
+fn parking_skips_a_session_that_was_archived_concurrently() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("park-race-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "PARKED_REQUEST", "parked answer");
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    // SESSION_A raced to `archived`; SESSION_B is still recovery-held. Both are otherwise
+    // identical, so only the shape re-check can tell them apart.
+    for (session, lifecycle) in [(SESSION_A, "archived"), (SESSION_B, "interrupted")] {
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                    source_kind,source_session_id,transcript_path,transcript_source,
+                    completion_reason,source_end_reason,lifecycle_state,active,
+                    state_generation,created_at_ms,updated_at_ms
+                 ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                           ?3,0,1,1,1)",
+                params![session, transcript.to_str().unwrap(), lifecycle],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let mut store = StateStore::open_for_source(&harness.state, SourceKind::Copilot).unwrap();
+    store
+        .park_recovery_session(SESSION_A, "origin-unresolved")
+        .unwrap();
+    store
+        .park_recovery_session(SESSION_B, "origin-unresolved")
+        .unwrap();
+    drop(store);
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let label = |session: &str| -> Option<String> {
+        connection
+            .query_row(
+                "SELECT last_error_category FROM sessions WHERE source_session_id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        label(SESSION_A),
+        None,
+        "an archived session keeps no misleading origin-unresolved label"
+    );
+    assert_eq!(
+        label(SESSION_B).as_deref(),
+        Some("origin-unresolved"),
+        "a still recovery-held session parks as before"
+    );
+    // The skipped park records no diagnostic either: exactly one, for the row that parked.
+    let diagnostics: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostics
+             WHERE operation='recovery' AND category='origin-unresolved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(diagnostics, 1);
 }
 
 /// Issue #40: a session whose origin directory was deleted after the fact used to park as

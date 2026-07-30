@@ -3559,6 +3559,16 @@ impl StateStore {
     /// queued, nothing on disk is touched). The visible category is written to the row and,
     /// only on the transition, one diagnostics entry is recorded — repeat sweeps over the
     /// same parked session stay quiet.
+    ///
+    /// The row must still be recovery-held inside the transaction, the same in-transaction
+    /// re-check [`hydrate_recovery_origin`] makes: the sweep derives its verdict outside any
+    /// transaction, so a session a concurrent hook has since claimed (`active=1`) or archived
+    /// would otherwise be labelled `origin-unresolved` on the way past. The guard spans both
+    /// recovery-held shapes the sweep parks from — the unhydrated `interrupted` rows and the
+    /// stuck `observed` ones — and a row that has moved on is left alone. Cosmetic only:
+    /// scheduling never consulted the label.
+    ///
+    /// [`hydrate_recovery_origin`]: StateStore::hydrate_recovery_origin
     pub fn park_recovery_session(
         &mut self,
         session_id: &str,
@@ -3573,6 +3583,7 @@ impl StateStore {
             .query_row(
                 "SELECT id FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1
+                   AND active=0 AND lifecycle_state IN ('interrupted','observed')
                    AND (last_error_category IS NULL OR last_error_category<>?3)",
                 params![session_id, self.source_kind, category],
                 |row| row.get::<_, i64>(0),

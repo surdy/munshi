@@ -314,7 +314,7 @@ pub enum SourceError {
     ChangedDuringRead,
     #[error("transcript ends with an incomplete JSON record")]
     IncompleteTrailingRecord,
-    #[error("transcript does not match the version-pinned Copilot event envelope")]
+    #[error("transcript does not match the version-pinned event envelope for its source")]
     UnsupportedEnvelope,
 }
 

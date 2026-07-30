@@ -46,7 +46,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
 
 use munshi_transcript::{
     Classification, Event, Record, RecordError, SUPPORTED_ARTIFACT_SET_VERSION, Source,
@@ -54,28 +53,20 @@ use munshi_transcript::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::http::{self, Header, HttpError};
+use crate::http::{self, HttpError};
 use crate::patwari::{self, PatwariError};
+use crate::patwari_read::{
+    API_BASE, DownloadError, LISTING_PAGE_SIZE, ListedArtifact, MAX_ARTIFACT_DOWNLOAD_BYTES,
+    ReadClient, ReadError, SizeDimension, SizeRefusal, nested_str, nested_u64, required_str,
+    required_u64, strip_digest,
+};
 
-/// The API base path every Patwari route is nested under.
-const API_BASE: &str = "/api/v1";
-/// Network timeout for a single request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Page size requested from the snapshot and artifact listings (Patwari's maximum).
-const LISTING_PAGE_SIZE: usize = 100;
-/// Guards a pagination loop against a misbehaving peer that never stops returning cursors.
+/// Guards a pagination loop against a misbehaving peer that never stops returning cursors. For an
+/// acceptance tool a silently truncated walk would hide snapshots, so hitting the bound is an
+/// error rather than a partial success.
 const MAX_LISTING_PAGES: usize = 10_000;
-/// Default upper bound on one downloaded stored artifact, matching claim-ticket retrieval: below
-/// the server's 1 GiB storage ceiling so an oversized transcript is skipped up front (with an
-/// accounting line) rather than truncated into a misleading verification failure. `--max-download-bytes`
-/// raises it deliberately.
-const MAX_ARTIFACT_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
-/// Read-bound headroom over the declared stored size, covering the status line and response
-/// headers so an artifact whose stored size sits exactly at the cap still transfers completely.
-const RESPONSE_HEADER_ALLOWANCE_BYTES: usize = 64 * 1024;
 /// The artifact-set-v1 logical path of the transcript artifact.
 const TRANSCRIPT_LOGICAL_PATH: &str = "transcript.jsonl";
 /// At most this many raw `Unknown` records are carried per snapshot as inspection samples.
@@ -134,7 +125,9 @@ pub enum SkipReason {
     UnsupportedArtifactSetVersion,
     /// The snapshot has no `transcript.jsonl` artifact.
     NoTranscriptArtifact,
-    /// The transcript's stored size exceeds the download cap; rerun with `--max-download-bytes`.
+    /// The transcript's declared stored *or* original size exceeds the download cap; rerun with
+    /// `--max-download-bytes`. Both dimensions are gated before transfer, so a highly compressible
+    /// transcript is set aside rather than decompressed into memory.
     TranscriptTooLarge,
 }
 
@@ -168,9 +161,11 @@ pub enum SnapshotStatus {
 pub struct UnknownSample {
     /// 1-based physical line number in the transcript.
     pub line: u64,
-    /// The extracted record-kind discriminator (best effort; see [`unknown_kind`]).
+    /// The extracted record-kind discriminator: the record's top-level `type`, refined with the
+    /// Codex `payload.type` when present. Best effort — an undiscriminated record groups under a
+    /// placeholder kind such as `<untyped>`.
     pub kind: String,
-    /// The raw record, truncated to [`MAX_UNKNOWN_SAMPLE_CHARS`] characters.
+    /// The raw record, truncated to a bounded number of characters.
     pub raw: String,
 }
 
@@ -198,11 +193,12 @@ pub struct ParseAccounting {
     /// Records the parser does not recognize at all — the gaps issue #29 hunts.
     pub unknown_records: u64,
     pub unknown_kinds: BTreeMap<String, u64>,
-    /// The first [`MAX_UNKNOWN_SAMPLES`] unknown records, truncated.
+    /// The first few unknown records, truncated — enough to inspect a gap, not enough to leak a
+    /// transcript.
     pub unknown_samples: Vec<UnknownSample>,
     /// Malformed lines (including a truncated trailing record).
     pub record_errors: u64,
-    /// The first [`MAX_RECORD_ERROR_SAMPLES`] record errors with line numbers.
+    /// The first few record errors with line numbers.
     pub record_error_samples: Vec<RecordErrorSample>,
 }
 
@@ -597,21 +593,12 @@ fn verify_snapshot(client: &VerifyClient, snapshot: &ListedSnapshot, cap: usize)
         };
         return report;
     };
-    if transcript.stored_size_bytes > cap as u64 {
-        report.status = SnapshotStatus::Skipped {
-            reason: SkipReason::TranscriptTooLarge,
-            message: format!(
-                "transcript stored size {} bytes exceeds the {cap}-byte download cap; pass --max-download-bytes to raise it",
-                transcript.stored_size_bytes
-            ),
-        };
-        return report;
-    }
-
-    let original_bytes = match client.download_verified(&transcript) {
+    // The download's size gate refuses an oversized or amplifying transcript before any transfer;
+    // for a walk that is an accounting line, not a failure.
+    let original_bytes = match client.download_verified(&transcript, cap) {
         Ok(bytes) => bytes,
-        Err(issue) => {
-            report.status = issue.into_status();
+        Err(status) => {
+            report.status = status;
             return report;
         }
     };
@@ -719,10 +706,12 @@ struct SnapshotProvenance {
     artifact_set_version: u64,
 }
 
-/// One artifact from a snapshot's artifact listing.
+/// One artifact from a snapshot's artifact listing. Both declared sizes are carried because both
+/// feed the pre-transfer size gate.
 struct SnapshotArtifact {
     logical_path: String,
     original_sha256: String,
+    original_size_bytes: u64,
     stored_size_bytes: u64,
     content_url: String,
 }
@@ -756,21 +745,18 @@ impl SnapshotIssue {
     }
 }
 
-/// A synchronous archive-walking client bound to one server, speaking the shared blocking
-/// [`crate::http`] client exactly as archive upload and claim-ticket retrieval do.
+/// A synchronous archive-walking client bound to one server: the shared Patwari read stack
+/// ([`crate::patwari_read`]) plus the walk's own error surface. Every wire rule — pagination, the
+/// size gate, the three-stage verification — lives in the shared module; what stays here is the
+/// mapping onto walk-aborting [`VerifyArchiveError`]s and per-snapshot [`SnapshotStatus`] entries.
 struct VerifyClient {
-    host: String,
-    port: u16,
-    timeout: Duration,
+    client: ReadClient,
 }
 
 impl VerifyClient {
     fn connect(endpoint: &str) -> Result<Self, VerifyArchiveError> {
-        let (host, port) = http::parse_http_endpoint(endpoint).map_err(from_http)?;
         Ok(Self {
-            host,
-            port,
-            timeout: REQUEST_TIMEOUT,
+            client: ReadClient::connect(endpoint).map_err(from_http)?,
         })
     }
 
@@ -780,62 +766,46 @@ impl VerifyClient {
         &self,
         session_id: Option<&str>,
     ) -> Result<Vec<ListedSnapshot>, VerifyArchiveError> {
-        let mut snapshots = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_LISTING_PAGES {
-            let mut path = format!("{API_BASE}/snapshots?limit={LISTING_PAGE_SIZE}");
-            if let Some(session_id) = session_id {
-                path.push_str("&session_id=");
-                path.push_str(&http::encode_path(session_id));
-            }
-            if let Some(cursor) = &cursor {
-                path.push_str("&cursor=");
-                path.push_str(&http::encode_path(cursor));
-            }
-            let response = self.get(&path, None).map_err(from_http)?;
-            match response.status {
-                200 => {}
-                422 => {
-                    return Err(VerifyArchiveError::InvalidInput(format!(
-                        "the archive server rejected the request: {}",
-                        error_code(&response.body).unwrap_or_else(|| "invalid_request".to_owned())
-                    )));
-                }
-                status => {
-                    return Err(VerifyArchiveError::Server {
-                        status,
-                        code: error_code(&response.body).unwrap_or_else(|| "unknown".to_owned()),
-                    });
-                }
-            }
-            let value = parse_json(&response.body).map_err(VerifyArchiveError::Protocol)?;
-            let items = value
-                .get("items")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    VerifyArchiveError::Protocol("snapshot listing missing items".to_owned())
-                })?;
-            for item in items {
-                snapshots.push(ListedSnapshot {
-                    snapshot_id: required_str(item, "snapshot_id")
-                        .map_err(VerifyArchiveError::Protocol)?,
-                    session_id: required_str(item, "session_id")
-                        .map_err(VerifyArchiveError::Protocol)?,
-                });
-            }
-            cursor = value
-                .get("next_cursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                return Ok(snapshots);
-            }
+        let listing = self
+            .client
+            .paginate(
+                "snapshot listing",
+                MAX_LISTING_PAGES,
+                |cursor| {
+                    let mut path = format!("{API_BASE}/snapshots?limit={LISTING_PAGE_SIZE}");
+                    if let Some(session_id) = session_id {
+                        path.push_str("&session_id=");
+                        path.push_str(&http::encode_path(session_id));
+                    }
+                    if let Some(cursor) = cursor {
+                        path.push_str("&cursor=");
+                        path.push_str(&http::encode_path(cursor));
+                    }
+                    path
+                },
+                |item| {
+                    Ok(ListedSnapshot {
+                        snapshot_id: required_str(item, "snapshot_id")?,
+                        session_id: required_str(item, "session_id")?,
+                    })
+                },
+            )
+            .map_err(|error| match error {
+                // 422 is the server rejecting the walk's own parameters (a malformed --session).
+                ReadError::Status {
+                    status: 422, code, ..
+                } => VerifyArchiveError::InvalidInput(format!(
+                    "the archive server rejected the request: {}",
+                    code.unwrap_or_else(|| "invalid_request".to_owned())
+                )),
+                other => from_read(other),
+            })?;
+        if !listing.terminated {
+            return Err(VerifyArchiveError::Protocol(format!(
+                "snapshot listing did not terminate within {MAX_LISTING_PAGES} pages"
+            )));
         }
-        // For an acceptance tool a silently truncated walk would hide snapshots, so a listing
-        // that never stops returning cursors is an error rather than a partial success.
-        Err(VerifyArchiveError::Protocol(format!(
-            "snapshot listing did not terminate within {MAX_LISTING_PAGES} pages"
-        )))
+        Ok(listing.items)
     }
 
     /// Reads `source_agent` and `artifact_set_version` from the snapshot's canonical manifest.
@@ -844,33 +814,25 @@ impl VerifyClient {
             "{API_BASE}/snapshots/{}/manifest",
             http::encode_path(snapshot_id)
         );
-        let response = self
-            .get(&path, None)
-            .map_err(|error| SnapshotIssue::transport(error.to_string()))?;
-        if response.status != 200 {
-            return Err(SnapshotIssue::transport(format!(
-                "manifest fetch returned status {}: {}",
-                response.status,
-                error_code(&response.body).unwrap_or_else(|| "unknown".to_owned())
-            )));
+        let value = self.client.get_json(&path).map_err(|error| match error {
+            ReadError::Http(error) => SnapshotIssue::transport(error.to_string()),
+            ReadError::Status { status, code } => SnapshotIssue::transport(format!(
+                "manifest fetch returned status {status}: {}",
+                code.unwrap_or_else(|| "unknown".to_owned())
+            )),
+            ReadError::Protocol(message) => SnapshotIssue::transport(message),
+        })?;
+        if value.get("manifest").is_none() {
+            return Err(SnapshotIssue::transport(
+                "manifest response missing manifest",
+            ));
         }
-        let value = parse_json(&response.body).map_err(SnapshotIssue::transport)?;
-        let manifest = value
-            .get("manifest")
-            .ok_or_else(|| SnapshotIssue::transport("manifest response missing manifest"))?;
-        let source_agent = manifest
-            .get("session")
-            .and_then(|session| session.get("source_agent"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| SnapshotIssue::transport("manifest missing session.source_agent"))?
-            .to_owned();
-        let artifact_set_version = manifest
-            .get("capture")
-            .and_then(|capture| capture.get("artifact_set_version"))
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                SnapshotIssue::transport("manifest missing capture.artifact_set_version")
-            })?;
+        let source_agent = nested_str(&value, &["manifest", "session", "source_agent"])
+            .ok_or_else(|| SnapshotIssue::transport("manifest missing session.source_agent"))?;
+        let artifact_set_version =
+            nested_u64(&value, &["manifest", "capture", "artifact_set_version"]).ok_or_else(
+                || SnapshotIssue::transport("manifest missing capture.artifact_set_version"),
+            )?;
         Ok(SnapshotProvenance {
             source_agent,
             artifact_set_version,
@@ -882,158 +844,106 @@ impl VerifyClient {
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<SnapshotArtifact>, SnapshotIssue> {
-        let mut artifacts = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_LISTING_PAGES {
-            let mut path = format!(
-                "{API_BASE}/artifacts?snapshot_id={}&limit={LISTING_PAGE_SIZE}",
-                http::encode_path(snapshot_id)
-            );
-            if let Some(cursor) = &cursor {
-                path.push_str("&cursor=");
-                path.push_str(&http::encode_path(cursor));
-            }
-            let response = self
-                .get(&path, None)
-                .map_err(|error| SnapshotIssue::transport(error.to_string()))?;
-            if response.status != 200 {
-                return Err(SnapshotIssue::transport(format!(
-                    "artifact listing returned status {}: {}",
-                    response.status,
-                    error_code(&response.body).unwrap_or_else(|| "unknown".to_owned())
-                )));
-            }
-            let value = parse_json(&response.body).map_err(SnapshotIssue::transport)?;
-            let items = value
-                .get("items")
-                .and_then(Value::as_array)
-                .ok_or_else(|| SnapshotIssue::transport("artifact listing missing items"))?;
-            for item in items {
-                artifacts.push(SnapshotArtifact {
-                    logical_path: required_str(item, "logical_path")
-                        .map_err(SnapshotIssue::transport)?,
-                    original_sha256: strip_digest(
-                        &required_str(item, "original_sha256").map_err(SnapshotIssue::transport)?,
-                    ),
-                    stored_size_bytes: required_u64(item, "stored_size_bytes")
-                        .map_err(SnapshotIssue::transport)?,
-                    content_url: required_str(item, "content_url")
-                        .map_err(SnapshotIssue::transport)?,
-                });
-            }
-            cursor = value
-                .get("next_cursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                return Ok(artifacts);
-            }
-        }
-        Err(SnapshotIssue::transport(format!(
-            "artifact listing did not terminate within {MAX_LISTING_PAGES} pages"
-        )))
-    }
-
-    /// Downloads the transcript's stored bytes and performs the full three-stage verification:
-    /// stored size + sha256 against the response headers, decompression per the declared
-    /// compression, then original size + sha256 against both the headers and the listing's
-    /// declared original hash. No unverified byte is ever parsed.
-    fn download_verified(&self, artifact: &SnapshotArtifact) -> Result<Vec<u8>, SnapshotIssue> {
-        // The caller pre-checked the stored size against the cap, so bound the read at the
-        // declared size plus header allowance: a longer-than-declared body then fails stored-size
-        // verification instead of exhausting memory.
-        let limit = usize::try_from(artifact.stored_size_bytes)
-            .unwrap_or(usize::MAX)
-            .saturating_add(RESPONSE_HEADER_ALLOWANCE_BYTES);
-        let response = self
-            .get(&artifact.content_url, Some(limit))
-            .map_err(|error| SnapshotIssue::transport(error.to_string()))?;
-        if response.status != 200 {
+        let listing = self
+            .client
+            .paginate(
+                "artifact listing",
+                MAX_LISTING_PAGES,
+                |cursor| {
+                    let mut path = format!(
+                        "{API_BASE}/artifacts?snapshot_id={}&limit={LISTING_PAGE_SIZE}",
+                        http::encode_path(snapshot_id)
+                    );
+                    if let Some(cursor) = cursor {
+                        path.push_str("&cursor=");
+                        path.push_str(&http::encode_path(cursor));
+                    }
+                    path
+                },
+                |item| {
+                    Ok(SnapshotArtifact {
+                        logical_path: required_str(item, "logical_path")?,
+                        original_sha256: strip_digest(&required_str(item, "original_sha256")?),
+                        original_size_bytes: required_u64(item, "original_size_bytes")?,
+                        stored_size_bytes: required_u64(item, "stored_size_bytes")?,
+                        content_url: required_str(item, "content_url")?,
+                    })
+                },
+            )
+            .map_err(|error| match error {
+                ReadError::Http(error) => SnapshotIssue::transport(error.to_string()),
+                ReadError::Status { status, code } => SnapshotIssue::transport(format!(
+                    "artifact listing returned status {status}: {}",
+                    code.unwrap_or_else(|| "unknown".to_owned())
+                )),
+                ReadError::Protocol(message) => SnapshotIssue::transport(message),
+            })?;
+        if !listing.terminated {
             return Err(SnapshotIssue::transport(format!(
-                "content download returned status {}: {}",
-                response.status,
-                error_code(&response.body).unwrap_or_else(|| "unknown".to_owned())
+                "artifact listing did not terminate within {MAX_LISTING_PAGES} pages"
             )));
         }
-        let compression = response
-            .header("x-patwari-compression")
-            .ok_or_else(|| SnapshotIssue::transport("content missing compression header"))?
-            .to_owned();
-        let stored_sha_header = header_digest(&response, "x-patwari-stored-sha256")?;
-        let original_sha_header = header_digest(&response, "x-patwari-original-sha256")?;
-        let stored_size_header = header_u64(&response, "x-patwari-stored-size-bytes")?;
-        let original_size_header = header_u64(&response, "x-patwari-original-size-bytes")?;
-
-        // 1. The transferred stored bytes must match the declared stored digest and size.
-        let stored_bytes = response.body;
-        if stored_bytes.len() as u64 != stored_size_header {
-            return Err(SnapshotIssue::verification(format!(
-                "stored size mismatch: got {} bytes, expected {stored_size_header}",
-                stored_bytes.len()
-            )));
-        }
-        if sha256_hex(&stored_bytes) != stored_sha_header {
-            return Err(SnapshotIssue::verification(
-                "stored content hash does not match the archive's declared stored hash",
-            ));
-        }
-
-        // 2. Decompress per the declared compression to recover the original bytes.
-        let original_bytes = match compression.as_str() {
-            "identity" => stored_bytes,
-            "zstd" => zstd::decode_all(stored_bytes.as_slice()).map_err(|error| {
-                SnapshotIssue::verification(format!("could not decompress stored content: {error}"))
-            })?,
-            other => {
-                return Err(SnapshotIssue::transport(format!(
-                    "unknown compression `{other}`"
-                )));
-            }
-        };
-
-        // 3. The recovered original must match the headers and the listing's declared hash.
-        if original_bytes.len() as u64 != original_size_header {
-            return Err(SnapshotIssue::verification(format!(
-                "original size mismatch: got {} bytes, expected {original_size_header}",
-                original_bytes.len()
-            )));
-        }
-        let original_digest = sha256_hex(&original_bytes);
-        if original_digest != original_sha_header {
-            return Err(SnapshotIssue::verification(
-                "decompressed content hash does not match the archive's declared original hash",
-            ));
-        }
-        if original_digest != artifact.original_sha256 {
-            return Err(SnapshotIssue::verification(format!(
-                "decompressed content hash sha256:{original_digest} does not match the listing's declared sha256:{}",
-                artifact.original_sha256
-            )));
-        }
-        Ok(original_bytes)
+        Ok(listing.items)
     }
 
-    fn get(
+    /// Downloads the transcript through the shared three-stage verification (stored size + sha256,
+    /// declared-compression decode, original size + sha256 cross-checked against the listing's
+    /// declared hash), gated on both declared sizes against `cap` before any transfer. No
+    /// unverified byte is ever parsed.
+    ///
+    /// The walk grades the outcomes itself: a refusal by the size gate is a skip — an accounting
+    /// line — while an integrity or transport problem is a per-snapshot failure that never stops
+    /// the walk.
+    fn download_verified(
         &self,
-        path: &str,
-        max_response_bytes: Option<usize>,
-    ) -> Result<http::HttpResponse, HttpError> {
-        let headers = [Header {
-            name: "Accept",
-            value: "*/*",
-        }];
-        let request = http::HttpRequest {
-            method: "GET",
-            path,
-            headers: &headers,
-            body: None,
+        artifact: &SnapshotArtifact,
+        cap: usize,
+    ) -> Result<Vec<u8>, SnapshotStatus> {
+        let listed = ListedArtifact {
+            content_url: &artifact.content_url,
+            stored_size_bytes: artifact.stored_size_bytes,
+            original_size_bytes: artifact.original_size_bytes,
+            expected_original_sha256: &artifact.original_sha256,
+            expected_label: "listing's declared",
         };
-        match max_response_bytes {
-            Some(limit) => {
-                http::send_with_limit(&self.host, self.port, self.timeout, &request, limit)
-            }
-            None => http::send(&self.host, self.port, self.timeout, &request),
-        }
+        self.client
+            .download_verified(&listed, cap)
+            .map_err(|error| match error {
+                DownloadError::TooLarge(SizeRefusal {
+                    dimension,
+                    size_bytes,
+                    cap,
+                }) => {
+                    let dimension = match dimension {
+                        SizeDimension::Stored => "stored",
+                        SizeDimension::Original => "original",
+                    };
+                    SnapshotStatus::Skipped {
+                        reason: SkipReason::TranscriptTooLarge,
+                        message: format!(
+                            "transcript {dimension} size {size_bytes} bytes exceeds the {cap}-byte download cap; pass --max-download-bytes to raise it"
+                        ),
+                    }
+                }
+                DownloadError::Http(error) => {
+                    SnapshotIssue::transport(error.to_string()).into_status()
+                }
+                DownloadError::Status { status, code } => SnapshotIssue::transport(format!(
+                    "content download returned status {status}: {}",
+                    code.unwrap_or_else(|| "unknown".to_owned())
+                ))
+                .into_status(),
+                DownloadError::Protocol(message) => {
+                    SnapshotIssue::transport(message).into_status()
+                }
+                DownloadError::Verification(message) => {
+                    SnapshotIssue::verification(message).into_status()
+                }
+                DownloadError::Decompression(message) => SnapshotIssue::verification(format!(
+                    "could not decompress stored content: {message}"
+                ))
+                .into_status(),
+            })
     }
 }
 
@@ -1078,58 +988,17 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     taken
 }
 
-fn parse_json(body: &[u8]) -> Result<Value, String> {
-    serde_json::from_slice(body).map_err(|error| error.to_string())
-}
-
-fn required_str(value: &Value, key: &str) -> Result<String, String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("listing item missing {key}"))
-}
-
-fn required_u64(value: &Value, key: &str) -> Result<u64, String> {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("listing item missing {key}"))
-}
-
-fn header_digest(response: &http::HttpResponse, name: &str) -> Result<String, SnapshotIssue> {
-    response
-        .header(name)
-        .map(strip_digest)
-        .ok_or_else(|| SnapshotIssue::transport(format!("content missing {name} header")))
-}
-
-fn header_u64(response: &http::HttpResponse, name: &str) -> Result<u64, SnapshotIssue> {
-    response
-        .header(name)
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| {
-            SnapshotIssue::transport(format!("content missing or invalid {name} header"))
-        })
-}
-
-/// Strips Patwari's `sha256:` document prefix, leaving the bare lowercase hex digest.
-fn strip_digest(value: &str) -> String {
-    value.strip_prefix("sha256:").unwrap_or(value).to_owned()
-}
-
-/// Reads Patwari's stable `error.code` from an error response body, if present.
-fn error_code(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("error")?
-        .get("code")?
-        .as_str()
-        .map(ToOwned::to_owned)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+/// Maps a shared-stack listing failure onto a walk-aborting error. The 422 case is handled by the
+/// snapshot listing, which words it as rejected input rather than a server fault.
+fn from_read(error: ReadError) -> VerifyArchiveError {
+    match error {
+        ReadError::Http(error) => from_http(error),
+        ReadError::Status { status, code } => VerifyArchiveError::Server {
+            status,
+            code: code.unwrap_or_else(|| "unknown".to_owned()),
+        },
+        ReadError::Protocol(message) => VerifyArchiveError::Protocol(message),
+    }
 }
 
 fn from_http(error: HttpError) -> VerifyArchiveError {
