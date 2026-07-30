@@ -405,6 +405,37 @@ fn committed_live_fixtures_contain_only_allowlisted_sanitized_values() {
     }
 }
 
+/// The 1.0.76 `agentStop` capture (issue #49): same payload as 1.0.70 plus the
+/// `stop_hook_active` field whose arrival the closed-schema parse used to reject.
+#[test]
+fn committed_copilot_1_0_76_hook_fixtures_contain_only_allowlisted_sanitized_values() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/copilot-1.0.76");
+    let mut files = Vec::new();
+    collect_files(&root, &mut files);
+    files.sort();
+
+    let expected = ["interactive/agent-stop.json"];
+    let relative: Vec<_> = files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(relative, expected);
+
+    for path in files {
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("/Users/"));
+        assert!(!contents.contains("/home/"));
+        assert!(!contents.contains("surdy"));
+        let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_sanitized_strings(&value);
+    }
+}
+
 #[test]
 fn committed_claude_hook_fixtures_contain_only_allowlisted_sanitized_values() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-code-2.1.205");

@@ -1593,6 +1593,267 @@ fn parked_origin_unresolved_hydrates_from_recorded_evidence_of_a_deleted_directo
     assert_eq!(parsed.completion_reason, "unknown");
 }
 
+/// Issue #49: an `observed` row with `active=0` and no session-end verdict is invisible to
+/// every hand-off path (`stale_known_sessions` needs `active=1`, reservation excludes
+/// `observed`, the #39 hydration is scoped to `interrupted`). A plain recovery sweep must
+/// requeue it through the interrupted pipeline — deriving the missing agent-stop evidence
+/// from the transcript mtime — and archive it.
+#[test]
+fn stuck_observed_inactive_row_with_evidence_hydrates_and_archives() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("observed-rescue-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "STUCK_REQUEST", "stuck answer");
+    harness.write_workspace(SESSION_A);
+    // The exact husk shape from the live census: swept into recovery, judged once by a
+    // worker, and returned to `observed` with no session-end verdict and no stop evidence.
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,?3,'version-pinned-recovery','unknown','unknown',
+                       'observed',0,2,1,1)",
+            params![
+                SESSION_A,
+                harness.project.to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    set_old_mtime(&transcript);
+    assert_success(&harness.recover(600_000, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let rescued: (String, Option<String>, Option<i64>, Option<String>) = connection
+        .query_row(
+            "SELECT lifecycle_state,origin_cwd,last_agent_stop_ms,last_error_category
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(rescued.0, "archived");
+    assert_eq!(rescued.1.as_deref(), harness.project.to_str());
+    // Activity evidence comes from the transcript mtime set above (tv_sec=1).
+    assert_eq!(rescued.2, Some(1_000));
+    assert_eq!(rescued.3, None);
+    let archived =
+        parse_archive_markdown(&fs::read_to_string(harness.archive_path(SESSION_A)).unwrap())
+            .unwrap();
+    assert_eq!(archived.completion_reason, "unknown");
+}
+
+/// Issue #49 safety case: an `observed` row whose transcript is still inside the mtime
+/// quiet period is a live session and must be left completely untouched by the sweep.
+#[test]
+fn live_observed_inactive_row_is_left_untouched_inside_the_quiet_period() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("observed-live-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "LIVE_REQUEST", "live answer");
+    harness.write_workspace(SESSION_A);
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,?3,'version-pinned-recovery','unknown','unknown',
+                       'observed',0,2,1,1)",
+            params![
+                SESSION_A,
+                harness.project.to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Fresh transcript mtime: the sweep must not requeue, reserve, or annotate the row.
+    assert_success(&harness.recover(600_000, false, false));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let untouched: (String, bool, Option<i64>, Option<String>, i64) = connection
+        .query_row(
+            "SELECT lifecycle_state,active,last_agent_stop_ms,last_error_category,
+                    state_generation
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(untouched.0, "observed");
+    assert!(!untouched.1);
+    assert_eq!(untouched.2, None);
+    assert_eq!(untouched.3, None);
+    assert_eq!(untouched.4, 2);
+    let attempts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM processing_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(attempts, 0);
+}
+
+/// Issue #49 with issue #40 composed: a stuck observed row whose recorded origin directory
+/// was deleted (subagent worktrees) keeps that origin through the rescue and archives via
+/// the worker's recorded-evidence project identity.
+#[test]
+fn stuck_observed_row_with_deleted_origin_archives_via_recorded_evidence() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("observed-recorded-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "STUCK_REQUEST", "stuck answer");
+    let gone = harness.root().join("gone-worktree");
+    fs::create_dir_all(&gone).unwrap();
+    let gone = gone.canonicalize().unwrap();
+    harness.write_workspace_with_cwd(SESSION_A, &gone);
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,?3,'version-pinned-recovery','unknown','unknown',
+                       'observed',0,2,1,1)",
+            params![
+                SESSION_A,
+                gone.to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    fs::remove_dir_all(&gone).unwrap();
+
+    set_old_mtime(&transcript);
+    assert_success(&harness.recover(600_000, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+    let expected = recorded_project_identity(&gone, None);
+    let markdown = fs::read_to_string(
+        harness
+            .output
+            .join(&expected.component)
+            .join(format!("{SESSION_A}.md")),
+    )
+    .unwrap();
+    assert!(markdown.contains("project_origin: \"recorded\""));
+    let parsed = parse_archive_markdown(&markdown).unwrap();
+    assert_eq!(parsed.project.identity, expected.identity);
+    assert_eq!(parsed.completion_reason, "unknown");
+}
+
+/// Issue #49 composed with issue #38's no-churn discipline: a rescued husk the worker again
+/// judges not archive-worthy settles — the rescue observation is deduplicated on the
+/// transcript evidence, so later sweeps do not reprocess an unchanged session forever.
+#[test]
+fn rescued_observed_husk_settles_without_rechurn_when_still_not_archive_worthy() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("observed-settle-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    // A transcript with a user request but no assistant activity: never archive-worthy.
+    let transcript = harness
+        .copilot_home
+        .join("session-state")
+        .join(SESSION_A)
+        .join("events.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        [
+            json!({
+                "id": "initial-start",
+                "timestamp": "2026-07-12T00:00:00.000Z",
+                "parentId": null,
+                "type": "session.start",
+                "data": {"sessionId": SESSION_A},
+            }),
+            json!({
+                "id": "initial-user",
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "parentId": "initial-start",
+                "type": "user.message",
+                "data": {"content": "UNANSWERED_REQUEST"},
+            }),
+        ]
+        .map(|value| value.to_string())
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let transcript = transcript.canonicalize().unwrap();
+    harness.write_workspace(SESSION_A);
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,?3,'version-pinned-recovery','unknown','unknown',
+                       'observed',0,2,1,1)",
+            params![
+                SESSION_A,
+                harness.project.to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    set_old_mtime(&transcript);
+    assert_success(&harness.recover(600_000, false, false));
+    // Rescued once, judged not archive-worthy, back to the observed verdict shape. A husk
+    // has no session-end verdict for `hook wait` to report, so poll the row directly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+        let (lifecycle, attempts): (String, i64) = connection
+            .query_row(
+                "SELECT lifecycle_state,
+                        (SELECT COUNT(*) FROM processing_attempts WHERE finished_at_ms IS NOT NULL)
+                 FROM sessions WHERE source_session_id=?1",
+                [SESSION_A],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if lifecycle == "observed" && attempts == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never returned the rescued husk to observed: {lifecycle} ({attempts})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // An unchanged transcript is not rescued again: exactly one attempt, ever.
+    assert_success(&harness.recover(600_000, false, false));
+    assert_success(&harness.recover(600_000, false, false));
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let attempts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM processing_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(attempts, 1);
+    assert!(transcript.is_file(), "never-drop: the transcript survives");
+}
+
 #[test]
 fn stale_issue_three_files_migrate_to_retryable_sqlite_work() {
     let harness = Harness::new();

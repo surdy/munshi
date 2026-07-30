@@ -3365,6 +3365,125 @@ impl StateStore {
         Ok(reserved)
     }
 
+    /// Known sessions stranded in the second recovery-invisible shape (issue #49, sibling of
+    /// [`unhydrated_recovery_sessions`]): `lifecycle_state='observed'` with `active=0` and no
+    /// session-end verdict. The shape arises when a session's stop/end hooks never ingested
+    /// (e.g. a rejected payload) and a swept `interrupted` row was then judged by a worker
+    /// that returned it to `observed` — `stale_known_sessions` needs `active=1`,
+    /// `reserve_eligible_workers` excludes `observed`, and the #39 hydration is scoped to
+    /// `interrupted`, so nothing can ever claim the row again. Rows with
+    /// `last_session_end_ms` set are excluded: for those, `observed` is a recorded
+    /// not-archive-worthy verdict reachable through `wait_state`, not a stuck shape. Spans
+    /// every source kind, like the other recovery work lists.
+    ///
+    /// [`unhydrated_recovery_sessions`]: StateStore::unhydrated_recovery_sessions
+    pub fn stuck_observed_sessions(&self) -> Result<Vec<SessionRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                id,source_session_id,origin_cwd,
+                origin_project_identity,origin_project_component,origin_project_name,
+                origin_repository,origin_branch,transcript_path,lifecycle_state,
+                completion_reason,source_end_reason,current_summary_revision,
+                current_summary_json,current_summary_hash,current_markdown_relative_path,
+                current_markdown_hash,normalizer_version,source_cursor_records,
+                source_cursor_bytes,source_prefix_hash,source_hash,source_bytes,
+                source_started_at,source_updated_at,source_user_requests,
+                source_assistant_messages,source_tool_activities,last_fallback_reason,
+                state_generation,active,last_agent_stop_ms,last_session_end_ms,
+                last_error_category,source_kind,next_retry_at_ms,failure_streak,
+                origin_project_origin
+             FROM sessions
+             WHERE active=0
+               AND lifecycle_state='observed'
+               AND last_session_end_ms IS NULL
+             ORDER BY updated_at_ms,id",
+        )?;
+        statement
+            .query_map([], session_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Requeues one stuck observed row (see [`stuck_observed_sessions`]) through the normal
+    /// interrupted-recovery pipeline: fills the missing origin and transcript-mtime activity
+    /// evidence, moves the row to `interrupted` (or `revision-pending` when a summary
+    /// already exists), and reserves the archive worker inside the same transaction — the
+    /// caller must spawn a worker whenever this reports a reservation, exactly as with
+    /// [`mark_recovery_interrupted`]. The rescue observation is deduplicated on the
+    /// transcript's byte/mtime evidence, so a session the worker again judges
+    /// not-archive-worthy settles instead of churning through every later sweep; only a
+    /// transcript that has since changed is rescued again. Returns `false` without changes
+    /// when the session no longer matches the stuck shape or was already rescued at this
+    /// transcript state.
+    ///
+    /// [`stuck_observed_sessions`]: StateStore::stuck_observed_sessions
+    /// [`mark_recovery_interrupted`]: StateStore::mark_recovery_interrupted
+    pub fn rescue_observed_session(
+        &mut self,
+        session_id: &str,
+        transcript_path: &Path,
+        origin_cwd: Option<&Path>,
+        evidence_key: &str,
+        activity_ms: i64,
+    ) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let now = now_ms();
+        let dedupe = dedupe_key(&["observed-recovery", session_id, evidence_key]);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let database_id = transaction
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE source_kind=?2 AND source_session_id=?1
+                   AND active=0 AND lifecycle_state='observed'
+                   AND last_session_end_ms IS NULL
+                   AND transcript_path IS NOT NULL",
+                params![session_id, self.source_kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(database_id) = database_id else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO source_observations(
+                session_id,event_kind,event_timestamp_ms,transcript_path,
+                completion_reason,dedupe_key,observed_at_ms
+             ) VALUES (?1,'recovery-scan',NULL,?2,'unknown',?3,?4)",
+            params![database_id, path_text(transcript_path)?, dedupe, now],
+        )?;
+        if inserted == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let observation_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "UPDATE sessions SET
+                current_observation_id=?2,state_generation=state_generation+1,
+                origin_cwd=COALESCE(origin_cwd,?3),
+                last_agent_stop_ms=COALESCE(last_agent_stop_ms,?4),
+                completion_reason=COALESCE(completion_reason,'unknown'),
+                source_end_reason=COALESCE(source_end_reason,'unknown'),
+                lifecycle_state=CASE WHEN current_summary_revision > 0
+                    THEN 'revision-pending' ELSE 'interrupted' END,
+                last_error_category=NULL,
+                updated_at_ms=?5
+             WHERE id=?1",
+            params![
+                database_id,
+                observation_id,
+                origin_cwd.map(path_text).transpose()?,
+                activity_ms,
+                now
+            ],
+        )?;
+        let reserved = reserve_worker_in_transaction(&transaction, database_id, now, false)?;
+        transaction.commit()?;
+        Ok(reserved)
+    }
+
     /// Marks a recovery-held session that cannot be hydrated safely (never-drop: it stays
     /// queued, nothing on disk is touched). The visible category is written to the row and,
     /// only on the transition, one diagnostics entry is recorded — repeat sweeps over the
