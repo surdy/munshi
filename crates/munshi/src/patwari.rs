@@ -2037,6 +2037,7 @@ mod tests {
             active: false,
             last_agent_stop_ms: Some(10_000),
             last_session_end_ms: None,
+            not_archive_worthy_at_ms: None,
             last_error_category: None,
             next_retry_at_ms: None,
             failure_streak: 0,

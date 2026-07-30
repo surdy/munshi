@@ -53,7 +53,7 @@ munshi sessions --limit 100 --json
 | `disabled-project` | The owning project is disabled (explicitly or via `.munshi.toml`), so processing is on hold. |
 | `processing` | A worker currently holds this session's lock and is actively summarizing it. |
 | `observed` | A hook has seen the session, but nothing has queued it for summarization yet. |
-| `not-archive-worthy` | The transcript never reached the minimum bar (a user request plus agent content or tool activity); it will not be archived. |
+| `not-archive-worthy` | The transcript never reached the minimum bar (a user request plus agent content or tool activity); it will not be archived. Covers hook-observed sessions and stubs the recovery sweep judged; if the transcript later grows a real reply, the session is picked up again and can archive. |
 | `unknown` | Doesn't cleanly map to any state above (rare; treat as diagnostic). |
 
 `--state` filters to one state; `--json` emits the stable machine-readable contract; `--limit`

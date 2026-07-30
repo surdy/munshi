@@ -3019,7 +3019,16 @@ fn operational_state(record: &SessionRecord) -> &'static str {
             }
         }
         "processing" => "processing",
-        "observed" if record.current_revision == 0 && record.last_session_end_ms.is_some() => {
+        // A recorded verdict on unarchived content: either the hook path (a session-end was
+        // ingested before the worker judged it) or the sweep path (the worker stamped
+        // `not_archive_worthy_at_ms` while settling the row, issue #50). The stored
+        // lifecycle stays `observed` so the row remains reactivatable when the transcript
+        // grows; only this label moves.
+        "observed"
+            if record.current_revision == 0
+                && (record.last_session_end_ms.is_some()
+                    || record.not_archive_worthy_at_ms.is_some()) =>
+        {
             "not-archive-worthy"
         }
         "observed" => "observed",
