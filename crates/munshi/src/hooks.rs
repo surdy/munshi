@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
+use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -25,7 +26,8 @@ use crate::render::{
 use crate::source::{
     PreviousSource, SessionReference, SourceError, SourceKind, TranscriptLoadMode,
     claude_transcript_origin, claude_transcript_recorded_origin, copilot_workspace_origin,
-    load_session_update, resolve_session_reference, validate_transcript_envelope,
+    for_each_claude_project_transcript, load_session_update, resolve_session_reference,
+    validate_transcript_envelope,
 };
 use crate::state::{
     BudgetOutcome, Claim, ClaimOutcome, CompletionReason, PersistedArchive, PlaceholderPark,
@@ -227,7 +229,11 @@ fn run_archive_worker_inner(
         .as_ref()
         .is_none_or(|session| session.current_revision == 0)
     {
-        let _ = state.hydrate_session_from_archives(&output_directory, session_id)?;
+        let _ = state.hydrate_session_from_archives(
+            &output_directory,
+            session_id,
+            &stored.harnesses.source_homes(),
+        )?;
     }
     if let Some(result) =
         reconcile_persisted_attempt(&mut state, state_directory, &output_directory, session_id)?
@@ -298,7 +304,11 @@ pub fn run_recovery(
     };
     let stored = load_stored_config(state_directory)?;
     if rebuild {
-        crate::state::rebuild_database(state_directory, Path::new(&stored.output_directory))?;
+        crate::state::rebuild_database(
+            state_directory,
+            Path::new(&stored.output_directory),
+            &stored.harnesses.source_homes(),
+        )?;
     }
     let mut state = StateStore::open(state_directory)?;
     migrate_legacy_state(
@@ -1751,10 +1761,12 @@ fn discover_unknown_sessions(
 }
 
 /// Recovery sweep of `~/.claude/projects` for sessions whose hooks never fired (force-kill emits
-/// none — phase-0 finding). Sessions are regular `<session-id>.jsonl` files inside per-project
-/// subdirectories; sibling `<uuid>/` directories and entries like `memory/` are not sessions and
-/// are skipped by the file-type and extension checks. The sweep yields explicit transcript paths,
-/// so the "no session-ID-only transcript lookup for Claude Code" rule is preserved.
+/// none — phase-0 finding). The `projects/*/<session-id>.jsonl` walk itself lives in
+/// [`for_each_claude_project_transcript`], shared with the transcript re-derivation the upload and
+/// rebuild paths use (issue #53); this sweep keeps only what is recovery's own — the
+/// already-known-session filter, the staleness gate, and the reservation. The scan yields explicit
+/// transcript paths, so the "no session-ID-only transcript lookup for Claude Code" rule is
+/// preserved.
 fn discover_unknown_claude_sessions(
     state: &mut StateStore,
     claude_projects: &Path,
@@ -1762,63 +1774,41 @@ fn discover_unknown_claude_sessions(
     max_source_bytes: usize,
 ) -> Result<Vec<String>, HookWorkerError> {
     let mut reserved = Vec::new();
-    if !claude_projects.is_dir() {
-        return Ok(reserved);
-    }
     let mut inspected = 0;
-    'projects: for project_entry in fs::read_dir(claude_projects)? {
-        let project_entry = project_entry?;
-        if project_entry.file_type()?.is_symlink() || !project_entry.metadata()?.is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(project_entry.path())? {
+    for_each_claude_project_transcript::<HookWorkerError, _>(
+        claude_projects,
+        |session_id, path| {
             if inspected >= RECOVERY_SCAN_LIMIT {
-                break 'projects;
+                return Ok(ControlFlow::Break(()));
             }
-            let entry = entry?;
-            if entry.file_type()?.is_symlink() || !entry.metadata()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(session_id) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(ToOwned::to_owned)
-            else {
-                continue;
-            };
-            if validate_session_id(&session_id).is_err()
-                || state.get_session(&session_id)?.is_some()
-            {
-                continue;
+            if state.get_session(session_id)?.is_some() {
+                return Ok(ControlFlow::Continue(()));
             }
             if !source_is_stale_and_supported(
                 SourceKind::ClaudeCode,
-                &path,
+                path,
                 cutoff_ms,
                 max_source_bytes,
             ) {
-                continue;
+                return Ok(ControlFlow::Continue(()));
             }
-            let metadata = fs::metadata(&path)?;
+            let metadata = fs::metadata(path)?;
             let evidence = format!(
                 "{}:{}:{}",
                 metadata.len(),
                 metadata.mtime(),
                 metadata.mtime_nsec()
             );
-            let origin = claude_transcript_origin(&path);
+            let origin = claude_transcript_origin(path);
             // `mark_recovery_interrupted` reserves the archive worker inside its transaction, so
             // the caller must spawn for every reservation it reports.
-            if state.mark_recovery_interrupted(&session_id, &path, origin.as_deref(), &evidence)? {
-                reserved.push(session_id);
+            if state.mark_recovery_interrupted(session_id, path, origin.as_deref(), &evidence)? {
+                reserved.push(session_id.to_owned());
             }
             inspected += 1;
-        }
-    }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
     Ok(reserved)
 }
 

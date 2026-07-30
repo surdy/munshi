@@ -40,7 +40,7 @@ use crate::registration::{
     DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS, RegistrationError, StoredConfig, load_stored_config,
     stored_config_exists, update_stored_config,
 };
-use crate::source::SourceKind;
+use crate::source::{SourceHomes, SourceKind, derive_transcript_path};
 use crate::state::{
     ArchiveUploadRecord, ArchiveUploadSuccess, SessionRecord, StateError, StateStore, now_ms,
     try_acquire_session_lock,
@@ -1001,6 +1001,46 @@ fn collect_artifacts(
     ))
 }
 
+/// [`collect_artifacts`], with one repair attempt when the transcript is what is missing: the path
+/// is re-derived from the session's ID through its source's own version-pinned discovery, persisted
+/// on the session row, and the artifact set assembled again (issue #53).
+///
+/// The sessions issue #47 correctly refuses to upload as summary-only snapshots are overwhelmingly
+/// sessions whose transcript is *on disk* and whose row simply forgot where — `rebuild-state`
+/// reconstructs a session from its archive Markdown, which never records a transcript path. Skipping
+/// those honestly is right but not sufficient: nothing would ever re-teach the row its path, so the
+/// session could never upload in full. Derivation runs at the moment of the skip, so the very same
+/// upload proceeds with the complete artifact set, and the recovered path is written back so every
+/// later read finds it without re-deriving.
+///
+/// The repair is narrow on purpose. It applies only to a missing transcript — a missing `summary.md`
+/// is a local-archive question, not a discovery one — and only when derivation produces a path that
+/// passes its source's safety validation ([`derive_transcript_path`]). A session whose transcript is
+/// genuinely gone, whose harness home is unregistered, or whose source (Codex) has no safe
+/// session-ID lookup falls straight through to the unchanged issue #47 skip.
+fn collect_recoverable_artifacts(
+    state: &mut StateStore,
+    output_directory: &Path,
+    record: &SessionRecord,
+    homes: &SourceHomes,
+    max_event_text_bytes: usize,
+) -> Result<Vec<ArtifactSource>, PatwariError> {
+    let first = collect_artifacts(output_directory, record, max_event_text_bytes);
+    if !matches!(
+        first,
+        Err(PatwariError::SnapshotIncomplete(TRANSCRIPT_LOGICAL_PATH))
+    ) {
+        return first;
+    }
+    let Some(derived) = derive_transcript_path(record.source, &record.session_id, homes) else {
+        return first;
+    };
+    state.record_derived_transcript_path(&record.session_id, &derived)?;
+    let mut recovered = record.clone();
+    recovered.transcript_path = Some(derived);
+    collect_artifacts(output_directory, &recovered, max_event_text_bytes)
+}
+
 /// Assembles the ordered snapshot artifact set v1 (ADR 0009/0010) from already-read bytes:
 /// `summary.md` (this revision's rendered summary), `transcript.jsonl` (the verbatim source bytes),
 /// and every re-derived `outputs/<sha256>` extracted output.
@@ -1081,6 +1121,7 @@ pub(crate) fn upload_after_archive(
         &endpoint,
         &output_directory,
         &record,
+        &config.harnesses.source_homes(),
         config.limits.max_event_text_bytes,
     )?;
     Ok(Some(outcome))
@@ -1129,6 +1170,7 @@ pub(crate) fn retry_pending_uploads(
             &endpoint,
             &output_directory,
             &session,
+            &config.harnesses.source_homes(),
             config.limits.max_event_text_bytes,
         )?;
     }
@@ -1137,6 +1179,7 @@ pub(crate) fn retry_pending_uploads(
 
 /// Uploads one session's current snapshot to the configured server, recording the result in
 /// operational state. Never mutates the session's archival lifecycle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn upload_one(
     state: &mut StateStore,
     settings: &crate::registration::StoredArchiveUpload,
@@ -1144,6 +1187,7 @@ pub(crate) fn upload_one(
     endpoint: &str,
     output_directory: &Path,
     record: &SessionRecord,
+    homes: &SourceHomes,
     max_event_text_bytes: usize,
 ) -> Result<UploadOutcome, PatwariError> {
     if record.current_revision == 0 {
@@ -1197,7 +1241,13 @@ pub(crate) fn upload_one(
     // recovery driver retries it; other collection errors (a genuine I/O fault) still propagate.
     // A required artifact that is not readable at all is neither a failure nor an upload: no
     // bounded attempt is burned, and the session uploads as soon as the artifact is readable.
-    let sources = match collect_artifacts(output_directory, record, max_event_text_bytes) {
+    let sources = match collect_recoverable_artifacts(
+        state,
+        output_directory,
+        record,
+        homes,
+        max_event_text_bytes,
+    ) {
         Ok(sources) => sources,
         Err(error @ PatwariError::TranscriptChanged) => {
             return record_upload_failure(state, settings, endpoint, record, &existing, error);
@@ -1690,6 +1740,7 @@ pub fn retry(
             &output_directory,
             record.source,
             &record.session_id,
+            &config.harnesses.source_homes(),
             config.limits.max_event_text_bytes,
             Some(force),
         )?;
@@ -1786,6 +1837,7 @@ pub fn backfill(
             &output_directory,
             session.source,
             &session.session_id,
+            &config.harnesses.source_homes(),
             config.limits.max_event_text_bytes,
             None,
         )?;
@@ -1809,6 +1861,7 @@ fn locked_upload_one(
     output_directory: &Path,
     source: SourceKind,
     session_id: &str,
+    homes: &SourceHomes,
     max_event_text_bytes: usize,
     reset_for_retry: Option<bool>,
 ) -> Result<UploadOutcome, PatwariError> {
@@ -1833,6 +1886,7 @@ fn locked_upload_one(
         endpoint,
         output_directory,
         &session,
+        homes,
         max_event_text_bytes,
     )
 }
@@ -2149,6 +2203,7 @@ mod tests {
                 endpoint,
                 &output_dir,
                 &record,
+                &SourceHomes::default(),
                 DEFAULT_MAX_EVENT_TEXT_BYTES,
             )
             .unwrap();
@@ -2263,6 +2318,7 @@ mod tests {
             endpoint,
             &output_dir,
             &record,
+            &SourceHomes::default(),
             DEFAULT_MAX_EVENT_TEXT_BYTES,
         )
         .unwrap();

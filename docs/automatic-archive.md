@@ -223,7 +223,11 @@ against pathological input — see [`configuration.md`](configuration.md#the-siz
 `--force-retry` makes failed retryable work immediately eligible. `--rebuild-state` backs aside the
 SQLite file, recreates the schema, and rebuilds current archive metadata and the current structured
 summary cache from validated Munshi-owned Markdown. Existing Markdown is never deleted or made
-invalid by a missing database.
+invalid by a missing database. Archive Markdown records everything about a session except where its
+transcript lives, so each rebuilt session is also looked up in the registered harness home it came
+from (Copilot's `session-state/<id>/`, Claude Code's `projects/*/`) and is born knowing its
+transcript path wherever one is resolvable; a session whose transcript is gone simply rebuilds
+without one, exactly as before.
 
 Registration imports recognized stale issue #3 `sessions/latest.json` and pending-job state before
 removing it. Fresh legacy workers are deferred, malformed or symlinked artifacts are left

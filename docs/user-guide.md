@@ -343,10 +343,16 @@ no self-contained snapshot for — sessions archived while upload was disabled o
 sessions whose recorded snapshot is not known to carry both `summary.md` and `transcript.jsonl` —
 running each through the normal upload path (`--limit` bounds one run, default 200).
 
-Every snapshot is self-contained by contract, so a session whose transcript munshi cannot read (one
-reconstructed by `rebuild-state` from its Markdown alone, or one whose harness transcript has been
-removed) is reported `skipped` rather than uploaded as a summary-only snapshot; it uploads normally
-once the transcript is readable. Snapshots recorded before munshi tracked which artifacts it
+Every snapshot is self-contained by contract, so a session whose transcript munshi cannot read is
+reported `skipped` rather than uploaded as a summary-only snapshot. Before skipping, munshi tries to
+find the transcript: a session whose row has no transcript path (one reconstructed by
+`rebuild-state` from its Markdown alone) or whose recorded path no longer reads is looked up inside
+the registered harness home — Copilot by its `session-state/<id>/events.jsonl` layout, Claude Code
+by scanning `projects/*/` for `<session-id>.jsonl` — and, once the file matches that harness's
+pinned envelope, the path is recorded on the session and the full snapshot uploads in the same run.
+Only a transcript that is genuinely gone (or a Codex session, whose rollout files are not named
+after the session) stays `skipped`; it uploads normally once the transcript is readable again.
+Snapshots recorded before munshi tracked which artifacts it
 uploaded are re-verified by the first `backfill` after upgrading: re-uploading an identical set
 transfers nothing (Patwari deduplicates blobs by content hash and coalesces the identical snapshot
 fingerprint), and a snapshot that really was summary-only gains a complete sibling. The incomplete

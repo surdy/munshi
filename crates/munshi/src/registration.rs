@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::archive_git::{ArchiveGitError, ensure_archive_repository};
 use crate::policy::{GlobalPolicy, ResolvedPolicy, resolve_policy};
 use crate::project::{ProjectIdentityError, inspect_project};
+use crate::source::SourceHomes;
 use crate::state::{StateStore, migrate_legacy_state};
 
 const HOOK_FILE_NAME: &str = "munshi.json";
@@ -163,6 +164,16 @@ pub(crate) struct StoredHarnesses {
 }
 
 impl StoredHarnesses {
+    /// The recorded homes as the transcript-discovery paths consume them (issue #53). Only a home
+    /// this registration manages is ever searched for a transcript, so an unregistered harness
+    /// simply has nothing to derive from.
+    pub(crate) fn source_homes(&self) -> SourceHomes {
+        SourceHomes {
+            copilot_home: self.copilot_home.as_deref().map(PathBuf::from),
+            claude_home: self.claude_home.as_deref().map(PathBuf::from),
+        }
+    }
+
     fn paths_are_absolute(&self) -> bool {
         self.copilot_home
             .as_deref()
@@ -566,8 +577,10 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     }
     install_or_update_json(&config_path, &stored)?;
     let mut state = StateStore::open(&state_directory).map_err(state_registration_error)?;
+    // The freshly written configuration is what names the harness homes, so the rebuild can
+    // re-derive transcript paths for the sessions it imports (issue #53).
     state
-        .rebuild_from_archives(&config.output_directory)
+        .rebuild_from_archives(&config.output_directory, &stored.harnesses.source_homes())
         .map_err(state_registration_error)?;
     migrate_legacy_state(
         &mut state,

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
+use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -121,6 +122,20 @@ pub struct ResolvedSession {
     pub source: SourceKind,
     pub session_id: String,
     pub events_path: PathBuf,
+}
+
+/// The harness installations this registration manages, each identified by its home directory
+/// (ADR 0008: the state directory is harness-neutral, so a home can no longer be derived from it).
+///
+/// This is the only place a transcript re-derivation is allowed to look. Nothing here falls back to
+/// an ambient `$HOME`: a source with no registered home has no derivable transcript, which keeps
+/// derivation confined to installations the operator explicitly registered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceHomes {
+    /// Copilot home holding the version-pinned `session-state/<id>/events.jsonl` layout.
+    pub copilot_home: Option<PathBuf>,
+    /// Claude Code home holding the `projects/<project>/<session-id>.jsonl` layout.
+    pub claude_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -451,6 +466,139 @@ fn derive_session_id_from_path(
                 .map(ToOwned::to_owned)
         }
     }
+}
+
+/// Line-scan bound for the envelope validation a re-derived path must pass. Envelope validation
+/// reads only the first meaningful record, and its `max_source_bytes` argument caps that single
+/// line (itself clamped to 256 KB), so this is a read-discipline bound and never a statement about
+/// how large a transcript may be — matching the bound the recovery sweep's Copilot fallback uses.
+const ENVELOPE_SCAN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Re-derives a session's transcript path from its session ID alone, using each source's own
+/// version-pinned discovery machinery (issue #53).
+///
+/// A session row can hold no transcript path — `rebuild-state` reconstructs a session from its
+/// archive Markdown, which never records one — or hold a path the harness has since moved. Both
+/// leave a session that cannot be read, archived in full, or uploaded as a self-contained snapshot
+/// even though its transcript is sitting on disk. Derivation is per source and never a guess:
+///
+/// - **Copilot** resolves through [`resolve_session_reference`]'s version-pinned
+///   `session-state/<id>/events.jsonl` fallback, which canonicalizes and confines the result to the
+///   registered home's session-state directory.
+/// - **Claude Code** scans the registered home's `projects/*/` for `<session-id>.jsonl` exactly the
+///   way the recovery sweep does, rejecting symlinked project directories and transcripts.
+/// - **Codex** has no safe session-ID-only lookup — its rollout files are not named after the
+///   session — so it never derives.
+///
+/// Every candidate must then match its source's pinned event envelope
+/// ([`validate_transcript_envelope`]), so an unrelated file that merely occupies the expected path
+/// is rejected rather than trusted. Failure is always `None`: derivation is an opportunistic
+/// repair, never an error a caller has to handle.
+pub fn derive_transcript_path(
+    source: SourceKind,
+    session_id: &str,
+    homes: &SourceHomes,
+) -> Option<PathBuf> {
+    let session_id = validate_session_id(session_id).ok()?;
+    let candidate = match source {
+        SourceKind::Copilot => {
+            resolve_session_reference(&SessionReference {
+                source,
+                session_id: Some(session_id.to_owned()),
+                events_path: None,
+                copilot_home: Some(homes.copilot_home.clone()?),
+            })
+            .ok()?
+            .events_path
+        }
+        SourceKind::ClaudeCode => {
+            // Canonical like the Copilot fallback's resolved path: the result is persisted on the
+            // session row, so it should be a stable absolute path rather than one carrying whatever
+            // `..` segments the registered home was configured with.
+            find_claude_project_transcript(
+                &homes.claude_home.as_ref()?.join("projects"),
+                session_id,
+            )?
+            .canonicalize()
+            .ok()?
+        }
+        SourceKind::Codex => return None,
+    };
+    validate_transcript_envelope(source, &candidate, ENVELOPE_SCAN_BYTES).ok()?;
+    Some(candidate)
+}
+
+/// The transcript a Claude Code home's `projects/*/` layout holds for `session_id`, if any. Shares
+/// [`for_each_claude_project_transcript`]'s scan — and therefore its safety discipline — with the
+/// recovery sweep, and stops at the first match. An I/O error part-way through simply yields no
+/// path, matching the rest of derivation's opportunistic contract.
+fn find_claude_project_transcript(claude_projects: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut found = None;
+    let _ =
+        for_each_claude_project_transcript::<io::Error, _>(claude_projects, |candidate, path| {
+            if candidate != session_id {
+                return Ok(ControlFlow::Continue(()));
+            }
+            found = Some(path.to_path_buf());
+            Ok(ControlFlow::Break(()))
+        });
+    found
+}
+
+/// Visits every transcript a Claude Code home's `projects/*/` layout holds, passing each session ID
+/// and its explicit path to `visit` until the walk is exhausted or `visit` breaks.
+///
+/// This is the single description of where Claude Code keeps its transcripts, shared by the
+/// recovery sweep (which reserves the unknown sessions it finds) and by
+/// [`derive_transcript_path`] (which looks one session up). Sessions are regular
+/// `<session-id>.jsonl` files inside per-project subdirectories; sibling `<uuid>/` directories and
+/// entries like `memory/` are not sessions and are skipped by the file-type and extension checks.
+/// Symlinked project directories and symlinked transcripts are refused outright, and every yielded
+/// stem has passed [`validate_session_id`] — so a caller always receives an explicit, in-home path,
+/// preserving the "no session-ID-only transcript lookup for Claude Code" rule.
+pub(crate) fn for_each_claude_project_transcript<E, F>(
+    claude_projects: &Path,
+    mut visit: F,
+) -> Result<(), E>
+where
+    E: From<io::Error>,
+    F: FnMut(&str, &Path) -> Result<ControlFlow<()>, E>,
+{
+    if !claude_projects.is_dir() {
+        return Ok(());
+    }
+    for project_entry in fs::read_dir(claude_projects).map_err(E::from)? {
+        let project_entry = project_entry.map_err(E::from)?;
+        if project_entry.file_type().map_err(E::from)?.is_symlink()
+            || !project_entry.metadata().map_err(E::from)?.is_dir()
+        {
+            continue;
+        }
+        for entry in fs::read_dir(project_entry.path()).map_err(E::from)? {
+            let entry = entry.map_err(E::from)?;
+            if entry.file_type().map_err(E::from)?.is_symlink()
+                || !entry.metadata().map_err(E::from)?.is_file()
+            {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| validate_session_id(stem).is_ok())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            if visit(&session_id, &path)?.is_break() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn load_session(

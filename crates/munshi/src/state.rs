@@ -19,12 +19,19 @@ use crate::registration::{
     RegistrationError, durable_remove, ensure_directory, validate_regular_owned_file,
 };
 use crate::render::{ArchivedMarkdown, content_hash, parse_archive_markdown};
-use crate::source::{PreviousSource, SourceKind};
+use crate::source::{PreviousSource, SourceHomes, SourceKind, derive_transcript_path};
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
 const SCHEMA_VERSION: i64 = 6;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
+
+/// The `transcript_source` recorded for a path re-derived from a session's ID through its source's
+/// own version-pinned discovery machinery (issue #53), as opposed to one a hook reported
+/// (`hook`), the Copilot session-ID fallback supplied at ingest (`version-pinned-fallback`), or the
+/// recovery sweep attached (`version-pinned-recovery`). It marks a path Munshi found for a row that
+/// had none — a rebuilt row, or one whose recorded transcript moved.
+const REDERIVED_TRANSCRIPT_SOURCE: &str = "version-pinned-rederived";
 
 /// Consecutive failures with the same error category on the same `state_generation` after which
 /// [`StateStore::fail_attempt`] parks the session permanently (`next_retry_at_ms = -1`) instead
@@ -3068,6 +3075,7 @@ impl StateStore {
         &mut self,
         output_directory: &Path,
         session_id: &str,
+        homes: &SourceHomes,
     ) -> Result<bool, StateError> {
         let records = scan_archives(output_directory, Some((&self.source_kind, session_id)))?;
         let Some(record) = records
@@ -3076,11 +3084,15 @@ impl StateStore {
         else {
             return Ok(false);
         };
-        self.import_archive_record(&record)?;
+        self.import_archive_record(&record, homes)?;
         Ok(true)
     }
 
-    pub fn rebuild_from_archives(&mut self, output_directory: &Path) -> Result<usize, StateError> {
+    pub fn rebuild_from_archives(
+        &mut self,
+        output_directory: &Path,
+        homes: &SourceHomes,
+    ) -> Result<usize, StateError> {
         let records = scan_archives(output_directory, None)?;
         // Group by the full (source, session_id) identity so cross-source sessions
         // that share a session ID are both retained and never overwrite each other.
@@ -3098,15 +3110,36 @@ impl StateStore {
             }
         }
         for record in latest.values() {
-            self.import_archive_record(record)?;
+            self.import_archive_record(record, homes)?;
         }
         Ok(latest.len())
     }
 
-    fn import_archive_record(&mut self, record: &OwnedArchive) -> Result<(), StateError> {
+    /// Imports one archived revision into operational state.
+    ///
+    /// An archive Markdown file records everything about a session except where its transcript
+    /// lives, so a rebuilt row used to be born with `transcript_path` NULL — unreadable, and (since
+    /// issue #47) unable to upload a self-contained snapshot even though the transcript was still on
+    /// disk. The import now re-derives the path from the session's ID through its source's own
+    /// version-pinned discovery (issue #53), so a rebuilt row is born with a path wherever one is
+    /// resolvable. Derivation is opportunistic by construction: a session whose transcript is gone,
+    /// whose harness home is not registered, or whose source has no safe lookup keeps the NULL it
+    /// had, and no derivation failure can fail a rebuild.
+    fn import_archive_record(
+        &mut self,
+        record: &OwnedArchive,
+        homes: &SourceHomes,
+    ) -> Result<(), StateError> {
         let now = now_ms();
         let summary_json = serde_json::to_string(&record.archive.summary)?;
         let summary_hash = content_hash(summary_json.as_bytes());
+        let transcript_path =
+            derive_transcript_path(record.archive.source, &record.archive.session_id, homes);
+        let transcript_source = if transcript_path.is_some() {
+            REDERIVED_TRANSCRIPT_SOURCE
+        } else {
+            "archive-rebuild"
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3115,8 +3148,8 @@ impl StateStore {
             record.archive.source.agent_label(),
             &record.archive.session_id,
             None,
-            None,
-            "archive-rebuild",
+            transcript_path.as_deref(),
+            transcript_source,
             now,
         )?;
         let current_revision: i64 = transaction.query_row(
@@ -3266,6 +3299,36 @@ impl StateStore {
             .query_map([], session_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Records a transcript path re-derived for a session that had none — or held one that no
+    /// longer reads (issue #53). Returns whether a row in this store's source scope was updated.
+    ///
+    /// Deliberately smaller than [`Self::attach_recovered_transcript`]: that one records a *new
+    /// observation* of unarchived work and re-enters the session into the archival lifecycle
+    /// (bumping the state generation and reserving a worker), which is exactly what a read path
+    /// such as archive upload must not do. This writes the located path and nothing else, so the
+    /// session's archival lifecycle is untouched and the next read simply finds its transcript.
+    pub fn record_derived_transcript_path(
+        &mut self,
+        session_id: &str,
+        transcript_path: &Path,
+    ) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let updated = self.connection.execute(
+            "UPDATE sessions SET
+                transcript_path=?3,transcript_source=?4,updated_at_ms=?5
+             WHERE source_kind=?2 AND source_session_id=?1
+               AND (transcript_path IS NULL OR transcript_path<>?3)",
+            params![
+                session_id,
+                self.source_kind,
+                path_text(transcript_path)?,
+                REDERIVED_TRANSCRIPT_SOURCE,
+                now_ms()
+            ],
+        )?;
+        Ok(updated == 1)
     }
 
     pub fn attach_recovered_transcript(
@@ -4298,6 +4361,7 @@ fn safe_legacy_code(code: &str) -> &str {
 pub fn rebuild_database(
     state_directory: &Path,
     output_directory: &Path,
+    homes: &SourceHomes,
 ) -> Result<usize, StateError> {
     let Some(_lock) = try_acquire_session_lock(state_directory, "_rebuild")? else {
         return Err(StateError::LockBusy);
@@ -4321,5 +4385,5 @@ pub fn rebuild_database(
     }
     File::open(state_directory)?.sync_all()?;
     let mut state = StateStore::open(state_directory)?;
-    state.rebuild_from_archives(output_directory)
+    state.rebuild_from_archives(output_directory, homes)
 }
