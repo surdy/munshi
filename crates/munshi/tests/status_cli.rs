@@ -409,7 +409,7 @@ fn doctor_hints_sessions_parked_on_a_size_cap() {
         "{message}"
     );
     assert!(
-        message.contains("1 summary-input-limit (raise --max-input-bytes)"),
+        message.contains("1 summary-input-limit (raise --chunk-threshold-bytes)"),
         "{message}"
     );
     assert_eq!(report["sessions"]["parked"], 2);

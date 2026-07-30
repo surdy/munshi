@@ -3020,7 +3020,7 @@ fn push_size_cap_park_check(checks: &mut Vec<CheckResult>, records: &[SessionRec
     }
     if input_limited > 0 {
         parts.push(format!(
-            "{input_limited} summary-input-limit (raise --max-input-bytes)"
+            "{input_limited} summary-input-limit (raise --chunk-threshold-bytes)"
         ));
     }
     push_check(
