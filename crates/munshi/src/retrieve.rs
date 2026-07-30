@@ -446,10 +446,13 @@ fn from_read(error: ReadError) -> RetrieveError {
 fn from_http(error: HttpError) -> RetrieveError {
     match error {
         HttpError::UnsupportedEndpoint(endpoint) => {
-            RetrieveError::Unreachable(format!("{endpoint} is not a supported http URL"))
+            RetrieveError::Unreachable(format!("{endpoint} is not a supported http(s) URL"))
         }
         HttpError::Transport(message) => RetrieveError::Unreachable(message),
         HttpError::Protocol(message) => RetrieveError::Protocol(message),
+        HttpError::Tls(message) => {
+            RetrieveError::Unreachable(format!("tls setup failed: {message}"))
+        }
     }
 }
 

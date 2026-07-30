@@ -130,6 +130,7 @@ fn from_http(error: HttpError) -> PatwariError {
         HttpError::UnsupportedEndpoint(endpoint) => PatwariError::UnsupportedEndpoint(endpoint),
         HttpError::Transport(message) => PatwariError::Transport(message),
         HttpError::Protocol(message) => PatwariError::Protocol(message),
+        HttpError::Tls(message) => PatwariError::Transport(format!("tls setup failed: {message}")),
     }
 }
 
@@ -335,19 +336,18 @@ enum StatusOutcome {
 
 /// A synchronous Patwari archive-upload client bound to one server and client identity.
 pub struct PatwariClient {
-    host: String,
-    port: u16,
+    endpoint: http::HttpEndpoint,
     client_id: String,
     timeout: Duration,
 }
 
 impl PatwariClient {
-    /// Connects a client for `endpoint` (`http://host[:port]`) uploading under `client_id`.
+    /// Connects a client for `endpoint` (`http://` or `https://` `host[:port]`, ADR 0013)
+    /// uploading under `client_id`.
     pub fn connect(endpoint: &str, client_id: &str) -> Result<Self, PatwariError> {
-        let (host, port) = http::parse_http_endpoint(endpoint).map_err(from_http)?;
+        let endpoint = http::parse_http_endpoint(endpoint).map_err(from_http)?;
         Ok(Self {
-            host,
-            port,
+            endpoint,
             client_id: client_id.to_owned(),
             timeout: REQUEST_TIMEOUT,
         })
@@ -537,8 +537,7 @@ impl PatwariClient {
             },
         ];
         let response = http::send(
-            &self.host,
-            self.port,
+            &self.endpoint,
             self.timeout,
             &http::HttpRequest {
                 method: "PUT",
@@ -592,8 +591,7 @@ impl PatwariClient {
             });
         }
         http::send(
-            &self.host,
-            self.port,
+            &self.endpoint,
             self.timeout,
             &http::HttpRequest {
                 method,

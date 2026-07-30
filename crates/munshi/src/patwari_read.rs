@@ -178,8 +178,7 @@ pub(crate) struct ListedArtifact<'a> {
 /// A synchronous Patwari read client bound to one archive server, speaking the shared blocking
 /// [`crate::http`] client exactly as archive upload does.
 pub(crate) struct ReadClient {
-    host: String,
-    port: u16,
+    endpoint: http::HttpEndpoint,
     timeout: Duration,
 }
 
@@ -187,10 +186,9 @@ impl ReadClient {
     /// Binds to `endpoint`. Callers map the [`HttpError`] onto their own unreachable-endpoint
     /// error, so the wording of an unusable endpoint stays each command's own.
     pub(crate) fn connect(endpoint: &str) -> Result<Self, HttpError> {
-        let (host, port) = http::parse_http_endpoint(endpoint)?;
+        let endpoint = http::parse_http_endpoint(endpoint)?;
         Ok(Self {
-            host,
-            port,
+            endpoint,
             timeout: REQUEST_TIMEOUT,
         })
     }
@@ -337,10 +335,8 @@ impl ReadClient {
             body: None,
         };
         match max_response_bytes {
-            Some(limit) => {
-                http::send_with_limit(&self.host, self.port, self.timeout, &request, limit)
-            }
-            None => http::send(&self.host, self.port, self.timeout, &request),
+            Some(limit) => http::send_with_limit(&self.endpoint, self.timeout, &request, limit),
+            None => http::send(&self.endpoint, self.timeout, &request),
         }
     }
 }
