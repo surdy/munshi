@@ -328,6 +328,45 @@ const REDUCE_REVISION_INSTRUCTION: &str = concat!(
     "no Markdown fence or commentary."
 );
 
+/// Every `instruction` value Munshi can put in a summary request, in one place so the
+/// summarizer-exhaust guard below matches on the exact strings Munshi emits rather than a copy
+/// that could drift from them.
+const REQUEST_INSTRUCTIONS: [&str; 5] = [
+    COMPLETE_INSTRUCTION,
+    REVISION_INSTRUCTION,
+    CHUNK_INSTRUCTION,
+    REDUCE_INSTRUCTION,
+    REDUCE_REVISION_INSTRUCTION,
+];
+
+/// The `"instruction":"` key of a serialized request. Munshi serializes requests compactly
+/// (`serde_json::to_vec`), so the key and its value are always adjacent with no whitespace.
+const INSTRUCTION_KEY: &str = "\"instruction\":\"";
+
+/// Whether `text` is one of Munshi's own summary-request envelopes — the JSON object Munshi writes
+/// to a summarizer's stdin (docs/summarizers.md "The input request").
+///
+/// This is the recognizer behind the summarizer-exhaust guard (issue #37). A summarizer that is
+/// itself a session-recording harness records Munshi's request as the first user message of a
+/// brand-new session of its own; if that session lands in a registered harness home, Munshi
+/// discovers it as fresh work and summarizing N sessions creates N more.
+///
+/// Recognition is deliberately keyed on the `instruction` value rather than on the envelope's
+/// leading bytes: the v1 envelope opened with `{"instruction":"…` while the v2 envelope
+/// ([`SUMMARY_CONTRACT_VERSION`]) opens with `contract_version` and `phase` before it, and a
+/// wrapper may hand the request to its harness with a prefix of its own. Matching the full
+/// instruction text — which is a fixed several-hundred-character literal — keeps that tolerance
+/// without making a false positive plausible.
+pub fn is_summary_request_envelope(text: &str) -> bool {
+    let Some(start) = text.find(INSTRUCTION_KEY) else {
+        return false;
+    };
+    let value = &text[start + INSTRUCTION_KEY.len()..];
+    REQUEST_INSTRUCTIONS
+        .iter()
+        .any(|instruction| value.starts_with(instruction))
+}
+
 fn required_schema() -> RequiredSchema {
     RequiredSchema {
         title: "non-empty string",

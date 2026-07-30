@@ -393,6 +393,7 @@ fn renderer_is_deterministic_and_atomic_replace_replaces_existing_file() {
         started_at: Some("2026-07-12T00:00:00.000Z".to_owned()),
         updated_at: Some("2026-07-12T00:01:00.000Z".to_owned()),
         artifact_index: Default::default(),
+        opening_summary_request: false,
     };
     let project = ProjectIdentity {
         identity: "github.com/surdy/munshi".to_owned(),

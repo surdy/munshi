@@ -17,6 +17,10 @@ use thiserror::Error;
 pub const DEFAULT_MAX_EVENT_TEXT_BYTES: usize = 128 * 1024;
 pub const NORMALIZER_VERSION: u32 = 2;
 
+/// The normalized event kind carrying a human request, as the shared transcript interpreter
+/// labels it (`munshi_transcript::ContentEvent::kind`).
+const USER_EVENT_KIND: &str = "user";
+
 /// Vendor-neutral identity of the coding-agent harness that produced a session.
 ///
 /// The variants form the adapter boundary: each maps a source-specific transcript
@@ -208,11 +212,29 @@ pub struct NormalizedSession {
     /// that produced `source_hash`. Populated for full transcript bytes even on delta loads, so it
     /// always describes the complete snapshot the renderer records and the upload path assembles.
     pub artifact_index: SnapshotArtifactIndex,
+    /// Whether this session's very first user message is one of Munshi's own summary-request
+    /// envelopes — the marker of a session a summarizer harness recorded while answering Munshi
+    /// (issue #37). Set only on [`TranscriptLoadMode::Full`] loads, where the normalized batch
+    /// really does start at the transcript's first record; a delta load's first user event is an
+    /// arbitrary mid-session message, so the flag stays `false` there and callers must not read it
+    /// as evidence either way.
+    ///
+    /// Decided before oversize elision, on the original event content: a summary request for a
+    /// substantial session easily exceeds `max_event_text_bytes`, and the claim-ticket marker that
+    /// replaces an elided event carries none of the envelope's text.
+    pub opening_summary_request: bool,
 }
 
 impl NormalizedSession {
     pub fn is_archive_worthy(&self) -> bool {
         self.user_requests > 0 && (self.assistant_messages > 0 || self.tool_activities > 0)
+    }
+
+    /// Whether this session is a summarizer's own exhaust: a session some harness recorded purely
+    /// because Munshi asked it for a summary (issue #37). See [`Self::opening_summary_request`] for
+    /// the recognition rule and its full-load-only validity.
+    pub fn is_summarizer_exhaust(&self) -> bool {
+        self.opening_summary_request
     }
 }
 
@@ -594,6 +616,10 @@ pub fn load_session_update(
             started_at,
             updated_at,
             artifact_index,
+            // Only a full load's batch begins at the transcript's first record, so only a full
+            // load can testify about the session's *first* user message (issue #37).
+            opening_summary_request: mode == TranscriptLoadMode::Full
+                && normalized.opening_summary_request,
         },
         mode,
         fallback_reason,
@@ -807,6 +833,11 @@ fn read_stable_source(
 struct NormalizedRecords {
     events: Vec<NormalizedEvent>,
     summary: SessionSummary,
+    /// Whether the batch's first user event carried one of Munshi's own summary-request envelopes
+    /// (issue #37), judged on the original content before oversize elision. Only the caller knows
+    /// whether the batch starts at the transcript's first record, so only a full load promotes this
+    /// to [`NormalizedSession::opening_summary_request`].
+    opening_summary_request: bool,
 }
 
 /// Opens the shared streaming interpreter (ADR 0011) over in-memory transcript bytes,
@@ -837,6 +868,7 @@ fn normalize_records(
     max_event_text_bytes: usize,
 ) -> Result<NormalizedRecords, SourceError> {
     let mut normalized = NormalizedRecords::default();
+    let mut seen_user_event = false;
     for item in transcript_stream(source, bytes) {
         normalized.summary.observe(&item);
         let record = item.map_err(|error| match error {
@@ -847,18 +879,26 @@ fn normalize_records(
         })?;
         if let Classification::Content { events } = record.classification {
             for event in events {
+                let event = NormalizedEvent {
+                    kind: event.kind(),
+                    content: event.legacy_content(),
+                };
+                // Issue #37: judge the summarizer-exhaust marker on the first user event's
+                // original content, before elision below can replace it with a claim-ticket
+                // marker that carries none of the envelope's text.
+                if event.kind == USER_EVENT_KIND && !seen_user_event {
+                    seen_user_event = true;
+                    normalized.opening_summary_request =
+                        crate::summary::is_summary_request_envelope(&event.content);
+                }
                 // Oversized content is extracted, not truncated: the full bytes become an
                 // `outputs/<sha256>` snapshot artifact (re-derived at upload time from the same
                 // transcript, see `extract_outputs`) and the summarizer sees a hash+size marker in
                 // their place. The activity counts in the summary reflect the original event
                 // either way.
-                normalized.events.push(elide_if_oversized(
-                    NormalizedEvent {
-                        kind: event.kind(),
-                        content: event.legacy_content(),
-                    },
-                    max_event_text_bytes,
-                ));
+                normalized
+                    .events
+                    .push(elide_if_oversized(event, max_event_text_bytes));
             }
         }
     }

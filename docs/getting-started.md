@@ -54,6 +54,15 @@ chmod +x /absolute/path/to/munshi/contrib/claude-summarizer.sh
 Either summarizer works regardless of which harness (Copilot CLI or Claude Code) captured the
 session — source capture and summarization are independent choices.
 
+> **Both options are coding-agent CLIs that record a session of their own on every run.** Left
+> un-isolated, the sessions they create while summarizing are discovered as new work to
+> summarize, and archiving feeds itself — this has happened in the field (issue #37). Prefer the
+> bundled wrappers ([`contrib/copilot-summarizer.sh`](../contrib/copilot-summarizer.sh),
+> [`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh)), which isolate their harness
+> homes, over pointing `--summarizer` at a bare `copilot` or `claude` binary; the plain Copilot
+> invocation above is shown for contract clarity, not as the recommended setup. Details:
+> [Summarizers that are themselves session-recording harnesses](summarizers.md#4-hazard-summarizers-that-are-themselves-session-recording-harnesses).
+
 ## 3. Register Munshi
 
 Registration installs lifecycle hooks for your coding-agent CLI(s), writes Munshi's config, and

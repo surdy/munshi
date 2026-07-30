@@ -731,6 +731,7 @@ mod tests {
             artifact_index: SnapshotArtifactIndex {
                 extracted_outputs: outputs,
             },
+            opening_summary_request: false,
         }
     }
 
