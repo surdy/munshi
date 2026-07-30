@@ -80,7 +80,9 @@ const COPILOT_BOOKKEEPING: &[&str] = &[
     "session.shutdown",
     "session.start",
     "session.task_complete",
+    "session.truncation",
     "session.usage_checkpoint",
+    "session.warning",
     "session.workspace_file_changed",
     "subagent.completed",
     "subagent.started",
@@ -709,6 +711,8 @@ mod tests {
             "session.plan_changed",
             "session.task_complete",
             "session.workspace_file_changed",
+            "session.truncation",
+            "session.warning",
         ] {
             let json = format!(r#"{{"type":"{kind}","data":{{}}}}"#);
             assert!(matches!(
