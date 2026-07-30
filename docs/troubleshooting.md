@@ -88,7 +88,7 @@ contract; the common causes are:
 - The process ran past `--timeout-ms` (default 300000ms) and was killed.
 - stdout exceeded `--max-stdout-bytes` (default 262144) or stderr exceeded `--max-stderr-bytes`
   (default 65536).
-- The normalized transcript itself exceeded `--max-input-bytes` (default 1048576) — this
+- The normalized transcript itself exceeded `--max-input-bytes` (default 8388608) — this
   produces a summary failure before your summarizer is even invoked.
 
 Test the summarizer standalone before blaming Munshi:
