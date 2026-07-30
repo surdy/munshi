@@ -5,6 +5,7 @@ mod delivery;
 mod hooks;
 mod http;
 mod patwari;
+mod patwari_read;
 mod policy;
 mod project;
 mod registration;

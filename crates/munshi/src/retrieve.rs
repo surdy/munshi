@@ -13,30 +13,23 @@
 //! archive-upload configuration already recorded.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::http::{self, Header, HttpError};
+use crate::http::{self, HttpError};
 use crate::patwari::{self, PatwariError};
+use crate::patwari_read::{
+    API_BASE, DownloadError, LISTING_PAGE_SIZE, ListedArtifact, MAX_ARTIFACT_DOWNLOAD_BYTES,
+    ReadClient, ReadError, SizeDimension, SizeRefusal, optional_str, required_str, required_u64,
+    strip_digest,
+};
 
-/// The API base path every Patwari route is nested under.
-const API_BASE: &str = "/api/v1";
-/// Network timeout for a single retrieval request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Page size requested from the artifact listing. Blob dedup means a hash can match across several
-/// snapshots, but the count is small in practice; this keeps a match set to one or two round-trips.
-const LISTING_PAGE_SIZE: usize = 100;
 /// Guards the listing-pagination loop against a misbehaving peer that never stops returning cursors.
+/// A match set that hits the bound is still usable — the newest of a thousand pages of duplicates
+/// reproduces the same bytes as the newest of all of them — so retrieval takes what it has.
 const MAX_LISTING_PAGES: usize = 1_000;
-/// Default upper bound on a downloaded stored artifact. The server stores artifacts up to 1 GiB, so
-/// this is below the storage ceiling: an artifact whose stored size exceeds it is refused up front
-/// (a distinct `TooLarge` error) rather than truncated into a misleading verification failure. A
-/// caller can raise it deliberately with `--max-download-bytes`.
-const MAX_ARTIFACT_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 /// Lines of context printed either side of a `--query` match.
 pub const QUERY_CONTEXT_LINES: usize = 2;
 
@@ -73,6 +66,13 @@ pub enum RetrieveError {
         "archived artifact stored size {stored_size_bytes} bytes exceeds the {cap}-byte download cap; pass --max-download-bytes to raise it"
     )]
     TooLarge { stored_size_bytes: u64, cap: u64 },
+    /// The artifact's *decompressed* size exceeds the download cap even though its stored size fits.
+    /// The listing declares both, so a highly compressible artifact is refused before transfer
+    /// rather than after it has been decompressed into memory. Same cap, same escape hatch.
+    #[error(
+        "archived artifact original size {original_size_bytes} bytes exceeds the {cap}-byte download cap; pass --max-download-bytes to raise it"
+    )]
+    OriginalTooLarge { original_size_bytes: u64, cap: u64 },
     /// The stored bytes could not be zstd-decompressed.
     #[error("could not decompress stored content: {0}")]
     Decompression(String),
@@ -100,7 +100,7 @@ impl RetrieveError {
             Self::NotFound(_) => 4,
             Self::Unreachable(_) | Self::Protocol(_) | Self::Server { .. } => 5,
             Self::Verification(_) | Self::Decompression(_) => 6,
-            Self::TooLarge { .. } => 7,
+            Self::TooLarge { .. } | Self::OriginalTooLarge { .. } => 7,
             Self::Io(_) | Self::Config(_) => 1,
         }
     }
@@ -151,9 +151,10 @@ pub enum RetrieveResult {
 /// `endpoint_override` bypasses configuration to retrieve from an explicit server; when `None`, the
 /// endpoint recorded by archive-upload configuration is used. The hash is validated locally before
 /// either is consulted, so a malformed hash never triggers configuration reads or network access.
-/// `max_download_bytes` overrides the default download cap; an artifact whose declared stored size
-/// exceeds the effective cap is refused (`TooLarge`) before any transfer, so a large artifact fails
-/// with an actionable error instead of a misleading truncated-body verification failure.
+/// `max_download_bytes` overrides the default download cap; an artifact whose declared stored *or*
+/// original size exceeds the effective cap is refused (`TooLarge` / `OriginalTooLarge`) before any
+/// transfer, so a large — or a highly compressible — artifact fails with an actionable error
+/// instead of a misleading truncated-body verification failure or an out-of-memory decompression.
 pub fn retrieve(
     state_directory: &Path,
     endpoint_override: Option<&str>,
@@ -180,14 +181,6 @@ pub fn retrieve(
     }
 
     let chosen = matches.into_iter().next().expect("match set is non-empty");
-    // The listing already carries the stored size, so an oversized artifact is refused before any
-    // bytes are transferred — never truncated into a misleading stored-size-mismatch verification.
-    if chosen.stored_size_bytes > cap as u64 {
-        return Err(RetrieveError::TooLarge {
-            stored_size_bytes: chosen.stored_size_bytes,
-            cap: cap as u64,
-        });
-    }
     let original_bytes = client.download_verified(&chosen, &hash, cap)?;
     Ok(RetrieveResult::Retrieved(Box::new(RetrievedContent {
         artifact: chosen,
@@ -238,176 +231,101 @@ fn sort_newest_first(matches: &mut [ArtifactMatch]) {
     });
 }
 
-/// A synchronous retrieval client bound to one archive server.
+/// A synchronous retrieval client bound to one archive server: the shared Patwari read stack
+/// ([`crate::patwari_read`]) plus retrieval's own error surface. Every wire rule — pagination,
+/// the size gate, the three-stage verification — lives in the shared module; what stays here is
+/// the mapping onto [`RetrieveError`] and its exit codes.
 struct RetrieveClient {
-    host: String,
-    port: u16,
-    timeout: Duration,
+    client: ReadClient,
 }
 
 impl RetrieveClient {
     fn connect(endpoint: &str) -> Result<Self, RetrieveError> {
-        let (host, port) = http::parse_http_endpoint(endpoint).map_err(from_http)?;
         Ok(Self {
-            host,
-            port,
-            timeout: REQUEST_TIMEOUT,
+            client: ReadClient::connect(endpoint).map_err(from_http)?,
         })
     }
 
     /// Pages through `GET /api/v1/artifacts?original_sha256=…`, collecting every match.
+    ///
+    /// A traversal that hits [`MAX_LISTING_PAGES`] keeps what it collected: blob dedup means the
+    /// pages are copies of the same bytes, so the newest of a truncated match set still reproduces
+    /// the requested content.
     fn list_matches(&self, hash: &str) -> Result<Vec<ArtifactMatch>, RetrieveError> {
-        let mut matches = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_LISTING_PAGES {
-            let mut path =
-                format!("{API_BASE}/artifacts?original_sha256={hash}&limit={LISTING_PAGE_SIZE}");
-            if let Some(cursor) = &cursor {
-                path.push_str("&cursor=");
-                path.push_str(&http::encode_path(cursor));
-            }
-            let response = self.get(&path)?;
-            match response.status {
-                200 => {}
-                422 => return Err(RetrieveError::InvalidHash(hash.to_owned())),
-                status => return Err(self.server_error(status, &response.body)),
-            }
-            let value = parse_json(&response.body)?;
-            let items = value
-                .get("items")
-                .and_then(Value::as_array)
-                .ok_or_else(|| RetrieveError::Protocol("listing missing items".to_owned()))?;
-            for item in items {
-                matches.push(artifact_match_from_value(item)?);
-            }
-            cursor = value
-                .get("next_cursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(matches)
+        self.client
+            .paginate(
+                "listing",
+                MAX_LISTING_PAGES,
+                |cursor| {
+                    let mut path = format!(
+                        "{API_BASE}/artifacts?original_sha256={hash}&limit={LISTING_PAGE_SIZE}"
+                    );
+                    if let Some(cursor) = cursor {
+                        path.push_str("&cursor=");
+                        path.push_str(&http::encode_path(cursor));
+                    }
+                    path
+                },
+                artifact_match_from_value,
+            )
+            .map(|listing| listing.items)
+            .map_err(|error| match error {
+                // A rejected hash is the caller's input problem, not the server's.
+                ReadError::Status { status: 422, .. } => {
+                    RetrieveError::InvalidHash(hash.to_owned())
+                }
+                other => from_read(other),
+            })
     }
 
-    /// Downloads the artifact's stored bytes, verifies the stored digest, decompresses, and verifies
-    /// the original digest and size against both the response headers and the requested hash. Any
-    /// mismatch returns an error before the caller can emit content.
+    /// Downloads the artifact's stored bytes and returns the verified original, refusing anything
+    /// past the download cap before a byte moves. Any mismatch returns an error before the caller
+    /// can emit content.
     fn download_verified(
         &self,
         artifact: &ArtifactMatch,
         requested_hash: &str,
         max_download_bytes: usize,
     ) -> Result<Vec<u8>, RetrieveError> {
-        let response = self.get_with_limit(&artifact.content_url, max_download_bytes)?;
-        match response.status {
-            200 => {}
-            404 => return Err(RetrieveError::NotFound(requested_hash.to_owned())),
-            status => return Err(self.server_error(status, &response.body)),
-        }
-
-        let compression = response
-            .header("x-patwari-compression")
-            .ok_or_else(|| {
-                RetrieveError::Protocol("content missing compression header".to_owned())
-            })?
-            .to_owned();
-        let stored_sha_header = header_digest(&response, "x-patwari-stored-sha256")?;
-        let original_sha_header = header_digest(&response, "x-patwari-original-sha256")?;
-        let stored_size_header = header_u64(&response, "x-patwari-stored-size-bytes")?;
-        let original_size_header = header_u64(&response, "x-patwari-original-size-bytes")?;
-
-        // 1. The transferred stored bytes must match the server's declared stored digest and size.
-        let stored_bytes = response.body;
-        if stored_bytes.len() as u64 != stored_size_header {
-            return Err(RetrieveError::Verification(format!(
-                "stored size mismatch: got {} bytes, expected {stored_size_header}",
-                stored_bytes.len()
-            )));
-        }
-        let stored_digest = sha256_hex(&stored_bytes);
-        if stored_digest != stored_sha_header {
-            return Err(RetrieveError::Verification(
-                "stored content hash does not match the archive's declared stored hash".to_owned(),
-            ));
-        }
-
-        // 2. Decompress per the declared compression to recover the original bytes.
-        let original_bytes = match compression.as_str() {
-            "identity" => stored_bytes,
-            "zstd" => zstd::decode_all(stored_bytes.as_slice())
-                .map_err(|error| RetrieveError::Decompression(error.to_string()))?,
-            other => {
-                return Err(RetrieveError::Protocol(format!(
-                    "unknown compression `{other}`"
-                )));
-            }
+        let listed = ListedArtifact {
+            content_url: &artifact.content_url,
+            stored_size_bytes: artifact.stored_size_bytes,
+            original_size_bytes: artifact.original_size_bytes,
+            expected_original_sha256: requested_hash,
+            expected_label: "requested",
         };
-
-        // 3. The recovered original must match the requested hash, the header hash, and the size.
-        if original_bytes.len() as u64 != original_size_header {
-            return Err(RetrieveError::Verification(format!(
-                "original size mismatch: got {} bytes, expected {original_size_header}",
-                original_bytes.len()
-            )));
-        }
-        let original_digest = sha256_hex(&original_bytes);
-        if original_digest != original_sha_header {
-            return Err(RetrieveError::Verification(
-                "decompressed content hash does not match the archive's declared original hash"
-                    .to_owned(),
-            ));
-        }
-        if original_digest != requested_hash {
-            return Err(RetrieveError::Verification(format!(
-                "decompressed content hash sha256:{original_digest} does not match the requested sha256:{requested_hash}"
-            )));
-        }
-        Ok(original_bytes)
-    }
-
-    fn get(&self, path: &str) -> Result<http::HttpResponse, RetrieveError> {
-        self.send(path, None)
-    }
-
-    fn get_with_limit(
-        &self,
-        path: &str,
-        max_response_bytes: usize,
-    ) -> Result<http::HttpResponse, RetrieveError> {
-        self.send(path, Some(max_response_bytes))
-    }
-
-    fn send(
-        &self,
-        path: &str,
-        max_response_bytes: Option<usize>,
-    ) -> Result<http::HttpResponse, RetrieveError> {
-        let headers = [Header {
-            name: "Accept",
-            value: "*/*",
-        }];
-        let request = http::HttpRequest {
-            method: "GET",
-            path,
-            headers: &headers,
-            body: None,
-        };
-        let result = match max_response_bytes {
-            Some(limit) => {
-                http::send_with_limit(&self.host, self.port, self.timeout, &request, limit)
-            }
-            None => http::send(&self.host, self.port, self.timeout, &request),
-        };
-        result.map_err(from_http)
-    }
-
-    fn server_error(&self, status: u16, body: &[u8]) -> RetrieveError {
-        RetrieveError::Server {
-            status,
-            code: error_code(body).unwrap_or_else(|| "unknown".to_owned()),
-        }
+        self.client
+            .download_verified(&listed, max_download_bytes)
+            .map_err(|error| match error {
+                DownloadError::Http(error) => from_http(error),
+                // The listing matched but the content route has nothing: the hash is unresolvable.
+                DownloadError::Status { status: 404, .. } => {
+                    RetrieveError::NotFound(requested_hash.to_owned())
+                }
+                DownloadError::Status { status, code } => RetrieveError::Server {
+                    status,
+                    code: code.unwrap_or_else(|| "unknown".to_owned()),
+                },
+                DownloadError::Protocol(message) => RetrieveError::Protocol(message),
+                DownloadError::Verification(message) => RetrieveError::Verification(message),
+                DownloadError::Decompression(message) => RetrieveError::Decompression(message),
+                DownloadError::TooLarge(SizeRefusal {
+                    dimension: SizeDimension::Stored,
+                    size_bytes,
+                    cap,
+                }) => RetrieveError::TooLarge {
+                    stored_size_bytes: size_bytes,
+                    cap,
+                },
+                DownloadError::TooLarge(SizeRefusal {
+                    dimension: SizeDimension::Original,
+                    size_bytes,
+                    cap,
+                }) => RetrieveError::OriginalTooLarge {
+                    original_size_bytes: size_bytes,
+                    cap,
+                },
+            })
     }
 }
 
@@ -496,15 +414,12 @@ fn build_group(
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-fn artifact_match_from_value(value: &Value) -> Result<ArtifactMatch, RetrieveError> {
+fn artifact_match_from_value(value: &Value) -> Result<ArtifactMatch, String> {
     Ok(ArtifactMatch {
         artifact_id: required_str(value, "artifact_id")?,
         snapshot_id: required_str(value, "snapshot_id")?,
         logical_path: required_str(value, "logical_path")?,
-        media_type: value
-            .get("media_type")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        media_type: optional_str(value, "media_type"),
         original_sha256: strip_digest(&required_str(value, "original_sha256")?),
         original_size_bytes: required_u64(value, "original_size_bytes")?,
         stored_sha256: strip_digest(&required_str(value, "stored_sha256")?),
@@ -515,56 +430,17 @@ fn artifact_match_from_value(value: &Value) -> Result<ArtifactMatch, RetrieveErr
     })
 }
 
-fn parse_json(body: &[u8]) -> Result<Value, RetrieveError> {
-    serde_json::from_slice(body).map_err(|error| RetrieveError::Protocol(error.to_string()))
-}
-
-fn required_str(value: &Value, key: &str) -> Result<String, RetrieveError> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| RetrieveError::Protocol(format!("listing item missing {key}")))
-}
-
-fn required_u64(value: &Value, key: &str) -> Result<u64, RetrieveError> {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| RetrieveError::Protocol(format!("listing item missing {key}")))
-}
-
-fn header_digest(response: &http::HttpResponse, name: &str) -> Result<String, RetrieveError> {
-    response
-        .header(name)
-        .map(strip_digest)
-        .ok_or_else(|| RetrieveError::Protocol(format!("content missing {name} header")))
-}
-
-fn header_u64(response: &http::HttpResponse, name: &str) -> Result<u64, RetrieveError> {
-    response
-        .header(name)
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| RetrieveError::Protocol(format!("content missing or invalid {name} header")))
-}
-
-/// Strips Patwari's `sha256:` document prefix, leaving the bare lowercase hex digest.
-fn strip_digest(value: &str) -> String {
-    value.strip_prefix("sha256:").unwrap_or(value).to_owned()
-}
-
-/// Reads Patwari's stable `error.code` from an error response body, if present.
-fn error_code(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("error")?
-        .get("code")?
-        .as_str()
-        .map(ToOwned::to_owned)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+/// Maps a shared-stack listing failure onto retrieval's error surface. The 422 case is handled by
+/// the caller, which knows the rejected hash.
+fn from_read(error: ReadError) -> RetrieveError {
+    match error {
+        ReadError::Http(error) => from_http(error),
+        ReadError::Status { status, code } => RetrieveError::Server {
+            status,
+            code: code.unwrap_or_else(|| "unknown".to_owned()),
+        },
+        ReadError::Protocol(message) => RetrieveError::Protocol(message),
+    }
 }
 
 fn from_http(error: HttpError) -> RetrieveError {
@@ -599,12 +475,6 @@ mod tests {
             normalize_hash(&"g".repeat(64)),
             Err(RetrieveError::InvalidHash(_))
         ));
-    }
-
-    #[test]
-    fn strips_the_digest_prefix() {
-        assert_eq!(strip_digest("sha256:abcd"), "abcd");
-        assert_eq!(strip_digest("abcd"), "abcd");
     }
 
     #[test]
