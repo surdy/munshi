@@ -595,6 +595,13 @@ classified as `archived`, `revision-pending`, `summary-pending`, `interrupted`, 
 `delivery-related`, `disabled-project`, `processing`, `observed`, `not-archive-worthy`, or
 `unknown`.
 
+`not-archive-worthy` is a read-time label over a stored `observed` lifecycle, derived from a
+recorded verdict: either a session-end was ingested before the worker judged the content (the
+hook path), or the worker stamped the verdict while settling a sweep-discovered session
+(issue #50). Keeping the stored lifecycle `observed` keeps the row reactivatable: a transcript
+that later grows re-enters the pipeline through hook ingestion or the recovery rescue
+(issue #49) and can still archive.
+
 `configuration-check` and `doctor` report:
 
 - capture state (`enabled`, `disabled-project`, `unknown`) from real issue #5 policy state

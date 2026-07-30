@@ -129,6 +129,11 @@ pub struct SessionRecord {
     pub active: bool,
     pub last_agent_stop_ms: Option<i64>,
     pub last_session_end_ms: Option<i64>,
+    /// When an archive worker last recorded a not-archive-worthy verdict while settling the
+    /// row back to `observed` (issue #50). A read-time display signal only: the stored
+    /// lifecycle stays `observed` so the issue #49 rescue and the hook requeue paths keep
+    /// treating the row as reactivatable when the transcript grows.
+    pub not_archive_worthy_at_ms: Option<i64>,
     pub last_error_category: Option<String>,
     /// When the failed session becomes retry-eligible again: `None` is immediately eligible, a
     /// timestamp is a scheduled backoff, and a negative value is a permanent park (issues #38/#44).
@@ -686,6 +691,7 @@ impl StateStore {
         ensure_processing_attempts_git_history_column(&self.connection)?;
         ensure_session_failure_streak_columns(&self.connection)?;
         ensure_session_project_origin_column(&self.connection)?;
+        ensure_session_not_archive_worthy_column(&self.connection)?;
         Ok(())
     }
 
@@ -907,7 +913,7 @@ impl StateStore {
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
                     last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                    origin_project_origin
+                    origin_project_origin,not_archive_worthy_at_ms
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -931,7 +937,7 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin
+                origin_project_origin,not_archive_worthy_at_ms
              FROM sessions
              ORDER BY updated_at_ms DESC,id DESC",
         )?;
@@ -1743,6 +1749,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         active: row.get(30)?,
         last_agent_stop_ms: row.get(31)?,
         last_session_end_ms: row.get(32)?,
+        not_archive_worthy_at_ms: row.get(38)?,
         last_error_category: row.get(33)?,
         next_retry_at_ms: row.get(35)?,
         failure_streak: row.get(36)?,
@@ -1897,6 +1904,48 @@ fn ensure_session_project_origin_column(connection: &Connection) -> Result<(), S
     if !existing.contains("origin_project_origin") {
         connection.execute(
             "ALTER TABLE sessions ADD COLUMN origin_project_origin TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Additive column recording when an archive worker last judged a session's content not
+/// archive-worthy while settling it back to `observed` (issue #50), added the same way as
+/// the columns above so existing databases upgrade in place without a schema rebuild.
+///
+/// The stored lifecycle deliberately stays `observed` — `not-archive-worthy` is a read-time
+/// label, exactly like the hook-path verdict derived from `last_session_end_ms` — so every
+/// reactivation path keeps working: hook ingestion requeues the row on new evidence, and
+/// the issue #49 rescue (which keys on `observed` with no session-end) rescues it again
+/// whenever the transcript has since changed. Only the display moves.
+///
+/// When the column is first added, rows already settled by the issue #49 rescue are
+/// backfilled: `observed`, inactive, revision 0, no session-end verdict, with a recorded
+/// succeeded attempt — the only shape a worker's not-archive-worthy verdict leaves behind
+/// (an archive verdict always raises the revision above 0). The verdict time is the row's
+/// `updated_at_ms`, written by that verdict.
+fn ensure_session_not_archive_worthy_column(connection: &Connection) -> Result<(), StateError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let existing: std::collections::BTreeSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    drop(statement);
+    if !existing.contains("not_archive_worthy_at_ms") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN not_archive_worthy_at_ms INTEGER",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE sessions SET not_archive_worthy_at_ms=updated_at_ms
+             WHERE lifecycle_state='observed'
+               AND active=0
+               AND current_summary_revision=0
+               AND last_session_end_ms IS NULL
+               AND EXISTS (
+                    SELECT 1 FROM processing_attempts
+                    WHERE session_id=sessions.id AND outcome='succeeded'
+               )",
             [],
         )?;
     }
@@ -2357,7 +2406,7 @@ impl StateStore {
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
                     last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                    origin_project_origin
+                    origin_project_origin,not_archive_worthy_at_ms
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -2823,6 +2872,16 @@ impl StateStore {
         Ok(())
     }
 
+    /// Records the worker's not-archive-worthy verdict. The row settles back to `observed`
+    /// — deliberately, not as a distinct lifecycle value: `observed` is the reactivatable
+    /// shape every requeue path understands (hook ingestion on new evidence, the issue #49
+    /// rescue on a changed transcript), so a stub that later grows a real reply re-enters
+    /// the normal pipeline. The verdict itself is stamped in `not_archive_worthy_at_ms`
+    /// (issue #50) so read-time surfaces (`operational_state`, [`wait_state`]) label the
+    /// session `not-archive-worthy` even when no session-end hook was ever ingested — the
+    /// sweep-discovered case that previously displayed as a phantom `observed` session.
+    ///
+    /// [`wait_state`]: StateStore::wait_state
     pub fn complete_not_archive_worthy(&mut self, claim: &Claim) -> Result<(), StateError> {
         let now = now_ms();
         let transaction = self
@@ -2835,6 +2894,7 @@ impl StateStore {
         )?;
         transaction.execute(
             "UPDATE sessions SET lifecycle_state='observed',
+                not_archive_worthy_at_ms=?2,
                 retry_state=NULL,next_retry_at_ms=NULL,
                 failure_streak=0,failure_streak_category=NULL,failure_streak_generation=NULL,
                 claim_token=NULL,claim_started_at_ms=NULL,
@@ -2930,7 +2990,14 @@ impl StateStore {
         let state = match record.lifecycle_state.as_str() {
             "archived" => WaitState::Archived,
             "failed" => WaitState::Failed,
-            "observed" if record.current_revision == 0 && record.last_session_end_ms.is_some() => {
+            // A recorded verdict on unarchived content: either the hook path (a session-end
+            // was ingested before the worker judged it) or the sweep path (the worker
+            // stamped the verdict while settling the row, issue #50).
+            "observed"
+                if record.current_revision == 0
+                    && (record.last_session_end_ms.is_some()
+                        || record.not_archive_worthy_at_ms.is_some()) =>
+            {
                 WaitState::NotArchiveWorthy
             }
             _ => WaitState::Pending,
@@ -3104,7 +3171,7 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin
+                origin_project_origin,not_archive_worthy_at_ms
              FROM sessions
              WHERE active=1
                AND last_agent_stop_ms IS NOT NULL
@@ -3133,7 +3200,7 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin
+                origin_project_origin,not_archive_worthy_at_ms
              FROM sessions
              WHERE transcript_path IS NULL
                AND lifecycle_state IN (
@@ -3301,7 +3368,7 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin
+                origin_project_origin,not_archive_worthy_at_ms
              FROM sessions
              WHERE active=0
                AND lifecycle_state='interrupted'
@@ -3373,8 +3440,12 @@ impl StateStore {
     /// `reserve_eligible_workers` excludes `observed`, and the #39 hydration is scoped to
     /// `interrupted`, so nothing can ever claim the row again. Rows with
     /// `last_session_end_ms` set are excluded: for those, `observed` is a recorded
-    /// not-archive-worthy verdict reachable through `wait_state`, not a stuck shape. Spans
-    /// every source kind, like the other recovery work lists.
+    /// not-archive-worthy verdict reachable through `wait_state`, not a stuck shape. Rows
+    /// the sweep itself already settled stay in this list on purpose: their verdict is
+    /// visible through `not_archive_worthy_at_ms` (issue #50), and the rescue's
+    /// evidence-keyed dedupe keeps an unchanged transcript from churning while a transcript
+    /// that has since grown is requeued through the normal pipeline. Spans every source
+    /// kind, like the other recovery work lists.
     ///
     /// [`unhydrated_recovery_sessions`]: StateStore::unhydrated_recovery_sessions
     pub fn stuck_observed_sessions(&self) -> Result<Vec<SessionRecord>, StateError> {
@@ -3391,7 +3462,7 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin
+                origin_project_origin,not_archive_worthy_at_ms
              FROM sessions
              WHERE active=0
                AND lifecycle_state='observed'

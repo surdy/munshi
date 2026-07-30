@@ -1854,6 +1854,227 @@ fn rescued_observed_husk_settles_without_rechurn_when_still_not_archive_worthy()
     assert!(transcript.is_file(), "never-drop: the transcript survives");
 }
 
+/// Writes the user-only stub transcript from the live census (a user request with no
+/// assistant or tool activity — abandoned before the first reply): never archive-worthy.
+fn write_stub_transcript(harness: &Harness, session_id: &str) -> PathBuf {
+    let transcript = harness
+        .copilot_home
+        .join("session-state")
+        .join(session_id)
+        .join("events.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        [
+            json!({
+                "id": "initial-start",
+                "timestamp": "2026-07-12T00:00:00.000Z",
+                "parentId": null,
+                "type": "session.start",
+                "data": {"sessionId": session_id},
+            }),
+            json!({
+                "id": "initial-user",
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "parentId": "initial-start",
+                "type": "user.message",
+                "data": {"content": "UNANSWERED_REQUEST"},
+            }),
+        ]
+        .map(|value| value.to_string())
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    transcript.canonicalize().unwrap()
+}
+
+/// Inserts the exact husk row from the live census: swept into recovery, judged once by a
+/// worker, and returned to `observed` with `active=0` and no session-end verdict.
+fn insert_recovery_husk_row(harness: &Harness, session_id: &str, transcript: &Path) {
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,?3,'version-pinned-recovery','unknown','unknown',
+                       'observed',0,2,1,1)",
+            params![
+                session_id,
+                harness.project.to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+/// Runs one recovery sweep over a husk row and waits until the worker has judged it not
+/// archive-worthy and returned it to the settled `observed` verdict shape.
+fn settle_husk(harness: &Harness, session_id: &str) {
+    assert_success(&harness.recover(600_000, false, false));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+        let (lifecycle, attempts): (String, i64) = connection
+            .query_row(
+                "SELECT lifecycle_state,
+                        (SELECT COUNT(*) FROM processing_attempts WHERE finished_at_ms IS NOT NULL)
+                 FROM sessions WHERE source_session_id=?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if lifecycle == "observed" && attempts == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never settled the rescued husk: {lifecycle} ({attempts})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Issue #50: a sweep-discovered stub the worker judges not archive-worthy must surface
+/// under the `not-archive-worthy` label in `status` and `sessions` (text and JSON), not as
+/// a phantom `observed` session. The stored lifecycle stays `observed` — the settled shape
+/// issue #49's rescue keys on — so only the read-time label moves.
+#[test]
+fn settled_sweep_verdict_surfaces_as_not_archive_worthy_in_status_and_sessions() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("naw-visible-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = write_stub_transcript(&harness, SESSION_A);
+    harness.write_workspace(SESSION_A);
+    insert_recovery_husk_row(&harness, SESSION_A, &transcript);
+    set_old_mtime(&transcript);
+    settle_husk(&harness, SESSION_A);
+
+    let status = harness.status_json();
+    assert_eq!(status["sessions"]["total"], 1);
+    assert_eq!(
+        status["sessions"]["not_archive_worthy"], 1,
+        "the settled verdict must be visible: {status}"
+    );
+    assert_eq!(
+        status["sessions"]["observed"], 0,
+        "a refused stub must not read as a live observed session: {status}"
+    );
+
+    let sessions = harness.sessions_json(None);
+    let items = sessions["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["state"], "not-archive-worthy");
+    assert_eq!(items[0]["lifecycle_state"], "observed");
+
+    let filtered = harness.sessions_json(Some("not-archive-worthy"));
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+    let observed_only = harness.sessions_json(Some("observed"));
+    assert_eq!(observed_only["items"].as_array().unwrap().len(), 0);
+}
+
+/// Issue #50 reactivation guarantee: settling the verdict must not strand the stub. A
+/// transcript that later grows a real reply presents new evidence, defeats the settle
+/// dedupe, re-enters the normal interrupted pipeline, and archives.
+#[test]
+fn settled_stub_that_later_grows_reenters_the_pipeline_and_archives() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("naw-regrow-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = write_stub_transcript(&harness, SESSION_A);
+    harness.write_workspace(SESSION_A);
+    insert_recovery_husk_row(&harness, SESSION_A, &transcript);
+    set_old_mtime(&transcript);
+    settle_husk(&harness, SESSION_A);
+    assert_eq!(harness.status_json()["sessions"]["not_archive_worthy"], 1);
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "id": "initial-assistant",
+            "timestamp": "2026-07-12T00:00:02.000Z",
+            "parentId": "initial-user",
+            "type": "assistant.message",
+            "data": {"content": "a real answer arrived", "messageId": "initial-message"},
+        })
+    )
+    .unwrap();
+    drop(file);
+    set_old_mtime(&transcript);
+    assert_success(&harness.recover(600_000, false, false));
+    assert_success(&harness.wait(SESSION_A, 15_000));
+
+    let status = harness.status_json();
+    assert_eq!(
+        status["sessions"]["archived"], 1,
+        "grown stub archives: {status}"
+    );
+    assert_eq!(status["sessions"]["not_archive_worthy"], 0);
+    assert!(harness.archive_path(SESSION_A).is_file());
+}
+
+/// Issue #50 upgrade path: settled husk rows written before the verdict column existed
+/// (`observed`, inactive, revision 0, no session-end, with a recorded succeeded attempt)
+/// are relabeled by the additive-column backfill on the next open. A husk that was never
+/// judged and a genuinely live observed row both keep the `observed` label.
+#[test]
+fn pre_upgrade_settled_husk_rows_are_relabeled_on_open() {
+    let live_session = "33333333-3333-4333-8333-333333333333";
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("naw-upgrade-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+
+    // The settled shape issue #49 left on the live store: judged once (a succeeded
+    // attempt), returned to `observed` with no session-end verdict.
+    let settled = write_stub_transcript(&harness, SESSION_A);
+    insert_recovery_husk_row(&harness, SESSION_A, &settled);
+    // An unjudged husk: same row shape, but no attempt was ever recorded.
+    let unjudged = write_stub_transcript(&harness, SESSION_B);
+    insert_recovery_husk_row(&harness, SESSION_B, &unjudged);
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO processing_attempts(
+                session_id,state_generation,retry_state,lease_token,
+                started_at_ms,lease_expires_at_ms,finished_at_ms,outcome
+             ) SELECT id,2,'interrupted','naw-upgrade-token',1,2,3,'succeeded'
+               FROM sessions WHERE source_session_id=?1",
+            [SESSION_A],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,origin_cwd,transcript_path,transcript_source,
+                lifecycle_state,active,state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,NULL,NULL,'observed',1,1,1,1)",
+            params![live_session, harness.project.to_str().unwrap()],
+        )
+        .unwrap();
+    // Strip the verdict column to simulate a database written before this release.
+    connection
+        .execute_batch("ALTER TABLE sessions DROP COLUMN not_archive_worthy_at_ms")
+        .unwrap();
+    drop(connection);
+
+    let status = harness.status_json();
+    assert_eq!(
+        status["sessions"]["not_archive_worthy"], 1,
+        "the pre-upgrade settled husk must be relabeled: {status}"
+    );
+    assert_eq!(
+        status["sessions"]["observed"], 2,
+        "the unjudged husk and the live session keep the observed label: {status}"
+    );
+}
+
 #[test]
 fn stale_issue_three_files_migrate_to_retryable_sqlite_work() {
     let harness = Harness::new();
@@ -2109,6 +2330,31 @@ impl Harness {
             .output()
             .unwrap();
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn status_json(&self) -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .args(["status", "--json"])
+            .arg("--state-dir")
+            .arg(&self.state)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn sessions_json(&self, state: Option<&str>) -> Value {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
+        command
+            .args(["sessions", "--json"])
+            .arg("--state-dir")
+            .arg(&self.state);
+        if let Some(state) = state {
+            command.args(["--state", state]);
+        }
+        let output = command.output().unwrap();
+        assert_success(&output);
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     fn commit_count(&self, repository: &Path) -> usize {
