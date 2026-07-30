@@ -138,6 +138,13 @@ const FIXTURES: &[Fixture] = &[
         Source::Copilot,
         "copilot-1.0.70/transcript/synthetic-envelope.jsonl",
     ),
+    // The four archive-observed tool-activity kinds (issue #51): skill.invoked,
+    // tool.user_requested, and external_tool.requested/completed must classify as
+    // content, leaving zero unknowns.
+    well_formed(
+        Source::Copilot,
+        "copilot-tool-activity/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events.jsonl",
+    ),
     well_formed(
         Source::Copilot,
         "copilot-1.0.5x-bookkeeping/55555555-5555-4555-8555-555555555555/events.jsonl",
