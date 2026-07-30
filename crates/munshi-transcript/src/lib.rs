@@ -189,8 +189,11 @@ impl Event {
 
 /// Structured fields of a tool event, keyed exactly as the legacy renderer keys them
 /// (`event`, `name`, `tool_use_id` / `tool_call_id` / `call_id`, `arguments` / `input`,
-/// `output`, `success`, `error`, `is_error`, `command`). The map is ordered so the legacy
-/// rendering is reproducible byte-for-byte.
+/// `output`, `success`, `error`, `is_error`, `command`), plus the Copilot tool-activity
+/// keys added by issue #51 (`request_id` correlating `external_tool.requested` /
+/// `external_tool.completed`, and the `skill.invoked` card fields `path`, `description`,
+/// `source`, `trigger`, `model`, `content`). The map is ordered so the legacy rendering
+/// is reproducible byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolEvent {
     pub fields: BTreeMap<String, String>,
@@ -198,7 +201,9 @@ pub struct ToolEvent {
 
 impl ToolEvent {
     /// The source-specific event discriminator (`tool_use`, `tool_result`,
-    /// `tool.execution_start`, `function_call`, `local_shell_call`, ...). Always present.
+    /// `tool.execution_start`, `tool.user_requested`, `skill.invoked`,
+    /// `external_tool.requested`, `external_tool.completed`, `function_call`,
+    /// `local_shell_call`, ...). Always present.
     pub fn event(&self) -> Option<&str> {
         self.fields.get("event").map(String::as_str)
     }

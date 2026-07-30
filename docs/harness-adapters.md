@@ -102,6 +102,17 @@ once the chunked-marathon giants uploaded (issue #45), added eight more: `abort`
 `session.plan_changed`, `session.task_complete`, and `session.workspace_file_changed` — same
 treatment.
 
+The census tail also surfaced four archive-observed **tool-activity** kinds that are content,
+not bookkeeping (issue #51), all normalized as `tool` events: `skill.invoked` (the agent loaded
+a skill — `name` required; `path`, `description`, `source`, `trigger`, `model`, and the full
+SKILL.md `content` rendered when present, with oversized content elided downstream per
+ADR 0010), `tool.user_requested` (a user-initiated tool call with the exact
+`tool.execution_start` payload shape), and `external_tool.requested` /
+`external_tool.completed` (MCP/external tool calls; `requested` carries the
+`tool.execution_start` shape plus a `requestId`, `completed` carries only the correlating
+`requestId` and is required to have one). Typing these was count-affecting —
+`tool_activities` grows for sessions containing them — hence normalizer version 3.
+
 ## Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 
 **Source of truth.** Claude Code stores each session as JSONL at

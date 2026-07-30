@@ -127,6 +127,12 @@ const CASES: &[(SourceKind, Source, &str, &str)] = &[
         "manual/copilot/77777777-7777-4777-8777-777777777777/events.jsonl",
         "77777777-7777-4777-8777-777777777777",
     ),
+    (
+        SourceKind::Copilot,
+        Source::Copilot,
+        "copilot-tool-activity/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events.jsonl",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ),
 ];
 
 fn load_legacy(source: SourceKind, path: &Path, session_id: &str) -> NormalizedSession {

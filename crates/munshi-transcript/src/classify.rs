@@ -123,12 +123,35 @@ fn classify_copilot(object: &Map<String, Value>) -> Class {
             }
         }
         "tool.execution_start" => match event_data(object).filter(|data| valid_tool_start(data)) {
-            Some(data) => Class::event(Event::Tool(extract_tool_start(data))),
+            Some(data) => Class::event(Event::Tool(extract_tool_invocation(event_type, data))),
             None => Class::ignored(event_type),
         },
         "tool.execution_complete" => {
             match event_data(object).filter(|data| valid_tool_complete(data)) {
                 Some(data) => Class::event(Event::Tool(extract_tool_complete(data))),
+                None => Class::ignored(event_type),
+            }
+        }
+        // Archive-observed tool-activity kinds (issue #51): real session content, not
+        // bookkeeping. `tool.user_requested` is a user-initiated sibling of
+        // `tool.execution_start` with the identical payload shape.
+        "tool.user_requested" => match event_data(object).filter(|data| valid_tool_start(data)) {
+            Some(data) => Class::event(Event::Tool(extract_tool_invocation(event_type, data))),
+            None => Class::ignored(event_type),
+        },
+        "skill.invoked" => match event_data(object).and_then(extract_skill_invoked) {
+            Some(tool) => Class::event(Event::Tool(tool)),
+            None => Class::ignored(event_type),
+        },
+        "external_tool.requested" => {
+            match event_data(object).filter(|data| valid_tool_start(data)) {
+                Some(data) => Class::event(Event::Tool(extract_external_tool_request(data))),
+                None => Class::ignored(event_type),
+            }
+        }
+        "external_tool.completed" => {
+            match event_data(object).and_then(extract_external_tool_completed) {
+                Some(tool) => Class::event(Event::Tool(tool)),
                 None => Class::ignored(event_type),
             }
         }
@@ -183,9 +206,12 @@ fn valid_tool_result(result: &Value) -> bool {
     has_content || has_textual_contents
 }
 
-fn extract_tool_start(data: &Map<String, Value>) -> ToolEvent {
+/// The shared tool-invocation extraction for the `valid_tool_start`-shaped payloads
+/// (`tool.execution_start`, `tool.user_requested`, `external_tool.requested`): the event
+/// discriminator, the validated call id and name, and the compacted arguments.
+fn extract_tool_invocation(event_type: &str, data: &Map<String, Value>) -> ToolEvent {
     let mut fields = BTreeMap::new();
-    insert(&mut fields, "event", "tool.execution_start".to_owned());
+    insert(&mut fields, "event", event_type.to_owned());
     insert(
         &mut fields,
         "tool_call_id",
@@ -206,6 +232,61 @@ fn extract_tool_start(data: &Map<String, Value>) -> ToolEvent {
         insert(&mut fields, "arguments", arguments);
     }
     ToolEvent { fields }
+}
+
+/// `skill.invoked` (issue #51): the agent loaded a skill — activity comparable to Claude
+/// Code's `Skill` tool use. Requires a nonempty skill `name`; carries the skill's path,
+/// card metadata, and full SKILL.md `content` (size policy belongs to consumers).
+fn extract_skill_invoked(data: &Map<String, Value>) -> Option<ToolEvent> {
+    let name = data
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(nonempty)?;
+    let mut fields = BTreeMap::new();
+    insert(&mut fields, "event", "skill.invoked".to_owned());
+    insert(&mut fields, "name", name);
+    for key in [
+        "path",
+        "description",
+        "source",
+        "trigger",
+        "model",
+        "content",
+    ] {
+        if let Some(value) = data.get(key).and_then(Value::as_str).and_then(nonempty) {
+            insert(&mut fields, key, value);
+        }
+    }
+    Some(ToolEvent { fields })
+}
+
+/// `external_tool.requested` (issue #51): an MCP/external tool invocation. The payload is
+/// the `tool.execution_start` shape plus a `requestId` correlating the eventual
+/// `external_tool.completed` marker.
+fn extract_external_tool_request(data: &Map<String, Value>) -> ToolEvent {
+    let mut tool = extract_tool_invocation("external_tool.requested", data);
+    if let Some(request_id) = data
+        .get("requestId")
+        .and_then(Value::as_str)
+        .and_then(nonempty)
+    {
+        insert(&mut tool.fields, "request_id", request_id);
+    }
+    tool
+}
+
+/// `external_tool.completed` (issue #51): the completion marker for an external tool
+/// call. Archived records carry only the correlating `requestId`, which is therefore
+/// required — without it the record marks nothing.
+fn extract_external_tool_completed(data: &Map<String, Value>) -> Option<ToolEvent> {
+    let request_id = data
+        .get("requestId")
+        .and_then(Value::as_str)
+        .and_then(nonempty)?;
+    let mut fields = BTreeMap::new();
+    insert(&mut fields, "event", "external_tool.completed".to_owned());
+    insert(&mut fields, "request_id", request_id);
+    Some(ToolEvent { fields })
 }
 
 fn extract_tool_complete(data: &Map<String, Value>) -> ToolEvent {
@@ -719,6 +800,65 @@ mod tests {
                 classify_json(Source::Copilot, &json),
                 Class::Ignored(ignored) if ignored == kind
             ));
+        }
+    }
+
+    #[test]
+    fn copilot_tool_activity_kinds_map_to_tool_events() {
+        // The four archive-observed content kinds (issue #51), shaped exactly as the
+        // live archive records them.
+        let expect_tool = |json: &str, rendered: &str| {
+            let Class::Content(events) = classify_json(Source::Copilot, json) else {
+                panic!("expected content: {json}");
+            };
+            let [Event::Tool(tool)] = events.as_slice() else {
+                panic!("expected one tool event: {json}");
+            };
+            assert_eq!(tool.rendered(), rendered, "rendering for {json}");
+        };
+
+        expect_tool(
+            r##"{"type":"skill.invoked","data":{"name":"synthetic-skill","path":"/home/u/.copilot/skills/synthetic-skill/SKILL.md","content":"# Synthetic Skill\nBody.","source":"personal-copilot","description":"A fixture skill.","trigger":"agent-invoked","model":"fixture-model"}}"##,
+            "content=# Synthetic Skill\nBody. description=A fixture skill. \
+             event=skill.invoked model=fixture-model name=synthetic-skill \
+             path=/home/u/.copilot/skills/synthetic-skill/SKILL.md \
+             source=personal-copilot trigger=agent-invoked",
+        );
+        expect_tool(
+            r#"{"type":"tool.user_requested","data":{"toolCallId":"call-1","toolName":"local_shell","arguments":{"command":"git remote -v"}}}"#,
+            "arguments={\"command\":\"git remote -v\"} event=tool.user_requested \
+             name=local_shell tool_call_id=call-1",
+        );
+        expect_tool(
+            r#"{"type":"external_tool.requested","data":{"requestId":"req-1","sessionId":"s","toolCallId":"toolu_01","toolName":"extensions_manage","arguments":{"operation":"guide"},"workingDirectory":"/w"}}"#,
+            "arguments={\"operation\":\"guide\"} event=external_tool.requested \
+             name=extensions_manage request_id=req-1 tool_call_id=toolu_01",
+        );
+        expect_tool(
+            r#"{"type":"external_tool.completed","data":{"requestId":"req-1"}}"#,
+            "event=external_tool.completed request_id=req-1",
+        );
+
+        // Recognized kinds with a missing required field degrade to ignored, not unknown.
+        for json in [
+            r#"{"type":"skill.invoked","data":{"path":"/p","content":"c"}}"#,
+            r#"{"type":"skill.invoked","data":{"name":"  "}}"#,
+            r#"{"type":"tool.user_requested","data":{"toolName":"local_shell"}}"#,
+            r#"{"type":"external_tool.requested","data":{"requestId":"req-1","toolName":"t"}}"#,
+            r#"{"type":"external_tool.completed","data":{}}"#,
+            r#"{"type":"external_tool.completed","data":{"requestId":42}}"#,
+        ] {
+            let expected = serde_json::from_str::<Value>(json).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                matches!(
+                    classify_json(Source::Copilot, json),
+                    Class::Ignored(kind) if kind == expected
+                ),
+                "expected ignored: {json}"
+            );
         }
     }
 

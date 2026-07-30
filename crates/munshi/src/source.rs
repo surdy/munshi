@@ -16,7 +16,12 @@ use thiserror::Error;
 /// input, rather than failing the load (ADR 0010). The default preserves the historical 128 KB cap
 /// on per-event summarizer input size; it is configurable via `limits.max_event_text_bytes`.
 pub const DEFAULT_MAX_EVENT_TEXT_BYTES: usize = 128 * 1024;
-pub const NORMALIZER_VERSION: u32 = 2;
+/// Version 3: the Copilot tool-activity kinds (`skill.invoked`, `tool.user_requested`,
+/// `external_tool.requested`, `external_tool.completed`) became typed `tool` events
+/// instead of unknowns (issue #51). The change is count-affecting — `tool_activities`
+/// grows for sessions containing them — so any cursor persisted under an older version
+/// falls back to a full re-normalization (`CursorFallbackReason::NormalizerChanged`).
+pub const NORMALIZER_VERSION: u32 = 3;
 
 /// The normalized event kind carrying a human request, as the shared transcript interpreter
 /// labels it (`munshi_transcript::ContentEvent::kind`).
