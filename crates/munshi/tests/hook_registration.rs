@@ -525,6 +525,92 @@ fn hook_payload_errors_fail_open_without_echoing_private_content() {
     );
 }
 
+/// Issue #49: Copilot 1.0.76 added `stop_hook_active` to the `agentStop` payload and the
+/// previous closed-schema parse rejected every stop as `payload-invalid`, so sessions never
+/// accumulated agent-stop evidence. The current payload shape must ingest cleanly.
+#[test]
+fn copilot_1_0_76_agent_stop_with_stop_hook_active_records_evidence() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    let project = git_project(directory.path());
+    let mut payload = agent_stop_payload(&project, &fixture_events());
+    payload["stop_hook_active"] = Value::Bool(false);
+    assert_success(&hook_command(
+        &paths,
+        "agent-stop",
+        payload.to_string().as_bytes(),
+    ));
+
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let row: (String, bool, Option<i64>, Option<String>) = connection
+        .query_row(
+            "SELECT lifecycle_state,active,last_agent_stop_ms,transcript_path
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "observed");
+    assert!(row.1, "the session must be live, not an inactive husk");
+    assert_eq!(row.2, Some(1_783_817_107_011));
+    assert_eq!(row.3.as_deref(), fixture_events().to_str());
+    let invalid: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostics WHERE category='payload-invalid'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid, 0);
+}
+
+/// Issue #49: a payload the pinned struct cannot parse at all (here: the timestamp field
+/// gone) must still record agent-stop evidence — with the timestamp taken from receipt
+/// time — instead of degrading into an evidence-less husk only the sweep can reconstruct.
+/// The drift stays visible as one `payload-schema-drift` diagnostic.
+#[test]
+fn unparseable_agent_stop_still_records_receipt_time_evidence() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    let project = git_project(directory.path());
+    let mut payload = agent_stop_payload(&project, &fixture_events());
+    payload.as_object_mut().unwrap().remove("timestamp");
+    payload["stop_hook_active"] = Value::Bool(false);
+    let before_ms: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    assert_success(&hook_command(
+        &paths,
+        "agent-stop",
+        payload.to_string().as_bytes(),
+    ));
+
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let row: (String, bool, Option<i64>) = connection
+        .query_row(
+            "SELECT lifecycle_state,active,last_agent_stop_ms
+             FROM sessions WHERE source_session_id=?1",
+            [SESSION_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "observed");
+    assert!(row.1, "the session must be live, not an inactive husk");
+    assert!(
+        row.2.is_some_and(|timestamp| timestamp >= before_ms),
+        "receipt-time evidence expected, got {:?}",
+        row.2
+    );
+    let failure = read_last_failure(&paths.state).unwrap().unwrap();
+    assert_eq!(failure.code, "payload-schema-drift");
+    assert_eq!(failure.session_id.as_deref(), Some(SESSION_ID));
+}
+
 #[test]
 fn unresolved_session_end_stays_pending_and_later_interruption_archives() {
     let directory = test_directory();

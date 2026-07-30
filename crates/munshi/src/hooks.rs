@@ -97,8 +97,13 @@ pub enum HookWorkerError {
     Deferred(&'static str),
 }
 
+/// Copilot `agentStop` payload (phase-0 pinned at 1.0.70). Deliberately tolerant of unknown
+/// fields, exactly like the Claude Code payloads below: Copilot 1.0.76 added
+/// `stop_hook_active` to the same payload and the previous `deny_unknown_fields` posture
+/// rejected every `agentStop` as `payload-invalid` (issue #49), so sessions accumulated no
+/// agent-stop evidence and could only be captured by the recovery sweep. The extra fields
+/// are never read, so payload content cannot leak into state or diagnostics.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AgentStopPayload {
     #[serde(rename = "sessionId")]
     session_id: String,
@@ -110,8 +115,9 @@ struct AgentStopPayload {
     stop_reason: String,
 }
 
+/// Copilot `sessionEnd` payload (phase-0 pinned at 1.0.70). Tolerant, like `agentStop`: an
+/// unknown field added by a newer Copilot must never drop a completion observation.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SessionEndPayload {
     #[serde(rename = "sessionId")]
     session_id: String,
@@ -304,6 +310,7 @@ pub fn run_recovery(
     let unresolved = state.unresolved_sessions()?;
     let stale = state.stale_known_sessions(cutoff)?;
     let unhydrated = state.unhydrated_recovery_sessions()?;
+    let stuck_observed = state.stuck_observed_sessions()?;
 
     let copilot_home = stored.harnesses.copilot_home.as_deref().map(PathBuf::from);
     for session in unresolved {
@@ -413,6 +420,76 @@ pub fn run_recovery(
             .saturating_mul(1_000)
             .saturating_add(metadata.mtime_nsec() / 1_000_000);
         if store.hydrate_recovery_origin(&session.session_id, &origin, activity_ms)? {
+            reserved_sessions.push((session.source, session.session_id));
+        }
+        hydrated += 1;
+    }
+    // The sibling stuck shape (issue #49): `observed` rows with `active=0` and no session-end
+    // verdict. No hand-off path can see them — `stale_known_sessions` requires `active=1`,
+    // reservation excludes `observed`, and the hydration above is scoped to `interrupted` —
+    // so requeue them through the same interrupted-recovery pipeline under the same
+    // quiet-period and adapter-envelope gates. The row's own origin is kept even when the
+    // directory is gone (the worker's recorded-evidence fallback, issue #40, derives the
+    // project identity); a missing origin is derived as at first-time discovery, and a
+    // session with neither transcript nor origin evidence is parked with a diagnostic,
+    // never dropped.
+    for session in stuck_observed {
+        let Some(path) = session.transcript_path.as_deref() else {
+            let store = recovery_store(
+                &mut state,
+                &mut source_stores,
+                state_directory,
+                session.source,
+            )?;
+            store.park_recovery_session(&session.session_id, "transcript-unresolved")?;
+            continue;
+        };
+        if !source_is_stale_and_supported(
+            session.source,
+            path,
+            cutoff,
+            stored.limits.max_source_bytes,
+        ) {
+            // Inside the quiet period (or unsupported): a genuinely live observed session is
+            // left untouched for a later sweep rather than captured mid-flight.
+            continue;
+        }
+        let origin = session.origin_cwd.clone().or_else(|| match session.source {
+            SourceKind::ClaudeCode => claude_transcript_origin(path),
+            SourceKind::Copilot => copilot_workspace_origin(path),
+            SourceKind::Codex => None,
+        });
+        let store = recovery_store(
+            &mut state,
+            &mut source_stores,
+            state_directory,
+            session.source,
+        )?;
+        let Some(origin) = origin else {
+            store.park_recovery_session(&session.session_id, "origin-unresolved")?;
+            continue;
+        };
+        if hydrated >= RECOVERY_SCAN_LIMIT {
+            continue;
+        }
+        let metadata = fs::metadata(path)?;
+        let evidence = format!(
+            "{}:{}:{}",
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        );
+        let activity_ms = metadata
+            .mtime()
+            .saturating_mul(1_000)
+            .saturating_add(metadata.mtime_nsec() / 1_000_000);
+        if store.rescue_observed_session(
+            &session.session_id,
+            path,
+            Some(&origin),
+            &evidence,
+            activity_ms,
+        )? {
             reserved_sessions.push((session.source, session.session_id));
         }
         hydrated += 1;
@@ -555,8 +632,16 @@ pub fn read_last_failure(state_directory: &Path) -> Result<Option<HookFailure>, 
 }
 
 fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), HookFailure> {
-    let payload: AgentStopPayload =
-        read_one_json(input).map_err(|code| failure("agent-stop", code, None))?;
+    let bytes = read_hook_bytes(input).map_err(|code| failure("agent-stop", code, None))?;
+    let payload: AgentStopPayload = match parse_one_json(&bytes) {
+        Ok(payload) => payload,
+        // A payload the pinned struct cannot parse (a future schema drift) must still record
+        // receipt-time evidence rather than leave the session to the recovery sweep (issue #49).
+        Err("payload-invalid") => {
+            return ingest_lenient_agent_stop(state_directory, SourceKind::Copilot, &bytes);
+        }
+        Err(code) => return Err(failure("agent-stop", code, None)),
+    };
     validate_session_id(&payload.session_id)
         .map_err(|_| failure("agent-stop", "invalid-session-id", None))?;
     validate_timestamp(payload.timestamp)
@@ -662,8 +747,16 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
 /// stamped locally), and the hook always carries an explicit `transcript_path`, so the ID-only
 /// transcript lookup rule for Claude Code is never exercised.
 fn handle_claude_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), HookFailure> {
-    let payload: ClaudeStopPayload =
-        read_one_json(input).map_err(|code| failure("agent-stop", code, None))?;
+    let bytes = read_hook_bytes(input).map_err(|code| failure("agent-stop", code, None))?;
+    let payload: ClaudeStopPayload = match parse_one_json(&bytes) {
+        Ok(payload) => payload,
+        // Same schema-drift posture as the Copilot handler: record receipt-time evidence
+        // instead of dropping the observation (issue #49).
+        Err("payload-invalid") => {
+            return ingest_lenient_agent_stop(state_directory, SourceKind::ClaudeCode, &bytes);
+        }
+        Err(code) => return Err(failure("agent-stop", code, None)),
+    };
     validate_session_id(&payload.session_id)
         .map_err(|_| failure("agent-stop", "invalid-session-id", None))?;
     validate_absolute_string(&payload.cwd)
@@ -1758,6 +1851,11 @@ fn spawn_detached(command: &mut Command) -> io::Result<()> {
 }
 
 fn read_one_json<T: for<'de> Deserialize<'de>>(input: impl Read) -> Result<T, &'static str> {
+    let bytes = read_hook_bytes(input)?;
+    parse_one_json(&bytes)
+}
+
+fn read_hook_bytes(input: impl Read) -> Result<Vec<u8>, &'static str> {
     let mut bytes = Vec::new();
     input
         .take(MAX_HOOK_PAYLOAD_BYTES + 1)
@@ -1766,12 +1864,82 @@ fn read_one_json<T: for<'de> Deserialize<'de>>(input: impl Read) -> Result<T, &'
     if bytes.len() as u64 > MAX_HOOK_PAYLOAD_BYTES {
         return Err("payload-too-large");
     }
-    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    Ok(bytes)
+}
+
+fn parse_one_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, &'static str> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = T::deserialize(&mut deserializer).map_err(|_| "payload-invalid")?;
     deserializer
         .end()
         .map_err(|_| "payload-not-single-object")?;
     Ok(value)
+}
+
+/// Last-resort evidence recovery for an agent-stop payload the pinned struct cannot parse
+/// (issue #49): a schema drift in the capturing harness must degrade to receipt-time
+/// evidence, never to a lost observation that only the recovery sweep can reconstruct as an
+/// origin-poor husk. Only the pinned identity fields are interpreted — both the camelCase
+/// (Copilot) and snake_case (Claude Code) spellings — and each is re-validated exactly like
+/// the typed path, so no other payload content (which includes conversation text) is read.
+fn ingest_lenient_agent_stop(
+    state_directory: &Path,
+    source: SourceKind,
+    bytes: &[u8],
+) -> Result<(), HookFailure> {
+    let invalid = || failure("agent-stop", "payload-invalid", None);
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let text = |camel: &str, snake: &str| {
+        value
+            .get(camel)
+            .or_else(|| value.get(snake))
+            .and_then(serde_json::Value::as_str)
+    };
+    let session_id = text("sessionId", "session_id").ok_or_else(invalid)?;
+    let cwd = value
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let transcript_path = text("transcriptPath", "transcript_path").ok_or_else(invalid)?;
+    validate_session_id(session_id)
+        .map_err(|_| failure("agent-stop", "invalid-session-id", None))?;
+    let session = || Some(session_id.to_owned());
+    validate_absolute_string(cwd).map_err(|code| failure("agent-stop", code, session()))?;
+    validate_absolute_string(transcript_path)
+        .map_err(|code| failure("agent-stop", code, session()))?;
+    // The event gates stay in force when the gating field is present; a drifted payload that
+    // dropped the field entirely still records evidence rather than a husk.
+    match source {
+        SourceKind::Copilot => {
+            let reason = value.get("stopReason").and_then(serde_json::Value::as_str);
+            if reason.is_some_and(|reason| reason != "end_turn") {
+                return Err(failure("agent-stop", "unsupported-stop-reason", session()));
+            }
+        }
+        SourceKind::ClaudeCode => {
+            let event = value
+                .get("hook_event_name")
+                .and_then(serde_json::Value::as_str);
+            if event.is_some_and(|event| event != "Stop") {
+                return Err(failure("agent-stop", "unexpected-hook-event", session()));
+            }
+        }
+        SourceKind::Codex => return Err(failure("agent-stop", "unsupported-hook-source", None)),
+    }
+    let mut state = StateStore::open_for_source(state_directory, source)
+        .map_err(|_| failure("agent-stop", "state-open-failed", session()))?;
+    state
+        .ingest_agent_stop(
+            session_id,
+            now_ms(),
+            Path::new(cwd),
+            Path::new(transcript_path),
+        )
+        .map_err(|_| failure("agent-stop", "state-write-failed", session()))?;
+    // The observation is recorded; the drift itself stays visible as a diagnostic so the
+    // pinned struct can be re-synchronized with the harness's current payload shape.
+    let _ = state.record_diagnostic("agent-stop", "payload-schema-drift", None, Some(session_id));
+    Ok(())
 }
 
 fn validate_timestamp(timestamp: u64) -> Result<(), &'static str> {
