@@ -77,6 +77,10 @@ const FIXTURES: &[Fixture] = &[
         "claude-code-2.1.2xx-bookkeeping/transcript/0c1a0de0-0000-4000-8000-000000000230.jsonl",
     ),
     well_formed(
+        Source::ClaudeCode,
+        "claude-code-2.1.2xx-bookkeeping/transcript/0c1a0de0-0000-4000-8000-000000000231.jsonl",
+    ),
+    well_formed(
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
     ),
@@ -137,6 +141,10 @@ const FIXTURES: &[Fixture] = &[
     well_formed(
         Source::Copilot,
         "copilot-1.0.5x-bookkeeping/55555555-5555-4555-8555-555555555555/events.jsonl",
+    ),
+    well_formed(
+        Source::Copilot,
+        "copilot-1.0.5x-bookkeeping/66666666-6666-4666-8666-666666666666/events.jsonl",
     ),
 ];
 
@@ -353,6 +361,88 @@ fn archive_observed_bookkeeping_kinds_classify_as_typed_ignored_not_unknown() {
     );
     let summary = SessionSummary::summarize(&items);
     assert_eq!(summary.ignored_events, 3);
+}
+
+#[test]
+fn census_typed_bookkeeping_kinds_classify_as_typed_ignored_not_unknown() {
+    // Issue #45: historical Copilot bookkeeping kinds surfaced by the full-archive
+    // census across pre-1.0.70 CLI versions.
+    let items = stream_fixture(
+        Source::Copilot,
+        "copilot-1.0.5x-bookkeeping/66666666-6666-4666-8666-666666666666/events.jsonl",
+    );
+    let ignored_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Ignored { kind },
+                ..
+            }) => Some(kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ignored_kinds,
+        [
+            "session.start",
+            "permission.requested",
+            "permission.completed",
+            "session.mode_changed",
+            "session.permissions_changed",
+            "subagent.started",
+            "subagent.completed",
+            "system.notification",
+            "session.binary_asset",
+            "session.compaction_start",
+            "session.shutdown",
+        ]
+    );
+    let content_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Content { events },
+                ..
+            }) => Some(events.iter().map(Event::kind).collect::<Vec<_>>()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(content_kinds, ["user", "assistant"]);
+    let summary = SessionSummary::summarize(&items);
+    assert_eq!(summary.ignored_events, 11);
+
+    // Issue #46: the Claude Code `agent-name` bookkeeping kind, the census's only
+    // remaining claude-code Unknown.
+    let items = stream_fixture(
+        Source::ClaudeCode,
+        "claude-code-2.1.2xx-bookkeeping/transcript/0c1a0de0-0000-4000-8000-000000000231.jsonl",
+    );
+    let ignored_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Ignored { kind },
+                ..
+            }) => Some(kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ignored_kinds, ["agent-name"]);
+    let content_kinds: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Content { events },
+                ..
+            }) => Some(events.iter().map(Event::kind).collect::<Vec<_>>()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(content_kinds, ["user", "assistant"]);
+    let summary = SessionSummary::summarize(&items);
+    assert_eq!(summary.ignored_events, 1);
 }
 
 #[test]

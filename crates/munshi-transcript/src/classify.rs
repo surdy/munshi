@@ -49,18 +49,31 @@ pub(crate) fn classify(source: crate::Source, object: &Map<String, Value>) -> Cl
 /// Copilot event types observed in the pinned 1.0.70 envelope that carry no
 /// archive-worthy content (`docs/phase-0-findings.md`), plus the
 /// `session.usage_checkpoint` bookkeeping kind surfaced by archived 1.0.5x
-/// snapshots (issue #34).
+/// snapshots (issue #34) and the historical bookkeeping kinds surfaced by the
+/// full-archive census (issue #45: `permission.requested`,
+/// `permission.completed`, `session.binary_asset`, `subagent.started`,
+/// `subagent.completed`, `system.notification`, `session.permissions_changed`,
+/// `session.mode_changed`, `session.compaction_start`).
 const COPILOT_BOOKKEEPING: &[&str] = &[
     "assistant.turn_end",
     "assistant.turn_start",
     "hook.end",
     "hook.start",
+    "permission.completed",
+    "permission.requested",
+    "session.binary_asset",
+    "session.compaction_start",
+    "session.mode_changed",
     "session.model_change",
+    "session.permissions_changed",
     "session.resume",
     "session.shutdown",
     "session.start",
     "session.usage_checkpoint",
+    "subagent.completed",
+    "subagent.started",
     "system.message",
+    "system.notification",
 ];
 
 fn classify_copilot(object: &Map<String, Value>) -> Class {
@@ -265,8 +278,10 @@ fn extract_tool_result_text(value: &Value) -> Option<String> {
 /// content: the 2.1.44 `summary`/`system` records, the 2.1.205 additions (`ai-title`,
 /// `attachment`, `last-prompt`, `mode`, `queue-operation`), `file-history-snapshot`,
 /// and the newer session-bookkeeping kinds observed in live archives (issue #30:
-/// `file-history-delta`, `frame-link`, `permission-mode`, `pr-link`).
+/// `file-history-delta`, `frame-link`, `permission-mode`, `pr-link`; issue #46:
+/// `agent-name`).
 const CLAUDE_BOOKKEEPING: &[&str] = &[
+    "agent-name",
     "ai-title",
     "attachment",
     "file-history-delta",
@@ -663,6 +678,24 @@ mod tests {
             ),
             Class::Ignored(kind) if kind == "session.usage_checkpoint"
         ));
+        // Historical bookkeeping kinds surfaced by the full-archive census (#45).
+        for kind in [
+            "permission.requested",
+            "permission.completed",
+            "session.binary_asset",
+            "subagent.started",
+            "subagent.completed",
+            "system.notification",
+            "session.permissions_changed",
+            "session.mode_changed",
+            "session.compaction_start",
+        ] {
+            let json = format!(r#"{{"type":"{kind}","data":{{}}}}"#);
+            assert!(matches!(
+                classify_json(Source::Copilot, &json),
+                Class::Ignored(ignored) if ignored == kind
+            ));
+        }
     }
 
     #[test]
@@ -682,6 +715,8 @@ mod tests {
             r#"{"type":"pr-link","sessionId":"s"}"#,
             r#"{"type":"file-history-delta","sessionId":"s"}"#,
             r#"{"type":"frame-link","sessionId":"s"}"#,
+            // Full-archive census (#46).
+            r#"{"type":"agent-name","name":"lively-crimson-otter","sessionId":"s"}"#,
         ] {
             let expected = serde_json::from_str::<Value>(json).unwrap()["type"]
                 .as_str()
