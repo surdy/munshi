@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/munshi",
+    "crates/munshi-dashboard",
     "crates/munshi-probe",
     "crates/munshi-runner",
     "crates/munshi-transcript",

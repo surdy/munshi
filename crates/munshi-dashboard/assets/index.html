@@ -626,6 +626,11 @@ function renderNow(d) {
     body.appendChild(dl);
   }
 }
+/* The CLI's session contract spells the Copilot source "copilot"; the retired SQLite path
+   spelled it "copilot-cli". Accept both so either data source renders. */
+function srcLabel(source) {
+  return String(source || "").startsWith("copilot") ? "copilot" : "claude";
+}
 function sessionTable(rows, cols) {
   const tbl = document.createElement("table");
   const tr0 = tbl.insertRow();
@@ -642,7 +647,7 @@ function renderRecent(d) {
   if (!arch.length) { const e = document.createElement("div"); e.className = "empty"; txt(e, "No data."); ra.appendChild(e); }
   else ra.appendChild(sessionTable(arch, [
     { h: "Session", f: (td, r) => { td.className = "mono"; txt(td, r.sid.slice(0, 8)); } },
-    { h: "Src", f: (td, r) => txt(td, r.source === "copilot-cli" ? "copilot" : "claude") },
+    { h: "Src", f: (td, r) => txt(td, srcLabel(r.source)) },
     { h: "Project", f: (td, r) => txt(td, r.project) },
     { h: "Title", f: (td, r) => { const s = document.createElement("span"); s.className = "prim";
         txt(s, r.title || "(untitled)"); td.appendChild(s); } },
@@ -653,7 +658,7 @@ function renderRecent(d) {
   if (!fails.length) { const e = document.createElement("div"); e.className = "empty"; txt(e, "No recent failures."); rf.appendChild(e); }
   else rf.appendChild(sessionTable(fails, [
     { h: "Session", f: (td, r) => { td.className = "mono"; txt(td, r.sid.slice(0, 8)); } },
-    { h: "Src", f: (td, r) => txt(td, r.source === "copilot-cli" ? "copilot" : "claude") },
+    { h: "Src", f: (td, r) => txt(td, srcLabel(r.source)) },
     { h: "Project", f: (td, r) => txt(td, r.project) },
     { h: "Error", f: (td, r) => { const b = document.createElement("span"); b.className = "badge";
         b.style.borderColor = cssVar("--status-critical");
@@ -681,7 +686,8 @@ function render(d) {
   renderHBars("proj-chart", projRows, "Remaining queued sessions by project");
   const src = (d.db && d.db.archived_by_source) || {};
   renderHBars("src-chart",
-    [["Copilot CLI", src["copilot-cli"] || 0], ["Claude Code", src["claude-code"] || 0]],
+    [["Copilot CLI", src["copilot"] || src["copilot-cli"] || 0],
+     ["Claude Code", src["claude-code"] || 0]],
     "Archived sessions by source agent");
   renderOutcomes(d);
   renderNow(d);

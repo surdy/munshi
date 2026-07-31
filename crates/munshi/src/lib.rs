@@ -45,7 +45,7 @@ pub use patwari::{
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{
     ProjectIdentity, ProjectIdentityError, ProjectOrigin, inspect_project, normalize_git_remote,
-    recorded_project_identity,
+    project_label, recorded_project_identity,
 };
 pub use registration::{
     ClaudeTarget, CopilotTarget, DEFAULT_CHUNK_THRESHOLD_BYTES, DisclosureDecision, ProjectStatus,
@@ -70,9 +70,9 @@ pub use source::{
     resolve_session_reference, snapshot_artifact_index, validate_transcript_envelope,
 };
 pub use state::{
-    ArchiveUploadRecord, ArchiveUploadSuccess, BudgetOutcome, CapturePrep, ClaimOutcome,
-    CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic, SessionRecord, StateError,
-    StateStore, WaitState, try_acquire_session_lock,
+    ArchiveUploadRecord, ArchiveUploadSuccess, AttemptRecord, BudgetOutcome, CapturePrep,
+    ClaimOutcome, CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic, SessionRecord,
+    StateError, StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
     ChunkingLimits, PLACEHOLDER_SUMMARY_TAG, PlaceholderReason, RESERVED_SUMMARIZER_ENV_PREFIX,

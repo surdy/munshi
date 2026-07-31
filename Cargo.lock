@@ -388,6 +388,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "munshi-dashboard"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "munshi-probe"
 version = "0.1.0"
 dependencies = [

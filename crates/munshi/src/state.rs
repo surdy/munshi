@@ -14,7 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::project::{ProjectIdentity, ProjectOrigin};
+use crate::project::{ProjectIdentity, ProjectOrigin, project_label};
 use crate::registration::{
     RegistrationError, durable_remove, ensure_directory, validate_regular_owned_file,
 };
@@ -148,6 +148,12 @@ pub struct SessionRecord {
     /// Consecutive failed attempts with the same error category on the same `state_generation`
     /// (issue #38). Reset by any successful attempt, a `--force` retry, or a lifted park.
     pub failure_streak: i64,
+    /// When Munshi first observed the session, which is not when the session itself began: the
+    /// row is created by the first hook or sweep that names it, possibly long after the first
+    /// turn. The transcript's own start time is `previous_source.started_at`.
+    pub created_at_ms: i64,
+    /// When any lifecycle, cursor, or bookkeeping write last touched this row.
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -221,13 +227,40 @@ pub struct PlaceholderPark<'a> {
     pub streak: i64,
 }
 
+/// One recorded diagnostic: the operation that failed or deferred, its stable category, and the
+/// session it named, if any. Every field is a bounded Munshi-authored code or identifier — the
+/// table has no free-form message column, so nothing here can carry transcript content.
+///
+/// `source` and `session_id` are both `None` when the diagnostic named no session, and both go
+/// `None` again if that session row is later deleted (the join is left, the foreign key sets
+/// `diagnostics.session_id` to NULL).
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
+    pub source: Option<SourceKind>,
     pub operation: String,
     pub category: String,
     pub cause_category: Option<String>,
     pub session_id: Option<String>,
     pub recorded_at_ms: i64,
+}
+
+/// One recorded processing attempt joined to the session it belongs to: the outcome bookkeeping
+/// a read-only caller needs to see what the worker has been doing (issue #56). The attempt's
+/// `planned_*` columns are deliberately absent — they describe archive content, and this view is
+/// consumed over the CLI JSON boundary (ADR 0007) by callers that must never learn about content.
+#[derive(Debug, Clone)]
+pub struct AttemptRecord {
+    pub source: SourceKind,
+    pub session_id: String,
+    /// The session's display project label, derived by [`project_label`]. `None` when the
+    /// session recorded no origin evidence at all.
+    pub project: Option<String>,
+    pub outcome: String,
+    pub error_category: Option<String>,
+    pub started_at_ms: i64,
+    /// `None` while the attempt still holds its lease; a recovery sweep settles abandoned
+    /// leases, so a long-unfinished attempt is a stalled worker rather than a live one.
+    pub finished_at_ms: Option<i64>,
 }
 
 /// The Munshi-owned remote delivery record for one logical session and one Notesmith sink.
@@ -947,7 +980,8 @@ impl StateStore {
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
                     last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                    origin_project_origin,not_archive_worthy_at_ms
+                    origin_project_origin,not_archive_worthy_at_ms,
+                    created_at_ms,updated_at_ms
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -971,7 +1005,8 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin,not_archive_worthy_at_ms
+                origin_project_origin,not_archive_worthy_at_ms,
+                created_at_ms,updated_at_ms
              FROM sessions
              ORDER BY updated_at_ms DESC,id DESC",
         )?;
@@ -1599,25 +1634,134 @@ impl StateStore {
     pub fn latest_diagnostic(&self) -> Result<Option<Diagnostic>, StateError> {
         self.connection
             .query_row(
-                "SELECT d.operation,d.category,d.cause_category,s.source_session_id,
-                        d.recorded_at_ms
-                 FROM diagnostics d
-                 LEFT JOIN sessions s ON s.id=d.session_id
-                 ORDER BY d.id DESC LIMIT 1",
+                &format!("{DIAGNOSTIC_COLUMNS} ORDER BY d.id DESC LIMIT 1"),
                 [],
-                |row| {
-                    Ok(Diagnostic {
-                        operation: row.get(0)?,
-                        category: row.get(1)?,
-                        cause_category: row.get(2)?,
-                        session_id: row.get(3)?,
-                        recorded_at_ms: row.get(4)?,
-                    })
-                },
+                diagnostic_from_row,
             )
             .optional()
             .map_err(Into::into)
     }
+
+    /// Lists recorded diagnostics newest first, at most `limit` of them. Spans every source kind
+    /// — a diagnostic is an operator-facing record of what Munshi did, not session-scoped work —
+    /// and reads nothing the `status` contract does not already expose.
+    pub fn list_diagnostics(&self, limit: usize) -> Result<Vec<Diagnostic>, StateError> {
+        let mut statement = self.connection.prepare(&format!(
+            "{DIAGNOSTIC_COLUMNS} ORDER BY d.recorded_at_ms DESC,d.id DESC LIMIT ?1"
+        ))?;
+        statement
+            .query_map([bounded_limit(limit)], diagnostic_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Counts every recorded diagnostic, so a caller can tell a truncated
+    /// [`Self::list_diagnostics`] tail from the whole table.
+    pub fn count_diagnostics(&self) -> Result<usize, StateError> {
+        let total: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM diagnostics", [], |row| row.get(0))?;
+        Ok(usize::try_from(total).unwrap_or_default())
+    }
+
+    /// Lists recorded processing attempts most recently finished first, with attempts still
+    /// holding a lease last, at most `limit` of them. Spans every source kind, like the recovery
+    /// work lists: the attempt log describes worker activity, not one harness's sessions.
+    ///
+    /// `since_ms` keeps only attempts whose activity — the finish instant, or the start instant
+    /// while unfinished — is at or after that Unix millisecond, so a caller polling a window
+    /// never has to page back through the whole history to find it.
+    pub fn list_processing_attempts(
+        &self,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AttemptRecord>, StateError> {
+        let mut statement = self.connection.prepare(&format!(
+            "{ATTEMPT_COLUMNS} {ATTEMPT_SINCE_FILTER}
+             ORDER BY a.finished_at_ms IS NULL,a.finished_at_ms DESC,a.id DESC
+             LIMIT ?2"
+        ))?;
+        statement
+            .query_map(params![since_ms, bounded_limit(limit)], attempt_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Counts the attempts [`Self::list_processing_attempts`] matches before `limit` truncates
+    /// them, under the same `since_ms` window.
+    pub fn count_processing_attempts(&self, since_ms: Option<i64>) -> Result<usize, StateError> {
+        let total: i64 = self.connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM processing_attempts a
+                 JOIN sessions s ON s.id=a.session_id {ATTEMPT_SINCE_FILTER}"
+            ),
+            params![since_ms],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(total).unwrap_or_default())
+    }
+}
+
+/// The diagnostics tail projection shared by [`StateStore::latest_diagnostic`] and
+/// [`StateStore::list_diagnostics`]; the left join keeps diagnostics that named no session (or
+/// whose session row is gone) instead of dropping them.
+const DIAGNOSTIC_COLUMNS: &str = "SELECT s.source_kind,d.operation,d.category,d.cause_category,
+            s.source_session_id,d.recorded_at_ms
+     FROM diagnostics d
+     LEFT JOIN sessions s ON s.id=d.session_id";
+
+/// The attempt projection shared by the attempt list and its count. The inner join is deliberate:
+/// an attempt whose session row is gone has no identity to report.
+const ATTEMPT_COLUMNS: &str = "SELECT s.source_kind,s.source_session_id,s.origin_project_name,
+            s.origin_project_component,s.origin_cwd,a.outcome,a.error_category,
+            a.started_at_ms,a.finished_at_ms
+     FROM processing_attempts a
+     JOIN sessions s ON s.id=a.session_id";
+
+/// The `since_ms` window as `?1`: a NULL bound selects everything.
+const ATTEMPT_SINCE_FILTER: &str =
+    "WHERE ?1 IS NULL OR COALESCE(a.finished_at_ms,a.started_at_ms) >= ?1";
+
+/// Clamps a caller-supplied row limit into SQLite's signed range; a limit too large to bind is
+/// indistinguishable from no limit at all.
+fn bounded_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+fn diagnostic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Diagnostic> {
+    Ok(Diagnostic {
+        source: row
+            .get::<_, Option<String>>(0)?
+            .as_deref()
+            .and_then(SourceKind::from_agent_label),
+        operation: row.get(1)?,
+        category: row.get(2)?,
+        cause_category: row.get(3)?,
+        session_id: row.get(4)?,
+        recorded_at_ms: row.get(5)?,
+    })
+}
+
+fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRecord> {
+    Ok(AttemptRecord {
+        source: SourceKind::from_agent_label(&row.get::<_, String>(0)?).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other("unknown source kind")),
+            )
+        })?,
+        session_id: row.get(1)?,
+        project: project_label(
+            row.get::<_, Option<String>>(2)?.as_deref(),
+            row.get::<_, Option<String>>(3)?.as_deref(),
+            row.get::<_, Option<String>>(4)?.as_deref().map(Path::new),
+        ),
+        outcome: row.get(5)?,
+        error_category: row.get(6)?,
+        started_at_ms: row.get(7)?,
+        finished_at_ms: row.get(8)?,
+    })
 }
 
 fn upsert_session(
@@ -1793,6 +1937,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         last_error_category: row.get(33)?,
         next_retry_at_ms: row.get(35)?,
         failure_streak: row.get(36)?,
+        created_at_ms: row.get(39)?,
+        updated_at_ms: row.get(40)?,
     })
 }
 
@@ -2468,7 +2614,8 @@ impl StateStore {
                     source_assistant_messages,source_tool_activities,last_fallback_reason,
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
                     last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                    origin_project_origin,not_archive_worthy_at_ms
+                    origin_project_origin,not_archive_worthy_at_ms,
+                    created_at_ms,updated_at_ms
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -3259,7 +3406,8 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin,not_archive_worthy_at_ms
+                origin_project_origin,not_archive_worthy_at_ms,
+                created_at_ms,updated_at_ms
              FROM sessions
              WHERE active=1
                AND last_agent_stop_ms IS NOT NULL
@@ -3288,7 +3436,8 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin,not_archive_worthy_at_ms
+                origin_project_origin,not_archive_worthy_at_ms,
+                created_at_ms,updated_at_ms
              FROM sessions
              WHERE transcript_path IS NULL
                AND lifecycle_state IN (
@@ -3486,7 +3635,8 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin,not_archive_worthy_at_ms
+                origin_project_origin,not_archive_worthy_at_ms,
+                created_at_ms,updated_at_ms
              FROM sessions
              WHERE active=0
                AND lifecycle_state='interrupted'
@@ -3580,7 +3730,8 @@ impl StateStore {
                 source_assistant_messages,source_tool_activities,last_fallback_reason,
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
-                origin_project_origin,not_archive_worthy_at_ms
+                origin_project_origin,not_archive_worthy_at_ms,
+                created_at_ms,updated_at_ms
              FROM sessions
              WHERE active=0
                AND lifecycle_state='observed'

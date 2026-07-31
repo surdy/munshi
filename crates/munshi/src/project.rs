@@ -114,6 +114,51 @@ pub fn recorded_project_identity(recorded_root: &Path, branch: Option<String>) -
     }
 }
 
+/// The human-facing project label for a captured session, derived from the origin evidence the
+/// session row records (issue #56). Priority is strict and stops at the first value present:
+/// the resolved project name, then the archive path component with its identity digest stripped,
+/// then the final segment of the origin working directory. `None` means the session recorded no
+/// origin evidence at all — a caller rendering the label chooses its own placeholder.
+///
+/// Display only, never identity: two unrelated projects whose directories share a basename share
+/// a label, which is why routing and archival keep using `ProjectIdentity::identity` and
+/// `ProjectIdentity::component` instead.
+pub fn project_label(
+    project_name: Option<&str>,
+    project_component: Option<&str>,
+    origin_cwd: Option<&Path>,
+) -> Option<String> {
+    if let Some(name) = project_name.filter(|name| !name.is_empty()) {
+        return Some(name.to_owned());
+    }
+    if let Some(component) = project_component.filter(|component| !component.is_empty()) {
+        return Some(strip_identity_digest(component).to_owned());
+    }
+    origin_cwd
+        .and_then(Path::file_name)
+        .and_then(|segment| segment.to_str())
+        .map(ToOwned::to_owned)
+}
+
+/// Recovers the project slug from a filesystem component by removing the identity digest
+/// [`filesystem_component`] appends. Only a trailing hyphen-delimited run of at least eight
+/// lowercase hex characters is removed, and only when a non-empty slug remains, so a component
+/// that never carried a digest — or that is nothing but one — survives unchanged.
+fn strip_identity_digest(component: &str) -> &str {
+    match component.rsplit_once('-') {
+        Some((slug, digest))
+            if !slug.is_empty()
+                && digest.len() >= 8
+                && digest.chars().all(|character| {
+                    character.is_ascii_digit() || matches!(character, 'a'..='f')
+                }) =>
+        {
+            slug
+        }
+        _ => component,
+    }
+}
+
 pub fn normalize_git_remote(remote: &str) -> Option<String> {
     let remote = remote.trim().trim_end_matches('/');
     if remote.is_empty() || remote.starts_with('/') || remote.starts_with("file:") {
@@ -243,5 +288,52 @@ mod tests {
         let after_delete = recorded_project_identity(&root, None);
         assert_eq!(after_delete.identity, recorded.identity);
         assert_eq!(after_delete.component, recorded.component);
+    }
+
+    /// The display label falls through name, then component, then origin basename, and the
+    /// component fallback recovers exactly the slug [`filesystem_component`] built from — never
+    /// a truncated real name and never an empty string.
+    #[test]
+    fn project_label_falls_through_name_component_then_origin_basename() {
+        let component = filesystem_component("munshi", "github.com/surdy/munshi");
+        assert!(component.starts_with("munshi-"), "{component}");
+
+        assert_eq!(
+            project_label(
+                Some("munshi"),
+                Some(&component),
+                Some(Path::new("/tmp/other"))
+            ),
+            Some("munshi".to_owned())
+        );
+        assert_eq!(
+            project_label(None, Some(&component), Some(Path::new("/tmp/other"))),
+            Some("munshi".to_owned())
+        );
+        assert_eq!(
+            project_label(Some(""), Some(""), Some(Path::new("/tmp/other"))),
+            Some("other".to_owned()),
+            "empty stored strings must fall through, not become the label"
+        );
+        assert_eq!(project_label(None, None, None), None);
+
+        // A hyphenated slug keeps every segment that is not the digest.
+        assert_eq!(
+            project_label(None, Some("my-cool-project-0123456789ab"), None),
+            Some("my-cool-project".to_owned())
+        );
+        // Too short, non-hex, and slug-less components are left alone.
+        assert_eq!(
+            project_label(None, Some("release-2024"), None),
+            Some("release-2024".to_owned())
+        );
+        assert_eq!(
+            project_label(None, Some("project-notahexdigest"), None),
+            Some("project-notahexdigest".to_owned())
+        );
+        assert_eq!(
+            project_label(None, Some("-0123456789ab"), None),
+            Some("-0123456789ab".to_owned())
+        );
     }
 }

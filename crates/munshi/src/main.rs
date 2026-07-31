@@ -9,17 +9,18 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
-    ArchiveUploadStatusReport, ArtifactMatch, DeliveryCredentialSource, DeliveryRunReport,
-    DeliverySinkConfig, DeliveryStatusReport, HistoryReport, HookEvent, HookFailure, HookResult,
-    ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults, SessionRecord,
-    SessionReference, SourceKind, StateStore, StructuredSummary, VerifyArchiveError,
-    VerifyArchiveReport, accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
-    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
-    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
-    lift_stale_source_limit_parks, parse_archive_markdown, parse_summarizer_env, project_status,
-    read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
-    set_archive_upload_enabled, set_delivery_enabled, set_project_enabled, unregister,
-    verify_archive_parse, wait_for_hook_result_for_source,
+    ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
+    DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic, HistoryReport,
+    HookEvent, HookFailure, HookResult, ProjectStatus, RegisterConfig, RetrieveError,
+    RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceKind, StateStore,
+    StructuredSummary, VerifyArchiveError, VerifyArchiveReport, accept_disclosure_from_terminal,
+    archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
+    configure_archive_upload, configure_delivery, delivery_backfill, delivery_retry,
+    delivery_status, delivery_verify_history, handle_hook, lift_stale_source_limit_parks,
+    parse_archive_markdown, parse_summarizer_env, project_label, project_status, read_last_failure,
+    register, retrieve, run_archive_worker_for_source, run_recovery, set_archive_upload_enabled,
+    set_delivery_enabled, set_project_enabled, unregister, verify_archive_parse,
+    wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -188,6 +189,30 @@ enum Command {
         #[arg(long, value_enum)]
         state: Option<SessionStateFilter>,
         #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// List recent processing attempts and how they ended.
+    Attempts {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Keep only attempts active at or after this Unix millisecond: finished then, or
+        /// started then and still running.
+        #[arg(long)]
+        since_ms: Option<i64>,
+    },
+    /// List the most recently recorded diagnostics.
+    Diagnostics {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 20)]
         limit: usize,
     },
     /// Show one session and its current summary.
@@ -616,6 +641,14 @@ enum Outcome {
         report: Box<SessionsReport>,
         json: bool,
     },
+    Attempts {
+        report: Box<AttemptsReport>,
+        json: bool,
+    },
+    Diagnostics {
+        report: Box<DiagnosticsReport>,
+        json: bool,
+    },
     Show {
         report: Box<ShowReport>,
         json: bool,
@@ -806,6 +839,60 @@ struct SessionListItem {
     summary_title: Option<String>,
     archive_path: Option<String>,
     last_error_code: Option<String>,
+    /// The session's display project label (issue #56). Additive on the `schema_version: 1`
+    /// contract, like the harness-adapter status fields: a reader pinned to the older shape sees
+    /// the same fields it always did. `null` when the session recorded no origin evidence.
+    project: Option<String>,
+    /// When Munshi first observed the session, and when its row was last written. Both are Unix
+    /// milliseconds. `created_at_ms` is Munshi's first sighting, not the session's first turn.
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+/// The `attempts` contract (issue #56): the processing-attempt log a dashboard bins into outcome
+/// and failure views, exposed as rows so every rollup stays on the caller's side.
+#[derive(Debug, Clone, Serialize)]
+struct AttemptsReport {
+    schema_version: u32,
+    command: &'static str,
+    since_ms: Option<i64>,
+    total: usize,
+    returned: usize,
+    items: Vec<AttemptListItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AttemptListItem {
+    source: String,
+    session_id: String,
+    project: Option<String>,
+    outcome: String,
+    error_category: Option<String>,
+    started_at_ms: i64,
+    /// `null` while the attempt still holds its lease.
+    finished_at_ms: Option<i64>,
+}
+
+/// The `diagnostics` contract (issue #56): the same operator-facing records `status` already
+/// surfaces one of as `last_failure`, as a bounded newest-first tail.
+#[derive(Debug, Clone, Serialize)]
+struct DiagnosticsReport {
+    schema_version: u32,
+    command: &'static str,
+    total: usize,
+    returned: usize,
+    items: Vec<DiagnosticListItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagnosticListItem {
+    /// `null` together with `session_id` when the diagnostic named no session.
+    source: Option<String>,
+    session_id: Option<String>,
+    operation: String,
+    category: String,
+    cause_category: Option<String>,
+    recorded_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1182,6 +1269,22 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Ok(Outcome::Attempts { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_attempts_human(&report);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::Diagnostics { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_diagnostics_human(&report);
+            }
+            ExitCode::SUCCESS
+        }
         Ok(Outcome::Show { report, json }) => {
             if json {
                 emit_json(&report);
@@ -1494,6 +1597,29 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Sessions {
                 report: Box::new(build_sessions_report(&state_directory, state, limit)?),
+                json,
+            })
+        }
+        Command::Attempts {
+            state_dir,
+            json,
+            limit,
+            since_ms,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Attempts {
+                report: Box::new(build_attempts_report(&state_directory, since_ms, limit)?),
+                json,
+            })
+        }
+        Command::Diagnostics {
+            state_dir,
+            json,
+            limit,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Diagnostics {
+                report: Box::new(build_diagnostics_report(&state_directory, limit)?),
                 json,
             })
         }
@@ -1912,6 +2038,59 @@ fn build_sessions_report(
         schema_version: 1,
         command: "sessions",
         filter: filter.map(session_filter_name).map(ToOwned::to_owned),
+        total,
+        returned: items.len(),
+        items,
+    })
+}
+
+fn build_attempts_report(
+    state_directory: &Path,
+    since_ms: Option<i64>,
+    limit: usize,
+) -> Result<AttemptsReport, Box<dyn Error>> {
+    let (total, records) = load_attempts(state_directory, since_ms, limit)?;
+    let items = records
+        .into_iter()
+        .map(|record| AttemptListItem {
+            source: record.source.as_selector().to_owned(),
+            session_id: record.session_id,
+            project: record.project,
+            outcome: record.outcome,
+            error_category: record.error_category,
+            started_at_ms: record.started_at_ms,
+            finished_at_ms: record.finished_at_ms,
+        })
+        .collect::<Vec<_>>();
+    Ok(AttemptsReport {
+        schema_version: 1,
+        command: "attempts",
+        since_ms,
+        total,
+        returned: items.len(),
+        items,
+    })
+}
+
+fn build_diagnostics_report(
+    state_directory: &Path,
+    limit: usize,
+) -> Result<DiagnosticsReport, Box<dyn Error>> {
+    let (total, records) = load_diagnostics(state_directory, limit)?;
+    let items = records
+        .into_iter()
+        .map(|record| DiagnosticListItem {
+            source: record.source.map(|source| source.as_selector().to_owned()),
+            session_id: record.session_id,
+            operation: record.operation,
+            category: record.category,
+            cause_category: record.cause_category,
+            recorded_at_ms: record.recorded_at_ms,
+        })
+        .collect::<Vec<_>>();
+    Ok(DiagnosticsReport {
+        schema_version: 1,
+        command: "diagnostics",
         total,
         returned: items.len(),
         items,
@@ -2984,6 +3163,19 @@ fn build_session_item(record: &SessionRecord) -> SessionListItem {
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         last_error_code: record.last_error_category.clone(),
+        project: project_label(
+            record
+                .project
+                .as_ref()
+                .map(|project| project.project.as_str()),
+            record
+                .project
+                .as_ref()
+                .map(|project| project.component.as_str()),
+            record.origin_cwd.as_deref(),
+        ),
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
     }
 }
 
@@ -3192,6 +3384,38 @@ fn load_sessions(state_directory: &Path) -> Result<Vec<SessionRecord>, Box<dyn E
     Ok(state.list_sessions()?)
 }
 
+/// The matching total and the bounded page of processing attempts, or an empty pair when the
+/// state directory has never been registered — a read-only caller polling before `munshi
+/// register` must get a valid empty contract, not an error (ADR 0007). Never opens the store in
+/// that state, so the query itself cannot create the database it is reporting on.
+fn load_attempts(
+    state_directory: &Path,
+    since_ms: Option<i64>,
+    limit: usize,
+) -> Result<(usize, Vec<AttemptRecord>), Box<dyn Error>> {
+    if !state_database_exists(state_directory) {
+        return Ok((0, Vec::new()));
+    }
+    let state = StateStore::open(state_directory)?;
+    Ok((
+        state.count_processing_attempts(since_ms)?,
+        state.list_processing_attempts(since_ms, limit)?,
+    ))
+}
+
+/// The recorded total and the bounded newest-first tail of diagnostics, degrading to an empty
+/// pair on an unregistered state directory exactly as [`load_attempts`] does.
+fn load_diagnostics(
+    state_directory: &Path,
+    limit: usize,
+) -> Result<(usize, Vec<Diagnostic>), Box<dyn Error>> {
+    if !state_database_exists(state_directory) {
+        return Ok((0, Vec::new()));
+    }
+    let state = StateStore::open(state_directory)?;
+    Ok((state.count_diagnostics()?, state.list_diagnostics(limit)?))
+}
+
 /// Projects the delivery record for one session (if any) into the `show` contract, deriving a
 /// Notesmith deep link for a delivered note.
 fn lookup_delivery_view(
@@ -3352,6 +3576,58 @@ fn print_sessions_human(report: &SessionsReport) {
                 .as_deref()
                 .map(|code| format!(" error={code}"))
                 .unwrap_or_default()
+        );
+    }
+}
+
+/// One line per attempt, in the two-space-separated shape `sessions` uses: identity, then the
+/// outcome, then only the bookkeeping the row actually carries.
+fn print_attempts_human(report: &AttemptsReport) {
+    if report.items.is_empty() {
+        println!("no attempts");
+        return;
+    }
+    println!("attempts returned {} of {}", report.returned, report.total);
+    for item in &report.items {
+        println!(
+            "{}  {}  project={}  started-at-ms={}{}{}",
+            item.session_id,
+            item.outcome,
+            item.project.as_deref().unwrap_or("<unknown>"),
+            item.started_at_ms,
+            item.finished_at_ms
+                .map(|finished| format!("  finished-at-ms={finished}"))
+                .unwrap_or_default(),
+            item.error_category
+                .as_deref()
+                .map(|category| format!("  error={category}"))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// One line per diagnostic, matching the `operation=`/`code=`/`session=` shape `status` already
+/// prints for the single most recent one.
+fn print_diagnostics_human(report: &DiagnosticsReport) {
+    if report.items.is_empty() {
+        println!("no diagnostics");
+        return;
+    }
+    println!(
+        "diagnostics returned {} of {}",
+        report.returned, report.total
+    );
+    for item in &report.items {
+        println!(
+            "{}  operation={} code={}{} session={}",
+            item.recorded_at_ms,
+            item.operation,
+            item.category,
+            item.cause_category
+                .as_deref()
+                .map(|cause| format!(" cause={cause}"))
+                .unwrap_or_default(),
+            item.session_id.as_deref().unwrap_or("<none>"),
         );
     }
 }
