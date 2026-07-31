@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Munshi backlog dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --series-1: #2a78d6;   /* archived  (blue)   */
+    --series-2: #eb6834;   /* queued    (orange) */
+    --series-3: #1baf7a;   /* failed-count line (aqua) */
+    --seq: #2a78d6;        /* sequential hue for magnitude bars */
+    --seq-track: #cde2fb;
+    --status-good: #0ca30c;
+    --status-warning: #fab219;
+    --status-serious: #ec835a;
+    --status-critical: #d03b3b;
+    --delta-good: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --seq: #3987e5;
+      --seq-track: #184f95;
+      --delta-good: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --seq: #3987e5;
+    --seq-track: #184f95;
+    --delta-good: #0ca30c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 20px 48px; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  header h1 { font-size: 19px; margin: 0; font-weight: 650; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+          padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border);
+          background: var(--surface-1); color: var(--text-secondary); }
+  .pill .ico { font-size: 11px; }
+  .spacer { flex: 1; }
+  .hdr-meta { color: var(--muted); font-size: 12.5px; }
+  button.ghost { font: inherit; font-size: 12.5px; color: var(--text-secondary);
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 4px 10px; cursor: pointer; }
+  button.ghost:hover { border-color: var(--baseline); }
+  .banner { display: none; background: var(--surface-1); border: 1px solid var(--status-serious);
+    border-radius: 10px; padding: 8px 12px; margin: 0 0 14px; font-size: 13px;
+    color: var(--text-secondary); }
+  .banner strong { color: var(--text-primary); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+           gap: 10px; margin-bottom: 14px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border);
+          border-radius: 12px; padding: 10px 14px 12px; }
+  .tile .lbl { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .tile .val { font-size: 24px; font-weight: 600; line-height: 1.15; }
+  .tile .sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+  .tile .sub.good { color: var(--delta-good); }
+  .tile .sub.bad  { color: var(--status-critical); }
+
+  .filters { display: flex; gap: 8px; align-items: center; margin: 4px 0 12px; }
+  .filters .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 9px;
+    overflow: hidden; background: var(--surface-1); }
+  .filters .seg button { font: inherit; font-size: 12.5px; border: 0; background: transparent;
+    color: var(--text-secondary); padding: 5px 12px; cursor: pointer; }
+  .filters .seg button[aria-pressed="true"] { background: var(--grid); color: var(--text-primary); font-weight: 600; }
+  .filters .note { color: var(--muted); font-size: 12px; }
+
+  .grid2 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 940px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+
+  .card { background: var(--surface-1); border: 1px solid var(--border);
+          border-radius: 12px; padding: 14px 16px; min-width: 0; }
+  .card h2 { margin: 0 0 2px; font-size: 13.5px; font-weight: 650; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .chartbox { position: relative; }
+  .chartbox svg { display: block; width: 100%; height: auto; }
+  .refreshing .chartbox, .refreshing .tiles { opacity: .6; transition: opacity .2s; }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px;
+            color: var(--text-secondary); margin: 6px 0 2px; }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .line { width: 14px; height: 0; border-top: 2px solid; border-radius: 2px; }
+  .legend .rect { width: 10px; height: 10px; border-radius: 3px; }
+
+  .tooltip { position: fixed; z-index: 10; pointer-events: none; display: none;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.18); padding: 7px 10px; font-size: 12.5px;
+    color: var(--text-secondary); min-width: 130px; }
+  .tooltip .tt-title { color: var(--muted); font-size: 11.5px; margin-bottom: 4px; }
+  .tooltip .tt-row { display: flex; align-items: center; gap: 7px; margin: 2px 0; }
+  .tooltip .tt-key { width: 12px; border-top: 2px solid; border-radius: 2px; }
+  .tooltip .tt-val { font-weight: 650; color: var(--text-primary); margin-left: auto;
+                     font-variant-numeric: tabular-nums; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11.5px;
+       padding: 3px 8px 5px 0; border-bottom: 1px solid var(--grid); }
+  td { padding: 5px 8px 5px 0; border-bottom: 1px solid var(--grid);
+       color: var(--text-secondary); vertical-align: top; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td .prim { color: var(--text-primary); }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+           border: 1px solid var(--border); color: var(--text-secondary); }
+  details.tableview { margin-top: 8px; }
+  details.tableview summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  details.tableview .scroll { overflow-x: auto; margin-top: 6px; }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 8px 0; }
+  ul.plain { list-style: none; margin: 0; padding: 0; }
+  ul.plain li { padding: 4px 0; border-bottom: 1px solid var(--grid); font-size: 12.5px;
+                color: var(--text-secondary); }
+  ul.plain li:last-child { border-bottom: 0; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+  <header>
+    <h1>Munshi backlog</h1>
+    <span class="pill" id="driver-pill"><span class="ico">…</span><span>checking driver</span></span>
+    <span class="pill" id="round-pill" hidden></span>
+    <span class="spacer"></span>
+    <span class="hdr-meta" id="updated-at">loading…</span>
+    <button class="ghost" id="theme-btn" type="button">Theme: auto</button>
+  </header>
+
+  <div class="banner" id="err-banner"></div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="filters">
+    <div class="seg" role="group" aria-label="Time scope">
+      <button id="scope-current" aria-pressed="true" type="button">Current epoch</button>
+      <button id="scope-all" aria-pressed="false" type="button">Full history</button>
+    </div>
+    <span class="note" id="scope-note"></span>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Backlog burndown</h2>
+      <div class="sub" id="burn-sub">Sessions per driver round</div>
+      <div class="legend" id="burn-legend"></div>
+      <div class="chartbox" id="burn-chart"></div>
+      <details class="tableview"><summary>Data table</summary>
+        <div class="scroll" id="burn-table"></div></details>
+    </div>
+    <div class="card">
+      <h2>Right now</h2>
+      <div class="sub" id="now-sub"></div>
+      <div id="now-body"></div>
+    </div>
+  </div>
+
+  <div class="grid3">
+    <div class="card">
+      <h2>Remaining by project</h2>
+      <div class="sub">Queued sessions (interrupted + observed), top 10</div>
+      <div class="chartbox" id="proj-chart"></div>
+    </div>
+    <div class="card">
+      <h2>Archived by source</h2>
+      <div class="sub">Completed archives per agent</div>
+      <div class="chartbox" id="src-chart"></div>
+    </div>
+    <div class="card">
+      <h2>Attempt outcomes — last 6 h</h2>
+      <div class="sub">Processing attempts per 30-minute bin</div>
+      <div class="legend" id="out-legend"></div>
+      <div class="chartbox" id="out-chart"></div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Recently archived</h2>
+      <div class="sub">Last 10 completed archives</div>
+      <div style="overflow-x:auto" id="recent-archived"></div>
+    </div>
+    <div class="card">
+      <h2>Recent failures</h2>
+      <div class="sub">Last 10 failed attempts</div>
+      <div style="overflow-x:auto" id="recent-failures"></div>
+    </div>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+const REFRESH_MS = 45000;
+let DATA = null, SCOPE = "current";
+
+/* ---------- theme toggle: auto -> light -> dark ---------- */
+const THEMES = ["auto", "light", "dark"];
+let themeIx = 0;
+$("theme-btn").addEventListener("click", () => {
+  themeIx = (themeIx + 1) % 3;
+  const t = THEMES[themeIx];
+  if (t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  $("theme-btn").textContent = "Theme: " + t;
+  if (DATA) render(DATA);
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (DATA) render(DATA); });
+
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+/* ---------- svg + tooltip helpers ---------- */
+function el(name, attrs, parent) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function txt(node, s) { node.textContent = s == null ? "" : String(s); return node; }
+const tooltip = $("tooltip");
+function showTip(x, y, title, rows) {
+  tooltip.textContent = "";
+  const t = document.createElement("div"); t.className = "tt-title"; txt(t, title);
+  tooltip.appendChild(t);
+  for (const r of rows) {
+    const row = document.createElement("div"); row.className = "tt-row";
+    const key = document.createElement("span"); key.className = "tt-key";
+    key.style.borderTopColor = r.color; row.appendChild(key);
+    const lbl = document.createElement("span"); txt(lbl, r.label); row.appendChild(lbl);
+    const val = document.createElement("span"); val.className = "tt-val"; txt(val, r.value);
+    row.appendChild(val); tooltip.appendChild(row);
+  }
+  tooltip.style.display = "block";
+  const w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+  let px = x + 14, py = y + 12;
+  if (px + w > innerWidth - 8) px = x - w - 14;
+  if (py + h > innerHeight - 8) py = y - h - 12;
+  tooltip.style.left = px + "px"; tooltip.style.top = py + "px";
+}
+function hideTip() { tooltip.style.display = "none"; }
+
+function fmt(n) {
+  if (n == null || isNaN(n)) return "—";
+  return Number(n).toLocaleString("en-US");
+}
+function ago(ms) {
+  if (!ms) return "—";
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function niceTicks(max, count) {
+  if (max <= 0) return [0, 1];
+  const raw = max / count, pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * pow).find(s => max / s <= count) || raw;
+  const out = []; for (let v = 0; v <= max + 1e-9; v += step) out.push(Math.round(v * 100) / 100);
+  return out;
+}
+/* bar with 4px rounded data-end, square at baseline (horizontal, grows right) */
+function hBarPath(x, y, w, h, r) {
+  r = Math.min(r, w, h / 2);
+  return `M${x},${y} h${w - r} a${r},${r} 0 0 1 ${r},${r} v${h - 2 * r} a${r},${r} 0 0 1 ${-r},${r} h${-(w - r)} z`;
+}
+/* vertical column segment; roundTop only for the topmost segment */
+function vSegPath(x, y, w, h, r, roundTop) {
+  if (!roundTop || h < 1) return `M${x},${y} h${w} v${h} h${-w} z`;
+  r = Math.min(r, h, w / 2);
+  return `M${x},${y + r} a${r},${r} 0 0 1 ${r},${-r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${h - r} h${-w} z`;
+}
+
+/* ---------- stat tiles ---------- */
+function tile(label, value, sub, subClass) {
+  const d = document.createElement("div"); d.className = "tile";
+  const l = document.createElement("div"); l.className = "lbl"; txt(l, label);
+  const v = document.createElement("div"); v.className = "val"; txt(v, value);
+  d.appendChild(l); d.appendChild(v);
+  if (sub) { const s = document.createElement("div"); s.className = "sub" + (subClass ? " " + subClass : ""); txt(s, sub); d.appendChild(s); }
+  return d;
+}
+function renderTiles(d) {
+  const root = $("tiles"); root.textContent = "";
+  const s = d.status && d.status.sessions;
+  if (s) {
+    const pct = s.total ? (100 * s.archived / s.total) : 0;
+    root.appendChild(tile("Archived", `${fmt(s.archived)} / ${fmt(s.total)}`,
+      pct.toFixed(1) + "% complete", "good"));
+    root.appendChild(tile("Queued", fmt(s.interrupted + s.observed),
+      `${fmt(s.interrupted)} interrupted · ${fmt(s.observed)} observed`));
+    root.appendChild(tile("Failed", fmt(s.failed),
+      s.processing || s.summary_pending || s.revision_pending
+        ? `${fmt(s.processing)} processing · ${fmt(s.revision_pending)} rev-pending` : "sessions in failed state",
+      s.failed > 0 ? "bad" : null));
+  } else {
+    root.appendChild(tile("Sessions", "—", "munshi status unavailable", "bad"));
+  }
+  const u = d.uploads;
+  root.appendChild(tile("Uploads", u ? `${fmt(u.uploaded)} / ${fmt(u.total)}` : "—",
+    u ? `${fmt(u.failed)} failed · ${fmt(u.dead_letter)} dead-letter` : "unavailable",
+    u && (u.failed || u.dead_letter) ? "bad" : null));
+  const dl = d.deliveries;
+  root.appendChild(tile("Deliveries", dl ? `${fmt(dl.delivered)} / ${fmt(dl.total)}` : "—",
+    dl ? `${fmt(dl.failed)} failed · ${fmt(dl.dead_letter)} dead-letter` : "unavailable",
+    dl && (dl.failed || dl.dead_letter) ? "bad" : null));
+  const r = d.rate || {};
+  root.appendChild(tile("Archiving rate", r.sessions_per_hour == null ? "—" : r.sessions_per_hour.toFixed(1),
+    r.sessions_per_hour == null ? "not enough epoch data" : `sessions / hr, last ${r.window_rounds} rounds`));
+  let eta = "—", etaSub = "insufficient data";
+  if (r.eta_hours != null) {
+    eta = r.eta_hours >= 48 ? (r.eta_hours / 24).toFixed(1) + " d" : r.eta_hours.toFixed(1) + " h";
+    etaSub = "naive, at current rate";
+  }
+  root.appendChild(tile("Queue ETA", eta, etaSub));
+}
+
+/* ---------- burndown chart ---------- */
+function burnSeriesDef() {
+  return [
+    { key: "archived", label: "Archived", color: cssVar("--series-1") },
+    { key: "queued",   label: "Queued",   color: cssVar("--series-2") },
+    { key: "failed",   label: "Failed",   color: cssVar("--series-3") },
+  ];
+}
+function currentEpochRows(d) {
+  const dr = d.driver || {}; const eps = dr.epochs || [];
+  if (!eps.length) return [];
+  return eps[dr.current_epoch_index != null ? dr.current_epoch_index : eps.length - 1].rows || [];
+}
+function renderBurn(d) {
+  const box = $("burn-chart"); box.textContent = "";
+  const legend = $("burn-legend"); legend.textContent = "";
+  const series = burnSeriesDef();
+  const eps = (d.driver && d.driver.epochs) || [];
+  let segments; // array of row-arrays; lines break between segments
+  if (SCOPE === "current") {
+    segments = [currentEpochRows(d)];
+    $("burn-sub").textContent = "Sessions per driver round — current epoch";
+  } else {
+    segments = eps.map(e => e.rows).filter(r => r.length);
+    $("burn-sub").textContent = "Sessions per driver round — all epochs (breaks = restarts)";
+  }
+  const pts = [];
+  segments.forEach((rows, si) => rows.forEach(r => pts.push({ seg: si, r })));
+  if (!pts.length) {
+    const e = document.createElement("div"); e.className = "empty";
+    txt(e, "No driver-log rounds in this epoch yet."); box.appendChild(e);
+    $("burn-table").textContent = ""; return;
+  }
+  for (const s of series) {
+    const k = document.createElement("span"); k.className = "key";
+    const sw = document.createElement("span"); sw.className = "line"; sw.style.borderTopColor = s.color;
+    const lb = document.createElement("span"); txt(lb, s.label);
+    k.appendChild(sw); k.appendChild(lb); legend.appendChild(k);
+  }
+  const W = 720, H = 300, m = { t: 14, r: 96, b: 26, l: 44 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Burndown of archived, queued and failed sessions over driver rounds" }, null);
+  box.appendChild(svg);
+  const X = i => m.l + (pts.length === 1 ? iw / 2 : i * iw / (pts.length - 1));
+  const maxY = Math.max(1, ...pts.flatMap(p => series.map(s => p.r[s.key] || 0)));
+  const ticks = niceTicks(maxY, 5);
+  const yMax = ticks[ticks.length - 1];
+  const Y = v => m.t + ih - (v / yMax) * ih;
+  for (const tv of ticks) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(tv), y2: Y(tv), stroke: cssVar("--grid"), "stroke-width": 1 }, svg);
+    txt(el("text", { x: m.l - 7, y: Y(tv) + 4, "text-anchor": "end", "font-size": 11,
+      fill: cssVar("--muted"), "font-variant-numeric": "tabular-nums" }, svg), fmt(tv));
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(0), y2: Y(0), stroke: cssVar("--baseline"), "stroke-width": 1 }, svg);
+  const nLbl = Math.min(6, pts.length);
+  for (let i = 0; i < nLbl; i++) {
+    const ix = Math.round(i * (pts.length - 1) / Math.max(1, nLbl - 1));
+    txt(el("text", { x: X(ix), y: H - 8, "text-anchor": "middle", "font-size": 11,
+      fill: cssVar("--muted") }, svg), pts[ix].r.time);
+  }
+  for (const s of series) {
+    let path = "", pen = false, lastSeg = -1;
+    pts.forEach((p, i) => {
+      const v = p.r[s.key]; if (v == null) { pen = false; return; }
+      const cmd = (!pen || p.seg !== lastSeg) ? "M" : "L";
+      path += `${cmd}${X(i).toFixed(1)},${Y(v).toFixed(1)}`;
+      pen = true; lastSeg = p.seg;
+    });
+    el("path", { d: path, fill: "none", stroke: s.color, "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  }
+  // end markers (8px dot + 2px surface ring) + direct end labels in text ink
+  const last = pts[pts.length - 1], lx = X(pts.length - 1);
+  const ends = series.map(s => ({ s, v: last.r[s.key] || 0, y: Y(last.r[s.key] || 0) }))
+                     .sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++)
+    if (ends[i].y - ends[i - 1].y < 14) ends[i].y = ends[i - 1].y + 14;
+  for (const e of ends) {
+    el("circle", { cx: lx, cy: Y(e.v), r: 6, fill: e.s.color,
+      stroke: cssVar("--surface-1"), "stroke-width": 2 }, svg);
+    txt(el("text", { x: lx + 10, y: e.y + 4, "font-size": 11.5,
+      fill: cssVar("--text-secondary") }, svg), `${e.s.label} ${fmt(e.v)}`);
+  }
+  // crosshair + full-series tooltip
+  const cross = el("line", { y1: m.t, y2: m.t + ih, stroke: cssVar("--baseline"),
+    "stroke-width": 1, visibility: "hidden" }, svg);
+  const hit = el("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent" }, svg);
+  hit.addEventListener("pointermove", ev => {
+    const bb = svg.getBoundingClientRect();
+    const fx = (ev.clientX - bb.left) * W / bb.width;
+    let ix = Math.round((fx - m.l) / (iw / Math.max(1, pts.length - 1)));
+    ix = Math.max(0, Math.min(pts.length - 1, ix));
+    const p = pts[ix];
+    cross.setAttribute("x1", X(ix)); cross.setAttribute("x2", X(ix));
+    cross.setAttribute("visibility", "visible");
+    showTip(ev.clientX, ev.clientY, `Round ${p.r.round} · ${p.r.time}`,
+      series.map(s => ({ label: s.label, value: fmt(p.r[s.key]), color: s.color })));
+  });
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  // table view
+  const tbl = document.createElement("table");
+  const tr0 = tbl.insertRow(); ["Round", "Time", "Archived", "Queued", "Failed", "Total"].forEach((h, i) => {
+    const th = document.createElement("th"); if (i >= 2) th.className = "num"; txt(th, h); tr0.appendChild(th);
+  });
+  for (const p of pts) {
+    const tr = tbl.insertRow();
+    [[p.r.round], [p.r.time], [p.r.archived, 1], [p.r.queued, 1], [p.r.failed, 1], [p.r.total, 1]]
+      .forEach(([v, num]) => { const td = tr.insertCell(); if (num) td.className = "num"; txt(td, fmt(v)); });
+  }
+  const bt = $("burn-table"); bt.textContent = ""; bt.appendChild(tbl);
+}
+
+/* ---------- horizontal bar charts (sequential single hue) ---------- */
+function renderHBars(boxId, rows, ariaLabel) {
+  const box = $(boxId); box.textContent = "";
+  if (!rows.length) {
+    const e = document.createElement("div"); e.className = "empty"; txt(e, "Nothing here."); box.appendChild(e);
+    return;
+  }
+  const barH = 20, gap = 10, lblW = 130, valW = 44;
+  const W = 340, H = rows.length * (barH + gap) + 6;
+  const iw = W - lblW - valW - 10;
+  const maxV = Math.max(...rows.map(r => r[1]), 1);
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": ariaLabel }, null);
+  box.appendChild(svg);
+  const seq = cssVar("--seq");
+  rows.forEach((r, i) => {
+    const y = 4 + i * (barH + gap);
+    const w = Math.max(2, (r[1] / maxV) * iw);
+    const name = el("text", { x: lblW - 8, y: y + barH / 2 + 4, "text-anchor": "end",
+      "font-size": 12, fill: cssVar("--text-secondary") }, svg);
+    txt(name, r[0].length > 18 ? r[0].slice(0, 17) + "…" : r[0]);
+    el("line", { x1: lblW, x2: lblW, y1: y - 2, y2: y + barH + 2,
+      stroke: cssVar("--baseline"), "stroke-width": 1 }, svg);
+    const p = el("path", { d: hBarPath(lblW, y, w, barH, 4), fill: seq }, svg);
+    txt(el("text", { x: lblW + w + 6, y: y + barH / 2 + 4, "font-size": 12,
+      fill: cssVar("--text-primary"), "font-weight": 600,
+      "font-variant-numeric": "tabular-nums" }, svg), fmt(r[1]));
+    const hit = el("rect", { x: 0, y: y - gap / 2, width: W, height: barH + gap, fill: "transparent" }, svg);
+    const move = ev => showTip(ev.clientX, ev.clientY, r[0],
+      [{ label: "sessions", value: fmt(r[1]), color: seq }]);
+    hit.addEventListener("pointermove", move);
+    hit.addEventListener("pointerleave", hideTip);
+    p.addEventListener("pointermove", move);
+  });
+}
+
+/* ---------- outcome stacked columns (status palette) ---------- */
+function outcomeDefs() {
+  return [
+    { key: "succeeded",  label: "✓ Succeeded",  color: cssVar("--status-good") },
+    { key: "recovered",  label: "↻ Recovered",  color: cssVar("--status-warning") },
+    { key: "superseded", label: "⤳ Superseded", color: cssVar("--muted") },
+    { key: "failed",     label: "✕ Failed",     color: cssVar("--status-critical") },
+  ];
+}
+function renderOutcomes(d) {
+  const box = $("out-chart"); box.textContent = "";
+  const legend = $("out-legend"); legend.textContent = "";
+  const bins = (d.db && d.db.outcome_bins) || [];
+  const defs = outcomeDefs();
+  for (const s of defs) {
+    const k = document.createElement("span"); k.className = "key";
+    const sw = document.createElement("span"); sw.className = "rect"; sw.style.background = s.color;
+    const lb = document.createElement("span"); txt(lb, s.label);
+    k.appendChild(sw); k.appendChild(lb); legend.appendChild(k);
+  }
+  if (!bins.length || !bins.some(b => defs.some(s => b[s.key]))) {
+    const e = document.createElement("div"); e.className = "empty";
+    txt(e, "No attempts finished in the last 6 hours."); box.appendChild(e);
+    return;
+  }
+  const W = 340, H = 210, m = { t: 10, r: 6, b: 22, l: 30 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Processing attempt outcomes per 30 minute bin over the last 6 hours" }, null);
+  box.appendChild(svg);
+  const maxT = Math.max(1, ...bins.map(b => defs.reduce((a, s) => a + (b[s.key] || 0), 0)));
+  const ticks = niceTicks(maxT, 4); const yMax = ticks[ticks.length - 1];
+  const Y = v => m.t + ih - (v / yMax) * ih;
+  for (const tv of ticks) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(tv), y2: Y(tv), stroke: cssVar("--grid"), "stroke-width": 1 }, svg);
+    txt(el("text", { x: m.l - 5, y: Y(tv) + 4, "text-anchor": "end", "font-size": 10.5,
+      fill: cssVar("--muted"), "font-variant-numeric": "tabular-nums" }, svg), fmt(tv));
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(0), y2: Y(0), stroke: cssVar("--baseline"), "stroke-width": 1 }, svg);
+  const slot = iw / bins.length, bw = Math.min(24, slot - 4);
+  const fmtT = ms => new Date(ms).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
+  bins.forEach((b, i) => {
+    const x = m.l + i * slot + (slot - bw) / 2;
+    const total = defs.reduce((a, s) => a + (b[s.key] || 0), 0);
+    let acc = 0;
+    const present = defs.filter(s => b[s.key] > 0);
+    present.forEach((s, si) => {
+      const v = b[s.key];
+      const y0 = Y(acc + v), y1 = Y(acc);
+      const gapPx = si < present.length - 1 ? 2 : 0; // 2px surface gap between segments
+      const h = Math.max(0, y1 - y0 - gapPx);
+      el("path", { d: vSegPath(x, y0, bw, h, 4, si === present.length - 1), fill: s.color }, svg);
+      acc += v;
+    });
+    if (i % 3 === 0)
+      txt(el("text", { x: x + bw / 2, y: H - 6, "text-anchor": "middle", "font-size": 10,
+        fill: cssVar("--muted") }, svg), fmtT(b.bin_start_ms));
+    const hit = el("rect", { x: m.l + i * slot, y: m.t, width: slot, height: ih, fill: "transparent" }, svg);
+    hit.addEventListener("pointermove", ev => showTip(ev.clientX, ev.clientY,
+      fmtT(b.bin_start_ms) + " – " + fmtT(b.bin_start_ms + 1.8e6) + (total ? "" : " (no attempts)"),
+      defs.map(s => ({ label: s.label.slice(2), value: fmt(b[s.key] || 0), color: s.color }))));
+    hit.addEventListener("pointerleave", hideTip);
+  });
+}
+
+/* ---------- right-now panel & tables ---------- */
+function renderNow(d) {
+  const sub = $("now-sub"), body = $("now-body"); body.textContent = "";
+  const dr = d.driver || {};
+  const pill = $("driver-pill"); pill.textContent = "";
+  const ico = document.createElement("span"); ico.className = "ico";
+  const lab = document.createElement("span");
+  if (dr.alive) {
+    ico.textContent = "●"; ico.style.color = cssVar("--status-good");
+    txt(lab, "driver running · pid " + (dr.pids || []).join(", "));
+  } else {
+    ico.textContent = "■"; ico.style.color = cssVar("--status-critical");
+    txt(lab, "driver not running");
+  }
+  pill.appendChild(ico); pill.appendChild(lab);
+
+  const rows = currentEpochRows(d);
+  const lastRow = rows.length ? rows[rows.length - 1] : null;
+  const rp = $("round-pill");
+  if (lastRow) {
+    rp.hidden = false;
+    txt(rp, `round ${lastRow.round} at ${lastRow.time} · log ${ago(dr.log_mtime_ms)}`);
+  } else rp.hidden = true;
+  txt(sub, lastRow ? `Epoch ${((d.driver && d.driver.current_epoch_index) || 0) + 1} · ${rows.length} rounds logged`
+                   : "No rounds in the current epoch yet");
+
+  const list = document.createElement("ul"); list.className = "plain";
+  const proc = (d.db && d.db.processing_now) || [];
+  const head = document.createElement("li");
+  const strong = document.createElement("span"); strong.className = "prim";
+  txt(strong, proc.length ? `Processing now (${proc.length})` : "Nothing processing right now");
+  strong.style.color = "var(--text-primary)"; strong.style.fontWeight = "600";
+  head.appendChild(strong); list.appendChild(head);
+  for (const p of proc.slice(0, 8)) {
+    const li = document.createElement("li");
+    const id = document.createElement("span"); id.className = "mono"; txt(id, p.sid.slice(0, 8));
+    li.appendChild(id); li.appendChild(document.createTextNode("  "));
+    const b = document.createElement("span"); b.className = "badge"; txt(b, p.state);
+    li.appendChild(b);
+    li.appendChild(document.createTextNode(" " + (p.source === "copilot-cli" ? "copilot" : p.source)
+      + " · " + p.project));
+    list.appendChild(li);
+  }
+  body.appendChild(list);
+
+  const diag = (d.db && d.db.diagnostics_tail) || [];
+  if (diag.length) {
+    const dl = document.createElement("ul"); dl.className = "plain"; dl.style.marginTop = "10px";
+    const h = document.createElement("li");
+    const hs = document.createElement("span"); hs.style.fontWeight = "600";
+    hs.style.color = "var(--text-primary)"; txt(hs, "Diagnostics tail");
+    h.appendChild(hs); dl.appendChild(h);
+    for (const g of diag) {
+      const li = document.createElement("li");
+      txt(li, `${g.operation} · ${g.category} · ${ago(g.recorded_at_ms)}`);
+      dl.appendChild(li);
+    }
+    body.appendChild(dl);
+  }
+}
+function sessionTable(rows, cols) {
+  const tbl = document.createElement("table");
+  const tr0 = tbl.insertRow();
+  for (const c of cols) { const th = document.createElement("th"); txt(th, c.h); tr0.appendChild(th); }
+  for (const r of rows) {
+    const tr = tbl.insertRow();
+    for (const c of cols) { const td = tr.insertCell(); c.f(td, r); }
+  }
+  return tbl;
+}
+function renderRecent(d) {
+  const ra = $("recent-archived"); ra.textContent = "";
+  const arch = (d.db && d.db.recent_archived) || [];
+  if (!arch.length) { const e = document.createElement("div"); e.className = "empty"; txt(e, "No data."); ra.appendChild(e); }
+  else ra.appendChild(sessionTable(arch, [
+    { h: "Session", f: (td, r) => { td.className = "mono"; txt(td, r.sid.slice(0, 8)); } },
+    { h: "Src", f: (td, r) => txt(td, r.source === "copilot-cli" ? "copilot" : "claude") },
+    { h: "Project", f: (td, r) => txt(td, r.project) },
+    { h: "Title", f: (td, r) => { const s = document.createElement("span"); s.className = "prim";
+        txt(s, r.title || "(untitled)"); td.appendChild(s); } },
+    { h: "When", f: (td, r) => txt(td, ago(r.at_ms)) },
+  ]));
+  const rf = $("recent-failures"); rf.textContent = "";
+  const fails = (d.db && d.db.recent_failures) || [];
+  if (!fails.length) { const e = document.createElement("div"); e.className = "empty"; txt(e, "No recent failures."); rf.appendChild(e); }
+  else rf.appendChild(sessionTable(fails, [
+    { h: "Session", f: (td, r) => { td.className = "mono"; txt(td, r.sid.slice(0, 8)); } },
+    { h: "Src", f: (td, r) => txt(td, r.source === "copilot-cli" ? "copilot" : "claude") },
+    { h: "Project", f: (td, r) => txt(td, r.project) },
+    { h: "Error", f: (td, r) => { const b = document.createElement("span"); b.className = "badge";
+        b.style.borderColor = cssVar("--status-critical");
+        txt(b, r.error_category || "unknown"); td.appendChild(b); } },
+    { h: "When", f: (td, r) => txt(td, ago(r.at_ms)) },
+  ]));
+}
+
+/* ---------- assemble ---------- */
+function render(d) {
+  DATA = d;
+  txt($("updated-at"), "data " + ago(d.generated_at_ms) + " · refresh 45s");
+  const banner = $("err-banner");
+  if (d.errors && d.errors.length) {
+    banner.textContent = "";
+    const s = document.createElement("strong"); txt(s, "Degraded sources: ");
+    banner.appendChild(s);
+    banner.appendChild(document.createTextNode(
+      d.errors.map(e => `${e.source} — ${e.message}`).join("  ·  ")));
+    banner.style.display = "block";
+  } else banner.style.display = "none";
+  renderTiles(d);
+  renderBurn(d);
+  const projRows = ((d.db && d.db.remaining_by_project) || []).slice(0, 10);
+  renderHBars("proj-chart", projRows, "Remaining queued sessions by project");
+  const src = (d.db && d.db.archived_by_source) || {};
+  renderHBars("src-chart",
+    [["Copilot CLI", src["copilot-cli"] || 0], ["Claude Code", src["claude-code"] || 0]],
+    "Archived sessions by source agent");
+  renderOutcomes(d);
+  renderNow(d);
+  renderRecent(d);
+  const eps = (d.driver && d.driver.epochs) || [];
+  txt($("scope-note"), SCOPE === "current" ? ""
+    : `${eps.filter(e => e.rows.length).length} epochs in log`);
+}
+function setScope(s) {
+  SCOPE = s;
+  $("scope-current").setAttribute("aria-pressed", String(s === "current"));
+  $("scope-all").setAttribute("aria-pressed", String(s === "all"));
+  if (DATA) render(DATA);
+}
+$("scope-current").addEventListener("click", () => setScope("current"));
+$("scope-all").addEventListener("click", () => setScope("all"));
+
+async function refresh() {
+  const app = $("app");
+  app.classList.add("refreshing");
+  try {
+    const r = await fetch("/api/data", { cache: "no-store" });
+    render(await r.json());
+  } catch (e) {
+    const banner = $("err-banner");
+    banner.textContent = "";
+    const s = document.createElement("strong"); txt(s, "Dashboard server unreachable. ");
+    banner.appendChild(s);
+    banner.appendChild(document.createTextNode(String(e)));
+    banner.style.display = "block";
+  } finally {
+    app.classList.remove("refreshing");
+  }
+}
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
