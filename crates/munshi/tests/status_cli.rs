@@ -156,7 +156,33 @@ fn status_sessions_and_show_json_contracts_cover_required_states() {
             item["source"], "copilot",
             "session list items must expose their source kind"
         );
+        // Additive on schema_version 1 (issue #56): a dashboard reads project and row
+        // timestamps from this contract instead of opening munshi.db.
+        let created = item["created_at_ms"].as_i64().expect("created_at_ms");
+        let updated = item["updated_at_ms"].as_i64().expect("updated_at_ms");
+        assert!(created > 0, "created_at_ms must be a real instant");
+        assert!(
+            updated >= created,
+            "updated_at_ms {updated} predates created_at_ms {created}"
+        );
     }
+
+    let archived_item = items
+        .iter()
+        .find(|item| item["session_id"] == archived)
+        .expect("archived session listed");
+    assert_eq!(
+        archived_item["project"], "munshi",
+        "a resolved project identity must surface as its project name"
+    );
+    let summary_pending_item = items
+        .iter()
+        .find(|item| item["session_id"] == summary_pending)
+        .expect("summary-pending session listed");
+    assert_eq!(
+        summary_pending_item["project"], "project",
+        "a session whose project never resolved falls back to its origin basename"
+    );
 
     let failed_only = harness.sessions_json(Some("failed"));
     assert!(
@@ -180,6 +206,210 @@ fn status_sessions_and_show_json_contracts_cover_required_states() {
         "Contract summary title"
     );
     assert!(!String::from_utf8_lossy(&show_output.stdout).contains("events.jsonl"));
+}
+
+/// A caller that only knows a project directory (Madari, or the dashboard, probing before the
+/// user has ever run `munshi register` there) must get a valid, empty `schema_version: 1`
+/// contract from every read-only command — including the two added for issue #56 — and the probe
+/// must not create the state database it is reporting on.
+#[test]
+fn attempts_and_diagnostics_json_on_an_unregistered_state_directory_degrade_to_empty_contracts() {
+    let harness = Harness::new();
+
+    let attempts = harness.attempts_json(None, None);
+    assert_eq!(attempts["schema_version"], 1);
+    assert_eq!(attempts["command"], "attempts");
+    assert_eq!(attempts["since_ms"], Value::Null);
+    assert_eq!(attempts["total"], 0);
+    assert_eq!(attempts["returned"], 0);
+    assert_eq!(attempts["items"], json!([]));
+
+    let diagnostics = harness.diagnostics_json(None);
+    assert_eq!(diagnostics["schema_version"], 1);
+    assert_eq!(diagnostics["command"], "diagnostics");
+    assert_eq!(diagnostics["total"], 0);
+    assert_eq!(diagnostics["returned"], 0);
+    assert_eq!(diagnostics["items"], json!([]));
+
+    assert!(
+        !harness.state.join("munshi.db").exists(),
+        "a read-only probe must not create the state database"
+    );
+}
+
+/// The `attempts` contract exposes one row per processing attempt — outcome, error category, and
+/// timing joined to session identity — so a dashboard can bin outcomes and list recent failures
+/// without opening the store (ADR 0007). Rows only: no rollup, no histogram.
+#[test]
+fn attempts_json_exposes_attempt_rows_ordered_by_finish_time() {
+    let harness = Harness::new();
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+
+    let archived = "aa000000-0000-4000-8000-000000000001";
+    let failed = "aa000000-0000-4000-8000-000000000002";
+
+    let archived_events = harness.write_transcript(archived, "ARCHIVE_REQUEST", "archive");
+    harness.complete_lifecycle(archived, &archived_events, 50_000, 50_001);
+    assert_success(&harness.wait(archived, 5_000));
+
+    let failed_events = harness.write_transcript(failed, "FAIL_REQUEST", "fails");
+    harness.complete_lifecycle(failed, &failed_events, 51_000, 51_001);
+    assert!(!harness.wait(failed, 5_000).status.success());
+
+    let report = harness.attempts_json(None, None);
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["command"], "attempts");
+    assert_eq!(report["since_ms"], Value::Null);
+    let items = report["items"].as_array().unwrap();
+    assert_eq!(report["total"], items.len());
+    assert_eq!(report["returned"], items.len());
+    assert!(items.len() >= 2, "both lifecycles recorded an attempt");
+
+    for item in items {
+        assert_eq!(
+            item.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "source",
+                "session_id",
+                "project",
+                "outcome",
+                "error_category",
+                "started_at_ms",
+                "finished_at_ms",
+            ]
+            .iter()
+            .collect::<Vec<_>>(),
+            "the attempt row must stay exactly the documented field set"
+        );
+        assert_eq!(item["source"], "copilot");
+        assert!(
+            item["project"].is_string(),
+            "every attempt inherits its session's project label"
+        );
+        assert!(item["started_at_ms"].as_i64().unwrap() > 0);
+    }
+
+    // Finished attempts come first, newest first; unfinished attempts sort last.
+    let finished = items
+        .iter()
+        .map(|item| item["finished_at_ms"].as_i64())
+        .collect::<Vec<_>>();
+    assert!(
+        finished.windows(2).all(|pair| match (pair[0], pair[1]) {
+            (Some(newer), Some(older)) => newer >= older,
+            (Some(_), None) => true,
+            (None, None) => true,
+            (None, Some(_)) => false,
+        }),
+        "attempts must be ordered by finish time with unfinished ones last: {finished:?}"
+    );
+
+    let succeeded = items
+        .iter()
+        .find(|item| item["session_id"] == archived)
+        .expect("the archived session recorded an attempt");
+    assert_eq!(succeeded["outcome"], "succeeded");
+    assert_eq!(succeeded["error_category"], Value::Null);
+    assert_eq!(
+        succeeded["project"], "munshi",
+        "an archived session has a resolved project identity to inherit"
+    );
+
+    let failure = items
+        .iter()
+        .find(|item| item["session_id"] == failed)
+        .expect("the failed session recorded an attempt");
+    assert_eq!(failure["outcome"], "failed");
+    assert!(
+        failure["error_category"].is_string(),
+        "a failed attempt must name its error category"
+    );
+    assert!(failure["finished_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(
+        failure["project"], "project",
+        "a session that never archived has only its origin basename to label with"
+    );
+
+    // `--limit` truncates the page but never the total, so a caller can tell it is paging.
+    let limited = harness.attempts_json(Some(1), None);
+    assert_eq!(limited["returned"], 1);
+    assert_eq!(limited["items"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["total"], report["total"]);
+
+    // `--since-ms` bounds the window on both the page and the total.
+    let future = harness.attempts_json(None, Some(i64::MAX / 2));
+    assert_eq!(future["since_ms"], i64::MAX / 2);
+    assert_eq!(future["total"], 0);
+    assert_eq!(future["items"], json!([]));
+}
+
+/// The `diagnostics` contract exposes the tail of the same operator-facing records `status`
+/// already surfaces one of as `last_failure`: bounded Munshi-authored codes and the session they
+/// named, newest first, and nothing that could carry transcript content.
+#[test]
+fn diagnostics_json_exposes_the_recorded_tail_newest_first() {
+    let harness = Harness::new();
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+
+    let first = "bb000000-0000-4000-8000-000000000001";
+    let second = "bb000000-0000-4000-8000-000000000002";
+
+    assert_success(&harness.project_disable());
+    for (session_id, stop) in [(first, 60_000), (second, 61_000)] {
+        let events = harness.write_transcript(session_id, "DISABLED_REQUEST", "blocked");
+        harness.complete_lifecycle(session_id, &events, stop, stop + 1);
+        assert!(!harness.wait(session_id, 5_000).status.success());
+    }
+
+    let report = harness.diagnostics_json(None);
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["command"], "diagnostics");
+    let items = report["items"].as_array().unwrap();
+    assert_eq!(report["total"], items.len());
+    assert_eq!(report["returned"], items.len());
+    assert!(items.len() >= 2, "both disabled lifecycles were recorded");
+
+    for item in items {
+        assert_eq!(
+            item.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "source",
+                "session_id",
+                "operation",
+                "category",
+                "cause_category",
+                "recorded_at_ms",
+            ]
+            .iter()
+            .collect::<Vec<_>>(),
+            "the diagnostic row must stay exactly the documented field set"
+        );
+        assert!(item["operation"].is_string());
+        assert!(item["category"].is_string());
+        assert!(item["recorded_at_ms"].as_i64().unwrap() > 0);
+    }
+
+    let recorded = items
+        .iter()
+        .map(|item| item["recorded_at_ms"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        recorded.windows(2).all(|pair| pair[0] >= pair[1]),
+        "diagnostics must be newest first: {recorded:?}"
+    );
+
+    let disabled = items
+        .iter()
+        .find(|item| item["session_id"] == second)
+        .expect("the disabled session was named by a diagnostic");
+    assert_eq!(disabled["source"], "copilot");
+    assert_eq!(disabled["category"], "project-disabled");
+
+    let limited = harness.diagnostics_json(Some(1));
+    assert_eq!(limited["returned"], 1);
+    assert_eq!(limited["items"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["total"], report["total"]);
+    assert_eq!(limited["items"][0], items[0]);
 }
 
 #[test]
@@ -535,6 +765,38 @@ impl Harness {
         if let Some(state) = state {
             args.push("--state".to_owned());
             args.push(state.to_owned());
+        }
+        self.json_output(args)
+    }
+
+    fn attempts_json(&self, limit: Option<usize>, since_ms: Option<i64>) -> Value {
+        let mut args = vec![
+            "attempts".to_owned(),
+            "--state-dir".to_owned(),
+            self.state.display().to_string(),
+            "--json".to_owned(),
+        ];
+        if let Some(limit) = limit {
+            args.push("--limit".to_owned());
+            args.push(limit.to_string());
+        }
+        if let Some(since_ms) = since_ms {
+            args.push("--since-ms".to_owned());
+            args.push(since_ms.to_string());
+        }
+        self.json_output(args)
+    }
+
+    fn diagnostics_json(&self, limit: Option<usize>) -> Value {
+        let mut args = vec![
+            "diagnostics".to_owned(),
+            "--state-dir".to_owned(),
+            self.state.display().to_string(),
+            "--json".to_owned(),
+        ];
+        if let Some(limit) = limit {
+            args.push("--limit".to_owned());
+            args.push(limit.to_string());
         }
         self.json_output(args)
     }

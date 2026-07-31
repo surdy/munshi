@@ -71,6 +71,29 @@ munshi show 11111111-1111-4111-8111-111111111111 --source claude-code
 munshi show 11111111-1111-4111-8111-111111111111 --json
 ```
 
+### `munshi attempts`
+
+Lists recent processing attempts — the per-run outcomes behind each session's current state
+(succeeded, failed, recovered, superseded) with their error categories and timestamps. Useful for
+spotting failure patterns that `sessions` (which shows only each session's latest state) folds away.
+
+```bash
+munshi attempts
+munshi attempts --limit 200 --json
+munshi attempts --since-ms 1785400000000   # attempts active at/after this Unix-ms instant
+```
+
+### `munshi diagnostics`
+
+Shows the tail of Munshi's diagnostics ledger: operation, category, and cause for recorded
+anomalies (parked evidence, schema drift fallbacks, worker errors). The deeper companion to the
+single `last failure` line in `status`.
+
+```bash
+munshi diagnostics
+munshi diagnostics --limit 50 --json
+```
+
 ### `munshi doctor`
 
 Diagnoses registration, dependencies, and runtime readiness — useful after upgrading Munshi, moving

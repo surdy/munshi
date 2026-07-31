@@ -2262,6 +2262,8 @@ mod tests {
             last_error_category: None,
             next_retry_at_ms: None,
             failure_streak: 0,
+            created_at_ms: 10_000,
+            updated_at_ms: 10_000,
         }
     }
 
