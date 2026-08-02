@@ -54,6 +54,7 @@ munshi sessions --limit 100 --json
 | `processing` | A worker currently holds this session's lock and is actively summarizing it. |
 | `observed` | A hook has seen the session, but nothing has queued it for summarization yet. |
 | `not-archive-worthy` | The transcript never reached the minimum bar (a user request plus agent content or tool activity); it will not be archived. Covers hook-observed sessions and stubs the recovery sweep judged; if the transcript later grows a real reply, the session is picked up again and can archive. |
+| `transcript-lost` | The operator settled the session with `settle-lost`: its transcript was destroyed and judged unrecoverable. Everything munshi recorded about the session is retained, and if a transcript reappears at its recorded path the verdict lifts automatically on the next `retry-all`. |
 | `unknown` | Doesn't cleanly map to any state above (rare; treat as diagnostic). |
 
 `--state` filters to one state; `--json` emits the stable machine-readable contract; `--limit`
@@ -93,6 +94,21 @@ single `last failure` line in `status`.
 munshi diagnostics
 munshi diagnostics --limit 50 --json
 ```
+
+### `munshi settle-lost`
+
+Declares destroyed transcripts lost — an explicit operator action, never automatic. Eligible
+sessions are permanently parked under a missing-source failure (`source-missing`, or the older
+lumped `source-failed`) with no file at their recorded transcript path. Settled sessions show as
+`transcript-lost`, leave the doctor warnings, and reactivate on their own if the file comes back.
+
+```bash
+munshi settle-lost <session-id>      # one session; exits non-zero if it did not settle
+munshi settle-lost --all-missing     # every eligible session
+```
+
+A parked session whose transcript still exists is refused (`transcript-present`) — that park is a
+size cap, and raising the limit is the fix.
 
 ### `munshi doctor`
 

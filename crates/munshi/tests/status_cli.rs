@@ -635,7 +635,9 @@ fn doctor_hints_sessions_parked_on_a_size_cap() {
         "{message}"
     );
     assert!(
-        message.contains("1 source-failed (raise --max-source-bytes)"),
+        // A pre-#57 lumped park whose transcript still exists on disk classifies as the
+        // size-cap case and is reported under its true name.
+        message.contains("1 source-oversized (raise --max-source-bytes)"),
         "{message}"
     );
     assert!(
@@ -643,6 +645,54 @@ fn doctor_hints_sessions_parked_on_a_size_cap() {
         "{message}"
     );
     assert_eq!(report["sessions"]["parked"], 2);
+}
+
+#[test]
+fn phantom_parks_drain_to_not_archive_worthy_via_forced_retry() {
+    let harness = Harness::new();
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+
+    // A failed rev-0 session with no cursor is the phantom shape (issue #58) once its
+    // transcript is gone: a non-interactive `claude` invocation that fired hooks without
+    // ever writing one.
+    let phantom = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let events = harness.write_transcript(phantom, "FAIL_REQUEST", "fails");
+    harness.complete_lifecycle(phantom, &events, 50_000, 50_001);
+    assert!(!harness.wait(phantom, 5_000).status.success());
+    harness.park_on_size_cap(phantom, "source-missing");
+    fs::remove_file(&events).unwrap();
+
+    // Doctor calls it what it is: a phantom, not a size cap, not a genuine loss.
+    let report = harness.doctor_json();
+    let codes: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"phantom-invocations-parked"), "{codes:?}");
+    assert!(!codes.contains(&"size-cap-parked"), "{codes:?}");
+    assert!(!codes.contains(&"transcript-missing-parked"), "{codes:?}");
+
+    // The documented drain: a forced retry settles the phantom not-archive-worthy.
+    let retry = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["retry-all", "--force", "--json", "--state-dir"])
+        .arg(&harness.state)
+        .output()
+        .unwrap();
+    assert_success(&retry);
+    let report: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(report["not_archive_worthy"], 1, "{report}");
+
+    let sessions = harness.sessions_json(Some("not-archive-worthy"));
+    let ids: Vec<&str> = sessions["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["session_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&phantom), "{ids:?}");
+    assert_eq!(harness.status_json()["sessions"]["parked"], 0);
 }
 
 struct Harness {

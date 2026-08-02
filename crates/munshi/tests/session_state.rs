@@ -308,10 +308,11 @@ fn retry_honors_raised_source_limit_after_source_failed_park() {
     harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
     let waited = harness.wait(SESSION_A, 5_000);
     assert!(!waited.status.success());
-    assert!(String::from_utf8_lossy(&waited.stdout).contains("source-failed"));
-    // The failed-era verdict is a permanent park recorded against the old limit.
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("source-oversized"));
+    // The failed-era verdict is a permanent park recorded against the old limit, under the
+    // size-specific category the issue #57 split introduced.
     let (category, next_retry) = session_retry_park(&harness, SESSION_A);
-    assert_eq!(category.as_deref(), Some("source-failed"));
+    assert_eq!(category.as_deref(), Some("source-oversized"));
     assert_eq!(next_retry, Some(-1));
 
     // Raise the configured limit the way a user would: re-register over the same state.
@@ -341,7 +342,7 @@ fn recovery_sweep_revives_parked_sessions_after_source_limit_raise() {
     let waited = harness.wait(SESSION_B, 5_000);
     assert!(!waited.status.success());
     let (category, next_retry) = session_retry_park(&harness, SESSION_B);
-    assert_eq!(category.as_deref(), Some("source-failed"));
+    assert_eq!(category.as_deref(), Some("source-oversized"));
     assert_eq!(next_retry, Some(-1));
 
     assert_success(&harness.register_with_source_limit(&summarizer, 10_000, 8_388_608));
@@ -2249,6 +2250,142 @@ fn fresh_issue_three_worker_files_are_deferred_without_cleanup() {
         .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn settle_lost_settles_missing_transcripts_and_reactivates_on_restore() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("lost-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "LOST_REQUEST", "lost answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+
+    // Reshape the archived row into the incident shape: permanently parked under a
+    // missing-source verdict, with the transcript truly gone from disk.
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET lifecycle_state='failed', next_retry_at_ms=-1,
+                last_error_category='source-missing'
+             WHERE source_session_id=?1",
+            params![SESSION_A],
+        )
+        .unwrap();
+    drop(connection);
+    let hidden = transcript.with_extension("hidden");
+    fs::rename(&transcript, &hidden).unwrap();
+
+    // Doctor names the real problem, not a size cap.
+    let doctor = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["doctor", "--state-dir"])
+        .arg(&harness.state)
+        .output()
+        .unwrap();
+    let doctor_text = String::from_utf8_lossy(&doctor.stdout).into_owned();
+    assert!(
+        doctor_text.contains("transcript no longer exists"),
+        "{doctor_text}"
+    );
+    assert!(
+        !doctor_text.contains("raise --max-source-bytes"),
+        "{doctor_text}"
+    );
+
+    // Settle: the verdict lands, and every surface reports it truthfully.
+    let settle = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["settle-lost", "--all-missing", "--json", "--state-dir"])
+        .arg(&harness.state)
+        .output()
+        .unwrap();
+    assert_success(&settle);
+    let report: Value = serde_json::from_slice(&settle.stdout).unwrap();
+    assert_eq!(report["settled"], 1, "{report}");
+    assert_eq!(report["items"][0]["result"], "settled", "{report}");
+
+    let listed = harness.sessions_json(Some("transcript-lost"));
+    assert_eq!(listed["returned"], 1, "{listed}");
+    assert_eq!(listed["items"][0]["state"], "transcript-lost", "{listed}");
+    assert!(harness.status_text().contains("transcript-lost=1"));
+
+    // A second sweep finds nothing: settling is terminal while the file stays gone.
+    let again = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["settle-lost", "--all-missing", "--json", "--state-dir"])
+        .arg(&harness.state)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(report["candidates"], 0, "{report}");
+
+    // Restore the transcript: retry-all's reactivation sweep lifts the verdict and the
+    // normal pipeline re-archives from the restored bytes.
+    fs::rename(&hidden, &transcript).unwrap();
+    let retry = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["retry-all", "--json", "--state-dir"])
+        .arg(&harness.state)
+        .output()
+        .unwrap();
+    assert_success(&retry);
+    let listed = harness.sessions_json(Some("transcript-lost"));
+    assert_eq!(listed["returned"], 0, "{listed}");
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let stamp: Option<i64> = connection
+        .query_row(
+            "SELECT transcript_lost_at_ms FROM sessions WHERE source_session_id=?1",
+            params![SESSION_A],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stamp, None);
+}
+
+#[test]
+fn settle_lost_refuses_present_transcripts_and_reports_the_named_target() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("present-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "PRESENT_REQUEST", "present answer");
+    harness.complete_lifecycle(SESSION_A, &transcript, 10, 11);
+    assert_success(&harness.wait(SESSION_A, 5_000));
+
+    // A pre-#57 lumped park whose file still exists is a size-cap park, not a loss.
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET lifecycle_state='failed', next_retry_at_ms=-1,
+                last_error_category='source-failed'
+             WHERE source_session_id=?1",
+            params![SESSION_A],
+        )
+        .unwrap();
+    drop(connection);
+
+    let settle = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["settle-lost", SESSION_A, "--json", "--state-dir"])
+        .arg(&harness.state)
+        .output()
+        .unwrap();
+    // The named target was not settled: explicit non-zero exit, explicit reason — never a
+    // silent zero-candidate success (the issue #54 lesson).
+    assert_eq!(settle.status.code(), Some(2), "{settle:?}");
+    let report: Value = serde_json::from_slice(&settle.stdout).unwrap();
+    assert_eq!(
+        report["items"][0]["result"], "transcript-present",
+        "{report}"
+    );
+    assert_eq!(report["settled"], 0, "{report}");
+
+    // An unregistered state directory degrades to an empty sweep, exit 0.
+    let empty_dir = harness.root().join("never-registered");
+    fs::create_dir_all(&empty_dir).unwrap();
+    let sweep = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["settle-lost", "--all-missing", "--json", "--state-dir"])
+        .arg(&empty_dir)
+        .output()
+        .unwrap();
+    assert_success(&sweep);
+    let report: Value = serde_json::from_slice(&sweep.stdout).unwrap();
+    assert_eq!(report["candidates"], 0, "{report}");
 }
 
 struct Harness {

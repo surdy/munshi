@@ -277,6 +277,20 @@ fn run_archive_worker_inner(
         }
         Err(error) => {
             let category = worker_error_code(&error);
+            // A phantom invocation, not a session (issue #58): the transcript is missing and
+            // nothing was ever read from it (no cursor, no revision). Non-interactive `claude`
+            // subcommands fire the SessionEnd hook without writing a transcript, so such rows
+            // would otherwise retry into a permanent park with nothing behind them. Settle the
+            // existing not-archive-worthy verdict instead — truthful (no archivable content
+            // was ever observed) and reactivatable through the issue #50 paths if a real
+            // transcript ever appears.
+            if category == "source-missing"
+                && claim.session.current_revision == 0
+                && claim.session.previous_source.is_none()
+            {
+                state.complete_not_archive_worthy(&claim)?;
+                return Ok(HookResult::NotArchiveWorthy);
+            }
             let retryable = worker_error_retryable(&error);
             state.fail_attempt(&claim, category, retryable)?;
             Ok(HookResult::Failed {
@@ -1597,12 +1611,13 @@ fn policy_gate(
     Ok(None)
 }
 
-/// A permanent `source-failed` park freezes a verdict reached under the source limit configured
-/// at failure time. The currently configured limit always wins on retry (issue #44): when the
-/// parked transcript now fits within `stored.limits.max_source_bytes`, the park is lifted so the
-/// normal claim gates re-evaluate the session against today's configuration instead of replaying
-/// the stale verdict. A transcript that still exceeds the current limit (or one that failed for a
-/// size-independent reason and still fails) simply re-parks on the next attempt.
+/// A permanent `source-oversized` park (or a pre-#57 `source-failed` one) freezes a verdict
+/// reached under the source limit configured at failure time. The currently configured limit
+/// always wins on retry (issue #44): when the parked transcript now fits within
+/// `stored.limits.max_source_bytes`, the park is lifted so the normal claim gates re-evaluate
+/// the session against today's configuration instead of replaying the stale verdict. A
+/// transcript that still exceeds the current limit (or one that failed for a size-independent
+/// reason and still fails) simply re-parks on the next attempt.
 fn lift_stale_source_limit_park(
     state: &mut StateStore,
     stored: &crate::registration::StoredConfig,
@@ -1612,7 +1627,10 @@ fn lift_stale_source_limit_park(
         return Ok(());
     };
     if session.lifecycle_state != "failed"
-        || session.last_error_category.as_deref() != Some("source-failed")
+        || !matches!(
+            session.last_error_category.as_deref(),
+            Some("source-oversized" | "source-failed")
+        )
     {
         return Ok(());
     }
@@ -1648,6 +1666,26 @@ pub fn lift_stale_source_limit_parks(state_directory: &Path) -> Result<(), HookW
         }
         let store = recovery_store(&mut state, &mut source_stores, state_directory, source)?;
         let _ = store.lift_source_limit_park(&session_id)?;
+    }
+    Ok(())
+}
+
+/// Sweeps every settled `transcript-lost` session (issue #58) and lifts the verdict of any
+/// whose transcript has reappeared at its recorded path — a restore from backup, another
+/// machine, or a vendor tool putting the file back. Settled rows carry session-end evidence,
+/// so no hook or observed-rescue path would ever requeue them; this sweep is their only way
+/// back into the pipeline, and the lift leaves them `failed`-and-eligible so the very next
+/// retry sweep re-reads the restored transcript. Best-effort by design, like the size-cap
+/// lift above.
+pub fn reactivate_regrown_lost_transcripts(state_directory: &Path) -> Result<(), HookWorkerError> {
+    let mut state = StateStore::open(state_directory)?;
+    let mut source_stores: BTreeMap<SourceKind, StateStore> = BTreeMap::new();
+    for (source, session_id, path) in state.settled_lost_transcripts()? {
+        if !path.exists() {
+            continue;
+        }
+        let store = recovery_store(&mut state, &mut source_stores, state_directory, source)?;
+        let _ = store.lift_transcript_lost(&session_id)?;
     }
     Ok(())
 }
@@ -2044,6 +2082,18 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
         HookWorkerError::Source(SourceError::ChangedDuringRead) => "source-changed",
         HookWorkerError::Source(SourceError::IncompleteTrailingRecord) => "source-incomplete",
         HookWorkerError::Source(SourceError::TranscriptNotFound) => "transcript-unresolved",
+        // The size-cap and vanished-transcript cases were one lumped `source-failed` until
+        // issue #57: the 2026-07-31 incident showed doctor advising a cap raise while the
+        // transcripts had been destroyed. The split keeps park behavior identical (both are
+        // non-retryable) but lets doctor and settle-lost (#58) tell the truth. `source-failed`
+        // remains the residual I/O category — and the legacy code on rows recorded before the
+        // split, which readers must keep accepting.
+        HookWorkerError::Source(SourceError::SourceLimit { .. }) => "source-oversized",
+        HookWorkerError::Source(SourceError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "source-missing"
+        }
         HookWorkerError::Source(_) => "source-failed",
         HookWorkerError::SourceNoLongerArchiveWorthy => "source-not-archive-worthy",
         HookWorkerError::Project(_) => "project-failed",
@@ -2080,4 +2130,29 @@ fn worker_error_retryable(error: &HookWorkerError) -> bool {
             | HookWorkerError::PostPersistWrite(_)
             | HookWorkerError::ArchiveGit(ArchiveGitError::LockBusy)
     )
+}
+
+#[cfg(test)]
+mod worker_error_code_tests {
+    use super::*;
+
+    /// The issue #57 split: a vanished transcript, an oversized one, and residual I/O are
+    /// three different problems with three different resolutions, and the code must say
+    /// which one happened.
+    #[test]
+    fn source_read_failures_split_by_cause() {
+        let missing = HookWorkerError::Source(SourceError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        assert_eq!(worker_error_code(&missing), "source-missing");
+        let oversized = HookWorkerError::Source(SourceError::SourceLimit { limit: 1024 });
+        assert_eq!(worker_error_code(&oversized), "source-oversized");
+        let residual = HookWorkerError::Source(SourceError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert_eq!(worker_error_code(&residual), "source-failed");
+        // Neither new code disturbs the park semantics: both remain non-retryable.
+        assert!(!worker_error_retryable(&missing));
+        assert!(!worker_error_retryable(&oversized));
+    }
 }
