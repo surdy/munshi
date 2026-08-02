@@ -141,6 +141,11 @@ pub struct SessionRecord {
     /// lifecycle stays `observed` so the issue #49 rescue and the hook requeue paths keep
     /// treating the row as reactivatable when the transcript grows.
     pub not_archive_worthy_at_ms: Option<i64>,
+    /// When the operator settled this session as `transcript-lost` (issue #58): its source
+    /// transcript was destroyed and judged unrecoverable. A read-time display signal like
+    /// `not_archive_worthy_at_ms` — the stored lifecycle stays `observed` so the row reactivates
+    /// through the normal paths if the transcript ever reappears at its recorded path.
+    pub transcript_lost_at_ms: Option<i64>,
     pub last_error_category: Option<String>,
     /// When the failed session becomes retry-eligible again: `None` is immediately eligible, a
     /// timestamp is a scheduled backoff, and a negative value is a permanent park (issues #38/#44).
@@ -759,6 +764,7 @@ impl StateStore {
         ensure_session_failure_streak_columns(&self.connection)?;
         ensure_session_project_origin_column(&self.connection)?;
         ensure_session_not_archive_worthy_column(&self.connection)?;
+        ensure_session_transcript_lost_column(&self.connection)?;
         Ok(())
     }
 
@@ -981,7 +987,7 @@ impl StateStore {
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
                     last_error_category,source_kind,next_retry_at_ms,failure_streak,
                     origin_project_origin,not_archive_worthy_at_ms,
-                    created_at_ms,updated_at_ms
+                    created_at_ms,updated_at_ms,transcript_lost_at_ms
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -1006,7 +1012,7 @@ impl StateStore {
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
                 origin_project_origin,not_archive_worthy_at_ms,
-                created_at_ms,updated_at_ms
+                created_at_ms,updated_at_ms,transcript_lost_at_ms
              FROM sessions
              ORDER BY updated_at_ms DESC,id DESC",
         )?;
@@ -1934,6 +1940,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         last_agent_stop_ms: row.get(31)?,
         last_session_end_ms: row.get(32)?,
         not_archive_worthy_at_ms: row.get(38)?,
+        transcript_lost_at_ms: row.get(41)?,
         last_error_category: row.get(33)?,
         next_retry_at_ms: row.get(35)?,
         failure_streak: row.get(36)?,
@@ -2160,6 +2167,25 @@ fn ensure_session_not_archive_worthy_column(connection: &Connection) -> Result<(
     Ok(())
 }
 
+/// Additive column recording when the operator settled a session as `transcript-lost`
+/// (issue #58): its transcript was destroyed and judged unrecoverable. Added the same way as
+/// the verdict column above so existing databases upgrade in place. No backfill: declaring
+/// data lost is an explicit operator action (`munshi settle-lost`), never inferred.
+fn ensure_session_transcript_lost_column(connection: &Connection) -> Result<(), StateError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let existing: std::collections::BTreeSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    drop(statement);
+    if !existing.contains("transcript_lost_at_ms") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN transcript_lost_at_ms INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn dedupe_key(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
@@ -2234,12 +2260,12 @@ impl StateStore {
         Ok(reserved_database_id.is_some())
     }
 
-    /// Failed sessions parked permanently (`next_retry_at_ms < 0`) under the `source-failed`
-    /// verdict, across every source scope. That verdict is config-dependent — it records that the
-    /// transcript exceeded the source limit configured at failure time — so callers re-check the
-    /// listed transcripts against the currently configured limit and lift stale parks
-    /// (issue #44). Sessions without a recorded transcript path are omitted: there is nothing to
-    /// re-measure.
+    /// Failed sessions parked permanently (`next_retry_at_ms < 0`) under the `source-oversized`
+    /// verdict — or the pre-#57 lumped `source-failed` code older rows still carry — across
+    /// every source scope. That verdict is config-dependent — it records that the transcript
+    /// exceeded the source limit configured at failure time — so callers re-check the listed
+    /// transcripts against the currently configured limit and lift stale parks (issue #44).
+    /// Sessions without a recorded transcript path are omitted: there is nothing to re-measure.
     pub fn parked_source_limit_sessions(
         &self,
     ) -> Result<Vec<(SourceKind, String, PathBuf)>, StateError> {
@@ -2248,7 +2274,7 @@ impl StateStore {
              FROM sessions
              WHERE lifecycle_state='failed'
                AND next_retry_at_ms<0
-               AND last_error_category='source-failed'
+               AND last_error_category IN ('source-oversized','source-failed')
                AND transcript_path IS NOT NULL
              ORDER BY updated_at_ms,id",
         )?;
@@ -2271,12 +2297,13 @@ impl StateStore {
             .collect())
     }
 
-    /// Lifts a permanent `source-failed` park so the normal claim gates re-evaluate the session.
-    /// The caller must first verify the transcript fits the currently configured source limit;
-    /// this only clears the frozen verdict (`next_retry_at_ms < 0`) recorded under a superseded
-    /// configuration (issue #44) and never touches sessions failed for other reasons. The
-    /// failure streak resets with the park (issue #38) so a lifted session gets a fresh
-    /// escalation window rather than inheriting the failed-era streak.
+    /// Lifts a permanent `source-oversized` park (or a pre-#57 `source-failed` one) so the
+    /// normal claim gates re-evaluate the session. The caller must first verify the transcript
+    /// fits the currently configured source limit; this only clears the frozen verdict
+    /// (`next_retry_at_ms < 0`) recorded under a superseded configuration (issue #44) and never
+    /// touches sessions failed for other reasons. The failure streak resets with the park
+    /// (issue #38) so a lifted session gets a fresh escalation window rather than inheriting
+    /// the failed-era streak.
     pub fn lift_source_limit_park(&mut self, session_id: &str) -> Result<bool, StateError> {
         validate_session_id(session_id)?;
         let changed = self.connection.execute(
@@ -2285,7 +2312,93 @@ impl StateStore {
              WHERE source_kind=?2 AND source_session_id=?1
                AND lifecycle_state='failed'
                AND next_retry_at_ms<0
-               AND last_error_category='source-failed'",
+               AND last_error_category IN ('source-oversized','source-failed')",
+            params![session_id, self.source_kind, now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Settles a parked session whose transcript was destroyed as `transcript-lost`
+    /// (issue #58). Only an operator declares data lost, and only over a session that is
+    /// unclaimed, permanently parked, failed under a missing-source category
+    /// (`source-missing`, or the pre-#57 lumped `source-failed`), and with **read history**
+    /// — a recorded source cursor or an archived revision — proving content existed before
+    /// the file vanished. A missing-source row with no history is a phantom invocation, not
+    /// a loss; the worker settles those not-archive-worthy on its own (issue #58). The
+    /// caller must first verify the recorded transcript path does not currently exist. The
+    /// row settles to `observed` with the verdict stamped in `transcript_lost_at_ms` — the
+    /// same read-time labeling shape as the issue #50 worthiness verdict — and every
+    /// recorded evidence column survives, so nothing munshi ever knew about the session is
+    /// destroyed with it.
+    pub fn settle_transcript_lost(&mut self, session_id: &str) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let now = now_ms();
+        let changed = self.connection.execute(
+            "UPDATE sessions SET lifecycle_state='observed',
+                transcript_lost_at_ms=?3,
+                retry_state=NULL,next_retry_at_ms=NULL,
+                failure_streak=0,failure_streak_category=NULL,failure_streak_generation=NULL,
+                last_error_category=NULL,updated_at_ms=?3
+             WHERE source_kind=?2 AND source_session_id=?1
+               AND lifecycle_state='failed'
+               AND next_retry_at_ms<0
+               AND claim_token IS NULL
+               AND last_error_category IN ('source-missing','source-failed')
+               AND (current_summary_revision>0 OR normalizer_version IS NOT NULL)",
+            params![session_id, self.source_kind, now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Settled `transcript-lost` rows that recorded a transcript path, across every source
+    /// scope, for the reactivation sweep: the caller re-checks each path and lifts the
+    /// verdict of any transcript that has reappeared ([`lift_transcript_lost`]).
+    ///
+    /// [`lift_transcript_lost`]: StateStore::lift_transcript_lost
+    pub fn settled_lost_transcripts(
+        &self,
+    ) -> Result<Vec<(SourceKind, String, PathBuf)>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_kind,source_session_id,transcript_path
+             FROM sessions
+             WHERE transcript_lost_at_ms IS NOT NULL
+               AND transcript_path IS NOT NULL
+             ORDER BY updated_at_ms,id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(source_kind, session_id, path)| {
+                SourceKind::from_agent_label(&source_kind)
+                    .map(|source| (source, session_id, PathBuf::from(path)))
+            })
+            .collect())
+    }
+
+    /// Lifts a `transcript-lost` verdict because the transcript reappeared at its recorded
+    /// path (issue #58). Settled rows carry session-end evidence, so neither hook ingestion
+    /// nor the issue #49 observed rescue would ever requeue them; the lift therefore returns
+    /// the row to `failed` and immediately retry-eligible, which the normal retry sweeps and
+    /// claim gates already understand — the next attempt re-reads the restored transcript.
+    pub fn lift_transcript_lost(&mut self, session_id: &str) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let changed = self.connection.execute(
+            "UPDATE sessions SET lifecycle_state='failed',
+                transcript_lost_at_ms=NULL,
+                retry_state=NULL,next_retry_at_ms=NULL,
+                failure_streak=0,failure_streak_category=NULL,failure_streak_generation=NULL,
+                last_error_category=NULL,updated_at_ms=?3
+             WHERE source_kind=?2 AND source_session_id=?1
+               AND transcript_lost_at_ms IS NOT NULL
+               AND claim_token IS NULL",
             params![session_id, self.source_kind, now_ms()],
         )?;
         Ok(changed == 1)
@@ -2615,7 +2728,7 @@ impl StateStore {
                     state_generation,active,last_agent_stop_ms,last_session_end_ms,
                     last_error_category,source_kind,next_retry_at_ms,failure_streak,
                     origin_project_origin,not_archive_worthy_at_ms,
-                    created_at_ms,updated_at_ms
+                    created_at_ms,updated_at_ms,transcript_lost_at_ms
                  FROM sessions
                  WHERE source_kind=?2 AND source_session_id=?1",
                 params![session_id, self.source_kind],
@@ -3407,7 +3520,7 @@ impl StateStore {
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
                 origin_project_origin,not_archive_worthy_at_ms,
-                created_at_ms,updated_at_ms
+                created_at_ms,updated_at_ms,transcript_lost_at_ms
              FROM sessions
              WHERE active=1
                AND last_agent_stop_ms IS NOT NULL
@@ -3437,7 +3550,7 @@ impl StateStore {
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
                 origin_project_origin,not_archive_worthy_at_ms,
-                created_at_ms,updated_at_ms
+                created_at_ms,updated_at_ms,transcript_lost_at_ms
              FROM sessions
              WHERE transcript_path IS NULL
                AND lifecycle_state IN (
@@ -3636,7 +3749,7 @@ impl StateStore {
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
                 origin_project_origin,not_archive_worthy_at_ms,
-                created_at_ms,updated_at_ms
+                created_at_ms,updated_at_ms,transcript_lost_at_ms
              FROM sessions
              WHERE active=0
                AND lifecycle_state='interrupted'
@@ -3731,11 +3844,12 @@ impl StateStore {
                 state_generation,active,last_agent_stop_ms,last_session_end_ms,
                 last_error_category,source_kind,next_retry_at_ms,failure_streak,
                 origin_project_origin,not_archive_worthy_at_ms,
-                created_at_ms,updated_at_ms
+                created_at_ms,updated_at_ms,transcript_lost_at_ms
              FROM sessions
              WHERE active=0
                AND lifecycle_state='observed'
                AND last_session_end_ms IS NULL
+               AND transcript_lost_at_ms IS NULL
              ORDER BY updated_at_ms,id",
         )?;
         statement

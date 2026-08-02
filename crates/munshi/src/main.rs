@@ -17,10 +17,10 @@ use munshi::{
     archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
     configure_archive_upload, configure_delivery, delivery_backfill, delivery_retry,
     delivery_status, delivery_verify_history, handle_hook, lift_stale_source_limit_parks,
-    parse_archive_markdown, parse_summarizer_env, project_label, project_status, read_last_failure,
-    register, retrieve, run_archive_worker_for_source, run_recovery, set_archive_upload_enabled,
-    set_delivery_enabled, set_project_enabled, unregister, verify_archive_parse,
-    wait_for_hook_result_for_source,
+    parse_archive_markdown, parse_summarizer_env, project_label, project_status,
+    reactivate_regrown_lost_transcripts, read_last_failure, register, retrieve,
+    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
+    set_project_enabled, unregister, verify_archive_parse, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -307,6 +307,25 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         limit: usize,
     },
+    /// Settle sessions whose transcripts were destroyed as transcript-lost (issue #58).
+    /// Declaring data lost is an explicit operator action: eligible sessions are permanently
+    /// parked under a missing-source failure and their recorded transcript no longer exists.
+    /// The verdict lifts automatically if a transcript reappears at its recorded path.
+    SettleLost {
+        /// A single session ID to settle; omit with `--all-missing` to settle every eligible one.
+        session_id: Option<String>,
+        /// Disambiguate when the same session ID exists under multiple sources.
+        #[arg(long)]
+        source: Option<String>,
+        /// Settle every parked session whose transcript is missing.
+        #[arg(long)]
+        all_missing: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose registration, dependencies, and runtime readiness.
     Doctor {
         #[arg(long)]
@@ -357,6 +376,7 @@ enum SessionStateFilter {
     Processing,
     Observed,
     NotArchiveWorthy,
+    TranscriptLost,
     Unknown,
 }
 
@@ -668,6 +688,13 @@ enum Outcome {
         report: Box<RetryReport>,
         json: bool,
     },
+    SettleLost {
+        report: SettleLostReport,
+        json: bool,
+        /// A named target that was not settled fails the command (issue #54's lesson:
+        /// never report an explicit request as silently satisfied-by-zero).
+        named_target_missed: bool,
+    },
     RetryAll {
         report: Box<RetryAllReport>,
         json: bool,
@@ -805,6 +832,10 @@ struct SessionStateSummary {
     processing: usize,
     observed: usize,
     not_archive_worthy: usize,
+    /// Sessions the operator settled as `transcript-lost` (issue #58): real content whose
+    /// transcript was destroyed and judged unrecoverable. Excluded from sweeps; reactivated
+    /// automatically if the transcript reappears at its recorded path.
+    transcript_lost: usize,
     unknown: usize,
 }
 
@@ -972,6 +1003,25 @@ struct RetryReport {
     state_before: Option<String>,
     state_after: Option<String>,
     archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SettleLostReport {
+    schema_version: u32,
+    command: &'static str,
+    all_missing: bool,
+    candidates: usize,
+    settled: usize,
+    skipped: usize,
+    items: Vec<SettleLostItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SettleLostItem {
+    source: String,
+    session_id: String,
+    /// `settled`, or a skip reason: `transcript-present`, `not-eligible`.
+    result: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1315,6 +1365,22 @@ fn main() -> ExitCode {
             }
             if matches!(report.result.as_str(), "failed" | "not-found") {
                 ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(Outcome::SettleLost {
+            report,
+            json,
+            named_target_missed,
+        }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_settle_lost_human(&report);
+            }
+            if named_target_missed {
+                ExitCode::from(2)
             } else {
                 ExitCode::SUCCESS
             }
@@ -1714,6 +1780,31 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             Ok(Outcome::RetryAll {
                 report: Box::new(build_retry_all_report(&state_directory, force, limit)?),
                 json,
+            })
+        }
+        Command::SettleLost {
+            session_id,
+            source,
+            all_missing,
+            state_dir,
+            json,
+        } => {
+            if session_id.is_none() && !all_missing {
+                return Err("provide a session ID or --all-missing".into());
+            }
+            let state_directory = resolve_state_directory(state_dir)?;
+            let source = source.as_deref().map(parse_source_selector).transpose()?;
+            let report = build_settle_lost_report(
+                &state_directory,
+                source,
+                session_id.as_deref(),
+                all_missing,
+            )?;
+            let named_target_missed = session_id.is_some() && report.settled == 0;
+            Ok(Outcome::SettleLost {
+                report,
+                json,
+                named_target_missed,
             })
         }
         Command::Doctor { state_dir, json } => {
@@ -2289,6 +2380,95 @@ fn resolved_operational_state(
         .map(|record| operational_state(&record).to_owned()))
 }
 
+/// Settles eligible parked sessions as `transcript-lost` (issue #58). Eligibility is
+/// re-checked here and again inside the guarded UPDATE: permanently parked, failed under a
+/// missing-source category (`source-missing`, or pre-#57 `source-failed`), and the recorded
+/// transcript absent from disk right now. A `source-failed` row whose file still exists is a
+/// size-cap park, not a loss — it reports `transcript-present` instead of settling (that park
+/// belongs to the issue #44 lift). A named session that does not qualify is always reported
+/// explicitly rather than silently producing zero candidates (issue #54's lesson).
+fn build_settle_lost_report(
+    state_directory: &Path,
+    source: Option<SourceKind>,
+    session_id: Option<&str>,
+    all_missing: bool,
+) -> Result<SettleLostReport, Box<dyn Error>> {
+    let mut report = SettleLostReport {
+        schema_version: 1,
+        command: "settle-lost",
+        all_missing,
+        candidates: 0,
+        settled: 0,
+        skipped: 0,
+        items: Vec::new(),
+    };
+    if !state_database_exists(state_directory) {
+        return Ok(report);
+    }
+    let sessions = load_sessions(state_directory)?;
+    let mut candidates: Vec<&SessionRecord> = sessions
+        .iter()
+        .filter(|record| match session_id {
+            Some(id) => {
+                record.session_id == id && source.is_none_or(|wanted| record.source == wanted)
+            }
+            None => true,
+        })
+        .filter(|record| {
+            record.lifecycle_state == "failed"
+                && record.next_retry_at_ms.is_some_and(|next| next < 0)
+                && matches!(
+                    record.last_error_category.as_deref(),
+                    Some("source-missing" | "source-failed")
+                )
+        })
+        .collect();
+    candidates.sort_by(|a, b| (a.source, &a.session_id).cmp(&(b.source, &b.session_id)));
+    report.candidates = candidates.len();
+
+    for record in candidates {
+        let present = record
+            .transcript_path
+            .as_deref()
+            .is_some_and(|path| path.exists());
+        let result = if present {
+            report.skipped += 1;
+            "transcript-present"
+        } else {
+            let mut store = StateStore::open_for_source(state_directory, record.source)?;
+            if store.settle_transcript_lost(&record.session_id)? {
+                report.settled += 1;
+                "settled"
+            } else {
+                report.skipped += 1;
+                "not-eligible"
+            }
+        };
+        report.items.push(SettleLostItem {
+            source: record.source.as_selector().to_owned(),
+            session_id: record.session_id.clone(),
+            result: result.to_owned(),
+        });
+    }
+    Ok(report)
+}
+
+fn print_settle_lost_human(report: &SettleLostReport) {
+    for item in &report.items {
+        println!("{}  {}  {}", item.session_id, item.source, item.result);
+    }
+    println!(
+        "settle-lost candidates={} settled={} skipped={}",
+        report.candidates, report.settled, report.skipped
+    );
+    if report.candidates == 0 {
+        println!(
+            "no eligible sessions: settle-lost covers permanently parked sessions whose \
+             transcript no longer exists (source-missing, or pre-#57 source-failed)"
+        );
+    }
+}
+
 fn build_retry_all_report(
     state_directory: &Path,
     force: bool,
@@ -2309,9 +2489,11 @@ fn build_retry_all_report(
         });
     }
 
-    // Re-evaluate permanent `source-failed` parks against the currently configured source limit
-    // (issue #44) so sessions that failed under a since-raised limit are eligible again below.
+    // Re-evaluate permanent size-cap parks against the currently configured source limit
+    // (issue #44) so sessions that failed under a since-raised limit are eligible again below,
+    // and lift any transcript-lost verdict whose transcript has reappeared (issue #58).
     lift_stale_source_limit_parks(state_directory)?;
+    reactivate_regrown_lost_transcripts(state_directory)?;
     let mut state = StateStore::open(state_directory)?;
     let reserved = state.reserve_eligible_workers(force, limit)?;
     drop(state);
@@ -2550,7 +2732,8 @@ fn build_doctor_report(state_directory: &Path) -> Result<DoctorReport, Box<dyn E
     }
 
     let sessions = load_sessions(state_directory)?;
-    push_size_cap_park_check(&mut checks, &sessions);
+    push_parked_session_checks(&mut checks, &sessions);
+    push_capture_failure_streak_check(&mut checks, state_directory);
     let status = overall_status(&checks);
 
     Ok(DoctorReport {
@@ -3183,48 +3366,153 @@ fn session_record_to_item(record: &SessionRecord) -> SessionListItem {
     build_session_item(record)
 }
 
-/// Doctor hint for sessions parked permanently on a size cap (issue #41). A deterministic
-/// `source-failed` or `summary-input-limit` verdict parks a session (`next_retry_at_ms < 0`,
-/// issues #38/#44), where it is indistinguishable from any other permanent failure in the session
-/// counters; this check names the limit flag whose raise lifts the park, so an undersized limit is
-/// visible instead of looking like a generic failure.
-fn push_size_cap_park_check(checks: &mut Vec<CheckResult>, records: &[SessionRecord]) {
-    let parked_on = |category: &str| {
-        records
-            .iter()
-            .filter(|record| {
-                record.lifecycle_state == "failed"
-                    && record.next_retry_at_ms.is_some_and(|next| next < 0)
-                    && record.last_error_category.as_deref() == Some(category)
-            })
-            .count()
+/// Doctor hints for permanently parked sessions (`next_retry_at_ms < 0`, issues #38/#44),
+/// split by what actually lifts each park (issue #57). A size-cap park (`source-oversized`,
+/// `summary-input-limit`) is lifted by raising the named limit; a vanished transcript
+/// (`source-missing`) is not a limit problem at all — the honest resolutions are restoring
+/// the file or settling the session as `transcript-lost` (issue #58). Rows recorded before
+/// the split still carry the lumped `source-failed` code, so those are classified here by
+/// whether their recorded transcript currently exists.
+fn push_parked_session_checks(checks: &mut Vec<CheckResult>, records: &[SessionRecord]) {
+    let parked = |record: &&SessionRecord| {
+        record.lifecycle_state == "failed" && record.next_retry_at_ms.is_some_and(|next| next < 0)
     };
-    let source_failed = parked_on("source-failed");
-    let input_limited = parked_on("summary-input-limit");
-    if source_failed == 0 && input_limited == 0 {
+    let mut oversized = 0usize;
+    let mut missing = 0usize;
+    let mut input_limited = 0usize;
+    for record in records.iter().filter(parked) {
+        match record.last_error_category.as_deref() {
+            Some("source-oversized") => oversized += 1,
+            Some("source-missing") => missing += 1,
+            Some("summary-input-limit") => input_limited += 1,
+            Some("source-failed") => {
+                let exists = record
+                    .transcript_path
+                    .as_deref()
+                    .is_some_and(|path| path.exists());
+                if exists {
+                    oversized += 1;
+                } else {
+                    missing += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if oversized > 0 || input_limited > 0 {
+        let mut parts = Vec::new();
+        if oversized > 0 {
+            parts.push(format!(
+                "{oversized} source-oversized (raise --max-source-bytes)"
+            ));
+        }
+        if input_limited > 0 {
+            parts.push(format!(
+                "{input_limited} summary-input-limit (raise --chunk-threshold-bytes)"
+            ));
+        }
+        push_check(
+            checks,
+            "size-cap-parked",
+            CheckStatus::Warning,
+            format!(
+                "{} session(s) parked on a size cap: {}; re-register with a larger limit, then `munshi retry-all --force`",
+                oversized + input_limited,
+                parts.join(", ")
+            ),
+        );
+    }
+    // Within the missing bucket, a row that never recorded a read is a phantom invocation
+    // (issue #58) — a non-interactive `claude` subcommand that fired the hook without ever
+    // writing a transcript. The worker settles new ones on its own; rows parked before that
+    // behavior existed drain through a forced retry. Only history-bearing rows are candidate
+    // genuine losses.
+    let phantom = records
+        .iter()
+        .filter(parked)
+        .filter(|record| {
+            matches!(
+                record.last_error_category.as_deref(),
+                Some("source-missing" | "source-failed")
+            ) && record.current_revision == 0
+                && record.previous_source.is_none()
+                && !record
+                    .transcript_path
+                    .as_deref()
+                    .is_some_and(|path| path.exists())
+        })
+        .count();
+    let genuine_missing = missing.saturating_sub(phantom);
+    if phantom > 0 {
+        push_check(
+            checks,
+            "phantom-invocations-parked",
+            CheckStatus::Warning,
+            format!(
+                "{phantom} parked record(s) are phantom CLI invocations (no transcript was ever written); `munshi retry-all --force` settles them not-archive-worthy (issue #58)"
+            ),
+        );
+    }
+    if genuine_missing > 0 {
+        push_check(
+            checks,
+            "transcript-missing-parked",
+            CheckStatus::Warning,
+            format!(
+                "{genuine_missing} session(s) parked because their transcript no longer exists at its recorded path; restore the file(s), or accept the loss with `munshi settle-lost --all-missing` (issue #58)"
+            ),
+        );
+    }
+}
+
+/// The trailing window and threshold for the capture-failure streak warning (issue #57): a
+/// burst of source-read failures means transcripts are disappearing or unreadable *right
+/// now*, which deserves a warning while it is happening — not a line item discovered days
+/// later. The threshold keeps one-off races (a transcript pruned between hook and worker)
+/// below the warning bar.
+const CAPTURE_FAILURE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+const CAPTURE_FAILURE_WARN_THRESHOLD: usize = 5;
+
+fn push_capture_failure_streak_check(checks: &mut Vec<CheckResult>, state_directory: &Path) {
+    if !state_database_exists(state_directory) {
         return;
     }
-    let mut parts = Vec::new();
-    if source_failed > 0 {
-        parts.push(format!(
-            "{source_failed} source-failed (raise --max-source-bytes)"
-        ));
+    let Ok(state) = StateStore::open(state_directory) else {
+        return;
+    };
+    let since = now_ms_for_streak() - CAPTURE_FAILURE_WINDOW_MS;
+    let Ok(attempts) = state.list_processing_attempts(Some(since), 500) else {
+        return;
+    };
+    let failures = attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.outcome == "failed"
+                && matches!(
+                    attempt.error_category.as_deref(),
+                    Some("source-missing" | "source-oversized" | "source-failed")
+                )
+        })
+        .count();
+    if failures >= CAPTURE_FAILURE_WARN_THRESHOLD {
+        push_check(
+            checks,
+            "capture-failing",
+            CheckStatus::Warning,
+            format!(
+                "{failures} source-read failure(s) in the last 24h — transcripts are missing, oversized, or unreadable while sessions are being captured (see issues #57/#58)"
+            ),
+        );
     }
-    if input_limited > 0 {
-        parts.push(format!(
-            "{input_limited} summary-input-limit (raise --chunk-threshold-bytes)"
-        ));
-    }
-    push_check(
-        checks,
-        "size-cap-parked",
-        CheckStatus::Warning,
-        format!(
-            "{} session(s) parked on a size cap: {}; re-register with a larger limit, then `munshi retry-all --force`",
-            source_failed + input_limited,
-            parts.join(", ")
-        ),
-    );
+}
+
+fn now_ms_for_streak() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Doctor check for the summarizer-size knob relation (issue #52). `register` and `archive` reject
@@ -3286,6 +3574,7 @@ fn summarize_sessions(records: &[SessionRecord]) -> SessionStateSummary {
             "processing" => summary.processing += 1,
             "observed" => summary.observed += 1,
             "not-archive-worthy" => summary.not_archive_worthy += 1,
+            "transcript-lost" => summary.transcript_lost += 1,
             _ => summary.unknown += 1,
         }
     }
@@ -3319,6 +3608,11 @@ fn operational_state(record: &SessionRecord) -> &'static str {
             }
         }
         "processing" => "processing",
+        // The operator's destroyed-transcript verdict (issue #58). Checked before the
+        // worthiness verdict: a settled-lost row carries session-end evidence and would
+        // otherwise mislabel as not-archive-worthy — but its content was real; only the
+        // transcript is gone.
+        "observed" if record.transcript_lost_at_ms.is_some() => "transcript-lost",
         // A recorded verdict on unarchived content: either the hook path (a session-end was
         // ingested before the worker judged it) or the sweep path (the worker stamped
         // `not_archive_worthy_at_ms` while settling the row, issue #50). The stored
@@ -3368,6 +3662,7 @@ fn session_filter_name(filter: SessionStateFilter) -> &'static str {
         SessionStateFilter::Processing => "processing",
         SessionStateFilter::Observed => "observed",
         SessionStateFilter::NotArchiveWorthy => "not-archive-worthy",
+        SessionStateFilter::TranscriptLost => "transcript-lost",
         SessionStateFilter::Unknown => "unknown",
     }
 }
@@ -3534,7 +3829,7 @@ fn print_status_human(report: &StatusReport) {
         report.configuration.runtime_compatible
     );
     println!(
-        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} placeholder={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} placeholder={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} transcript-lost={} unknown={}",
         report.sessions.total,
         report.sessions.archived,
         report.sessions.revision_pending,
@@ -3548,6 +3843,7 @@ fn print_status_human(report: &StatusReport) {
         report.sessions.processing,
         report.sessions.observed,
         report.sessions.not_archive_worthy,
+        report.sessions.transcript_lost,
         report.sessions.unknown
     );
     if let Some(failure) = &report.last_failure {
@@ -3773,7 +4069,7 @@ fn print_doctor_human(report: &DoctorReport) {
         );
     }
     println!(
-        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} placeholder={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} unknown={}",
+        "sessions total={} archived={} revision-pending={} summary-pending={} interrupted={} failed={} parked={} placeholder={} delivery-related={} disabled-project={} processing={} observed={} not-archive-worthy={} transcript-lost={} unknown={}",
         report.sessions.total,
         report.sessions.archived,
         report.sessions.revision_pending,
@@ -3787,6 +4083,7 @@ fn print_doctor_human(report: &DoctorReport) {
         report.sessions.processing,
         report.sessions.observed,
         report.sessions.not_archive_worthy,
+        report.sessions.transcript_lost,
         report.sessions.unknown
     );
     if let Some(failure) = &report.last_failure {
