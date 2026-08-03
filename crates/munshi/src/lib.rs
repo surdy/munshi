@@ -35,7 +35,7 @@ pub use exhaust::{
 };
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, SUMMARIZER_EXHAUST_DIAGNOSTIC,
-    handle_hook, lift_stale_source_limit_parks, reactivate_regrown_lost_transcripts,
+    WorkerContext, handle_hook, lift_stale_source_limit_parks, reactivate_regrown_lost_transcripts,
     read_last_failure, run_archive_worker, run_archive_worker_for_source, run_recovery,
     tick_recovery_sweep, wait_for_hook_result, wait_for_hook_result_for_source,
 };

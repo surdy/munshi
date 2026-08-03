@@ -11,9 +11,10 @@ use std::time::Duration;
 use munshi::{
     ArchiveConfig, ArchiveOutcome, CompletionReason, HookResult, NormalizedEvent,
     NormalizedSession, ProjectIdentity, SUMMARIZER_EXHAUST_DIAGNOSTIC, SessionReference,
-    SourceError, SourceHomes, SourceKind, StateStore, archive_session, build_summary_input,
-    inspect_project, load_session, parse_archive_markdown, recorded_project_identity,
-    resolve_session_reference, run_archive_worker_for_source, validate_transcript_envelope,
+    SourceError, SourceHomes, SourceKind, StateStore, WorkerContext, archive_session,
+    build_summary_input, inspect_project, load_session, parse_archive_markdown,
+    recorded_project_identity, resolve_session_reference, run_archive_worker_for_source,
+    validate_transcript_envelope,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -719,9 +720,13 @@ fn claude_gone_origin_archives_from_recorded_cwd_and_branch() {
     }
     fs::remove_dir_all(&gone).unwrap();
 
-    let result =
-        run_archive_worker_for_source(&harness.state, SourceKind::ClaudeCode, CLAUDE_NORMAL)
-            .unwrap();
+    let result = run_archive_worker_for_source(
+        &harness.state,
+        SourceKind::ClaudeCode,
+        CLAUDE_NORMAL,
+        WorkerContext::Interactive,
+    )
+    .unwrap();
     assert!(matches!(result, HookResult::Archived { .. }), "{result:?}");
     let markdown = harness.read_archive(SourceKind::ClaudeCode, CLAUDE_NORMAL);
     // Identity comes from the RECORDED cwd (/work/demo), not the deleted hook-provided origin.
@@ -732,6 +737,94 @@ fn claude_gone_origin_archives_from_recorded_cwd_and_branch() {
     // The recorded gitBranch reaches provenance where the live path would have supplied it.
     assert_eq!(markdown.project.branch.as_deref(), Some("main"));
     assert_eq!(markdown.project.repository, None);
+}
+
+/// Issue #61: a scheduler-descended (background) worker must not inspect a session's origin
+/// directory — even one that exists — because on macOS that access is attributed to munshi
+/// itself and raises a TCC prompt. An identity-less session is deferred untouched, and the
+/// next interactive worker archives it with the full live identity, not the recorded-evidence
+/// fallback.
+#[test]
+fn background_worker_defers_identity_less_session_instead_of_inspecting_origin() {
+    let harness = StateHarness::new();
+    let transcript = harness.copy_transcript(
+        &fixture(
+            "claude-code-2.1.44",
+            "normal",
+            &format!("{CLAUDE_NORMAL}.jsonl"),
+        ),
+        CLAUDE_NORMAL,
+    );
+    let origin = harness.directory.path().join("live-project");
+    fs::create_dir_all(&origin).unwrap();
+    let origin = origin.canonicalize().unwrap();
+    // Make the origin its own remote-less git root so live inspection resolves it (and not
+    // an enclosing repository the temp directory happens to sit inside).
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&origin)
+            .status()
+            .unwrap()
+            .success()
+    );
+    {
+        let mut store =
+            StateStore::open_for_source(&harness.state, SourceKind::ClaudeCode).unwrap();
+        store
+            .ingest_agent_stop(CLAUDE_NORMAL, 100, &origin, &transcript)
+            .unwrap();
+        store
+            .ingest_session_end(
+                CLAUDE_NORMAL,
+                101,
+                &origin,
+                "other",
+                CompletionReason::Complete,
+                None,
+            )
+            .unwrap();
+    }
+
+    let before = {
+        let store = StateStore::open_for_source(&harness.state, SourceKind::ClaudeCode).unwrap();
+        store.get_session(CLAUDE_NORMAL).unwrap().unwrap()
+    };
+    let result = run_archive_worker_for_source(
+        &harness.state,
+        SourceKind::ClaudeCode,
+        CLAUDE_NORMAL,
+        WorkerContext::Background,
+    )
+    .unwrap();
+    assert!(
+        matches!(&result, HookResult::Failed { code } if code == "project-inspection-deferred"),
+        "{result:?}"
+    );
+    // The deferral leaves the session exactly where it was: same lifecycle, still no
+    // project identity, ready for the next interactive sweep.
+    let after = {
+        let store = StateStore::open_for_source(&harness.state, SourceKind::ClaudeCode).unwrap();
+        store.get_session(CLAUDE_NORMAL).unwrap().unwrap()
+    };
+    assert_eq!(after.lifecycle_state, before.lifecycle_state);
+    assert!(after.project.is_none());
+
+    let result = run_archive_worker_for_source(
+        &harness.state,
+        SourceKind::ClaudeCode,
+        CLAUDE_NORMAL,
+        WorkerContext::Interactive,
+    )
+    .unwrap();
+    assert!(matches!(result, HookResult::Archived { .. }), "{result:?}");
+    let markdown = harness.read_archive(SourceKind::ClaudeCode, CLAUDE_NORMAL);
+    // Identity comes from the LIVE origin directory (the deferral preserved that fidelity),
+    // not from the transcript's recorded cwd (/work/demo) the background worker would have
+    // had to settle for.
+    let expected = recorded_project_identity(&origin, None);
+    assert_eq!(markdown.project.identity, expected.identity);
+    assert_eq!(markdown.project.component, expected.component);
 }
 
 /// The same for Codex: recovery must route the stale session to the Codex adapter and
@@ -1265,7 +1358,8 @@ impl StateHarness {
                 .ingest_session_end(session_id, end_ts, &self.project, reason, completion, None)
                 .unwrap();
         }
-        run_archive_worker_for_source(&self.state, source, session_id).unwrap()
+        run_archive_worker_for_source(&self.state, source, session_id, WorkerContext::Interactive)
+            .unwrap()
     }
 
     /// Builds one of Munshi's real summary-request envelopes — byte for byte what a summarizer

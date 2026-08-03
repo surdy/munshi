@@ -14,10 +14,10 @@ use munshi::{
     EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport, HookEvent, HookFailure, HookResult,
     PatwariError, ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults,
     SessionRecord, SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary,
-    VerifyArchiveError, VerifyArchiveReport, accept_disclosure_from_terminal, archive_session,
-    archive_upload_backfill, archive_upload_retry, archive_upload_status, configure_archive_upload,
-    configure_delivery, conflicting_source_home, default_copilot_home, delivery_backfill,
-    delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    VerifyArchiveError, VerifyArchiveReport, WorkerContext, accept_disclosure_from_terminal,
+    archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
+    configure_archive_upload, configure_delivery, conflicting_source_home, default_copilot_home,
+    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
     lift_stale_source_limit_parks, parse_archive_markdown, parse_summarizer_env, project_label,
     project_status, prune_summarizer_exhaust, reactivate_regrown_lost_transcripts,
     read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
@@ -380,6 +380,10 @@ enum Command {
         source: String,
         #[arg(long)]
         session_id: String,
+        /// Set by the scheduler-descended recovery sweep (issue #61): the worker must not
+        /// inspect a session's origin directory, deferring identity-less sessions instead.
+        #[arg(long)]
+        background: bool,
     },
 }
 
@@ -1962,9 +1966,15 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             state_dir,
             source,
             session_id,
+            background,
         } => {
             let source = parse_source_selector(&source)?;
-            let _ = run_archive_worker_for_source(&state_dir, source, &session_id)?;
+            let context = if background {
+                WorkerContext::Background
+            } else {
+                WorkerContext::Interactive
+            };
+            let _ = run_archive_worker_for_source(&state_dir, source, &session_id, context)?;
             Ok(Outcome::Worker)
         }
         Command::Hook(HookCommand::Wait {
@@ -1989,6 +1999,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 Duration::from_millis(stale_after_ms),
                 force_retry,
                 rebuild_state,
+                WorkerContext::Interactive,
             )?;
             Ok(Outcome::Worker)
         }
@@ -2450,11 +2461,15 @@ fn build_retry_report(
         let _ = state.reserve_worker(session_id, force)?;
     }
 
-    let hook = run_archive_worker_for_source(state_directory, target_source, session_id).unwrap_or(
-        HookResult::Failed {
-            code: "worker-error".to_owned(),
-        },
-    );
+    let hook = run_archive_worker_for_source(
+        state_directory,
+        target_source,
+        session_id,
+        WorkerContext::Interactive,
+    )
+    .unwrap_or(HookResult::Failed {
+        code: "worker-error".to_owned(),
+    });
     let (result, code, archive_path) = retry_fields_from_hook(hook);
     let state_after = resolved_operational_state(state_directory, target_source, session_id)?
         .or(Some(before_state.clone()));
@@ -2706,11 +2721,15 @@ fn build_retry_all_report(
     let mut failed = 0;
 
     for (source, session_id) in reserved {
-        let hook = run_archive_worker_for_source(state_directory, source, &session_id).unwrap_or(
-            HookResult::Failed {
-                code: "worker-error".to_owned(),
-            },
-        );
+        let hook = run_archive_worker_for_source(
+            state_directory,
+            source,
+            &session_id,
+            WorkerContext::Interactive,
+        )
+        .unwrap_or(HookResult::Failed {
+            code: "worker-error".to_owned(),
+        });
         let (result, code, archive_path) = retry_fields_from_hook(hook);
         match result.as_str() {
             "archived" => archived += 1,
