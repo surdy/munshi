@@ -49,7 +49,7 @@ use munshi_runner::RunnerError;
 pub const SUMMARIZER_EXHAUST_DIAGNOSTIC: &str = "summarizer-exhaust";
 
 const MAX_HOOK_PAYLOAD_BYTES: u64 = 64 * 1024;
-const DEFAULT_RECOVERY_STALE_MS: u64 = 30 * 60 * 1_000;
+pub const DEFAULT_RECOVERY_STALE_MS: u64 = 30 * 60 * 1_000;
 const RECOVERY_SCAN_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +297,23 @@ fn run_archive_worker_inner(
                 code: category.to_owned(),
             })
         }
+    }
+}
+
+/// Runs the standard recovery sweep for `munshi tick` (issue #55): exactly the sweep a hook
+/// event triggers, minus the hook. Returns `Ok(false)` without error when another process
+/// already holds the recovery lock — a busy pipeline means the machine is not idle, and the
+/// tick has nothing to add.
+pub fn tick_recovery_sweep(state_directory: &Path) -> Result<bool, HookWorkerError> {
+    match run_recovery(
+        state_directory,
+        Duration::from_millis(DEFAULT_RECOVERY_STALE_MS),
+        false,
+        false,
+    ) {
+        Ok(()) => Ok(true),
+        Err(HookWorkerError::State(StateError::LockBusy)) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

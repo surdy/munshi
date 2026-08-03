@@ -1615,6 +1615,10 @@ pub struct ArchiveUploadRunReport {
     pub already_uploaded: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Issue #54: set when a named session matched no candidate because its upload rows all
+    /// belong to endpoints other than the configured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub items: Vec<ArchiveUploadRunItem>,
 }
 
@@ -1636,6 +1640,9 @@ impl ArchiveUploadRunReport {
             "{label} candidates={} uploaded={} already-uploaded={} skipped={} failed={}",
             self.candidates, self.uploaded, self.already_uploaded, self.skipped, self.failed
         );
+        if let Some(note) = &self.note {
+            println!("note: {note}");
+        }
         for item in &self.items {
             println!("{} -> {}", item.session_id, item.outcome.as_kind());
         }
@@ -1671,6 +1678,37 @@ fn print_settings(settings: &ArchiveUploadSettings) {
     );
 }
 
+/// Issue #54: a named session whose only upload rows belong to endpoints other than the
+/// configured one would otherwise produce a silent zero-candidate retry — which reads as
+/// "nothing wrong" while the session sits unreconciled after an endpoint change. This names
+/// the stale endpoint(s) and the designed reconciliation path (`backfill`) instead.
+fn stale_endpoint_note(
+    recorded: &[ArchiveUploadRecord],
+    endpoint: &str,
+    session_id: &str,
+    source: Option<SourceKind>,
+) -> Option<String> {
+    let row_matches = |record: &ArchiveUploadRecord| {
+        record.session_id == session_id && source.is_none_or(|wanted| record.source == wanted)
+    };
+    let mut foreign: Vec<&str> = recorded
+        .iter()
+        .filter(|record| row_matches(record) && record.endpoint != endpoint)
+        .map(|record| record.endpoint.as_str())
+        .collect();
+    foreign.sort_unstable();
+    foreign.dedup();
+    let any_configured = recorded
+        .iter()
+        .any(|record| row_matches(record) && record.endpoint == endpoint);
+    (!any_configured && !foreign.is_empty()).then(|| {
+        format!(
+            "session has upload history only for {}; run `munshi archive-upload backfill` to reconcile against the configured server",
+            foreign.join(", ")
+        )
+    })
+}
+
 /// Retries failed uploads, or one session's upload, against the configured server. Requires archive
 /// upload to be enabled and addressable. Each candidate's backoff is cleared before the attempt
 /// (`force` additionally revives a dead-letter row and resets its bounded attempt count), then the
@@ -1702,6 +1740,9 @@ pub fn retry(
     } else {
         Vec::new()
     };
+    let stale_endpoint_note = session_id
+        .as_ref()
+        .and_then(|id| stale_endpoint_note(&recorded, &endpoint, id, source));
     let mut candidates: Vec<ArchiveUploadRecord> = recorded
         .into_iter()
         .filter(|record| record.endpoint == endpoint)
@@ -1727,6 +1768,7 @@ pub fn retry(
         already_uploaded: 0,
         skipped: 0,
         failed: 0,
+        note: stale_endpoint_note,
         items: Vec::new(),
     };
     for record in candidates {
@@ -1824,6 +1866,7 @@ pub fn backfill(
         already_uploaded: 0,
         skipped: 0,
         failed: 0,
+        note: None,
         items: Vec::new(),
     };
     for session in candidates {
@@ -2116,6 +2159,63 @@ mod tests {
         let body = br#"{"error":{"code":"capture_id_conflict","message":"x"}}"#;
         assert_eq!(error_code(body).as_deref(), Some("capture_id_conflict"));
         assert_eq!(error_code(b"not json"), None);
+    }
+
+    #[test]
+    fn stale_endpoint_note_fires_only_when_a_named_session_has_rows_elsewhere_only() {
+        let row = |session_id: &str, endpoint: &str| ArchiveUploadRecord {
+            session_database_id: 1,
+            source: SourceKind::Copilot,
+            session_id: session_id.to_owned(),
+            endpoint: endpoint.to_owned(),
+            capture_id: None,
+            capture_revision: None,
+            captured_at: None,
+            upload_id: None,
+            uploaded_revision: None,
+            uploaded_summary_hash: None,
+            snapshot_id: None,
+            uploaded_artifact_paths: None,
+            upload_state: "dead-letter".to_owned(),
+            attempts: 5,
+            next_attempt_at_ms: None,
+            last_error_category: Some("transcript-changed".to_owned()),
+            updated_at_ms: 0,
+        };
+        let configured = "https://patwari.example";
+        let stale = "http://127.0.0.1:18787";
+
+        // The issue #54 shape: history exists only under the pre-reconfiguration endpoint.
+        let note = stale_endpoint_note(&[row("s1", stale)], configured, "s1", None)
+            .expect("stale-only history must produce the note");
+        assert!(note.contains(stale), "{note}");
+        assert!(note.contains("archive-upload backfill"), "{note}");
+
+        // A row under the configured endpoint means retry owns the session: no note.
+        assert_eq!(
+            stale_endpoint_note(
+                &[row("s1", stale), row("s1", configured)],
+                configured,
+                "s1",
+                None
+            ),
+            None
+        );
+        // Other sessions' rows never speak for the named one.
+        assert_eq!(
+            stale_endpoint_note(&[row("other", stale)], configured, "s1", None),
+            None
+        );
+        // A source narrowing excludes rows from other sources.
+        assert_eq!(
+            stale_endpoint_note(
+                &[row("s1", stale)],
+                configured,
+                "s1",
+                Some(SourceKind::ClaudeCode)
+            ),
+            None
+        );
     }
 
     #[test]

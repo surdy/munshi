@@ -110,6 +110,23 @@ munshi settle-lost --all-missing     # every eligible session
 A parked session whose transcript still exists is refused (`transcript-present`) — that park is a
 size cap, and raising the limit is the fix.
 
+### `munshi tick`
+
+One idempotent maintenance sweep, made for platform schedulers (issue #55): the recovery sweep
+a hook event would run, park and lost-verdict re-evaluation, and the eligible upload/delivery
+retries. It prints nothing when there is nothing to do and is a silent no-op on an unregistered
+machine, so a timer can fire it forever without conditioning on state. Hook events already run
+most of this on a busy machine — the tick exists for the *idle* one, where parked retries would
+otherwise wait for the next session.
+
+```bash
+munshi tick
+munshi tick --json
+```
+
+`contrib/launchd/com.munshi.tick.plist` runs it every 15 minutes on macOS; see the comment in
+the plist for install/remove commands (systemd user timers are the Linux equivalent).
+
 ### `munshi doctor`
 
 Diagnoses registration, dependencies, and runtime readiness — useful after upgrading Munshi, moving

@@ -10,17 +10,18 @@ use clap::{Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
     ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
-    DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic, HistoryReport,
-    HookEvent, HookFailure, HookResult, ProjectStatus, RegisterConfig, RetrieveError,
-    RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceKind, StateStore,
-    StructuredSummary, VerifyArchiveError, VerifyArchiveReport, accept_disclosure_from_terminal,
-    archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
-    configure_archive_upload, configure_delivery, delivery_backfill, delivery_retry,
-    delivery_status, delivery_verify_history, handle_hook, lift_stale_source_limit_parks,
-    parse_archive_markdown, parse_summarizer_env, project_label, project_status,
-    reactivate_regrown_lost_transcripts, read_last_failure, register, retrieve,
+    DeliveryError, DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic,
+    HistoryReport, HookEvent, HookFailure, HookResult, PatwariError, ProjectStatus, RegisterConfig,
+    RetrieveError, RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceKind,
+    StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport,
+    accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
+    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
+    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    lift_stale_source_limit_parks, parse_archive_markdown, parse_summarizer_env, project_label,
+    project_status, reactivate_regrown_lost_transcripts, read_last_failure, register, retrieve,
     run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
-    set_project_enabled, unregister, verify_archive_parse, wait_for_hook_result_for_source,
+    set_project_enabled, tick_recovery_sweep, unregister, verify_archive_parse,
+    wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -304,6 +305,20 @@ enum Command {
         /// Emit a stable machine-readable contract.
         #[arg(long)]
         json: bool,
+        #[arg(long, default_value_t = 32)]
+        limit: usize,
+    },
+    /// One idempotent maintenance sweep for platform schedulers (issue #55): the recovery
+    /// sweep a hook event would run, park/verdict re-evaluation, and the eligible upload and
+    /// delivery retries. Prints nothing when there is nothing to do, so a launchd/systemd
+    /// timer can fire it quietly; an unregistered machine is a silent no-op.
+    Tick {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+        /// Bound the upload and delivery retries per tick.
         #[arg(long, default_value_t = 32)]
         limit: usize,
     },
@@ -699,6 +714,10 @@ enum Outcome {
         report: Box<RetryAllReport>,
         json: bool,
     },
+    Tick {
+        report: Box<TickReport>,
+        json: bool,
+    },
     Doctor {
         report: Box<DoctorReport>,
         json: bool,
@@ -1022,6 +1041,24 @@ struct SettleLostItem {
     session_id: String,
     /// `settled`, or a skip reason: `transcript-present`, `not-eligible`.
     result: String,
+}
+
+/// The `munshi tick` contract (issue #55): one scheduled maintenance sweep. Every count is
+/// zero and `recovery` is `"skipped"` on an unregistered machine — the tick is a silent
+/// no-op there, mirroring how read-only contracts degrade (ADR 0007).
+#[derive(Debug, Clone, Serialize)]
+struct TickReport {
+    schema_version: u32,
+    command: &'static str,
+    registered: bool,
+    /// `"swept"` when the recovery sweep ran, `"busy"` when another process held the
+    /// recovery lock (the pipeline is active; nothing for a tick to add), `"skipped"` when
+    /// unregistered.
+    recovery: &'static str,
+    upload_candidates: usize,
+    upload_failed: usize,
+    delivery_candidates: usize,
+    delivery_failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1392,6 +1429,18 @@ fn main() -> ExitCode {
                 print_retry_all_human(&report);
             }
             if report.failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(Outcome::Tick { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_tick_human(&report);
+            }
+            if report.upload_failed + report.delivery_failed > 0 {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -1779,6 +1828,17 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::RetryAll {
                 report: Box::new(build_retry_all_report(&state_directory, force, limit)?),
+                json,
+            })
+        }
+        Command::Tick {
+            state_dir,
+            json,
+            limit,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::Tick {
+                report: Box::new(build_tick_report(&state_directory, limit)?),
                 json,
             })
         }
@@ -2465,6 +2525,71 @@ fn print_settle_lost_human(report: &SettleLostReport) {
         println!(
             "no eligible sessions: settle-lost covers permanently parked sessions whose \
              transcript no longer exists (source-missing, or pre-#57 source-failed)"
+        );
+    }
+}
+
+/// One idempotent tick (issue #55): re-evaluate parks and lost-transcript verdicts, run the
+/// standard recovery sweep (rescue + eligible session retries through the normal worker
+/// state machine), then drain eligible upload and delivery retries. Disabled subsystems and
+/// an already-running sweep are quiet non-events, never errors: the tick's contract is that
+/// a scheduler can fire it forever without conditioning on state.
+fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport, Box<dyn Error>> {
+    let mut report = TickReport {
+        schema_version: 1,
+        command: "tick",
+        registered: state_database_exists(state_directory),
+        recovery: "skipped",
+        upload_candidates: 0,
+        upload_failed: 0,
+        delivery_candidates: 0,
+        delivery_failed: 0,
+    };
+    if !report.registered {
+        return Ok(report);
+    }
+    lift_stale_source_limit_parks(state_directory)?;
+    reactivate_regrown_lost_transcripts(state_directory)?;
+    report.recovery = if tick_recovery_sweep(state_directory)? {
+        "swept"
+    } else {
+        "busy"
+    };
+    match archive_upload_retry(state_directory, None, None, true, false, limit) {
+        Ok(upload) => {
+            report.upload_candidates = upload.candidates;
+            report.upload_failed = upload.failed;
+        }
+        Err(PatwariError::NotEnabled | PatwariError::NotConfigured) => {}
+        Err(error) => return Err(error.into()),
+    }
+    match delivery_retry(state_directory, None, None, true, false, limit) {
+        Ok(delivery) => {
+            report.delivery_candidates = delivery.candidates;
+            report.delivery_failed = delivery.failed;
+        }
+        Err(DeliveryError::NotEnabled | DeliveryError::NotConfigured) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(report)
+}
+
+/// Silence is the tick's normal voice: a scheduler fires it every few minutes, and output
+/// only exists when something actually happened (or failed) this round.
+fn print_tick_human(report: &TickReport) {
+    if report.recovery == "busy" {
+        println!("tick: recovery sweep already running elsewhere");
+    }
+    if report.upload_candidates > 0 {
+        println!(
+            "tick: archive-upload retried candidates={} failed={}",
+            report.upload_candidates, report.upload_failed
+        );
+    }
+    if report.delivery_candidates > 0 {
+        println!(
+            "tick: summary-delivery retried candidates={} failed={}",
+            report.delivery_candidates, report.delivery_failed
         );
     }
 }
