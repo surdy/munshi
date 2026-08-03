@@ -68,7 +68,7 @@ pub enum DeliveryCredentialSource {
 }
 
 impl DeliveryCredentialSource {
-    fn to_stored(&self) -> StoredCredential {
+    pub(crate) fn to_stored(&self) -> StoredCredential {
         match self {
             Self::Env { var } => StoredCredential::Env { var: var.clone() },
             Self::Keychain { service, account } => StoredCredential::Keychain {
@@ -317,7 +317,7 @@ pub enum SinkError {
 }
 
 impl SinkError {
-    fn category(&self) -> &'static str {
+    pub(crate) fn category(&self) -> &'static str {
         match self {
             Self::AlreadyExists { .. } => "delivery-conflict",
             Self::NotFound => "delivery-not-found",
@@ -525,7 +525,7 @@ fn delivery_document(map: &serde_json::Map<String, serde_json::Value>, body: &st
     format!("---\n{}---\n{}\n", frontmatter_yaml(map), body.trim_end())
 }
 
-fn backoff_ms(attempts: u32) -> i64 {
+pub(crate) fn backoff_ms(attempts: u32) -> i64 {
     let shift = attempts.saturating_sub(1).min(16);
     BASE_BACKOFF_MS
         .saturating_mul(1_i64 << shift)
@@ -810,7 +810,7 @@ pub(crate) fn deliver_one(
 }
 
 /// The result of committing (or recovering the commit of) a delivered revision.
-enum CommitCorrelation {
+pub(crate) enum CommitCorrelation {
     Committed(HistoryCommit),
     Failed { category: &'static str },
 }
@@ -827,7 +827,7 @@ enum CommitCorrelation {
 ///   existing commit; a missing commit is a failure, never a delivered-without-history success;
 /// - a transport error (the commit may have landed before its response was lost) triggers a lookup
 ///   before the attempt is recorded as a failure.
-fn commit_and_correlate(sink: &dyn NotesmithSink, message: &str) -> CommitCorrelation {
+pub(crate) fn commit_and_correlate(sink: &dyn NotesmithSink, message: &str) -> CommitCorrelation {
     match sink.commit_revision(message) {
         Ok(outcome) if outcome.committed => match sink.find_commit_by_message(message) {
             Ok(Some(commit)) => CommitCorrelation::Committed(commit),
@@ -866,7 +866,7 @@ fn commit_and_correlate(sink: &dyn NotesmithSink, message: &str) -> CommitCorrel
 
 /// Normalizes a vault-relative note path for comparison against `git/status` paths (which never
 /// carry a leading slash).
-fn normalize_note_path(path: &str) -> &str {
+pub(crate) fn normalize_note_path(path: &str) -> &str {
     path.trim_start_matches('/')
 }
 
@@ -911,8 +911,9 @@ fn create_or_adopt(
 // ---------------------------------------------------------------------------
 
 /// Resolves the bearer credential from the environment or the OS credential store. The credential
-/// is never read from committed configuration.
-fn resolve_credential(credential: &StoredCredential) -> Result<String, DeliveryError> {
+/// is never read from committed configuration. Shared with memory sync (issue #59), whose
+/// credential source uses the identical stored shape.
+pub(crate) fn resolve_credential(credential: &StoredCredential) -> Result<String, DeliveryError> {
     match credential {
         StoredCredential::Env { var } => std::env::var(var).map_err(|_| {
             DeliveryError::Credential(format!("environment variable {var} is not set"))

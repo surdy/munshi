@@ -1384,6 +1384,13 @@ fn process_claim(
             Some(&claim.session.session_id),
         );
     }
+    // Harness-memory mirroring is the third independent downstream (issue #59): an unchanged
+    // memory tree is a hash-compare no-op, and any failure lands in the memory-sync state
+    // machine's own bounded retries — never in the archived result.
+    if let Err(error) = crate::memory_sync::sync_after_archive(state_directory, stored) {
+        let _ = error;
+        let _ = state.record_diagnostic("memory-sync", "memory-sync-error", None, None);
+    }
     Ok(HookResult::Archived {
         relative_path: relative_path.to_string_lossy().into_owned(),
     })

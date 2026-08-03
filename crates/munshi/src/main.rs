@@ -12,18 +12,19 @@ use munshi::{
     ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
     DeliveryError, DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic,
     EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport, HookEvent, HookFailure, HookResult,
-    PatwariError, ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults,
-    SessionRecord, SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary,
-    VerifyArchiveError, VerifyArchiveReport, WorkerContext, accept_disclosure_from_terminal,
-    archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
-    configure_archive_upload, configure_delivery, conflicting_source_home, default_copilot_home,
-    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
-    lift_stale_source_limit_parks, parse_archive_markdown, parse_summarizer_env, project_label,
-    project_status, prune_summarizer_exhaust, reactivate_regrown_lost_transcripts,
-    read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
-    set_archive_upload_enabled, set_delivery_enabled, set_project_enabled,
-    summarizer_exhaust_bytes, tick_recovery_sweep, unregister, verify_archive_parse,
-    wait_for_hook_result_for_source,
+    MemorySinkConfig, MemorySyncError, PatwariError, ProjectStatus, RegisterConfig, RetrieveError,
+    RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceHomes, SourceKind,
+    StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport, WorkerContext,
+    accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
+    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
+    configure_memory_sync, conflicting_source_home, default_copilot_home, delivery_backfill,
+    delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    lift_stale_source_limit_parks, memory_sync_run, memory_sync_status, parse_archive_markdown,
+    parse_summarizer_env, project_label, project_status, prune_summarizer_exhaust,
+    reactivate_regrown_lost_transcripts, read_last_failure, register, retrieve,
+    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
+    set_memory_sync_enabled, set_project_enabled, summarizer_exhaust_bytes, tick_recovery_sweep,
+    unregister, verify_archive_parse, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +185,9 @@ enum Command {
     /// Configure and operate opt-in Patwari archive upload of full session snapshots.
     #[command(subcommand)]
     ArchiveUpload(ArchiveUploadCommand),
+    /// Configure and operate opt-in mirroring of harness auto-memory into Notesmith (issue #59).
+    #[command(subcommand)]
+    MemorySync(MemorySyncCommand),
     /// Show overall operational status.
     Status {
         #[arg(long)]
@@ -535,6 +539,73 @@ enum SummaryDeliveryCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum MemorySyncCommand {
+    /// Record the Notesmith mirror target (endpoint, vault, folder, credential source, canonical
+    /// machine label) without enabling it.
+    Configure {
+        /// Base URL of the Notesmith daemon, for example `http://127.0.0.1:27183`.
+        #[arg(long)]
+        endpoint: String,
+        /// Target Notesmith vault name (a document vault, never the fact-memory vault).
+        #[arg(long)]
+        vault: String,
+        /// Optional vault-relative folder the per-machine memory trees are filed under.
+        #[arg(long)]
+        folder: Option<String>,
+        /// The canonical machine label mirrored paths are routed under. Chosen once, here;
+        /// defaults to the sanitized hostname when omitted.
+        #[arg(long)]
+        machine: Option<String>,
+        /// Name of the environment variable holding the bearer credential.
+        #[arg(long, conflicts_with = "credential_keychain")]
+        credential_env: Option<String>,
+        /// OS credential-store entry as `service:account` holding the bearer credential.
+        #[arg(long, conflicts_with = "credential_env")]
+        credential_keychain: Option<String>,
+        /// Bounded number of sync attempts before a memory directory parks as a dead letter.
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        /// Explicitly configure the Notesmith vault's revision-history capability when absent
+        /// instead of only verifying it. Use `--no-provision-history` to return to verify-only.
+        #[arg(long, overrides_with = "no_provision_history")]
+        provision_history: bool,
+        #[arg(long, overrides_with = "provision_history", hide = true)]
+        no_provision_history: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Enable memory sync. Requires a configured, addressable mirror target.
+    Enable {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Disable memory sync. Future syncs stop while sync history is retained.
+    Disable {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show memory-sync configuration and per-directory sync state.
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one sync pass now. Unchanged directories are hash-compare no-ops.
+    Run {
+        /// Also revive dead-letter directories and ignore retry backoff.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ArchiveUploadCommand {
     /// Record the Patwari archive server endpoint without enabling upload.
     Configure {
@@ -665,6 +736,23 @@ enum Outcome {
     },
     DeliveryHistory {
         report: Box<HistoryReport>,
+        json: bool,
+    },
+    MemorySyncConfigured {
+        settings: Box<munshi::MemorySyncSettings>,
+    },
+    MemorySyncEnabled {
+        settings: Box<munshi::MemorySyncSettings>,
+    },
+    MemorySyncDisabled {
+        settings: Box<munshi::MemorySyncSettings>,
+    },
+    MemorySyncStatus {
+        report: Box<munshi::MemorySyncStatusReport>,
+        json: bool,
+    },
+    MemorySyncRun {
+        report: Box<munshi::MemorySyncRunReport>,
         json: bool,
     },
     ArchiveUploadConfigured {
@@ -1079,6 +1167,11 @@ struct TickReport {
     upload_failed: usize,
     delivery_candidates: usize,
     delivery_failed: usize,
+    /// Memory-sync drain (issue #59): directories synced/failed/blocked this tick. All zero on a
+    /// tick where every memory directory's manifest was unchanged (the healthy steady state).
+    memory_synced: usize,
+    memory_failed: usize,
+    memory_blocked: usize,
     /// Summarizer-exhaust retention (issue #60): `"off"` when unconfigured, `"conflict"` when the
     /// configured home overlaps a captured harness home, `"absent"` when the home does not exist,
     /// `"busy"` when a summarization claim is live, `"swept"` when the pass ran.
@@ -1348,6 +1441,49 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
+            }
+        }
+        Ok(Outcome::MemorySyncConfigured { settings }) => {
+            println!(
+                "configured memory-sync mirror endpoint={} vault={} machine={}",
+                settings.endpoint.as_deref().unwrap_or("<unset>"),
+                settings.vault.as_deref().unwrap_or("<unset>"),
+                settings.machine_label.as_deref().unwrap_or("<unset>")
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::MemorySyncEnabled { settings }) => {
+            println!(
+                "memory sync enabled (endpoint {}, vault {}, machine {})",
+                settings.endpoint.as_deref().unwrap_or("<unset>"),
+                settings.vault.as_deref().unwrap_or("<unset>"),
+                settings.machine_label.as_deref().unwrap_or("<unset>")
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::MemorySyncDisabled { settings }) => {
+            let _ = settings;
+            println!("memory sync disabled; existing sync history is retained");
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::MemorySyncStatus { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::MemorySyncRun { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            if report.failed > 0 || report.blocked > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
             }
         }
         Ok(Outcome::ArchiveUploadConfigured { settings }) => {
@@ -1749,6 +1885,7 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         }
         Command::SummaryDelivery(command) => run_summary_delivery(command),
         Command::ArchiveUpload(command) => run_archive_upload(command),
+        Command::MemorySync(command) => run_memory_sync(command),
         Command::Status { state_dir, json } => {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Status {
@@ -2115,6 +2252,80 @@ fn run_summary_delivery(command: SummaryDeliveryCommand) -> Result<Outcome, Box<
                     force,
                     limit,
                 )?),
+                json,
+            })
+        }
+    }
+}
+
+fn run_memory_sync(command: MemorySyncCommand) -> Result<Outcome, Box<dyn Error>> {
+    match command {
+        MemorySyncCommand::Configure {
+            endpoint,
+            vault,
+            folder,
+            machine,
+            credential_env,
+            credential_keychain,
+            max_attempts,
+            provision_history,
+            no_provision_history,
+            state_dir,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let credential = resolve_credential_source(credential_env, credential_keychain)?;
+            let provision = if provision_history {
+                Some(true)
+            } else if no_provision_history {
+                Some(false)
+            } else {
+                None
+            };
+            let settings = configure_memory_sync(
+                &state_directory,
+                MemorySinkConfig {
+                    endpoint,
+                    vault,
+                    folder,
+                    credential,
+                    max_attempts,
+                    machine_label: machine,
+                    provision_history: provision,
+                },
+            )?;
+            Ok(Outcome::MemorySyncConfigured {
+                settings: Box::new(settings),
+            })
+        }
+        MemorySyncCommand::Enable { state_dir } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = set_memory_sync_enabled(&state_directory, true)?;
+            Ok(Outcome::MemorySyncEnabled {
+                settings: Box::new(settings),
+            })
+        }
+        MemorySyncCommand::Disable { state_dir } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let settings = set_memory_sync_enabled(&state_directory, false)?;
+            Ok(Outcome::MemorySyncDisabled {
+                settings: Box::new(settings),
+            })
+        }
+        MemorySyncCommand::Status { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::MemorySyncStatus {
+                report: Box::new(memory_sync_status(&state_directory)?),
+                json,
+            })
+        }
+        MemorySyncCommand::Run {
+            force,
+            state_dir,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::MemorySyncRun {
+                report: Box::new(memory_sync_run(&state_directory, force)?),
                 json,
             })
         }
@@ -2611,6 +2822,9 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
         upload_failed: 0,
         delivery_candidates: 0,
         delivery_failed: 0,
+        memory_synced: 0,
+        memory_failed: 0,
+        memory_blocked: 0,
         exhaust: ExhaustStatus::NotConfigured.as_str(),
         exhaust_reason: None,
         exhaust_pruned_dirs: 0,
@@ -2651,6 +2865,18 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
         Err(DeliveryError::NotEnabled | DeliveryError::NotConfigured) => {}
         Err(error) => return Err(error.into()),
     }
+    // Memory-sync drain (issue #59): covers force-killed sessions whose post-archival pass never
+    // ran, and retries whose backoff has elapsed. Reads only harness homes (never session cwds),
+    // so it is safe in the tick's background TCC context (#61).
+    match memory_sync_run(state_directory, false) {
+        Ok(memory) => {
+            report.memory_synced = memory.synced;
+            report.memory_failed = memory.failed;
+            report.memory_blocked = memory.blocked;
+        }
+        Err(MemorySyncError::NotEnabled | MemorySyncError::NotConfigured) => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(report)
 }
 
@@ -2670,6 +2896,12 @@ fn print_tick_human(report: &TickReport) {
         println!(
             "tick: summary-delivery retried candidates={} failed={}",
             report.delivery_candidates, report.delivery_failed
+        );
+    }
+    if report.memory_synced > 0 || report.memory_failed > 0 || report.memory_blocked > 0 {
+        println!(
+            "tick: memory-sync synced={} failed={} blocked={}",
+            report.memory_synced, report.memory_failed, report.memory_blocked
         );
     }
     // Unconfigured, missing, and busy retention are silent; a conflicting home is a
