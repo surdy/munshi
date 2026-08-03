@@ -127,6 +127,56 @@ munshi tick --json
 `contrib/launchd/com.munshi.tick.plist` runs it every 15 minutes on macOS; see the comment in
 the plist for install/remove commands (systemd user timers are the Linux equivalent).
 
+#### Summarizer-exhaust retention
+
+`contrib/copilot-summarizer.sh` runs Copilot under an isolated `COPILOT_HOME` so the summarizer's
+own sessions never feed back into Munshi's pipeline. That isolation has a disposal gap: every
+summarization deposits a full Copilot session there — a `session-state/<id>/` directory plus rows
+in the monolithic `session-store.db` — and nothing removes it. Measured 2026-08-02 on one machine:
+**5.6 GB after a month**, 905 session directories (2.8 GB) beside a 2.9 GB session store.
+
+Deleting it is safe by construction. The exhaust is derived byproduct of work already persisted
+three times over — each summary as local Markdown, in Notesmith, and in Patwari — while the source
+transcripts live in their harness homes and in Patwari. Nothing in the exhaust is the only copy of
+anything.
+
+Point `munshi register` at the isolated home to have `munshi tick` keep it pruned:
+
+```bash
+munshi register ... \
+  --summarizer-exhaust-home ~/.copilot-summarizer \
+  --summarizer-exhaust-retention-days 7
+```
+
+Both flags are registration-owned: re-registering without `--summarizer-exhaust-home` turns
+retention off again. Omitting it — the default — keeps everything, exactly as Munshi behaved
+before this existed. `--summarizer-exhaust-retention-days 0` also keeps everything.
+
+Each tick deletes `session-state/` entries whose newest file is older than the window, at most 200
+per run so a backlog drains over successive ticks instead of stalling one. `session-store.db` and
+its `-wal`/`-shm` sidecars go only once no entry remains at all: the store is one monolith with no
+per-session eviction, so partial pruning cannot shrink it.
+
+Deletion refuses rather than guesses, and says why:
+
+| Guard | Behavior |
+| --- | --- |
+| No home configured | Retention is off; the tick and `doctor` say nothing |
+| Home overlaps a registered harness home or `~/.copilot` | `register` refuses; `doctor` reports an error naming the conflict; the tick refuses on every run |
+| Home does not exist | Nothing to do, silently |
+| A summarization claim is live | The whole pass is skipped, silently; the next tick retries |
+| Entry modified in the last 10 minutes | Kept, whatever the window says |
+| Entry is a symlink, or unreadable | Never followed, never deleted, and it keeps the store |
+
+The tick stays silent unless it deletes something, then prints one line:
+
+```
+tick: summarizer-exhaust pruned dirs=37 bytes=118293504
+```
+
+`munshi doctor` reports the home's current size whenever retention is configured, and warns past
+1 GiB — so growth is visible early instead of discovered at 5.6 GB.
+
 ### `munshi doctor`
 
 Diagnoses registration, dependencies, and runtime readiness — useful after upgrading Munshi, moving

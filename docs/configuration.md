@@ -144,6 +144,23 @@ registration manages (ADR 0008). Each key is absent when that harness is not reg
 | `copilot_home` | Copilot home whose `hooks/munshi.json` this registration owns. |
 | `claude_home` | Claude Code home whose `settings.json` carries Munshi's managed `Stop` and `SessionEnd` entries. |
 
+## `summarizer_exhaust` — retention for the isolated summarizer home
+
+Written by `munshi register` from its flags, like the top-level settings: re-running `register`
+without `--summarizer-exhaust-home` turns retention off again. Absent — the default — means
+`munshi tick` prunes nothing, which is how Munshi behaved before issue #60. Additive with a serde
+default (no version bump), so configurations written before it load unchanged.
+
+Munshi has no other record of the isolated home: the isolation lives inside the summarizer wrapper
+(`contrib/copilot-summarizer.sh` sets `COPILOT_HOME`), which Munshi treats as an opaque executable.
+Naming it here is what makes retention possible — and why `home` is validated against every home
+Munshi captures from. See [`user-guide.md`](user-guide.md) for the guards and the rationale.
+
+| Setting | Meaning |
+| --- | --- |
+| `home` | Absolute path of the isolated summarizer home whose `session-state/` entries and session store `munshi tick` prunes. Refused at `register`, and reported as a `doctor` error, when it equals, contains, or is contained by a registered harness home or `~/.copilot`. `--summarizer-exhaust-home`. |
+| `retention_days` | Age in whole days above which a `session-state/` entry is deleted. `0` keeps everything, as does an absent `home` (`7`). `--summarizer-exhaust-retention-days`. |
+
 ## Related files
 
 - `munshi.db` — rebuildable SQLite operational state; never configuration.

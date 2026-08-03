@@ -2,6 +2,7 @@ mod archive;
 mod archive_git;
 mod claude_settings;
 mod delivery;
+mod exhaust;
 mod hooks;
 mod http;
 mod patwari;
@@ -27,6 +28,11 @@ pub use delivery::{
     set_enabled as set_delivery_enabled, status as delivery_status,
     verify_history as delivery_verify_history,
 };
+pub use exhaust::{
+    EXHAUST_PRUNE_LIMIT, EXHAUST_QUIET_PERIOD, EXHAUST_SIZE_WARN_BYTES, ExhaustError,
+    ExhaustPolicy, ExhaustReport, ExhaustStatus, SESSION_STORE_FILES, conflicting_source_home,
+    default_copilot_home, prune_summarizer_exhaust, summarizer_exhaust_bytes,
+};
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, SUMMARIZER_EXHAUST_DIAGNOSTIC,
     handle_hook, lift_stale_source_limit_parks, reactivate_regrown_lost_transcripts,
@@ -48,8 +54,9 @@ pub use project::{
     project_label, recorded_project_identity,
 };
 pub use registration::{
-    ClaudeTarget, CopilotTarget, DEFAULT_CHUNK_THRESHOLD_BYTES, DisclosureDecision, ProjectStatus,
-    RegisterConfig, RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
+    ClaudeTarget, CopilotTarget, DEFAULT_CHUNK_THRESHOLD_BYTES,
+    DEFAULT_SUMMARIZER_EXHAUST_RETENTION_DAYS, DisclosureDecision, ProjectStatus, RegisterConfig,
+    RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
     configured_chunk_threshold_bytes, configured_max_event_text_bytes, project_status, register,
     set_project_enabled, unregister,
 };

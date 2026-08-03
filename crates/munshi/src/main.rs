@@ -11,16 +11,18 @@ use munshi::{
     ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
     ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
     DeliveryError, DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic,
-    HistoryReport, HookEvent, HookFailure, HookResult, PatwariError, ProjectStatus, RegisterConfig,
-    RetrieveError, RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceKind,
-    StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport,
-    accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
-    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
-    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport, HookEvent, HookFailure, HookResult,
+    PatwariError, ProjectStatus, RegisterConfig, RetrieveError, RetrieveResult, SearchResults,
+    SessionRecord, SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary,
+    VerifyArchiveError, VerifyArchiveReport, accept_disclosure_from_terminal, archive_session,
+    archive_upload_backfill, archive_upload_retry, archive_upload_status, configure_archive_upload,
+    configure_delivery, conflicting_source_home, default_copilot_home, delivery_backfill,
+    delivery_retry, delivery_status, delivery_verify_history, handle_hook,
     lift_stale_source_limit_parks, parse_archive_markdown, parse_summarizer_env, project_label,
-    project_status, reactivate_regrown_lost_transcripts, read_last_failure, register, retrieve,
-    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
-    set_project_enabled, tick_recovery_sweep, unregister, verify_archive_parse,
+    project_status, prune_summarizer_exhaust, reactivate_regrown_lost_transcripts,
+    read_last_failure, register, retrieve, run_archive_worker_for_source, run_recovery,
+    set_archive_upload_enabled, set_delivery_enabled, set_project_enabled,
+    summarizer_exhaust_bytes, tick_recovery_sweep, unregister, verify_archive_parse,
     wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
@@ -153,6 +155,16 @@ enum Command {
         /// Maximum number of sessions summarized concurrently across all projects.
         #[arg(long, default_value_t = 2)]
         max_concurrency: usize,
+        /// Isolated summarizer home whose Copilot exhaust `munshi tick` prunes (issue #60) — the
+        /// COPILOT_HOME contrib/copilot-summarizer.sh runs under, typically
+        /// `~/.copilot-summarizer`. Omitted: nothing is ever pruned. Refused when it overlaps a
+        /// registered harness home or `~/.copilot`.
+        #[arg(long)]
+        summarizer_exhaust_home: Option<PathBuf>,
+        /// Age above which the exhaust home's `session-state/` entries are deleted. `0` keeps
+        /// everything; ignored without --summarizer-exhaust-home.
+        #[arg(long, default_value_t = munshi::DEFAULT_SUMMARIZER_EXHAUST_RETENTION_DAYS)]
+        summarizer_exhaust_retention_days: u32,
     },
     /// Remove only Munshi's dedicated user hook and active configuration.
     Unregister {
@@ -826,6 +838,10 @@ struct ConfigurationAssessment {
     claude_settings_path: Option<String>,
     summarizer_executable: Option<String>,
     output_directory: Option<String>,
+    /// The isolated summarizer home whose exhaust `munshi tick` prunes, when retention is
+    /// configured and its home does not overlap a captured harness home (issue #60). Absent means
+    /// nothing is ever pruned.
+    summarizer_exhaust_home: Option<String>,
     checks: Vec<CheckResult>,
 }
 
@@ -1059,6 +1075,16 @@ struct TickReport {
     upload_failed: usize,
     delivery_candidates: usize,
     delivery_failed: usize,
+    /// Summarizer-exhaust retention (issue #60): `"off"` when unconfigured, `"conflict"` when the
+    /// configured home overlaps a captured harness home, `"absent"` when the home does not exist,
+    /// `"busy"` when a summarization claim is live, `"swept"` when the pass ran.
+    exhaust: &'static str,
+    /// The refusal reason behind `"conflict"`; absent for every other state.
+    exhaust_reason: Option<String>,
+    exhaust_pruned_dirs: usize,
+    exhaust_reclaimed_bytes: u64,
+    exhaust_remaining_dirs: usize,
+    exhaust_store_removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1127,6 +1153,26 @@ struct RawStoredConfig {
     limits: Option<RawLimits>,
     #[serde(default)]
     harnesses: Option<RawHarnesses>,
+    /// Summarizer-exhaust retention (issue #60). Absent in every configuration written before it,
+    /// and absent means the feature is off, so doctor stays silent about it.
+    #[serde(default)]
+    summarizer_exhaust: Option<RawSummarizerExhaust>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawSummarizerExhaust {
+    home: Option<String>,
+    #[serde(default)]
+    retention_days: Option<u32>,
+}
+
+impl RawSummarizerExhaust {
+    /// The configured home and window, or `None` when this configuration keeps everything.
+    fn active(&self) -> Option<(&str, u32)> {
+        let home = self.home.as_deref().filter(|value| !value.is_empty())?;
+        let days = self.retention_days.unwrap_or_default();
+        (days > 0).then_some((home, days))
+    }
 }
 
 /// The subset of the `limits` section doctor re-checks: the two knobs whose relation `register`
@@ -1141,7 +1187,6 @@ struct RawLimits {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawHarnesses {
     copilot_home: Option<String>,
-    #[allow(dead_code)]
     claude_home: Option<String>,
 }
 
@@ -1554,6 +1599,8 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             max_calls_per_hour,
             max_calls_per_day,
             max_concurrency,
+            summarizer_exhaust_home,
+            summarizer_exhaust_retention_days,
         } => {
             // Cross-flag validation runs before the disclosure prompt and any file write, so a
             // rejected registration leaves nothing behind (issue #52).
@@ -1649,6 +1696,8 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 max_calls_per_hour,
                 max_calls_per_day,
                 max_concurrency,
+                summarizer_exhaust_home,
+                summarizer_exhaust_retention_days,
                 executable,
             })?;
             Ok(Outcome::Registered { hook_paths })
@@ -2529,11 +2578,14 @@ fn print_settle_lost_human(report: &SettleLostReport) {
     }
 }
 
-/// One idempotent tick (issue #55): re-evaluate parks and lost-transcript verdicts, run the
-/// standard recovery sweep (rescue + eligible session retries through the normal worker
-/// state machine), then drain eligible upload and delivery retries. Disabled subsystems and
-/// an already-running sweep are quiet non-events, never errors: the tick's contract is that
-/// a scheduler can fire it forever without conditioning on state.
+/// One idempotent tick (issue #55): prune the summarizer exhaust, re-evaluate parks and
+/// lost-transcript verdicts, run the standard recovery sweep (rescue + eligible session retries
+/// through the normal worker state machine), then drain eligible upload and delivery retries.
+/// Disabled subsystems and an already-running sweep are quiet non-events, never errors: the tick's
+/// contract is that a scheduler can fire it forever without conditioning on state.
+///
+/// Retention runs first, before the sweep starts any summarizer invocation, so a pass can never
+/// race the exhaust this very tick is about to create (issue #60).
 fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport, Box<dyn Error>> {
     let mut report = TickReport {
         schema_version: 1,
@@ -2544,10 +2596,23 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
         upload_failed: 0,
         delivery_candidates: 0,
         delivery_failed: 0,
+        exhaust: ExhaustStatus::NotConfigured.as_str(),
+        exhaust_reason: None,
+        exhaust_pruned_dirs: 0,
+        exhaust_reclaimed_bytes: 0,
+        exhaust_remaining_dirs: 0,
+        exhaust_store_removed: false,
     };
     if !report.registered {
         return Ok(report);
     }
+    let exhaust = prune_summarizer_exhaust(state_directory)?;
+    report.exhaust = exhaust.status.as_str();
+    report.exhaust_reason = exhaust.status.reason();
+    report.exhaust_pruned_dirs = exhaust.pruned_directories;
+    report.exhaust_reclaimed_bytes = exhaust.reclaimed_bytes;
+    report.exhaust_remaining_dirs = exhaust.remaining_directories;
+    report.exhaust_store_removed = exhaust.store_removed;
     lift_stale_source_limit_parks(state_directory)?;
     reactivate_regrown_lost_transcripts(state_directory)?;
     report.recovery = if tick_recovery_sweep(state_directory)? {
@@ -2590,6 +2655,17 @@ fn print_tick_human(report: &TickReport) {
         println!(
             "tick: summary-delivery retried candidates={} failed={}",
             report.delivery_candidates, report.delivery_failed
+        );
+    }
+    // Unconfigured, missing, and busy retention are silent; a conflicting home is a
+    // misconfiguration that disables retention forever, so it is said on every tick.
+    if let Some(reason) = &report.exhaust_reason {
+        println!("tick: summarizer-exhaust retention refused: {reason}");
+    }
+    if report.exhaust_pruned_dirs > 0 || report.exhaust_reclaimed_bytes > 0 {
+        println!(
+            "tick: summarizer-exhaust pruned dirs={} bytes={}",
+            report.exhaust_pruned_dirs, report.exhaust_reclaimed_bytes
         );
     }
 }
@@ -2856,6 +2932,11 @@ fn build_doctor_report(state_directory: &Path) -> Result<DoctorReport, Box<dyn E
         ),
     }
 
+    push_summarizer_exhaust_size_check(
+        &mut checks,
+        configuration.summarizer_exhaust_home.as_deref(),
+    );
+
     let sessions = load_sessions(state_directory)?;
     push_parked_session_checks(&mut checks, &sessions);
     push_capture_failure_streak_check(&mut checks, state_directory);
@@ -2889,6 +2970,7 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
     let mut versioned_delivery = None;
     let mut provision_remote_history = None;
     let mut disabled_projects = 0usize;
+    let mut summarizer_exhaust_home = None;
 
     let mut config_recognized = false;
     if !config_path.exists() {
@@ -2948,6 +3030,14 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         .as_ref()
                         .and_then(|harnesses| harnesses.claude_home.as_deref())
                         .map(PathBuf::from);
+                    summarizer_exhaust_home = push_summarizer_exhaust_check(
+                        &mut checks,
+                        config.summarizer_exhaust.as_ref(),
+                        &SourceHomes {
+                            copilot_home: copilot_home_recorded.clone(),
+                            claude_home: claude_home_recorded.clone(),
+                        },
+                    );
                     let policy = config.policy.unwrap_or(RawPolicy {
                         max_calls_per_hour: None,
                         max_calls_per_day: None,
@@ -3296,7 +3386,96 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
         claude_settings_path: claude_settings_path.map(|path| path.display().to_string()),
         summarizer_executable,
         output_directory,
+        summarizer_exhaust_home,
         checks,
+    }
+}
+
+/// Reports how much the isolated summarizer home currently holds, warning past
+/// [`EXHAUST_SIZE_WARN_BYTES`] (issue #60). Runs only in `doctor`, not in `configuration-check`:
+/// it measures the disk, not the configuration. Nothing is reported when retention is off, so
+/// growth becomes visible on the machines that asked to have it pruned.
+fn push_summarizer_exhaust_size_check(checks: &mut Vec<CheckResult>, home: Option<&str>) {
+    let Some(home) = home else {
+        return;
+    };
+    let path = Path::new(home);
+    if !path.is_dir() {
+        push_check(
+            checks,
+            "summarizer-exhaust-size",
+            CheckStatus::Ok,
+            format!("{home} does not exist yet"),
+        );
+        return;
+    }
+    match summarizer_exhaust_bytes(path) {
+        Ok(bytes) if bytes > EXHAUST_SIZE_WARN_BYTES => push_check(
+            checks,
+            "summarizer-exhaust-size",
+            CheckStatus::Warning,
+            format!(
+                "{home} holds {:.1} GiB, past the {:.0} GiB threshold; check that `munshi tick` \
+                 is scheduled",
+                gibibytes(bytes),
+                gibibytes(EXHAUST_SIZE_WARN_BYTES)
+            ),
+        ),
+        Ok(bytes) => push_check(
+            checks,
+            "summarizer-exhaust-size",
+            CheckStatus::Ok,
+            format!("{home} holds {:.2} GiB", gibibytes(bytes)),
+        ),
+        Err(error) => push_check(
+            checks,
+            "summarizer-exhaust-size",
+            CheckStatus::Warning,
+            format!("could not measure {home}: {error}"),
+        ),
+    }
+}
+
+fn gibibytes(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Validates a configured summarizer-exhaust home against every home Munshi captures from
+/// (issue #60) and returns it only when it is safe to prune. An unconfigured section adds no
+/// check at all: retention off is Munshi's historical behavior, not a finding.
+///
+/// The overlap refusal is an error rather than a warning because it silently disables retention
+/// forever — the tick would keep skipping while the home keeps growing — and because the named
+/// path is one Munshi archives from, where deletion would destroy captured sessions.
+fn push_summarizer_exhaust_check(
+    checks: &mut Vec<CheckResult>,
+    section: Option<&RawSummarizerExhaust>,
+    sources: &SourceHomes,
+) -> Option<String> {
+    let (home, retention_days) = section.and_then(RawSummarizerExhaust::active)?;
+    match conflicting_source_home(Path::new(home), sources, default_copilot_home().as_deref()) {
+        Some(registered) => {
+            push_check(
+                checks,
+                "summarizer-exhaust-home",
+                CheckStatus::Error,
+                format!(
+                    "summarizer exhaust home {home} overlaps the registered source home {}; \
+                     retention is refused and nothing is ever pruned",
+                    registered.display()
+                ),
+            );
+            None
+        }
+        None => {
+            push_check(
+                checks,
+                "summarizer-exhaust-home",
+                CheckStatus::Ok,
+                format!("{home} pruned after {retention_days}d, isolated from every source home"),
+            );
+            Some(home.to_owned())
+        }
     }
 }
 
