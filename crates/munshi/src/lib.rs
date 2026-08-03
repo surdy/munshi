@@ -5,6 +5,7 @@ mod delivery;
 mod exhaust;
 mod hooks;
 mod http;
+mod memory_sync;
 mod patwari;
 mod patwari_read;
 mod policy;
@@ -38,6 +39,11 @@ pub use hooks::{
     WorkerContext, handle_hook, lift_stale_source_limit_parks, reactivate_regrown_lost_transcripts,
     read_last_failure, run_archive_worker, run_archive_worker_for_source, run_recovery,
     tick_recovery_sweep, wait_for_hook_result, wait_for_hook_result_for_source,
+};
+pub use memory_sync::{
+    MemorySinkConfig, MemorySyncError, MemorySyncItem, MemorySyncRunItem, MemorySyncRunReport,
+    MemorySyncSettings, MemorySyncStatusReport, configure_sink as configure_memory_sync,
+    run as memory_sync_run, set_enabled as set_memory_sync_enabled, status as memory_sync_status,
 };
 pub use patwari::{
     ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
@@ -78,8 +84,8 @@ pub use source::{
 };
 pub use state::{
     ArchiveUploadRecord, ArchiveUploadSuccess, AttemptRecord, BudgetOutcome, CapturePrep,
-    ClaimOutcome, CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic, SessionRecord,
-    StateError, StateStore, WaitState, try_acquire_session_lock,
+    ClaimOutcome, CompletionReason, DeliveryRecord, DeliverySuccess, Diagnostic, MemorySyncRecord,
+    MemorySyncSuccess, SessionRecord, StateError, StateStore, WaitState, try_acquire_session_lock,
 };
 pub use summary::{
     ChunkingLimits, PLACEHOLDER_SUMMARY_TAG, PlaceholderReason, RESERVED_SUMMARIZER_ENV_PREFIX,

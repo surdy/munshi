@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceHomes, SourceKind, derive_transcript_p
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 /// The `transcript_source` recorded for a path re-derived from a session's ID through its source's
@@ -293,6 +293,37 @@ pub struct DeliveryRecord {
     pub next_attempt_at_ms: Option<i64>,
     pub last_error_category: Option<String>,
     pub updated_at_ms: i64,
+}
+
+/// One mirrored harness-memory directory's sync state for one Notesmith sink (issue #59).
+#[derive(Debug, Clone)]
+pub struct MemorySyncRecord {
+    pub slug: String,
+    pub endpoint: String,
+    pub vault: String,
+    /// The canonical machine label the mirror was routed under (provenance; routing itself
+    /// always derives from the configured label at run time).
+    pub machine: String,
+    /// sha256 of the per-file content manifest at the last successful sync, or `None` when the
+    /// directory has never synced.
+    pub manifest_hash: Option<String>,
+    pub synced_revision: u64,
+    pub file_count: u64,
+    /// The correlated Notesmith history commit that preserves this synced revision.
+    pub history_commit: Option<String>,
+    pub sync_state: String,
+    pub attempts: u32,
+    pub next_attempt_at_ms: Option<i64>,
+    pub last_error_category: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// A successful memory sync result to persist for one directory's sink row.
+#[derive(Debug, Clone)]
+pub struct MemorySyncSuccess {
+    pub manifest_hash: String,
+    pub file_count: u64,
+    pub history_commit: Option<String>,
 }
 
 /// A successful delivery result to persist for one session's sink row.
@@ -752,6 +783,49 @@ impl StateStore {
                 params![6, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 6)?;
+            transaction.commit()?;
+        }
+        if current < 7 {
+            // Issue #59: rebuildable operational state for mirroring harness auto-memory
+            // directories into a Notesmith vault, one row per (memory directory, endpoint,
+            // vault). `manifest_hash` is the sha256 of the per-file content manifest at the last
+            // successful sync — the change detector that lets an unchanged directory no-op
+            // without ever contacting the sink. Rows are not session-scoped (memory belongs to a
+            // project directory, not a session), so unlike `deliveries` there is no `sessions`
+            // join and the table is shared across source scopes. The state machine mirrors
+            // `deliveries` (issue #9 semantics for `blocked`).
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE memory_sync (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    vault TEXT NOT NULL,
+                    machine TEXT NOT NULL,
+                    manifest_hash TEXT,
+                    synced_revision INTEGER NOT NULL DEFAULT 0,
+                    file_count INTEGER NOT NULL DEFAULT 0,
+                    history_commit TEXT,
+                    sync_state TEXT NOT NULL CHECK (sync_state IN (
+                        'pending','synced','failed','dead-letter','blocked'
+                    )),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_ms INTEGER,
+                    last_error_category TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(slug, endpoint, vault)
+                 );
+                 CREATE INDEX memory_sync_state_idx
+                    ON memory_sync(sync_state, next_attempt_at_ms);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![7, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 7)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -1262,6 +1336,194 @@ impl StateStore {
             ],
         )?;
         self.get_delivery(session_id, endpoint, vault)
+    }
+
+    /// Ensures a memory-sync row exists for one memory directory and sink, returning the current
+    /// record. Created idempotently on the `(slug, endpoint, vault)` key; the recorded machine
+    /// label follows the configured one so a relabeled machine's provenance stays truthful.
+    pub fn ensure_memory_sync_target(
+        &mut self,
+        slug: &str,
+        endpoint: &str,
+        vault: &str,
+        machine: &str,
+    ) -> Result<MemorySyncRecord, StateError> {
+        let now = now_ms();
+        self.connection.execute(
+            "INSERT INTO memory_sync(
+                slug,endpoint,vault,machine,sync_state,attempts,created_at_ms,updated_at_ms
+             ) VALUES (?1,?2,?3,?4,'pending',0,?5,?5)
+             ON CONFLICT(slug,endpoint,vault) DO UPDATE SET machine=?4",
+            params![slug, endpoint, vault, machine, now],
+        )?;
+        self.get_memory_sync(slug, endpoint, vault)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Reads the memory-sync record for one directory and sink, if any.
+    pub fn get_memory_sync(
+        &self,
+        slug: &str,
+        endpoint: &str,
+        vault: &str,
+    ) -> Result<Option<MemorySyncRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT slug,endpoint,vault,machine,manifest_hash,synced_revision,file_count,
+                        history_commit,sync_state,attempts,next_attempt_at_ms,
+                        last_error_category,updated_at_ms
+                 FROM memory_sync WHERE slug=?1 AND endpoint=?2 AND vault=?3",
+                params![slug, endpoint, vault],
+                memory_sync_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Lists every recorded memory sync, most recently updated first.
+    pub fn list_memory_sync(&self) -> Result<Vec<MemorySyncRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT slug,endpoint,vault,machine,manifest_hash,synced_revision,file_count,
+                    history_commit,sync_state,attempts,next_attempt_at_ms,
+                    last_error_category,updated_at_ms
+             FROM memory_sync ORDER BY updated_at_ms DESC,id DESC",
+        )?;
+        statement
+            .query_map([], memory_sync_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Records a successful memory sync: stores the synced manifest, advances the revision
+    /// counter, clears retry bookkeeping, and marks the row `synced`.
+    pub fn record_memory_sync_success(
+        &mut self,
+        slug: &str,
+        endpoint: &str,
+        vault: &str,
+        success: &MemorySyncSuccess,
+    ) -> Result<MemorySyncRecord, StateError> {
+        let now = now_ms();
+        self.connection.execute(
+            "UPDATE memory_sync SET
+                manifest_hash=?4,file_count=?5,history_commit=?6,
+                synced_revision=synced_revision+1,sync_state='synced',attempts=0,
+                next_attempt_at_ms=NULL,last_error_category=NULL,updated_at_ms=?7
+             WHERE slug=?1 AND endpoint=?2 AND vault=?3",
+            params![
+                slug,
+                endpoint,
+                vault,
+                success.manifest_hash,
+                i64::try_from(success.file_count).unwrap_or(i64::MAX),
+                success.history_commit,
+                now,
+            ],
+        )?;
+        self.get_memory_sync(slug, endpoint, vault)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Records a memory sync blocked by a missing remote revision-history capability. Same
+    /// semantics as [`Self::record_delivery_blocked`]: a configuration gate, never an attempt.
+    pub fn record_memory_sync_blocked(
+        &mut self,
+        slug: &str,
+        endpoint: &str,
+        vault: &str,
+        category: &str,
+    ) -> Result<MemorySyncRecord, StateError> {
+        let now = now_ms();
+        self.connection.execute(
+            "UPDATE memory_sync SET
+                sync_state='blocked',next_attempt_at_ms=NULL,
+                last_error_category=?4,updated_at_ms=?5
+             WHERE slug=?1 AND endpoint=?2 AND vault=?3",
+            params![slug, endpoint, vault, category, now],
+        )?;
+        self.get_memory_sync(slug, endpoint, vault)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Records a failed memory sync attempt with the same bounded-backoff/dead-letter semantics
+    /// as [`Self::record_delivery_failure`].
+    pub fn record_memory_sync_failure(
+        &mut self,
+        slug: &str,
+        endpoint: &str,
+        vault: &str,
+        category: &str,
+        max_attempts: u32,
+        next_attempt_at_ms: i64,
+    ) -> Result<MemorySyncRecord, StateError> {
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempts: u32 = transaction
+            .query_row(
+                "SELECT attempts FROM memory_sync
+                 WHERE slug=?1 AND endpoint=?2 AND vault=?3",
+                params![slug, endpoint, vault],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let attempts = attempts.saturating_add(1);
+        let exhausted = attempts >= max_attempts;
+        let (state, next_attempt) = if exhausted {
+            ("dead-letter", None)
+        } else {
+            ("failed", Some(next_attempt_at_ms))
+        };
+        transaction.execute(
+            "UPDATE memory_sync SET
+                sync_state=?4,attempts=?5,next_attempt_at_ms=?6,
+                last_error_category=?7,updated_at_ms=?8
+             WHERE slug=?1 AND endpoint=?2 AND vault=?3",
+            params![
+                slug,
+                endpoint,
+                vault,
+                state,
+                attempts,
+                next_attempt,
+                category,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        self.get_memory_sync(slug, endpoint, vault)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Resets a memory-sync row to `pending` so a subsequent sync attempt is eligible, clearing
+    /// backoff. With `force`, a `dead-letter` row is revived and its attempt count reset.
+    pub fn reset_memory_sync_for_retry(
+        &mut self,
+        slug: &str,
+        endpoint: &str,
+        vault: &str,
+        force: bool,
+    ) -> Result<Option<MemorySyncRecord>, StateError> {
+        let Some(current) = self.get_memory_sync(slug, endpoint, vault)? else {
+            return Ok(None);
+        };
+        if current.sync_state == "dead-letter" && !force {
+            return Ok(Some(current));
+        }
+        let now = now_ms();
+        let reset_attempts = force || current.sync_state == "dead-letter";
+        self.connection.execute(
+            "UPDATE memory_sync SET
+                sync_state='pending',next_attempt_at_ms=NULL,
+                attempts=CASE WHEN ?4 THEN 0 ELSE attempts END,updated_at_ms=?5
+             WHERE slug=?1 AND endpoint=?2 AND vault=?3",
+            params![slug, endpoint, vault, reset_attempts, now],
+        )?;
+        self.get_memory_sync(slug, endpoint, vault)
     }
 
     /// Ensures a `pending` archive-upload row exists for one session and server, returning the
@@ -1974,6 +2236,24 @@ fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord
         next_attempt_at_ms: row.get(12)?,
         last_error_category: row.get(13)?,
         updated_at_ms: row.get(14)?,
+    })
+}
+
+fn memory_sync_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySyncRecord> {
+    Ok(MemorySyncRecord {
+        slug: row.get(0)?,
+        endpoint: row.get(1)?,
+        vault: row.get(2)?,
+        machine: row.get(3)?,
+        manifest_hash: row.get(4)?,
+        synced_revision: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
+        file_count: row.get::<_, i64>(6)?.try_into().unwrap_or_default(),
+        history_commit: row.get(7)?,
+        sync_state: row.get(8)?,
+        attempts: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+        next_attempt_at_ms: row.get(10)?,
+        last_error_category: row.get(11)?,
+        updated_at_ms: row.get(12)?,
     })
 }
 

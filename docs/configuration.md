@@ -134,6 +134,31 @@ independent of summary delivery (ADR 0009).
 | `client_id` | The persistent client UUID Munshi registers and uploads under. Minted once by `archive-upload configure`, reused verbatim, and durable across operational-database rebuilds (ADR 0004) — which is why it lives here rather than in SQLite. |
 | `max_attempts` | Bounded upload attempts before a session's upload is parked as a dead letter (`5`). |
 
+## `memory_sync` — opt-in mirroring of harness auto-memory (issue #59)
+
+Owned by the `munshi memory-sync` commands (`configure`, `enable`, `disable`, `status`, `run`).
+Mirrors each registered harness's auto-memory directories (`<claude_home>/projects/<slug>/memory/`)
+into a Notesmith *document* vault — never the fact-memory vault — with the vault's per-vault Git
+history as the snapshot mechanism (the issue #9 machinery; history is required, so an absent
+capability blocks rather than degrades). Files are mirrored verbatim; identity and correlation ride
+in a per-directory `<machine>/<slug>.manifest.md` note and the correlated commit message
+`munshi memory <machine>:<slug> revision <n>`. Collection is read-only, change detection is a
+per-file sha256 manifest (an unchanged directory never contacts the sink), and the whole path is
+strictly downstream of archival (ADR 0006): triggered after each archive and drained by
+`munshi tick`, with bounded retries into a dead letter.
+
+| Setting | Meaning |
+| --- | --- |
+| `enabled` | Whether memory directories are mirrored after archival and from the tick. Opt-in; `false` by default. Enabling requires endpoint + vault + machine label. |
+| `endpoint` | Base URL of the Notesmith daemon, e.g. `http://127.0.0.1:27183`. |
+| `vault` | Target Notesmith vault name (a document vault). |
+| `folder` | Optional vault-relative folder the per-machine memory trees are filed under; routes are `[folder/]<machine>/<slug>/<file>`. |
+| `credential` | Where the bearer credential is read from at sync time; same shape as `summary_delivery.credential`. Never the secret itself. |
+| `max_attempts` | Bounded sync attempts before a memory directory is parked as a dead letter (`5`). Revive with `memory-sync run --force`. |
+| `machine_label` | The one canonical machine label mirrored paths are routed under. Chosen at configure time (`--machine`, else the sanitized hostname) and persisted — never re-derived per run, so one physical machine can never appear as two. |
+| `machine_id` | The `archive_upload.client_id` captured at configure time when that section is configured, carried in the manifest so the memory mirror and the Patwari archive correlate without name matching. |
+| `provision_history` | `true` lets Munshi explicitly configure the vault's revision-history capability when absent instead of only verifying it (`false` by default). |
+
 ## `harnesses` — registered hook installations
 
 Recorded by `munshi register` so `unregister`, `doctor`, and recovery know which harness homes this

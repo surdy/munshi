@@ -111,10 +111,11 @@ fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
     let config_path = paths.state.join("config.json");
 
     // Downgrade the freshly written v2 config to the exact v1 on-disk shape. Sections added after
-    // version 2 was current (`summarizer_exhaust`, issue #60) are dropped: no real v1 file has
-    // them, and the v1 shape rejects keys it does not know.
+    // version 2 was current (`summarizer_exhaust`, issue #60; `memory_sync`, issue #59) are
+    // dropped: no real v1 file has them, and the v1 shape rejects keys it does not know.
     let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     config.as_object_mut().unwrap().remove("summarizer_exhaust");
+    config.as_object_mut().unwrap().remove("memory_sync");
     let mut delivery = config
         .as_object_mut()
         .unwrap()
@@ -168,6 +169,9 @@ fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
     // A migrated configuration never gains retention it did not ask for (issue #60).
     assert_eq!(migrated["summarizer_exhaust"]["home"], Value::Null);
     assert_eq!(migrated["summarizer_exhaust"]["retention_days"], 0);
+    // Nor memory sync (issue #59): migrated configurations stay opted out.
+    assert_eq!(migrated["memory_sync"]["enabled"], false);
+    assert_eq!(migrated["memory_sync"]["machine_label"], Value::Null);
 
     // A v2 config round-trips: a second load rewrites nothing.
     let bytes_before = fs::read(&config_path).unwrap();
@@ -186,6 +190,7 @@ fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
     fs::write(&config_path, {
         let mut value = migrated.clone();
         value.as_object_mut().unwrap().remove("summarizer_exhaust");
+        value.as_object_mut().unwrap().remove("memory_sync");
         let mut delivery = value
             .as_object_mut()
             .unwrap()

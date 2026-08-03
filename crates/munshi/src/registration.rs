@@ -172,6 +172,88 @@ pub(crate) struct StoredConfig {
     /// behave exactly as they did.
     #[serde(default)]
     pub summarizer_exhaust: StoredSummarizerExhaust,
+    /// Opt-in mirroring of harness auto-memory directories into a Notesmith vault (issue #59).
+    /// Additive with a serde default (no config version bump); disabled by default.
+    #[serde(default)]
+    pub memory_sync: StoredMemorySync,
+}
+
+/// The Munshi-owned harness-memory mirroring configuration (issue #59). Like `summary_delivery`
+/// it is self-contained (its own endpoint, vault, credential source, and attempt bound) and never
+/// stores the credential itself. Two fields are chosen once at configure time and then treated as
+/// canonical rather than re-derived per run: `machine_label`, because deriving a machine name from
+/// whatever API answers on a given day is how one physical machine ends up mirrored as two, and
+/// `machine_id`, the `archive_upload` client UUID captured when that section is configured so the
+/// mirror and the transcript archive correlate to the same machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredMemorySync {
+    /// Whether harness memory directories are mirrored after archival and from the tick. Opt-in;
+    /// disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the Notesmith daemon, for example `http://127.0.0.1:27183`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Target Notesmith vault name. Deliberately a document vault, never Notesmith's fact-memory
+    /// vault: these are harness-owned working files Munshi overwrites wholesale, not curated
+    /// atomic claims.
+    #[serde(default)]
+    pub vault: Option<String>,
+    /// Optional vault-relative folder the machine trees are filed under.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Where the bearer credential is read from, or `None` for an unauthenticated local daemon.
+    #[serde(default)]
+    pub credential: Option<StoredCredential>,
+    /// Bounded number of sync attempts per memory directory before it parks as a dead letter.
+    #[serde(default = "default_max_delivery_attempts")]
+    pub max_attempts: u32,
+    /// The canonical machine label all mirrored paths are routed under. Chosen and persisted at
+    /// configure time; never re-derived per run.
+    #[serde(default)]
+    pub machine_label: Option<String>,
+    /// The `archive_upload` client UUID at configure time, when that section was configured.
+    /// Carried in the mirrored manifest so the memory mirror and the Patwari archive of the same
+    /// machine correlate without name matching.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// Whether Munshi should explicitly configure the vault's revision-history capability when
+    /// absent (`true`) or only verify it (`false`, the default). History is required here —
+    /// snapshots are half the feature — so an absent capability blocks, never degrades.
+    #[serde(default)]
+    pub provision_history: bool,
+}
+
+impl Default for StoredMemorySync {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            vault: None,
+            folder: None,
+            credential: None,
+            max_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
+            machine_label: None,
+            machine_id: None,
+            provision_history: false,
+        }
+    }
+}
+
+impl StoredMemorySync {
+    /// A mirror target is fully addressable only when the endpoint, the vault, and the canonical
+    /// machine label are all present.
+    pub(crate) fn is_addressable(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && self.vault.as_deref().is_some_and(|value| !value.is_empty())
+            && self
+                .machine_label
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+    }
 }
 
 /// Where the summarizer's isolated home lives and how long its byproduct is kept.
@@ -366,6 +448,7 @@ impl From<StoredConfigV1> for StoredConfig {
             archive_upload: previous.archive_upload,
             harnesses: previous.harnesses,
             summarizer_exhaust: StoredSummarizerExhaust::default(),
+            memory_sync: StoredMemorySync::default(),
         }
     }
 }
@@ -741,16 +824,18 @@ impl StoredConfig {
         // UUID must survive because it is the durable identity uploads are keyed under
         // (ADR 0004/0009). Each carried section is self-contained (enablement lives inside it), so
         // nothing else needs to travel with it.
-        let (disabled_projects, summary_delivery, archive_upload) = match existing {
+        let (disabled_projects, summary_delivery, archive_upload, memory_sync) = match existing {
             Some(previous) => (
                 previous.policy.disabled_projects,
                 previous.summary_delivery,
                 previous.archive_upload,
+                previous.memory_sync,
             ),
             None => (
                 Vec::new(),
                 StoredSummaryDelivery::default(),
                 StoredArchiveUpload::default(),
+                StoredMemorySync::default(),
             ),
         };
         Ok(Self {
@@ -787,6 +872,7 @@ impl StoredConfig {
             },
             summary_delivery,
             archive_upload,
+            memory_sync,
             policy: StoredPolicy {
                 max_calls_per_hour: config.max_calls_per_hour,
                 max_calls_per_day: config.max_calls_per_day,
@@ -913,6 +999,7 @@ pub(crate) fn load_stored_config(
         || config.policy.max_concurrency < 1
         || (config.summary_delivery.enabled && !config.summary_delivery.is_addressable())
         || (config.archive_upload.enabled && !config.archive_upload.is_addressable())
+        || (config.memory_sync.enabled && !config.memory_sync.is_addressable())
         || Path::new(&config.state_directory) != state_directory
         || !config.harnesses.paths_are_absolute()
         || !config.summarizer_exhaust.path_is_absolute()
