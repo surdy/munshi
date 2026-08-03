@@ -180,11 +180,33 @@ pub fn handle_hook(event: HookEvent, source: SourceKind, state_directory: &Path,
     let _ = spawn_recovery_sweep(state_directory);
 }
 
+/// The privacy context an archive worker (and the recovery sweep that spawns it) runs in
+/// (issue #61). macOS TCC attributes a protected-folder access to the responsible process:
+/// for anything descended from the user's terminal that is the terminal (already granted),
+/// but for a scheduler-launched `munshi tick` it is munshi itself, so touching a session's
+/// origin directory from that context raises a permission prompt — re-raised on every
+/// rebuild while the binary is ad-hoc signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerContext {
+    /// Descended from a user-attributed process (harness hooks, `munshi retry`, `munshi
+    /// recover`): live project inspection of the origin directory is allowed.
+    Interactive,
+    /// Descended from a platform scheduler (`munshi tick`): the worker must not touch the
+    /// origin directory — not even to check that it exists. A session whose project identity
+    /// is not already recorded is deferred to the next interactive sweep instead.
+    Background,
+}
+
 pub fn run_archive_worker(
     state_directory: &Path,
     session_id: &str,
 ) -> Result<HookResult, HookWorkerError> {
-    run_archive_worker_for_source(state_directory, SourceKind::Copilot, session_id)
+    run_archive_worker_for_source(
+        state_directory,
+        SourceKind::Copilot,
+        session_id,
+        WorkerContext::Interactive,
+    )
 }
 
 /// Run the shared archive worker for a specific capturing harness.
@@ -197,8 +219,9 @@ pub fn run_archive_worker_for_source(
     state_directory: &Path,
     source: SourceKind,
     session_id: &str,
+    context: WorkerContext,
 ) -> Result<HookResult, HookWorkerError> {
-    let result = run_archive_worker_inner(state_directory, source, session_id);
+    let result = run_archive_worker_inner(state_directory, source, session_id, context);
     if let Err(error) = &result {
         if let Ok(mut state) = StateStore::open_for_source(state_directory, source) {
             let category = worker_error_code(error);
@@ -213,6 +236,7 @@ fn run_archive_worker_inner(
     state_directory: &Path,
     source: SourceKind,
     session_id: &str,
+    context: WorkerContext,
 ) -> Result<HookResult, HookWorkerError> {
     validate_session_id(session_id).map_err(|_| StateError::InvalidState)?;
     let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
@@ -247,7 +271,7 @@ fn run_archive_worker_inner(
         state.abandon_processing(session_id, "worker-interrupted")?;
     }
     lift_stale_source_limit_park(&mut state, &stored, session_id)?;
-    if let Some(result) = policy_gate(&mut state, &stored, session_id)? {
+    if let Some(result) = policy_gate(&mut state, &stored, session_id, context)? {
         return Ok(result);
     }
 
@@ -264,7 +288,14 @@ fn run_archive_worker_inner(
             }
             ClaimOutcome::Claimed(claim) => claim,
         };
-    match process_claim(&mut state, state_directory, source, &stored, &claim) {
+    match process_claim(
+        &mut state,
+        state_directory,
+        source,
+        &stored,
+        &claim,
+        context,
+    ) {
         Ok(result) => Ok(result),
         Err(error @ (HookWorkerError::PostPersist(_) | HookWorkerError::PostPersistWrite(_))) => {
             Err(error)
@@ -310,6 +341,7 @@ pub fn tick_recovery_sweep(state_directory: &Path) -> Result<bool, HookWorkerErr
         Duration::from_millis(DEFAULT_RECOVERY_STALE_MS),
         false,
         false,
+        WorkerContext::Background,
     ) {
         Ok(()) => Ok(true),
         Err(HookWorkerError::State(StateError::LockBusy)) => Ok(false),
@@ -322,6 +354,7 @@ pub fn run_recovery(
     stale_after: Duration,
     force_retry: bool,
     rebuild: bool,
+    context: WorkerContext,
 ) -> Result<(), HookWorkerError> {
     let recovery_deadline = Instant::now() + Duration::from_secs(1);
     let _recovery_lock = loop {
@@ -583,7 +616,7 @@ pub fn run_recovery(
     let mut seen = BTreeSet::new();
     reserved_sessions.retain(|entry| seen.insert(entry.clone()));
     for (source, session_id) in reserved_sessions {
-        if spawn_worker(state_directory, source, &session_id).is_err() {
+        if spawn_worker(state_directory, source, &session_id, context).is_err() {
             let store = recovery_store(&mut state, &mut source_stores, state_directory, source)?;
             let _ = store.clear_worker_reservation(&session_id);
             let _ =
@@ -778,7 +811,14 @@ fn handle_session_end(state_directory: &Path, input: impl Read) -> Result<(), Ho
                 Some(payload.session_id.clone()),
             )
         })?;
-    if reserved && spawn_worker(state_directory, SourceKind::Copilot, &payload.session_id).is_err()
+    if reserved
+        && spawn_worker(
+            state_directory,
+            SourceKind::Copilot,
+            &payload.session_id,
+            WorkerContext::Interactive,
+        )
+        .is_err()
     {
         let _ = state.clear_worker_reservation(&payload.session_id);
         return Err(failure(
@@ -895,7 +935,13 @@ fn handle_claude_session_end(state_directory: &Path, input: impl Read) -> Result
             )
         })?;
     if reserved
-        && spawn_worker(state_directory, SourceKind::ClaudeCode, &payload.session_id).is_err()
+        && spawn_worker(
+            state_directory,
+            SourceKind::ClaudeCode,
+            &payload.session_id,
+            WorkerContext::Interactive,
+        )
+        .is_err()
     {
         let _ = state.clear_worker_reservation(&payload.session_id);
         return Err(failure(
@@ -913,6 +959,7 @@ fn process_claim(
     source: SourceKind,
     stored: &crate::registration::StoredConfig,
     claim: &Claim,
+    context: WorkerContext,
 ) -> Result<HookResult, HookWorkerError> {
     let transcript_path = claim
         .session
@@ -1033,6 +1080,15 @@ fn process_claim(
 
     let project = match claim.session.project.clone() {
         Some(project) if !project.component.is_empty() => project,
+        // A background worker must not inspect the origin directory (issue #61) — even a
+        // stat of a TCC-protected folder raises the permission prompt this context exists
+        // to avoid. Deferring (not failing) leaves the session eligible for the next
+        // interactive sweep, which derives the full live identity; settling for the
+        // recorded-evidence identity here would archive remote-backed projects under the
+        // remote-less `local:` identity forever.
+        _ if context == WorkerContext::Background => {
+            return Err(HookWorkerError::Deferred("project-inspection-deferred"));
+        }
         _ => {
             let origin_cwd = claim
                 .session
@@ -1578,11 +1634,19 @@ fn recorded_project_fallback(source: SourceKind, events_path: &Path) -> Option<P
 
 /// Determines a session's project identity, preferring the cached identity from a prior
 /// successful summary and falling back to inspecting the session's recorded origin directory.
-fn resolve_session_project(session: &SessionRecord) -> Option<ProjectIdentity> {
+/// A background worker never inspects (issue #61): it answers `None` and lets the claim path
+/// defer the session instead of touching a possibly TCC-protected origin.
+fn resolve_session_project(
+    session: &SessionRecord,
+    context: WorkerContext,
+) -> Option<ProjectIdentity> {
     if let Some(project) = session.project.clone() {
         if !project.component.is_empty() {
             return Some(project);
         }
+    }
+    if context == WorkerContext::Background {
+        return None;
     }
     session
         .origin_cwd
@@ -1598,6 +1662,7 @@ fn policy_gate(
     state: &mut StateStore,
     stored: &crate::registration::StoredConfig,
     session_id: &str,
+    context: WorkerContext,
 ) -> Result<Option<HookResult>, HookWorkerError> {
     // Concurrency is intentionally not checked here: it is enforced atomically inside
     // `claim_session`'s own `BEGIN IMMEDIATE` transaction, so the count it decides on and the
@@ -1607,7 +1672,7 @@ fn policy_gate(
     let Some(session) = state.get_session(session_id)? else {
         return Ok(None);
     };
-    let Some(project) = resolve_session_project(&session) else {
+    let Some(project) = resolve_session_project(&session, context) else {
         return Ok(None);
     };
     let policy = resolve_policy(
@@ -1883,18 +1948,28 @@ fn source_is_stale_and_supported(
     modified_ms <= cutoff_ms && validate_transcript_envelope(source, path, max_source_bytes).is_ok()
 }
 
-fn spawn_worker(state_directory: &Path, source: SourceKind, session_id: &str) -> io::Result<()> {
+fn spawn_worker(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+    context: WorkerContext,
+) -> io::Result<()> {
     let executable = std::env::current_exe()?;
-    spawn_detached(
-        Command::new(executable)
-            .arg("hook-worker")
-            .arg("--state-dir")
-            .arg(state_directory)
-            .arg("--source")
-            .arg(source.as_selector())
-            .arg("--session-id")
-            .arg(session_id),
-    )
+    let mut command = Command::new(executable);
+    command
+        .arg("hook-worker")
+        .arg("--state-dir")
+        .arg(state_directory)
+        .arg("--source")
+        .arg(source.as_selector())
+        .arg("--session-id")
+        .arg(session_id);
+    // The detached worker is its own TCC responsible process; the flag carries the
+    // scheduler-descended context across the process boundary (issue #61).
+    if context == WorkerContext::Background {
+        command.arg("--background");
+    }
+    spawn_detached(&mut command)
 }
 
 fn spawn_recovery_sweep(state_directory: &Path) -> io::Result<()> {

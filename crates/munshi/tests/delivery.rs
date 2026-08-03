@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use munshi::{CompletionReason, SourceKind, StateStore, run_archive_worker_for_source};
+use munshi::{
+    CompletionReason, SourceKind, StateStore, WorkerContext, run_archive_worker_for_source,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -1843,7 +1845,13 @@ impl Harness {
                 )
                 .unwrap();
         }
-        run_archive_worker_for_source(&self.state, SourceKind::ClaudeCode, session_id).unwrap();
+        run_archive_worker_for_source(
+            &self.state,
+            SourceKind::ClaudeCode,
+            session_id,
+            WorkerContext::Interactive,
+        )
+        .unwrap();
         // Confirm the Claude session archived locally regardless of any delivery outcome.
         let store = StateStore::open_for_source(&self.state, SourceKind::ClaudeCode).unwrap();
         let record = store.get_session(session_id).unwrap().unwrap();
