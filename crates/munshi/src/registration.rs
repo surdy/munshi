@@ -12,6 +12,7 @@ use tempfile::Builder;
 use thiserror::Error;
 
 use crate::archive_git::{ArchiveGitError, ensure_archive_repository};
+use crate::exhaust::{ExhaustPolicy, conflicting_source_home, default_copilot_home};
 use crate::policy::{GlobalPolicy, ResolvedPolicy, resolve_policy};
 use crate::project::{ProjectIdentityError, inspect_project};
 use crate::source::SourceHomes;
@@ -33,6 +34,10 @@ const DEFAULT_MAX_CONCURRENCY: usize = 2;
 pub(crate) const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 5;
 /// Bounded archive-upload attempts before a session's upload is parked as a dead letter.
 pub(crate) const DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS: u32 = 5;
+/// Retention window applied to the isolated summarizer home when one is configured (issue #60).
+/// A week outlives any troubleshooting window for a summarization that already succeeded, and the
+/// exhaust it protects is a third copy of content already in the archive and in Patwari.
+pub const DEFAULT_SUMMARIZER_EXHAUST_RETENTION_DAYS: u32 = 7;
 
 pub const DISCLOSURE: &str = "\
 IMPORTANT: MUNSHI TRANSCRIPT PROCESSING DISCLOSURE
@@ -81,6 +86,13 @@ pub struct RegisterConfig {
     pub max_calls_per_hour: u32,
     pub max_calls_per_day: u32,
     pub max_concurrency: usize,
+    /// Isolated summarizer home whose Copilot exhaust `munshi tick` prunes (issue #60), or `None`
+    /// to keep everything. Refused when it overlaps a harness home this registration captures
+    /// from, or the default `~/.copilot`.
+    pub summarizer_exhaust_home: Option<PathBuf>,
+    /// Age above which the exhaust home's `session-state/` entries are deleted. `0` keeps
+    /// everything, as does an absent `summarizer_exhaust_home`.
+    pub summarizer_exhaust_retention_days: u32,
     pub executable: PathBuf,
 }
 
@@ -106,6 +118,11 @@ pub enum RegistrationError {
     NoninteractiveAcceptanceRequired,
     #[error("registration paths and executables must be absolute")]
     RelativePath,
+    #[error(
+        "summarizer exhaust home {home} overlaps the harness home {registered}; \
+         retention never deletes inside a captured harness home"
+    )]
+    SummarizerExhaustOverlap { home: PathBuf, registered: PathBuf },
     #[error("refusing an unsafe symlink, file type, or ownership at {0}")]
     UnsafePath(PathBuf),
     #[error("the existing Munshi-owned file is malformed or was not created by this version")]
@@ -150,6 +167,44 @@ pub(crate) struct StoredConfig {
     /// harness-neutral (ADR 0008); each recorded home locates that harness's hook installation.
     #[serde(default)]
     pub harnesses: StoredHarnesses,
+    /// Retention for the isolated summarizer home's exhaust (issue #60). Defaulted to the
+    /// keep-everything shape, so configurations written before this feature load unchanged and
+    /// behave exactly as they did.
+    #[serde(default)]
+    pub summarizer_exhaust: StoredSummarizerExhaust,
+}
+
+/// Where the summarizer's isolated home lives and how long its byproduct is kept.
+///
+/// Munshi has no other record of that home: the isolation lives inside the summarizer wrapper
+/// (`contrib/copilot-summarizer.sh` sets `COPILOT_HOME`), which Munshi treats as an opaque
+/// executable. Naming it here is what makes retention possible at all — and the reason the
+/// overlap guard exists, since nothing else proves the named path is not a captured harness home.
+///
+/// Registration-owned like `summarizer.executable`/`args`: each `munshi register` rewrites this
+/// section from its flags, so omitting the flags turns retention off again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredSummarizerExhaust {
+    /// Absolute path of the isolated summarizer home, or absent for no retention at all.
+    #[serde(default)]
+    pub home: Option<String>,
+    /// Age in whole days above which a `session-state/` entry is deleted. `0` keeps everything.
+    #[serde(default)]
+    pub retention_days: u32,
+}
+
+impl StoredSummarizerExhaust {
+    /// The active retention policy, or `None` when this configuration keeps everything.
+    pub(crate) fn policy(&self) -> Option<ExhaustPolicy> {
+        ExhaustPolicy::new(self.home.as_deref(), self.retention_days)
+    }
+
+    fn path_is_absolute(&self) -> bool {
+        self.home
+            .as_deref()
+            .is_none_or(|home| Path::new(home).is_absolute())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +365,7 @@ impl From<StoredConfigV1> for StoredConfig {
             policy: previous.policy,
             archive_upload: previous.archive_upload,
             harnesses: previous.harnesses,
+            summarizer_exhaust: StoredSummarizerExhaust::default(),
         }
     }
 }
@@ -539,6 +595,7 @@ pub fn register(config: &RegisterConfig) -> Result<(), RegistrationError> {
     if !config.harnesses_selected() {
         return Err(RegistrationError::NoHarnessSelected);
     }
+    validate_summarizer_exhaust_home(config)?;
     let state_directory = ensure_directory(&config.state_directory)?;
     let locks_directory = ensure_child_directory(&state_directory, "locks")?;
     let config_path = state_directory.join(CONFIG_FILE_NAME);
@@ -748,6 +805,14 @@ impl StoredConfig {
                     .map(|target| utf8(&target.home))
                     .transpose()?,
             },
+            summarizer_exhaust: StoredSummarizerExhaust {
+                home: config
+                    .summarizer_exhaust_home
+                    .as_deref()
+                    .map(utf8)
+                    .transpose()?,
+                retention_days: config.summarizer_exhaust_retention_days,
+            },
         })
     }
 }
@@ -850,6 +915,7 @@ pub(crate) fn load_stored_config(
         || (config.archive_upload.enabled && !config.archive_upload.is_addressable())
         || Path::new(&config.state_directory) != state_directory
         || !config.harnesses.paths_are_absolute()
+        || !config.summarizer_exhaust.path_is_absolute()
     {
         return Err(RegistrationError::MalformedOwnedFile);
     }
@@ -1226,6 +1292,9 @@ fn validate_absolute_paths(config: &RegisterConfig) -> Result<(), RegistrationEr
     if let Some(claude) = &config.claude {
         paths.push(&claude.home);
     }
+    if let Some(exhaust) = &config.summarizer_exhaust_home {
+        paths.push(exhaust);
+    }
     for path in paths {
         if !path.is_absolute() {
             return Err(RegistrationError::RelativePath);
@@ -1235,6 +1304,27 @@ fn validate_absolute_paths(config: &RegisterConfig) -> Result<(), RegistrationEr
         validate_regular_file(executable)?;
     }
     Ok(())
+}
+
+/// Refuses a summarizer exhaust home that overlaps a harness home this registration captures from,
+/// or the default `~/.copilot`. Checked before anything is written, so a rejected registration
+/// leaves no configuration behind — and so the misconfiguration is reported once, at the moment it
+/// is made, rather than only by `munshi doctor` after retention has silently never run.
+fn validate_summarizer_exhaust_home(config: &RegisterConfig) -> Result<(), RegistrationError> {
+    let Some(home) = config.summarizer_exhaust_home.as_deref() else {
+        return Ok(());
+    };
+    let sources = SourceHomes {
+        copilot_home: config.copilot.as_ref().map(|target| target.home.clone()),
+        claude_home: config.claude.as_ref().map(|target| target.home.clone()),
+    };
+    match conflicting_source_home(home, &sources, default_copilot_home().as_deref()) {
+        Some(registered) => Err(RegistrationError::SummarizerExhaustOverlap {
+            home: home.to_path_buf(),
+            registered,
+        }),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn utf8(path: &Path) -> Result<String, RegistrationError> {

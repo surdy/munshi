@@ -110,8 +110,11 @@ fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
     assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
     let config_path = paths.state.join("config.json");
 
-    // Downgrade the freshly written v2 config to the exact v1 on-disk shape.
+    // Downgrade the freshly written v2 config to the exact v1 on-disk shape. Sections added after
+    // version 2 was current (`summarizer_exhaust`, issue #60) are dropped: no real v1 file has
+    // them, and the v1 shape rejects keys it does not know.
     let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("summarizer_exhaust");
     let mut delivery = config
         .as_object_mut()
         .unwrap()
@@ -162,6 +165,9 @@ fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
     assert_eq!(section["credential"]["var"], "MUNSHI_TOKEN");
     assert_eq!(section["max_attempts"], 7);
     assert_eq!(section["provision_history"], true);
+    // A migrated configuration never gains retention it did not ask for (issue #60).
+    assert_eq!(migrated["summarizer_exhaust"]["home"], Value::Null);
+    assert_eq!(migrated["summarizer_exhaust"]["retention_days"], 0);
 
     // A v2 config round-trips: a second load rewrites nothing.
     let bytes_before = fs::read(&config_path).unwrap();
@@ -179,6 +185,7 @@ fn v1_config_migrates_losslessly_to_v2_and_round_trips() {
     // Re-registering over a v1 config also carries the section forward into the v2 shape.
     fs::write(&config_path, {
         let mut value = migrated.clone();
+        value.as_object_mut().unwrap().remove("summarizer_exhaust");
         let mut delivery = value
             .as_object_mut()
             .unwrap()

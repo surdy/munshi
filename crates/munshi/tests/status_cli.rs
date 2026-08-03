@@ -1,9 +1,10 @@
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, FileTimes};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -54,6 +55,212 @@ fn tick_is_silent_when_unregistered_and_when_registered_with_nothing_to_do() {
         human.stdout.is_empty(),
         "idle tick must print nothing: {}",
         String::from_utf8_lossy(&human.stdout)
+    );
+}
+
+#[test]
+fn tick_prunes_the_configured_exhaust_and_leaves_an_unconfigured_home_untouched() {
+    let harness = Harness::new();
+    let home = harness.root().join("copilot-summarizer");
+    let old = exhaust_entry(&home, "old", 30);
+    let fresh = exhaust_entry(&home, "fresh", 1);
+    exhaust_store(&home);
+
+    // Registered without the retention flags, the home is not Munshi's business at all: the tick
+    // reports the feature off and deletes nothing (issue #60's keep-everything default).
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+    let unconfigured = harness.tick_json();
+    assert_eq!(unconfigured["exhaust"], "off");
+    assert_eq!(unconfigured["exhaust_pruned_dirs"], 0);
+    assert_eq!(unconfigured["exhaust_reason"], Value::Null);
+    assert!(old.is_dir(), "an unconfigured home is never touched");
+    assert!(harness.tick_human().is_empty());
+
+    // Configured: the aged entry goes, the fresh one stays, and a surviving entry keeps the
+    // monolithic session store alive.
+    assert_success(&harness.register_with_exhaust(fake("status-contract.sh"), &home, 7));
+    let swept = harness.tick_json();
+    assert_eq!(swept["exhaust"], "swept");
+    assert_eq!(swept["exhaust_pruned_dirs"], 1);
+    assert_eq!(swept["exhaust_remaining_dirs"], 1);
+    assert_eq!(swept["exhaust_reclaimed_bytes"], 128);
+    assert_eq!(swept["exhaust_store_removed"], false);
+    assert!(!old.exists(), "an entry past the window is deleted");
+    assert!(fresh.is_dir(), "an entry inside the window survives");
+    assert!(home.join("session-store.db").is_file());
+
+    // A pass with nothing to prune keeps the tick's silence; a pass that prunes says one line.
+    assert!(harness.tick_human().is_empty());
+    exhaust_entry(&home, "older", 45);
+    let printed = harness.tick_human();
+    assert_eq!(
+        printed.trim(),
+        "tick: summarizer-exhaust pruned dirs=1 bytes=128",
+        "a pruning tick reports directories and bytes on one line"
+    );
+
+    // Once the last entry is gone the store follows it, counted into the same byte total.
+    fs::remove_dir_all(&fresh).unwrap();
+    let drained = harness.tick_json();
+    assert_eq!(drained["exhaust_pruned_dirs"], 0);
+    assert_eq!(drained["exhaust_remaining_dirs"], 0);
+    assert_eq!(drained["exhaust_store_removed"], true);
+    assert_eq!(drained["exhaust_reclaimed_bytes"], 3 * 64);
+    for name in [
+        "session-store.db",
+        "session-store.db-wal",
+        "session-store.db-shm",
+    ] {
+        assert!(
+            !home.join(name).exists(),
+            "{name} is removed with the store"
+        );
+    }
+}
+
+#[test]
+fn a_live_summarization_claim_skips_the_whole_retention_pass() {
+    let harness = Harness::new();
+    let home = harness.root().join("copilot-summarizer");
+    let old = exhaust_entry(&home, "old", 30);
+    exhaust_store(&home);
+    assert_success(&harness.register_with_exhaust(fake("status-contract.sh"), &home, 7));
+
+    let session = "6f1c0d38-6a2e-4a1f-9f0a-1b2c3d4e5f60";
+    let events = harness.write_transcript(session, "CLAIM_REQUEST", "claim");
+    harness.complete_lifecycle(session, &events, 20_000, 20_001);
+    assert_success(&harness.wait(session, 5_000));
+    harness.claim_processing(session);
+
+    // Skipping is quiet: the summarizer's own exhaust is not evidence of a stuck machine, and
+    // the next tick tries again.
+    let busy = harness.tick_json();
+    assert_eq!(busy["exhaust"], "busy");
+    assert_eq!(busy["exhaust_pruned_dirs"], 0);
+    assert_eq!(busy["exhaust_reason"], Value::Null);
+    assert!(old.is_dir(), "nothing is deleted while a claim is live");
+    assert!(home.join("session-store.db").is_file());
+    assert!(
+        !harness.tick_human().contains("summarizer-exhaust"),
+        "a skipped pass logs nothing"
+    );
+}
+
+#[test]
+fn an_exhaust_home_overlapping_a_captured_harness_home_is_refused() {
+    let harness = Harness::new();
+
+    // Registration refuses the overlap outright and writes nothing.
+    let refused = harness.register_with_exhaust(
+        fake("status-contract.sh"),
+        &harness.copilot_home.join("session-state"),
+        7,
+    );
+    assert!(
+        !refused.status.success(),
+        "an exhaust home inside a captured harness home must be refused"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        message.contains("overlaps"),
+        "the refusal names the conflict: {message}"
+    );
+    assert!(
+        !harness.state.join("config.json").exists(),
+        "a refused registration leaves no configuration behind"
+    );
+
+    // A hand-edited configuration reaches doctor and the tick, which refuse it just as loudly.
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+    let captured = harness.copilot_home.display().to_string();
+    harness.mutate_config(|config| {
+        config["summarizer_exhaust"] = json!({ "home": captured, "retention_days": 7 });
+    });
+    exhaust_entry(&harness.copilot_home, "sacred", 400);
+
+    let doctor = harness.doctor_json();
+    assert_eq!(doctor["status"], "error");
+    let check = find_check(&doctor, "summarizer-exhaust-home");
+    assert_eq!(check["status"], "error");
+    assert!(
+        check["message"].as_str().unwrap().contains("overlaps"),
+        "doctor names the path conflict: {check}"
+    );
+    assert!(
+        doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["code"] != "summarizer-exhaust-size"),
+        "a refused home is never measured"
+    );
+
+    let tick = harness.tick_json();
+    assert_eq!(tick["exhaust"], "conflict");
+    assert_eq!(tick["exhaust_pruned_dirs"], 0);
+    assert!(
+        tick["exhaust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps"),
+        "the tick contract carries the refusal reason"
+    );
+    assert!(
+        harness
+            .tick_human()
+            .contains("summarizer-exhaust retention refused"),
+        "a conflicting home is never a silent skip"
+    );
+    assert!(
+        harness.copilot_home.join("session-state/sacred").is_dir(),
+        "nothing inside a captured harness home is ever deleted"
+    );
+}
+
+#[test]
+fn doctor_reports_exhaust_home_size_only_when_retention_is_configured() {
+    let harness = Harness::new();
+    let home = harness.root().join("copilot-summarizer");
+    exhaust_entry(&home, "recent", 1);
+
+    // Unconfigured: retention is not a finding, so neither check appears.
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+    let silent = harness.doctor_json();
+    for code in ["summarizer-exhaust-home", "summarizer-exhaust-size"] {
+        assert!(
+            silent["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|check| check["code"] != code),
+            "{code} must be absent when retention is off"
+        );
+    }
+
+    // Configured and small: an informational size line, no warning.
+    assert_success(&harness.register_with_exhaust(fake("status-contract.sh"), &home, 7));
+    let healthy = harness.doctor_json();
+    assert_eq!(
+        find_check(&healthy, "summarizer-exhaust-home")["status"],
+        "ok"
+    );
+    assert_eq!(
+        find_check(&healthy, "summarizer-exhaust-size")["status"],
+        "ok"
+    );
+
+    // Past the threshold it warns. The fixture is sparse: apparent size is what doctor reads.
+    let store = home.join("session-store.db");
+    fs::File::create(&store)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024 + 1)
+        .unwrap();
+    let grown = harness.doctor_json();
+    let size = find_check(&grown, "summarizer-exhaust-size");
+    assert_eq!(size["status"], "warning");
+    assert!(
+        size["message"].as_str().unwrap().contains("GiB"),
+        "the warning reports the measured size: {size}"
     );
 }
 
@@ -803,6 +1010,30 @@ impl Harness {
         timeout_ms: u64,
         archive_git_history: bool,
     ) -> Output {
+        let mut command = self.register_command(summarizer, timeout_ms);
+        if archive_git_history {
+            command.arg("--archive-git-history");
+        }
+        command.output().unwrap()
+    }
+
+    /// Registers with summarizer-exhaust retention pointed at `exhaust_home` (issue #60).
+    fn register_with_exhaust(
+        &self,
+        summarizer: PathBuf,
+        exhaust_home: &Path,
+        retention_days: u32,
+    ) -> Output {
+        self.register_command(summarizer, 2_000)
+            .arg("--summarizer-exhaust-home")
+            .arg(exhaust_home)
+            .arg("--summarizer-exhaust-retention-days")
+            .arg(retention_days.to_string())
+            .output()
+            .unwrap()
+    }
+
+    fn register_command(&self, summarizer: PathBuf, timeout_ms: u64) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
         command
             .arg("register")
@@ -818,10 +1049,22 @@ impl Harness {
             .arg("--timeout-ms")
             .arg(timeout_ms.to_string())
             .stdin(Stdio::null());
-        if archive_git_history {
-            command.arg("--archive-git-history");
-        }
-        command.output().unwrap()
+        command
+    }
+
+    fn tick_json(&self) -> Value {
+        self.json_output([
+            "tick",
+            "--state-dir",
+            self.state.to_str().unwrap(),
+            "--json",
+        ])
+    }
+
+    fn tick_human(&self) -> String {
+        let output = self.output(["tick", "--state-dir", self.state.to_str().unwrap()]);
+        assert_success(&output);
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     fn project_disable(&self) -> Output {
@@ -1005,6 +1248,27 @@ impl Harness {
             .unwrap();
     }
 
+    /// Fabricates a live (unexpired) processing lease: from Munshi's side a summarizer process
+    /// may be writing into the exhaust home this instant (issue #60).
+    fn claim_processing(&self, session_id: &str) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let connection = Connection::open(self.state.join("munshi.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO processing_attempts(
+                    session_id,state_generation,retry_state,lease_token,owner_pid,
+                    started_at_ms,lease_expires_at_ms,outcome
+                 )
+                 SELECT id,0,'summary-pending','exhaust-live-lease',999999,?2,?3,'processing'
+                 FROM sessions WHERE source_kind='copilot-cli' AND source_session_id=?1",
+                rusqlite::params![session_id, now, now + 600_000],
+            )
+            .unwrap();
+    }
+
     fn next_retry(&self, session_id: &str) -> Option<i64> {
         let connection = Connection::open(self.state.join("munshi.db")).unwrap();
         connection
@@ -1159,6 +1423,48 @@ fn transcript(session_id: &str, request: &str, answer: &str) -> String {
     .collect::<Vec<_>>()
     .join("\n")
         + "\n"
+}
+
+/// A `<home>/session-state/<name>` entry holding one 128-byte transcript, aged `days` days so a
+/// retention window can be exercised without waiting (issue #60).
+fn exhaust_entry(home: &Path, name: &str, days: u64) -> PathBuf {
+    let directory = home.join("session-state").join(name);
+    fs::create_dir_all(&directory).unwrap();
+    let events = directory.join("events.jsonl");
+    fs::write(&events, vec![b'e'; 128]).unwrap();
+    let stamp = SystemTime::now() - Duration::from_secs(days * 86_400);
+    let times = FileTimes::new().set_accessed(stamp).set_modified(stamp);
+    fs::File::options()
+        .write(true)
+        .open(&events)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
+    fs::File::open(&directory)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
+    directory
+}
+
+/// The three files making up Copilot's monolithic session store, 64 bytes each.
+fn exhaust_store(home: &Path) {
+    for name in [
+        "session-store.db",
+        "session-store.db-wal",
+        "session-store.db-shm",
+    ] {
+        fs::write(home.join(name), vec![b's'; 64]).unwrap();
+    }
+}
+
+fn find_check<'a>(report: &'a Value, code: &str) -> &'a Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["code"] == code)
+        .unwrap_or_else(|| panic!("missing doctor check {code}: {report}"))
 }
 
 fn fake(name: &str) -> PathBuf {
