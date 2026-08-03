@@ -10,6 +10,54 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[test]
+fn tick_is_silent_when_unregistered_and_when_registered_with_nothing_to_do() {
+    let harness = Harness::new();
+
+    // Unregistered: a valid empty contract, no human output, success — a scheduler can fire
+    // the tick on a machine that never ran `munshi register` (issue #55).
+    let unregistered = harness.json_output([
+        "tick",
+        "--state-dir",
+        harness.state.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(unregistered["schema_version"], 1);
+    assert_eq!(unregistered["command"], "tick");
+    assert_eq!(unregistered["registered"], false);
+    assert_eq!(unregistered["recovery"], "skipped");
+    assert_eq!(unregistered["upload_candidates"], 0);
+    assert_eq!(unregistered["delivery_candidates"], 0);
+    let human = harness.output(["tick", "--state-dir", harness.state.to_str().unwrap()]);
+    assert_success(&human);
+    assert!(
+        human.stdout.is_empty(),
+        "unregistered tick must print nothing: {}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    // Registered with nothing queued: the sweep runs, the retries find nothing, and the
+    // human output stays empty — silence is the tick's healthy state.
+    assert_success(&harness.register(fake("status-contract.sh"), 2_000));
+    let registered = harness.json_output([
+        "tick",
+        "--state-dir",
+        harness.state.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(registered["registered"], true);
+    assert_eq!(registered["recovery"], "swept");
+    assert_eq!(registered["upload_candidates"], 0);
+    assert_eq!(registered["delivery_candidates"], 0);
+    let human = harness.output(["tick", "--state-dir", harness.state.to_str().unwrap()]);
+    assert_success(&human);
+    assert!(
+        human.stdout.is_empty(),
+        "idle tick must print nothing: {}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+}
+
+#[test]
 fn configuration_check_json_distinguishes_disabled_and_delivery_states() {
     let harness = Harness::new();
     assert_success(&harness.register(fake("status-contract.sh"), 2_000));
