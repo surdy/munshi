@@ -4,12 +4,17 @@ Register with absolute paths and explicitly accept the disclosure:
 
 ```bash
 munshi register --accept-transcript-processing \
-  --summarizer /absolute/path/to/copilot \
-  --summarizer-arg=-s \
-  --summarizer-arg=--no-ask-user \
+  --summarizer /absolute/path/to/munshi/contrib/copilot-summarizer.sh \
   --archive-git-history \
   --output-dir /absolute/path/to/munshi-summaries
 ```
+
+The summarizer here is one of the bundled wrappers ([`contrib/copilot-summarizer.sh`](../contrib/copilot-summarizer.sh)
+or [`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh)), not a bare `copilot` or
+`claude` binary — the wrappers isolate the harness home the summarizer runs under so archiving
+does not feed itself (issue #37); see
+[getting started](getting-started.md) and
+[summarizers.md](summarizers.md#4-hazard-summarizers-that-are-themselves-session-recording-harnesses).
 
 With no `--harness` (or explicit home) flag, registration targets every harness whose home
 directory exists. `--harness copilot` and `--harness claude-code` (repeatable) select explicitly;
@@ -21,7 +26,10 @@ noninteractive registration fails. `--dry-run` prints the managed paths without 
 disclosure states that transcript summarization becomes default-on for all projects, the full
 transcript is sent again to the configured summarizer and may consume credits, v1 does not redact
 secrets or provide granular filtering, output is local Markdown, and remote delivery remains
-disabled.
+disabled **by default**: three opt-in sinks — [`munshi summary-delivery`](user-guide.md)
+(summaries to Notesmith, ADR 0006), [`munshi archive-upload`](user-guide.md) (full snapshots to
+Patwari, ADR 0009), and `munshi memory-sync` (harness auto-memory to Notesmith, issue #59; see
+[`configuration.md`](configuration.md)) — can each be enabled later, separately.
 
 Archive Git history is disabled by default. `--archive-git-history` enables one commit per
 successful non-cursor summary revision in the configured output directory's dedicated repository.
@@ -153,25 +161,31 @@ lock and hash checks prevent races and duplicate revisions. The internal command
 for deterministic repair and tests:
 
 ```bash
-munshi hook recover --state-dir /absolute/copilot-home/munshi \
+munshi hook recover --state-dir "$HOME/.munshi" \
   --stale-after-ms 1800000
 ```
 
-A transcript larger than the configured `max_source_bytes` fails as `source-failed` and is parked
-rather than retried, since the same limit would reject it again. That verdict is tied to the
-configuration that produced it: `retry`, `retry-all`, and the recovery sweep re-measure parked
+A transcript larger than the configured `max_source_bytes` fails as `source-oversized` and is
+parked rather than retried, since the same limit would reject it again. That verdict is tied to
+the configuration that produced it: `retry`, `retry-all`, and the recovery sweep re-measure parked
 transcripts against the currently configured limit and make sessions that now fit eligible again,
-so raising `max_source_bytes` is enough — no `--force` needed (issue #44).
+so raising `max_source_bytes` is enough — no `--force` needed (issue #44). A transcript that has
+*vanished* from its recorded path is a different problem with a different honest resolution, so
+issue #57 split what used to be one lumped `source-failed` category in two: `source-oversized` is
+the size-cap park above, and `source-missing` marks a missing transcript — lifted automatically
+if the file reappears, or settled explicitly as lost with `munshi settle-lost` (issue #58).
+`source-failed` survives only as the residual category for other read failures (and on pre-#57
+rows, which the split-aware code still recognizes).
 
 A retryable failure schedules the session's next attempt with an escalating per-session backoff
 derived from its consecutive-failure streak — 10 minutes after the first failure, then 30 minutes,
 90 minutes, 4 hours, capped at 24 hours — and any successful attempt resets the streak. After 5
 consecutive failures with the same category against the same session content, the failure is
-treated as deterministic and the session is parked (like the `source-failed` park above, with the
-real category retained), so one broken session can no longer win the `max_concurrency` slots every
-sweep and starve the rest of the queue (issue #38). Plain sweeps and `retry-all` never touch such a
-park; a targeted `munshi retry <id>` lifts it explicitly, and `--force` (or `--force-retry` below)
-lifts it for bulk retries — every lift, including the automatic `source-failed` re-measurement,
+treated as deterministic and the session is parked (like the `source-oversized` park above, with
+the real category retained), so one broken session can no longer win the `max_concurrency` slots
+every sweep and starve the rest of the queue (issue #38). Plain sweeps and `retry-all` never touch
+such a park; a targeted `munshi retry <id>` lifts it explicitly, and `--force` (or `--force-retry`
+below) lifts it for bulk retries — every lift, including the automatic `source-oversized` re-measurement,
 restarts the streak so the session gets fresh attempts. Sweeps also scan eligible work
 least-recently-attempted first, and `munshi status` reports currently parked sessions as
 `parked=<n>` on its sessions line.
@@ -245,6 +259,18 @@ munshi project disable /absolute/path/to/project
 munshi project enable /absolute/path/to/project
 munshi project status /absolute/path/to/project
 ```
+
+Beyond policy, registration also owns the summarizer-run bounds and environment: repeatable
+`--summarizer-env KEY=VALUE` variables set on every summarizer invocation (opaque to Munshi;
+the wrapper contract gives keys like `CLAUDE_MODEL` or `MUNSHI_CHUNK_MODEL` meaning, and
+reserved `MUNSHI_SUMMARIZER_*` keys are rejected), the chunking knobs `--chunk-threshold-bytes`
+and `--chunk-size-bytes` (issue #48, above), the size and timeout caps (`--timeout-ms`,
+`--max-source-bytes`, `--max-input-bytes`, and the stdout/stderr caps — see
+[`configuration.md`](configuration.md#limits--summarizer-run-bounds) for the full list and the
+size-knob relation), and the registration-only exhaust-retention pair
+`--summarizer-exhaust-home`/`--summarizer-exhaust-retention-days` that lets `munshi tick` prune
+the isolated summarizer home (issue #60; see the
+[user guide](user-guide.md#summarizer-exhaust-retention)).
 
 Project identity is the same normalized canonical remote (or local fallback) used for archive
 routing, so disabling follows clones and worktrees. Disabling stops future processing and delivery

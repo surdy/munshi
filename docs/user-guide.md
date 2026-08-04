@@ -32,6 +32,9 @@ munshi status
 munshi status --json   # stable machine-readable contract
 ```
 
+If you prefer watching this in a browser, an optional local web dashboard addon renders the same
+operational picture over the CLI's `--json` contracts; see [`dashboard.md`](dashboard.md).
+
 ### `munshi sessions`
 
 Lists individual sessions and their current operational state.
@@ -95,6 +98,10 @@ munshi diagnostics
 munshi diagnostics --limit 50 --json
 ```
 
+Unlike `sessions` and `attempts`, whose `--limit` defaults to 50, `diagnostics` defaults to a
+shorter tail of 20 — the ledger records one row per anomaly, so recent entries are usually all
+that matters.
+
 ### `munshi settle-lost`
 
 Declares destroyed transcripts lost — an explicit operator action, never automatic. Eligible
@@ -113,16 +120,37 @@ size cap, and raising the limit is the fix.
 ### `munshi tick`
 
 One idempotent maintenance sweep, made for platform schedulers (issue #55): the recovery sweep
-a hook event would run, park and lost-verdict re-evaluation, and the eligible upload/delivery
-retries. It prints nothing when there is nothing to do and is a silent no-op on an unregistered
-machine, so a timer can fire it forever without conditioning on state. Hook events already run
-most of this on a busy machine — the tick exists for the *idle* one, where parked retries would
-otherwise wait for the next session.
+a hook event would run, park and lost-verdict re-evaluation, the eligible upload/delivery
+retries, and — when [memory sync](#memory-sync-harness-auto-memory-in-brief) is enabled — a
+memory-sync drain pass. It prints nothing when there is nothing to do and is a silent no-op on
+an unregistered machine, so a timer can fire it forever without conditioning on state. Hook
+events already run most of this on a busy machine — the tick exists for the *idle* one, where
+parked retries would otherwise wait for the next session.
 
 ```bash
 munshi tick
 munshi tick --json
+munshi tick --limit 64
 ```
+
+`--limit` (default 32) bounds how many upload retries and how many delivery retries one tick
+attempts; a larger backlog simply drains over successive ticks. When something does happen, the
+tick reports it one line per subsystem:
+
+```
+tick: recovery sweep already running elsewhere
+tick: archive-upload retried candidates=<n> failed=<n>
+tick: summary-delivery retried candidates=<n> failed=<n>
+tick: memory-sync synced=<n> failed=<n> blocked=<n>
+tick: summarizer-exhaust retention refused: <reason>
+tick: summarizer-exhaust pruned dirs=<n> bytes=<n>
+```
+
+The first line means another process already holds the recovery sweep — a quiet non-event, not
+an error. The retention-refused line is the one deliberate exception to "silence unless
+something happened": a summarizer-exhaust home that conflicts with a registered harness home is
+a standing misconfiguration that disables retention forever, so it is said on every tick (see
+below).
 
 `contrib/launchd/com.munshi.tick.plist` runs it every 15 minutes on macOS; see the comment in
 the plist for install/remove commands (systemd user timers are the Linux equivalent).
@@ -312,7 +340,9 @@ munshi project status /absolute/path/to/project
 ```
 
 Project identity follows the normalized Git remote (or a local fallback hash), so disabling a
-project follows its clones and worktrees. Disabling only stops *future* processing and delivery —
+project follows its clones and worktrees. `project status` reports the *effective* enabled state
+— after the explicit disabled list and any `.munshi.toml` override are resolved, with the reason
+when disabled — plus the hourly/daily call budgets that actually apply to the project. Disabling only stops *future* processing and delivery —
 it never deletes anything already archived or delivered. Re-running `munshi register` (say, to
 change budgets) never silently re-enables a project you disabled; the `disabled_projects` list is
 preserved across registration.
@@ -414,12 +444,16 @@ munshi summary-delivery backfill              # dry run by default
 munshi summary-delivery backfill --confirm    # actually publish
 munshi summary-delivery retry --all
 munshi summary-delivery retry <session-id> --force
+munshi summary-delivery history               # verify the vault's revision-history capability
+munshi summary-delivery history --configure   # explicitly enable it when absent
 ```
 
 `configure` records the sink without turning it on; `enable` reports how many existing summaries
 are pending backfill; `disable` stops future delivery while keeping history. `backfill` publishes
 existing archives (dry run unless `--confirm`); `retry` retries failed deliveries (`--force`
-revives dead-letter sessions). Full design and rationale:
+revives dead-letter sessions); both bound one run with `--limit` (default 100). `history` checks
+the Notesmith vault's revision-history capability required for versioned delivery (issue #9), and
+with `--configure` enables it remotely instead of only verifying. Full design and rationale:
 [`automatic-archive.md`](automatic-archive.md) and
 [ADR 0006](adr/0006-deliver-to-notesmith-downstream-of-local-archival.md).
 
@@ -435,12 +469,21 @@ local Markdown write, and it runs in parallel with, and independently of, Notesm
 
 ```bash
 munshi archive-upload configure --endpoint http://127.0.0.1:8080
+munshi archive-upload configure --endpoint https://patwari.example.net   # published endpoints
 munshi archive-upload enable
 munshi archive-upload status
 munshi archive-upload retry --all
 munshi archive-upload retry <session-id> --force
 munshi archive-upload backfill
 ```
+
+Endpoints may be `https://` (issue #35): Munshi speaks TLS through rustls, verifying against the
+operating system's trust store, and deliberately grows no TLS policy surface — there is no
+`--insecure` escape hatch and no CA-bundle flag, so a private CA must be installed in the system
+store like any other trusted root
+([ADR 0013](adr/0013-speak-tls-to-published-endpoints-through-rustls-and-the-system-trust-store.md)).
+Plain `http://` remains fully supported for localhost tunnels and trusted-LAN addresses, and the
+same applies to every endpoint Munshi dials, including the Notesmith endpoints above.
 
 `configure` records the server without turning upload on; `enable` requires a configured server and
 turns upload on; `disable` stops future upload while keeping upload history. `status` shows the
@@ -468,7 +511,13 @@ fingerprint), and a snapshot that really was summary-only gains a complete sibli
 snapshot itself is never rewritten — Patwari snapshots are immutable, so it stays as historical
 provenance of what was captured then. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
 claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
-download cap for a deliberately large artifact). Before the snapshot uploads — or with the archive
+download cap for a deliberately large artifact). `--list` enumerates every artifact matching the
+hash across snapshots without downloading anything, `--query` searches the retrieved content for
+a substring instead of emitting it, `--output` writes the verified bytes to a file (`--force` to
+overwrite an existing one) rather than stdout, and `--endpoint` retrieves from a different
+archive server than the configured one; each failure class exits with a distinct stable code
+(1–7), so scripts can tell error kinds apart without parsing messages — the code table is in
+[`troubleshooting.md`](troubleshooting.md). Before the snapshot uploads — or with the archive
 server unreachable — `munshi retrieve <sha256> --local --session <id>` redeems the same ticket
 directly from the session's on-disk transcript, with no network involved; `--session` accepts a
 bare source session ID or the prefixed identity summarizer input carries (`copilot:<id>`), and
@@ -495,6 +544,42 @@ configuration problems (see the module docs' table, and `--json` for the machine
 manually after a harness format bump or new-adapter support — Unknown kinds are interpretation
 gaps to type, not noise.
 
+## Memory sync (harness auto-memory) in brief
+
+Harness auto-memory — the distilled notes Claude Code accumulates under
+`<claude_home>/projects/<slug>/memory/` — is the highest value-per-byte artifact an agent
+produces, and nothing durable captures it: lose the disk, lose the memory. `munshi memory-sync`
+(issue #59) mirrors those directories into a Notesmith *document* vault — never the fact-memory
+vault — reusing the delivery sink and the versioned-history machinery (issue #9). Like delivery
+and upload it is opt-in, disabled by default, and strictly downstream of archival (ADR 0006):
+collection is strictly read-only (nothing ever writes into a harness home), a sync pass is
+triggered after each archive, and no memory-sync failure ever touches sessions or archives.
+
+```bash
+munshi memory-sync configure --endpoint http://127.0.0.1:27183 --vault my-docs --machine laptop
+munshi memory-sync enable
+munshi memory-sync disable
+munshi memory-sync status
+munshi memory-sync run
+munshi memory-sync run --force   # also revive dead-letter directories, ignore retry backoff
+```
+
+`configure` records the mirror target (endpoint, vault, optional folder, credential source, and
+the one canonical machine label — chosen once, defaulting to the sanitized hostname) without
+enabling anything; `enable` requires that addressable target; `disable` stops future syncs while
+keeping sync history; `status` shows the configuration and per-directory sync state. `run`
+performs one pass now: files are mirrored verbatim under `[folder/]<machine>/<slug>/`, identity
+and correlation ride in a sibling `<machine>/<slug>.manifest.md` note and the commit message
+`munshi memory <machine>:<slug> revision <n>`, and change detection is a per-file sha256
+manifest, so an unchanged directory never contacts the sink. The vault's revision-history
+capability *is* the snapshot mechanism, so it is required, not optional: a vault without it
+blocks (attempt-neutral, reported as `blocked`) rather than degrading to unversioned writes.
+Failures retry with backoff into a bounded dead letter, which only an operator's
+`run --force` revives — you rarely need `run` otherwise, since the post-archival trigger and the
+[`munshi tick`](#munshi-tick) drain (which covers force-killed sessions whose post-archival pass
+never ran) keep it current. Every `memory_sync` setting is documented in
+[`configuration.md`](configuration.md).
+
 ## Unregistering and cleanup
 
 ```bash
@@ -513,5 +598,12 @@ over.
 - [`getting-started.md`](getting-started.md) — first-time registration and setup.
 - [`configuration.md`](configuration.md) — every `config.json` setting in one place.
 - [`summarizers.md`](summarizers.md) — choosing and configuring a compatible summarizer.
+- [`automatic-archive.md`](automatic-archive.md) — the full design behind hooks, the worker state
+  machine, and Notesmith delivery.
+- [`manual-archive.md`](manual-archive.md) — archiving a transcript by hand, outside the hook
+  pipeline.
+- [`harness-adapters.md`](harness-adapters.md) — per-harness capture details and sidecar
+  artifacts.
+- [`dashboard.md`](dashboard.md) — the optional local web dashboard addon.
 - [`troubleshooting.md`](troubleshooting.md) — diagnosing failures beyond what `doctor` and
   `configuration-check` cover.
