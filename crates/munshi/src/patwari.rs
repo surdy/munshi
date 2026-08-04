@@ -1377,6 +1377,9 @@ pub(crate) fn upload_one(
                         .iter()
                         .map(|artifact| artifact.logical_path.clone())
                         .collect(),
+                    transfer_bytes: receipt.upload_transfer_bytes,
+                    total_stored_bytes: receipt.total_stored_bytes,
+                    total_original_bytes: receipt.total_original_bytes,
                 },
             )?;
             Ok(UploadOutcome::Uploaded {
@@ -1556,6 +1559,11 @@ pub struct ArchiveUploadItem {
     pub attempts: u32,
     pub next_attempt_at_ms: Option<i64>,
     pub last_error_category: Option<String>,
+    /// Lifetime bytes actually transferred for this session's uploads (issue #65); 0 when every
+    /// artifact deduplicated server-side, and 0 on rows recorded before transfer accounting.
+    pub transfer_bytes_total: u64,
+    /// The latest uploaded snapshot's stored (compressed) byte total, when measured.
+    pub last_stored_bytes: Option<u64>,
 }
 
 /// The `archive upload status` contract.
@@ -1569,6 +1577,15 @@ pub struct ArchiveUploadStatusReport {
     pub pending: usize,
     pub failed: usize,
     pub dead_letter: usize,
+    /// Lifetime bytes actually transferred to this endpoint across every recorded upload
+    /// (issue #65): the sum of each row's accumulated receipt `upload_transfer_bytes`. This is
+    /// the measured number issue #24's "real transfer-volume pain" trigger asks for. Rows
+    /// recorded before transfer accounting contribute 0, so the total is a floor.
+    pub transfer_bytes_total: u64,
+    /// The stored (compressed) byte total of every session's *latest* snapshot summed —
+    /// approximately what the archive's current generation occupies, before cross-session blob
+    /// dedup. Latest, not lifetime, because successive revisions overlap almost entirely.
+    pub stored_bytes_latest_total: u64,
     pub items: Vec<ArchiveUploadItem>,
 }
 
@@ -1624,6 +1641,8 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
             pending: 0,
             failed: 0,
             dead_letter: 0,
+            transfer_bytes_total: 0,
+            stored_bytes_latest_total: 0,
             items: Vec::new(),
         });
     }
@@ -1639,6 +1658,8 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
     let mut pending = 0;
     let mut failed = 0;
     let mut dead_letter = 0;
+    let mut transfer_bytes_total: u64 = 0;
+    let mut stored_bytes_latest_total: u64 = 0;
     let items = uploads
         .iter()
         .map(|record| {
@@ -1649,6 +1670,10 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
                 "dead-letter" => dead_letter += 1,
                 _ => {}
             }
+            transfer_bytes_total =
+                transfer_bytes_total.saturating_add(record.transfer_bytes_total);
+            stored_bytes_latest_total =
+                stored_bytes_latest_total.saturating_add(record.last_stored_bytes.unwrap_or(0));
             ArchiveUploadItem {
                 source: record.source.as_selector().to_owned(),
                 session_id: record.session_id.clone(),
@@ -1658,6 +1683,8 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
                 attempts: record.attempts,
                 next_attempt_at_ms: record.next_attempt_at_ms,
                 last_error_category: record.last_error_category.clone(),
+                transfer_bytes_total: record.transfer_bytes_total,
+                last_stored_bytes: record.last_stored_bytes,
             }
         })
         .collect::<Vec<_>>();
@@ -1671,6 +1698,8 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
         pending,
         failed,
         dead_letter,
+        transfer_bytes_total,
+        stored_bytes_latest_total,
         items,
     })
 }
@@ -1681,6 +1710,10 @@ impl ArchiveUploadStatusReport {
         println!(
             "archive uploads total={} uploaded={} pending={} failed={} dead-letter={}",
             self.total, self.uploaded, self.pending, self.failed, self.dead_letter
+        );
+        println!(
+            "archive transfer lifetime-bytes={} latest-snapshots-stored-bytes={}",
+            self.transfer_bytes_total, self.stored_bytes_latest_total
         );
         for item in &self.items {
             println!(
@@ -2359,6 +2392,9 @@ mod tests {
             next_attempt_at_ms: None,
             last_error_category: Some("transcript-changed".to_owned()),
             updated_at_ms: 0,
+            transfer_bytes_total: 0,
+            last_stored_bytes: None,
+            last_original_bytes: None,
         };
         let configured = "https://patwari.example";
         let stale = "http://127.0.0.1:18787";
@@ -2417,6 +2453,9 @@ mod tests {
             next_attempt_at_ms: None,
             last_error_category: None,
             updated_at_ms: 0,
+            transfer_bytes_total: 0,
+            last_stored_bytes: None,
+            last_original_bytes: None,
         };
         // A row written before the ledger recorded artifact sets proves nothing.
         assert!(!records_full_snapshot(&row(None)));

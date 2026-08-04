@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceHomes, SourceKind, derive_transcript_p
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 /// The `transcript_source` recorded for a path re-derived from a session's ID through its source's
@@ -371,6 +371,16 @@ pub struct ArchiveUploadRecord {
     pub next_attempt_at_ms: Option<i64>,
     pub last_error_category: Option<String>,
     pub updated_at_ms: i64,
+    /// Lifetime bytes actually transferred to this endpoint for this session across every
+    /// successful upload (issue #65) — the receipt's `upload_transfer_bytes`, accumulated. Blob
+    /// dedup makes a fully deduplicated re-upload contribute 0. 0 on pre-#65 rows.
+    pub transfer_bytes_total: u64,
+    /// The latest uploaded snapshot's total stored (compressed) bytes; `None` before any
+    /// measured upload.
+    pub last_stored_bytes: Option<u64>,
+    /// The latest uploaded snapshot's total original (uncompressed) bytes; `None` before any
+    /// measured upload.
+    pub last_original_bytes: Option<u64>,
 }
 
 /// The resolved capture identity for one upload attempt returned by
@@ -392,6 +402,13 @@ pub struct ArchiveUploadSuccess {
     /// Every artifact logical path the uploaded snapshot contained (issue #47), so a later run can
     /// tell a self-contained snapshot from one that predates the full-snapshot guarantee.
     pub uploaded_artifact_paths: Vec<String>,
+    /// The receipt's `upload_transfer_bytes` for this upload — bytes actually moved on the wire,
+    /// 0 when every artifact deduplicated (issue #65). Accumulated into the row's lifetime total.
+    pub transfer_bytes: u64,
+    /// The receipt's snapshot-wide stored (compressed) byte total.
+    pub total_stored_bytes: u64,
+    /// The receipt's snapshot-wide original (uncompressed) byte total.
+    pub total_original_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,6 +843,31 @@ impl StateStore {
                 params![7, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 7)?;
+            transaction.commit()?;
+        }
+        if current < 8 {
+            // Issue #65: persist the transfer accounting Patwari's upload receipts already
+            // report, so "real transfer-volume pain" (the deferral trigger of issue #24) is a
+            // measured number instead of an estimate. `transfer_bytes_total` accumulates the
+            // bytes actually moved on the wire across every successful upload of this row
+            // (0 when blob dedup absorbed everything); `last_stored_bytes`/`last_original_bytes`
+            // are the latest snapshot's compressed and original totals — latest, not summed,
+            // because successive revisions of one session overlap almost entirely. Rows written
+            // before this migration carry 0/NULL: their transfers were never measured.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE archive_uploads
+                    ADD COLUMN transfer_bytes_total INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE archive_uploads ADD COLUMN last_stored_bytes INTEGER;
+                 ALTER TABLE archive_uploads ADD COLUMN last_original_bytes INTEGER;",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![8, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 8)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -1565,7 +1607,8 @@ impl StateStore {
                     au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
                     au.uploaded_artifact_paths,
                     au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
-                    au.updated_at_ms
+                    au.updated_at_ms,
+                    au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes
                  FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
                  WHERE au.session_id=?1 AND au.endpoint=?2",
                 params![database_id, endpoint],
@@ -1584,7 +1627,8 @@ impl StateStore {
                 au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
                 au.uploaded_artifact_paths,
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
-                au.updated_at_ms
+                au.updated_at_ms,
+                au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
              ORDER BY au.updated_at_ms DESC,au.id DESC",
         )?;
@@ -1612,7 +1656,8 @@ impl StateStore {
                 au.uploaded_revision,au.uploaded_summary_hash,au.snapshot_id,
                 au.uploaded_artifact_paths,
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
-                au.updated_at_ms
+                au.updated_at_ms,
+                au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
              WHERE au.upload_state IN ('pending','failed')
                AND (au.next_attempt_at_ms IS NULL OR au.next_attempt_at_ms <= ?1)
@@ -1746,6 +1791,8 @@ impl StateStore {
             "UPDATE archive_uploads SET
                 uploaded_revision=?3,uploaded_summary_hash=?4,snapshot_id=?5,
                 uploaded_artifact_paths=?6,
+                transfer_bytes_total=transfer_bytes_total+?8,
+                last_stored_bytes=?9,last_original_bytes=?10,
                 upload_state='uploaded',attempts=0,next_attempt_at_ms=NULL,
                 last_error_category=NULL,updated_at_ms=?7
              WHERE session_id=?1 AND endpoint=?2",
@@ -1757,6 +1804,9 @@ impl StateStore {
                 success.snapshot_id,
                 join_artifact_paths(&success.uploaded_artifact_paths),
                 now_ms(),
+                i64::try_from(success.transfer_bytes).unwrap_or(i64::MAX),
+                i64::try_from(success.total_stored_bytes).unwrap_or(i64::MAX),
+                i64::try_from(success.total_original_bytes).unwrap_or(i64::MAX),
             ],
         )?;
         Ok(())
@@ -2298,6 +2348,12 @@ fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveU
         next_attempt_at_ms: row.get(14)?,
         last_error_category: row.get(15)?,
         updated_at_ms: row.get(16)?,
+        transfer_bytes_total: row
+            .get::<_, i64>(17)?
+            .try_into()
+            .unwrap_or_default(),
+        last_stored_bytes: revision(18)?,
+        last_original_bytes: revision(19)?,
     })
 }
 

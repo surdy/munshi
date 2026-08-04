@@ -547,6 +547,9 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
                     "summary.md".to_owned(),
                     "transcript.jsonl".to_owned(),
                 ],
+                transfer_bytes: 4096,
+                total_stored_bytes: 8192,
+                total_original_bytes: 16384,
             },
         )
         .unwrap();
@@ -554,6 +557,43 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
         .prepare_archive_capture(session, endpoint, 2, "capture-C", "2026-07-25T02:00:00Z")
         .unwrap();
     assert_eq!(after_success.capture_id, "capture-C");
+
+    // Transfer accounting (issue #65): the receipt bytes land on the row, and a later success
+    // accumulates transfer bytes while the stored/original totals track the latest snapshot only.
+    let row = |store: &munshi::StateStore| {
+        store
+            .list_archive_uploads()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.endpoint == endpoint)
+            .expect("upload row exists")
+    };
+    let first_row = row(&store);
+    assert_eq!(first_row.transfer_bytes_total, 4096);
+    assert_eq!(first_row.last_stored_bytes, Some(8192));
+    assert_eq!(first_row.last_original_bytes, Some(16384));
+    store
+        .record_archive_upload_success(
+            session,
+            endpoint,
+            &munshi::ArchiveUploadSuccess {
+                uploaded_revision: 3,
+                uploaded_summary_hash: "hash3".to_owned(),
+                snapshot_id: "snap-3".to_owned(),
+                uploaded_artifact_paths: vec![
+                    "summary.md".to_owned(),
+                    "transcript.jsonl".to_owned(),
+                ],
+                transfer_bytes: 100,
+                total_stored_bytes: 9000,
+                total_original_bytes: 20000,
+            },
+        )
+        .unwrap();
+    let second_row = row(&store);
+    assert_eq!(second_row.transfer_bytes_total, 4196, "lifetime accumulates");
+    assert_eq!(second_row.last_stored_bytes, Some(9000), "latest, not summed");
+    assert_eq!(second_row.last_original_bytes, Some(20000));
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +647,16 @@ fn backfill_uploads_archived_sessions_without_rows_and_is_idempotent() {
     assert_eq!(status["items"][0]["session_id"], BACKFILL_SESSION);
     assert_eq!(status["items"][0]["state"], "uploaded");
     assert!(status["items"][0]["snapshot_id"].is_string());
+    // Transfer accounting (issue #65): the receipt's measured bytes are persisted and summed —
+    // a fresh upload transferred every stored byte, so lifetime transfer equals the stored total.
+    let transferred = status["transfer_bytes_total"].as_u64().unwrap();
+    let stored = status["stored_bytes_latest_total"].as_u64().unwrap();
+    assert!(transferred > 0, "a fresh upload moved bytes");
+    assert_eq!(transferred, stored);
+    assert_eq!(
+        status["items"][0]["transfer_bytes_total"].as_u64().unwrap(),
+        transferred
+    );
 
     // The uploaded snapshot is self-contained (ADR 0009, issue #47): the summary and the verbatim
     // transcript are both in the manifest, and the ledger records the set that was uploaded.
@@ -2115,6 +2165,24 @@ fn complete_upload(upload_id: &str, state: &mut FakeState) -> Vec<u8> {
     }
     let upload = &state.uploads[index];
     let snapshot_id = format!("snap-{:016x}", upload.manifest_sig);
+    // Report real byte totals like Patwari does (issue #65): the stored sum from the accepted
+    // manifest, and the bytes this upload actually PUT (0 when every chunk was already held).
+    let total_stored: u64 = upload
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.stored_size)
+        .sum();
+    let transferred: u64 = upload
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            artifact
+                .accepted
+                .iter()
+                .map(|chunk| chunk_len(artifact, *chunk))
+                .sum::<u64>()
+        })
+        .sum();
     json_response(
         200,
         &json!({
@@ -2124,18 +2192,27 @@ fn complete_upload(upload_id: &str, state: &mut FakeState) -> Vec<u8> {
                 "snapshot_fingerprint": format!("fp-{:016x}", upload.manifest_sig),
                 "manifest_sha256": format!("{:064x}", upload.manifest_sig),
                 "artifact_count": upload.artifacts.len(),
-                "total_original_bytes": 0,
-                "total_stored_bytes": 0,
+                "total_original_bytes": total_stored,
+                "total_stored_bytes": total_stored,
             },
             "transfer": {
                 "upload_id": upload_id,
                 "capture_id": upload.capture_id,
-                "upload_transfer_bytes": 0,
-                "newly_persisted_physical_bytes": 0,
+                "upload_transfer_bytes": transferred,
+                "newly_persisted_physical_bytes": transferred,
             },
             "capture": { "capture_id": upload.capture_id },
         }),
     )
+}
+
+/// The negotiated byte length of one chunk: `CHUNK_SIZE` except a smaller final chunk.
+fn chunk_len(artifact: &AcceptedArtifact, chunk_index: u64) -> u64 {
+    if chunk_index + 1 == artifact.chunk_count {
+        artifact.stored_size - (artifact.chunk_count - 1) * CHUNK_SIZE
+    } else {
+        CHUNK_SIZE
+    }
 }
 
 /// A deterministic upload id derived from the upload's index (the fake never expires uploads).
