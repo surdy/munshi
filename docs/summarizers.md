@@ -106,9 +106,28 @@ The marker is a single line, deterministic (a pure function of the content and i
 across retries. **Reference these markers; never invent them.** Treat a claim ticket as "content
 that exists but was too large to inline here": you may mention that a large tool output / message was
 produced and, if useful, cite its `sha256`, but do not fabricate the elided text or guess at its
-contents. There is no way to redeem a ticket mid-summary — the summarizer contract stays one-shot.
-A holder of the finished summary can later fetch the exact original bytes with
+contents. A holder of the finished summary can later fetch the exact original bytes with
 `munshi retrieve <sha256>` once the snapshot is archived.
+
+The subprocess contract itself stays one-shot — Munshi writes one request, reads one response, and
+offers no redemption round-trips over stdin/stdout. But an **agentic** summarizer that can run
+commands may redeem tickets itself, mid-run, against the session's own on-disk transcript
+(issue #25):
+
+```sh
+munshi retrieve <sha256> --local --session <session.id> [--query <term>]
+```
+
+`--local` needs no network and no upload: at summarize time the snapshot has not been uploaded yet
+(upload runs strictly downstream of summarization), so the local transcript is exactly where the
+elided bytes live. `--session` accepts the `session.id` value from the request envelope verbatim
+(the prefixed `copilot:<id>` form). Only hash-verified bytes are emitted, so a transcript growing
+under the read can at worst miss, never return wrong content. Redeem selectively — mind the
+ticket's `bytes:` size and prefer `--query` over dumping large content into your own context — and
+budget for it: redemption happens inside your invocation's `timeout_ms`, and any extra model turns
+it causes are invisible to Munshi's per-project call budgets (section 8).
+`contrib/claude-summarizer.sh` implements this behind the opt-in `MUNSHI_TICKET_REDEMPTION=1`
+(section 6).
 
 When `previous_summary` is set, the instruction asks for a **complete replacement** summary,
 not a diff or an append: read the prior summary, read the new events, and return a full
@@ -301,6 +320,13 @@ Before using it:
   enough). The optional `MUNSHI_CHUNK_MODEL`/`MUNSHI_REDUCE_MODEL` variables select a different
   model per phase for chunked marathon sessions (contract v2 above); set them persistently with
   `munshi register --summarizer-env` rather than the ambient environment.
+- Optionally set `MUNSHI_TICKET_REDEMPTION=1` (again via `--summarizer-env`) to let the Claude
+  agent redeem claim tickets mid-run through `munshi retrieve --local` (section 2, issue #25).
+  The permission grant stays limited to that one command shape, settings remain unloaded so
+  Munshi's hooks never fire, and the agent is instructed to redeem selectively and to prefer
+  `--query` for large content. `MUNSHI_BIN` points at a non-PATH munshi binary;
+  `MUNSHI_STATE_DIR` is passed through as `--state-dir`. Raise `--timeout-ms` when enabling
+  this — redemption and the extra model turns it causes spend your invocation's wall-clock.
 - Make it executable: `chmod +x contrib/claude-summarizer.sh`.
 - Point `--summarizer` at its **absolute** path:
 
@@ -366,6 +392,10 @@ automatic capture, using [`munshi archive`](manual-archive.md).
   marathon session (contract v2 above) makes one budgeted call **per chunk plus the reduce
   pass(es)**, so a single 20 MiB session can consume around fifteen calls; size the budgets
   accordingly if you archive marathons routinely.
+- Budgets count **invocations**, not what happens inside one. An agentic summarizer that redeems
+  claim tickets mid-run (section 2) makes extra backend turns and local `munshi retrieve` calls
+  that Munshi cannot see or bound — the only Munshi-side limits that apply to them are the
+  invocation's `--timeout-ms` and stdout/stderr caps.
 - **v1 does not redact secrets.** If a transcript contains credentials, tokens, or other
   sensitive text, that text is sent to your summarizer verbatim like everything else. Choose a
   summarizer backend you're comfortable sending session content to, and keep that in mind for

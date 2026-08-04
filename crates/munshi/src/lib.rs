@@ -72,7 +72,8 @@ pub use render::{
 };
 pub use retrieve::{
     ArtifactMatch, MatchLine, QUERY_CONTEXT_LINES, RetrieveError, RetrieveResult, RetrievedContent,
-    SearchResults, retrieve, search_content, write_output as write_retrieved_output,
+    SearchResults, retrieve, retrieve_local, search_content,
+    write_output as write_retrieved_output,
 };
 pub use source::{
     ArtifactIndexEntry, ClaudeRecordedOrigin, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES,

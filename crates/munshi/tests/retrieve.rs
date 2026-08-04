@@ -406,6 +406,115 @@ fn real_patwari_round_trips_uploaded_artifacts() {
 }
 
 // ---------------------------------------------------------------------------
+// Local redemption (`--local`, issue #25 groundwork)
+// ---------------------------------------------------------------------------
+
+/// Writes a Copilot transcript containing one oversized tool output, registers the session in a
+/// fresh state directory the way an agent-stop hook would, and returns the state dir plus the
+/// ticket hash and original content of the oversized event.
+fn seed_local_session(session_id: &str) -> (TempDir, TempDir, String, Vec<u8>) {
+    let state = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let session_dir = home.path().join("session-state").join(session_id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let transcript_path = session_dir.join("events.jsonl");
+    let oversized = "x".repeat(500);
+    let transcript = format!(
+        "{}\n{}\n",
+        json!({
+            "id": "user-record",
+            "timestamp": "2026-07-25T00:00:00Z",
+            "parentId": "root",
+            "type": "user.message",
+            "data": { "content": "run the build" },
+        }),
+        json!({
+            "id": "call-1",
+            "timestamp": "2026-07-25T00:00:00Z",
+            "parentId": "root",
+            "type": "tool.execution_complete",
+            "data": { "toolCallId": "call-1", "success": true, "result": { "content": oversized } },
+        }),
+    )
+    .into_bytes();
+    std::fs::write(&transcript_path, &transcript).unwrap();
+
+    let mut store =
+        munshi::StateStore::open_for_source(state.path(), munshi::SourceKind::Copilot).unwrap();
+    store
+        .ingest_agent_stop(session_id, 1_753_400_000_000, home.path(), &transcript_path)
+        .unwrap();
+
+    // The ticket hash is whatever extraction addresses the oversized event as, derived through the
+    // same pure function the elision marker and the artifact index use.
+    let outputs = munshi::extract_outputs(&transcript, munshi::SourceKind::Copilot, 64);
+    assert_eq!(outputs.len(), 1, "exactly one event exceeds the threshold");
+    let ticket = outputs[0].sha256.clone();
+    let content = outputs[0].content.clone();
+    (state, home, ticket, content)
+}
+
+#[test]
+fn local_redeems_a_ticket_from_the_transcript_without_a_server() {
+    let (state, _home, ticket, content) = seed_local_session("sess-local");
+
+    // Bare session ID, no endpoint, no network: stdout reproduces the elided bytes exactly.
+    let output = run_raw(
+        state.path(),
+        &[&ticket, "--local", "--session", "sess-local"],
+    );
+    assert!(output.status.success(), "stderr: {}", output.stderr());
+    assert_eq!(output.stdout, content, "byte-for-byte local redemption");
+
+    // The prefixed identity summarizer input carries resolves identically.
+    let prefixed = run_raw(
+        state.path(),
+        &[&ticket, "--local", "--session", "copilot:sess-local"],
+    );
+    assert!(prefixed.status.success(), "stderr: {}", prefixed.stderr());
+    assert_eq!(prefixed.stdout, content);
+
+    // Client-side --query works over locally redeemed content too.
+    let query = run_raw(
+        state.path(),
+        &[&ticket, "--local", "--session", "sess-local", "--query", "xxx"],
+    );
+    assert!(query.status.success(), "stderr: {}", query.stderr());
+    assert!(String::from_utf8_lossy(&query.stdout).contains("xxx"));
+}
+
+#[test]
+fn local_misses_exit_distinctly_without_emitting_bytes() {
+    let (state, _home, ticket, _content) = seed_local_session("sess-local");
+
+    // A hash no event carries: exit 4 (no matching artifact), nothing on stdout.
+    let absent = "0".repeat(64);
+    let miss = run_raw(state.path(), &[&absent, "--local", "--session", "sess-local"]);
+    assert_eq!(miss.status.code(), Some(4), "stderr: {}", miss.stderr());
+    assert!(miss.stdout.is_empty());
+
+    // An unknown session: exit 4 as well — a script-visible miss, not CLI misuse.
+    let unknown = run_raw(state.path(), &[&ticket, "--local", "--session", "sess-other"]);
+    assert_eq!(unknown.status.code(), Some(4), "stderr: {}", unknown.stderr());
+    assert!(unknown.stdout.is_empty());
+
+    // A session prefix contradicting --source is CLI misuse and fails hard.
+    let contradicted = run_raw(
+        state.path(),
+        &[
+            &ticket,
+            "--local",
+            "--session",
+            "copilot:sess-local",
+            "--source",
+            "claude-code",
+        ],
+    );
+    assert!(!contradicted.status.success());
+    assert!(contradicted.stdout.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 

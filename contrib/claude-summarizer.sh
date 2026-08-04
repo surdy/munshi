@@ -53,6 +53,19 @@
 # (or the phase variable is absent, under a pre-v2 Munshi) every invocation uses CLAUDE_MODEL
 # exactly as before.
 #
+# Mid-run claim-ticket redemption (issue #25): opt-in via MUNSHI_TICKET_REDEMPTION=1 (set it
+# through `munshi register --summarizer-env`). When enabled, the Claude agent is allowed to run
+# exactly one command shape — `munshi retrieve … --local` — to read elided oversized events
+# (`[munshi claim-ticket sha256:… bytes:… label:…]` markers) from the session's own on-disk
+# transcript while it summarizes. Redemption is local-only by design: at summarize time the
+# snapshot has not been uploaded yet, so the transcript is the only place the bytes exist; a
+# local-only tool surface also keeps the summarizer off the network for content. The permission
+# stays narrowly scoped (`--allowedTools "Bash(<munshi> retrieve:*)"` with settings still not
+# loaded), so Munshi's hooks remain disabled and no other tool is available. Redemption spends
+# summarizer wall-clock: raise `--timeout-ms` when enabling this on sessions with many tickets.
+# MUNSHI_BIN overrides the munshi binary (defaults to `munshi` on PATH); MUNSHI_STATE_DIR is
+# passed through as `--state-dir` for a non-default state directory.
+#
 # Adjust these two defaults for your machine (or override them via environment), then pass
 # this script's absolute path to `munshi register --summarizer`:
 CLAUDE_BIN="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
@@ -85,10 +98,23 @@ case "${MUNSHI_SUMMARIZER_PHASE:-complete}" in
   chunk) MODEL="${MUNSHI_CHUNK_MODEL:-$CLAUDE_MODEL}" ;;
   reduce) MODEL="${MUNSHI_REDUCE_MODEL:-$CLAUDE_MODEL}" ;;
 esac
-"$CLAUDE_BIN" -p --model "$MODEL" \
+SYSTEM_PROMPT="Respond with exactly one JSON object matching required_schema."
+REDEEM_TOOLS=""
+if [ -n "${MUNSHI_TICKET_REDEMPTION:-}" ]; then
+    MUNSHI_BIN="${MUNSHI_BIN:-$(command -v munshi || true)}"
+    if [ -n "$MUNSHI_BIN" ]; then
+        STATE_ARG=""
+        [ -n "${MUNSHI_STATE_DIR:-}" ] && STATE_ARG=" --state-dir $MUNSHI_STATE_DIR"
+        REDEEM_TOOLS="Bash($MUNSHI_BIN retrieve:*)"
+        SYSTEM_PROMPT="$SYSTEM_PROMPT Oversized elided events appear as markers: [munshi claim-ticket sha256:<hex> bytes:<n> label:<kind>]. To read one that matters to the summary, run: $MUNSHI_BIN retrieve <hex> --local --session <session.id from the request JSON>$STATE_ARG. Mind bytes:<n>: for large content add --query <term> to search inside it instead of printing it all. Redeem only tickets whose content you actually need; never invent elided content."
+    fi
+fi
+set -- -p --model "$MODEL" \
   --no-session-persistence \
   --setting-sources '' \
-  --append-system-prompt "Respond with exactly one JSON object matching required_schema." \
+  --append-system-prompt "$SYSTEM_PROMPT"
+[ -n "$REDEEM_TOOLS" ] && set -- "$@" --allowedTools "$REDEEM_TOOLS"
+"$CLAUDE_BIN" "$@" \
   | python3 -c '
 import json, re, sys
 text = sys.stdin.read().strip()
