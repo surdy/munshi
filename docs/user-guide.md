@@ -465,7 +465,11 @@ fingerprint), and a snapshot that really was summary-only gains a complete sibli
 snapshot itself is never rewritten — Patwari snapshots are immutable, so it stays as historical
 provenance of what was captured then. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
 claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
-download cap for a deliberately large artifact). Full design and rationale:
+download cap for a deliberately large artifact). Before the snapshot uploads — or with the archive
+server unreachable — `munshi retrieve <sha256> --local --session <id>` redeems the same ticket
+directly from the session's on-disk transcript, with no network involved; `--session` accepts a
+bare source session ID or the prefixed identity summarizer input carries (`copilot:<id>`), and
+`--source` disambiguates a bare ID shared across harnesses. Full design and rationale:
 [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and
 [ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md).
 

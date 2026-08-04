@@ -288,7 +288,9 @@ exists, even if no snapshot reached Patwari. Check in order:
    gains a complete sibling — the original stays, because Patwari snapshots are immutable.
 5. `munshi retrieve <sha256>` failing with "not found" for a hash a summary references usually
    means that session's snapshot has not been uploaded yet — same checks as above. Manually
-   archived sessions (`munshi archive`) never upload; only the hook pipeline does.
+   archived sessions (`munshi archive`) never upload; only the hook pipeline does. When the
+   session's transcript is still on disk, `munshi retrieve <sha256> --local --session <id>`
+   redeems the ticket from the transcript directly, without waiting for the upload.
 
 ## Getting more signal
 

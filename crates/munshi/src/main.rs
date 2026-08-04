@@ -267,6 +267,17 @@ enum Command {
         /// deliberately retrieve an artifact larger than the default cap.
         #[arg(long)]
         max_download_bytes: Option<usize>,
+        /// Redeem the ticket from a session's local transcript instead of a server (no network;
+        /// works before the snapshot uploads). Requires --session.
+        #[arg(long, requires = "session", conflicts_with_all = ["list", "endpoint", "max_download_bytes"])]
+        local: bool,
+        /// The session whose transcript holds the elided content, as a bare session ID or the
+        /// prefixed identity summarizer input carries (for example `copilot:<id>`).
+        #[arg(long, requires = "local")]
+        session: Option<String>,
+        /// Disambiguate --session when the same ID exists under multiple sources.
+        #[arg(long, requires = "session")]
+        source: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Emit a stable machine-readable contract (for `--list` and `--query`).
@@ -1949,17 +1960,26 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             list,
             endpoint,
             max_download_bytes,
+            local,
+            session,
+            source,
             state_dir,
             json,
         } => {
             let state_directory = resolve_state_directory(state_dir)?;
-            let result = retrieve(
-                &state_directory,
-                endpoint.as_deref(),
-                &sha256,
-                list,
-                max_download_bytes,
-            );
+            let result = if local {
+                let session = session.expect("clap: --local requires --session");
+                let source = source.as_deref().map(parse_source_selector).transpose()?;
+                retrieve_local_target(&state_directory, source, &session, &sha256)?
+            } else {
+                retrieve(
+                    &state_directory,
+                    endpoint.as_deref(),
+                    &sha256,
+                    list,
+                    max_download_bytes,
+                )
+            };
             Ok(Outcome::Retrieve {
                 result: Box::new(result),
                 query,
@@ -4338,6 +4358,40 @@ fn resolve_session_target(
             sources.dedup();
             Ok(SessionTarget::Ambiguous(sources))
         }
+    }
+}
+
+/// Resolves a `retrieve --local` session reference and redeems the ticket from its transcript.
+/// The session may be a bare source session ID or the prefixed identity summarizer input carries
+/// (`copilot:<id>`); a prefix acts as a source selector and must agree with `--source` when both
+/// are given. An unknown session maps onto retrieval's own error surface (exit code 4) so scripts
+/// distinguish it from CLI misuse; only ambiguity and a bad selector are hard CLI errors.
+fn retrieve_local_target(
+    state_directory: &Path,
+    source: Option<SourceKind>,
+    session: &str,
+    sha256: &str,
+) -> Result<Result<RetrieveResult, RetrieveError>, Box<dyn Error>> {
+    let (source, session_id) = match session.split_once(':') {
+        Some((prefix, rest)) => {
+            let prefixed = parse_source_selector(prefix)?;
+            if let Some(explicit) = source
+                && explicit != prefixed
+            {
+                return Err(format!(
+                    "session prefix {prefix} contradicts --source {}",
+                    explicit.as_selector()
+                )
+                .into());
+            }
+            (Some(prefixed), rest)
+        }
+        None => (source, session),
+    };
+    match resolve_session_target(state_directory, source, session_id)? {
+        SessionTarget::One(record) => Ok(munshi::retrieve_local(&record, sha256)),
+        SessionTarget::NotFound => Ok(Err(RetrieveError::LocalSessionUnknown(session.to_owned()))),
+        SessionTarget::Ambiguous(sources) => Err(ambiguous_source_error(session_id, &sources)),
     }
 }
 

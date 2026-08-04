@@ -1140,6 +1140,40 @@ pub fn extract_outputs(
     extracted.into_values().collect()
 }
 
+/// Finds one extracted output by its content address: streams the transcript exactly as
+/// [`extract_outputs`] does and returns the first content event whose sha256 matches `sha256_hex`
+/// (bare lowercase hex). No size threshold applies — a ticket minted under any historical
+/// extraction threshold still redeems even if configuration changed since — and the scan stops at
+/// the first match instead of buffering the full extracted set. Emitting only hash-verified content
+/// makes this safe against a transcript growing or tearing under the read: a mutated transcript can
+/// at worst fail to match, never yield wrong bytes.
+pub fn find_extracted_output(
+    bytes: &[u8],
+    source: SourceKind,
+    sha256_hex: &str,
+) -> Option<ExtractedOutput> {
+    for item in transcript_stream(source, bytes) {
+        let Ok(record) = item else {
+            continue;
+        };
+        let Classification::Content { events } = record.classification else {
+            continue;
+        };
+        for event in events {
+            let content = event.legacy_content();
+            if content_sha256_hex(content.as_bytes()) == sha256_hex {
+                return Some(ExtractedOutput {
+                    sha256: sha256_hex.to_owned(),
+                    media_type: Some("text/plain; charset=utf-8".to_owned()),
+                    label: event.kind().to_owned(),
+                    content: content.into_bytes(),
+                });
+            }
+        }
+    }
+    None
+}
+
 fn count_records(bytes: &[u8]) -> u64 {
     bytes
         .split(|byte| *byte == b'\n')

@@ -20,6 +20,8 @@ use thiserror::Error;
 
 use crate::http::{self, HttpError};
 use crate::patwari::{self, PatwariError};
+use crate::source::find_extracted_output;
+use crate::state::SessionRecord;
 use crate::patwari_read::{
     API_BASE, DownloadError, LISTING_PAGE_SIZE, ListedArtifact, MAX_ARTIFACT_DOWNLOAD_BYTES,
     ReadClient, ReadError, SizeDimension, SizeRefusal, optional_str, required_str, required_u64,
@@ -48,6 +50,15 @@ pub enum RetrieveError {
         "no archived artifact matches sha256:{0}; its snapshot may not be uploaded yet, or the hash is unknown"
     )]
     NotFound(String),
+    /// `--local`: the named session is not known to this state directory.
+    #[error("no local session {0} is known to this state directory")]
+    LocalSessionUnknown(String),
+    /// `--local`: the session row exists but records no readable on-disk transcript.
+    #[error("session {0} has no transcript on disk to redeem from")]
+    LocalTranscriptUnavailable(String),
+    /// `--local`: no event in the session's transcript has this content hash.
+    #[error("no event in session {session}'s transcript matches sha256:{hash}")]
+    LocalNotFound { hash: String, session: String },
     /// The archive server could not be reached (connection refused, DNS, timeout).
     #[error("archive server is unreachable: {0}")]
     Unreachable(String),
@@ -97,7 +108,8 @@ impl RetrieveError {
         match self {
             Self::InvalidHash(_) | Self::OutputExists(_) => 2,
             Self::NotConfigured => 3,
-            Self::NotFound(_) => 4,
+            Self::NotFound(_) | Self::LocalSessionUnknown(_) | Self::LocalNotFound { .. } => 4,
+            Self::LocalTranscriptUnavailable(_) => 1,
             Self::Unreachable(_) | Self::Protocol(_) | Self::Server { .. } => 5,
             Self::Verification(_) | Self::Decompression(_) => 6,
             Self::TooLarge { .. } | Self::OriginalTooLarge { .. } => 7,
@@ -186,6 +198,62 @@ pub fn retrieve(
         artifact: chosen,
         original_bytes,
     })))
+}
+
+/// Redeems a claim ticket from the session's local transcript, with no server involved (issue #25
+/// groundwork). Streams the transcript at `record.transcript_path` and emits the first content
+/// event whose sha256 matches the ticket. Only hash-verified bytes are ever emitted, so a
+/// transcript growing or tearing under the read can at worst fail to match, never produce wrong
+/// content — the local analogue of the download path's three-stage verification. Works before the
+/// snapshot uploads and with Patwari unreachable, which is exactly the window a running summarizer
+/// occupies: upload is strictly downstream of summarization, so the current revision's elided
+/// content is only ever redeemable locally while the summary is being written.
+pub fn retrieve_local(
+    record: &SessionRecord,
+    input_hash: &str,
+) -> Result<RetrieveResult, RetrieveError> {
+    let hash = normalize_hash(input_hash)?;
+    let path = record
+        .transcript_path
+        .as_ref()
+        .ok_or_else(|| RetrieveError::LocalTranscriptUnavailable(session_label(record)))?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RetrieveError::LocalTranscriptUnavailable(session_label(
+                record,
+            )));
+        }
+        Err(error) => return Err(RetrieveError::Io(error)),
+    };
+    let Some(output) = find_extracted_output(&bytes, record.source, &hash) else {
+        return Err(RetrieveError::LocalNotFound {
+            hash,
+            session: session_label(record),
+        });
+    };
+    let size = output.content.len() as u64;
+    Ok(RetrieveResult::Retrieved(Box::new(RetrievedContent {
+        artifact: ArtifactMatch {
+            artifact_id: "local".to_owned(),
+            snapshot_id: session_label(record),
+            logical_path: format!("outputs/{hash}"),
+            media_type: output.media_type,
+            original_sha256: hash.clone(),
+            original_size_bytes: size,
+            stored_sha256: hash,
+            stored_size_bytes: size,
+            compression: "identity".to_owned(),
+            created_at: String::new(),
+            content_url: String::new(),
+        },
+        original_bytes: output.content,
+    })))
+}
+
+/// The prefixed session identity (`copilot:<id>`) used in summarizer input and error messages.
+fn session_label(record: &SessionRecord) -> String {
+    format!("{}:{}", record.source.id_prefix(), record.session_id)
 }
 
 /// Writes verified original bytes to `path`, refusing to clobber an existing file unless `force`.
