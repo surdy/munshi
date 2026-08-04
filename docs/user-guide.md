@@ -426,7 +426,10 @@ revives dead-letter sessions). Full design and rationale:
 ## Archive upload (Patwari) in brief
 
 Archive upload publishes each summary revision's full snapshot — the rendered summary, the verbatim
-transcript, and any extracted outputs — to a Patwari archive server. Like delivery, it is disabled
+transcript, any extracted outputs, and (for Copilot sessions) a bounded allowlist of harness
+sidecar files (`sidecar/…` artifacts: workspace, plan, and checkpoint state, staged beside the
+archive Markdown at archive time; see [`harness-adapters.md`](harness-adapters.md)) — to a Patwari
+archive server. Like delivery, it is disabled
 by default and strictly downstream of local archival: a Patwari outage never blocks or rolls back a
 local Markdown write, and it runs in parallel with, and independently of, Notesmith delivery.
 

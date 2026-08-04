@@ -92,5 +92,15 @@ pub fn archive_session(config: &ArchiveConfig) -> Result<ArchiveOutcome, Archive
         .strip_prefix(&config.output_directory)
         .unwrap_or(Path::new(&output))
         .to_path_buf();
+    // Stage this revision's harness sidecar set beside the Markdown (issue #23). Best-effort:
+    // sidecars are optional snapshot artifacts, so staging failure never fails the archive.
+    if session.source == crate::source::SourceKind::Copilot {
+        let sidecars = crate::source::collect_copilot_sidecars(&resolved.events_path);
+        let _ = crate::render::stage_sidecar_files(
+            &config.output_directory,
+            &relative_path,
+            &sidecars,
+        );
+    }
     Ok(ArchiveOutcome::Archived { id, relative_path })
 }

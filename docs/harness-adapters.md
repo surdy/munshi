@@ -102,6 +102,22 @@ once the chunked-marathon giants uploaded (issue #45), added eight more: `abort`
 `session.plan_changed`, `session.task_complete`, and `session.workspace_file_changed` — same
 treatment.
 
+### Sidecar artifacts (snapshot artifact set v2, issue #23)
+
+Beside `events.jsonl`, the session-state directory holds harness sidecar files, an allowlisted
+subset of which is captured into Patwari snapshots as `sidecar/<relative-path>` artifacts:
+`workspace.yaml`, `plan.md`, `vscode.metadata.json`, `checkpoints/*.md`, and
+`rewind-file-snapshots/{tracking,index}.json` — the small textual narrative state. Deliberately
+excluded: `session.db` (a live SQLite, largely duplicative of the events), `rewind-file-snapshots/
+backups/**` and `rewind-snapshots/**` (bulk content-addressed user-file blobs), `files/**`
+(arbitrary workspace trees, including symlinked `node_modules`), and dotfiles. Capture is bounded
+(64 files / 1 MiB per file / 4 MiB total), refuses symlinks, stable-reads each file, and is
+staged into the archive output directory at archive time so upload retries re-serialize a
+byte-identical manifest; sidecars are optional by contract and any capture problem skips the file
+rather than failing the archive or upload. Claude Code and Codex contribute no sidecar artifacts:
+Claude's `todos/` are ephemeral scratch state and its shell snapshots are timestamp-keyed
+environment caches, neither worth archiving.
+
 The census tail also surfaced four archive-observed **tool-activity** kinds that are content,
 not bookkeeping (issue #51), all normalized as `tool` events: `skill.invoked` (the agent loaded
 a skill — `name` required; `path`, `description`, `source`, `trigger`, `model`, and the full

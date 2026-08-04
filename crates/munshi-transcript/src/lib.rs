@@ -45,10 +45,14 @@ mod envelope;
 
 pub use envelope::{claude_git_branch, claude_origin_cwd, envelope_matches};
 
-/// The only artifact-set version any source supports today. [`TranscriptStream::new`]
-/// rejects other versions so future artifact sets fail loudly instead of being
-/// misinterpreted with version-1 assumptions.
-pub const SUPPORTED_ARTIFACT_SET_VERSION: u16 = 1;
+/// The oldest artifact-set version any source supports.
+pub const MIN_SUPPORTED_ARTIFACT_SET_VERSION: u16 = 1;
+/// The newest artifact-set version any source supports. Version 2 (munshi issue #23) added
+/// optional `sidecar/<path>` snapshot artifacts without changing transcript interpretation, so
+/// versions 1..=2 share one interpreter per source. [`TranscriptStream::new`] rejects versions
+/// outside the range so future artifact sets fail loudly instead of being misinterpreted with
+/// stale assumptions.
+pub const SUPPORTED_ARTIFACT_SET_VERSION: u16 = 2;
 
 /// The [`Classification::Ignored`] kind recorded for a line that is valid JSON but not a
 /// JSON object. No transcript envelope produces such records, but the historical
@@ -80,7 +84,7 @@ pub enum Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error(
     "artifact set version {version} of source {source_kind:?} is not supported \
-     (supported: {SUPPORTED_ARTIFACT_SET_VERSION})"
+     (supported: {MIN_SUPPORTED_ARTIFACT_SET_VERSION}..={SUPPORTED_ARTIFACT_SET_VERSION})"
 )]
 pub struct UnsupportedVersion {
     // Named `source_kind` rather than `source` so thiserror does not treat the field as
@@ -250,7 +254,9 @@ impl<R: BufRead> TranscriptStream<R> {
         artifact_set_version: u16,
         reader: R,
     ) -> Result<Self, UnsupportedVersion> {
-        if artifact_set_version != SUPPORTED_ARTIFACT_SET_VERSION {
+        if !(MIN_SUPPORTED_ARTIFACT_SET_VERSION..=SUPPORTED_ARTIFACT_SET_VERSION)
+            .contains(&artifact_set_version)
+        {
             return Err(UnsupportedVersion {
                 source_kind: source,
                 version: artifact_set_version,

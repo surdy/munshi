@@ -201,7 +201,7 @@ fn unsupported_versions_and_unknown_agents_are_skipped_not_fatal() {
                 "22222222-2222-4222-8222-222222222222",
                 "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                 "claude-code",
-                2,
+                99,
                 vec![FakeArtifact::zstd("art-2", "transcript.jsonl", &claude)],
             ),
             FakeSnapshot::new(

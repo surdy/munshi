@@ -2301,8 +2301,9 @@ fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveU
     })
 }
 
-/// The stored artifact-path list separator. Logical paths are reserved names or content-addressed
-/// `outputs/<sha256>` paths (ADR 0009), so none can contain a newline.
+/// The stored artifact-path list separator. Logical paths are reserved names, content-addressed
+/// `outputs/<sha256>` paths, or allowlist-derived `sidecar/<relative>` paths (ADR 0009, issue
+/// #23), so none can contain a newline.
 const ARTIFACT_PATH_SEPARATOR: &str = "\n";
 
 /// Joins an uploaded snapshot's artifact logical paths into the single ledger column.

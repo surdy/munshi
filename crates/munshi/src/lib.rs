@@ -47,7 +47,8 @@ pub use memory_sync::{
 };
 pub use patwari::{
     ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
-    ArchiveUploadStatusReport, ArtifactSource, CaptureContext, INITIAL_ARTIFACT_SET_VERSION,
+    ArchiveUploadStatusReport, ArtifactSource, CaptureContext, CURRENT_ARTIFACT_SET_VERSION,
+    INITIAL_ARTIFACT_SET_VERSION,
     PatwariClient, PatwariError, PreparedArtifact, SessionContext, UploadOutcome, UploadReceipt,
     assemble_artifact_sources, backfill as archive_upload_backfill, build_manifest,
     configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
@@ -77,8 +78,9 @@ pub use retrieve::{
 };
 pub use source::{
     ArtifactIndexEntry, ClaudeRecordedOrigin, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES,
-    ExtractedOutput, NormalizedEvent, NormalizedSession, PreviousSource, SnapshotArtifactIndex,
-    SourceError, SourceHomes, SourceKind, TranscriptLoadMode, TranscriptUpdate,
+    ExtractedOutput, NormalizedEvent, NormalizedSession, PreviousSource, SIDECAR_MAX_FILE_BYTES,
+    SIDECAR_MAX_FILES, SIDECAR_MAX_TOTAL_BYTES, SidecarFile, SnapshotArtifactIndex, SourceError,
+    SourceHomes, SourceKind, TranscriptLoadMode, TranscriptUpdate, collect_copilot_sidecars,
     claude_transcript_origin, claude_transcript_recorded_origin, copilot_workspace_origin,
     derive_transcript_path, extract_outputs, load_session, load_session_update,
     resolve_session_reference, snapshot_artifact_index, validate_transcript_envelope,

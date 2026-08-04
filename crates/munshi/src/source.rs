@@ -995,12 +995,12 @@ struct NormalizedRecords {
 
 /// Opens the shared streaming interpreter (ADR 0011) over in-memory transcript bytes,
 /// keyed by the capture source and the artifact-set version capture provenance records
-/// ([`crate::patwari::INITIAL_ARTIFACT_SET_VERSION`]). Both are compile-time constants, so
+/// ([`crate::patwari::CURRENT_ARTIFACT_SET_VERSION`]). Both are compile-time constants, so
 /// an unsupported pairing is a build defect, not a runtime condition.
 fn transcript_stream(source: SourceKind, bytes: &[u8]) -> TranscriptStream<&[u8]> {
     TranscriptStream::new(
         source.into(),
-        crate::patwari::INITIAL_ARTIFACT_SET_VERSION,
+        crate::patwari::CURRENT_ARTIFACT_SET_VERSION,
         bytes,
     )
     .expect("munshi-transcript supports the capture artifact-set version")
@@ -1138,6 +1138,121 @@ pub fn extract_outputs(
         }
     }
     extracted.into_values().collect()
+}
+
+/// One harness sidecar file captured alongside a snapshot (issue #23): workspace/plan/checkpoint
+/// state the harness keeps beside the transcript, staged into the local archive at archive time so
+/// upload retries re-serialize a byte-identical manifest (Patwari rejects a reused capture id whose
+/// canonical manifest changed, and capture identity is reused across retries of one revision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarFile {
+    /// Forward-slash relative path within the sidecar set (also the `sidecar/<path>` logical-path
+    /// stem). Always drawn from the fixed allowlist below, never from arbitrary directory content.
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Bounds on one revision's sidecar capture. The allowlisted kinds are all small textual state —
+/// the live corpus median is well under 32 KiB per file — so these caps exist to keep a
+/// pathological session from bloating snapshots, not to trim healthy ones.
+pub const SIDECAR_MAX_FILES: usize = 64;
+pub const SIDECAR_MAX_FILE_BYTES: usize = 1024 * 1024;
+pub const SIDECAR_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// Collects the Copilot session-state sidecar files for the session whose transcript is
+/// `events_path` (issue #23). Allowlist, not a directory walk: the session-state directory also
+/// holds `session.db` (a live SQLite), `rewind-file-snapshots/backups/**` (bulk user-file blobs),
+/// and `files/**` (arbitrary workspace trees, including symlinked `node_modules`), none of which
+/// belong in a snapshot. What is captured is the small textual narrative state: `workspace.yaml`,
+/// `plan.md`, `vscode.metadata.json`, `checkpoints/*.md`, and the two rewind-file-snapshots
+/// indexes.
+///
+/// Read discipline matches [`copilot_workspace_origin`]: `symlink_metadata` first so symlinked
+/// entries are refused, regular files only, per-file and total caps, and a stable read
+/// (stat/read/re-stat) per file. Sidecars are optional by contract — any file that is missing,
+/// oversized, or mutating mid-read is silently skipped; a later revision re-captures it. Ordering
+/// is deterministic (fixed allowlist order, `checkpoints/` sorted by name).
+#[must_use]
+pub fn collect_copilot_sidecars(events_path: &Path) -> Vec<SidecarFile> {
+    let Some(session_directory) = events_path.parent() else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    for name in ["workspace.yaml", "plan.md", "vscode.metadata.json"] {
+        candidates.push((name.to_owned(), session_directory.join(name)));
+    }
+    let checkpoints = session_directory.join("checkpoints");
+    if let Ok(entries) = fs::read_dir(&checkpoints) {
+        let mut names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(ToOwned::to_owned))
+            .filter(|name| {
+                name.ends_with(".md") && !name.starts_with('.') && portable_path_component(name)
+            })
+            .collect();
+        names.sort_unstable();
+        for name in names {
+            let path = checkpoints.join(&name);
+            candidates.push((format!("checkpoints/{name}"), path));
+        }
+    }
+    let rewind = session_directory.join("rewind-file-snapshots");
+    for name in ["tracking.json", "index.json"] {
+        candidates.push((format!("rewind-file-snapshots/{name}"), rewind.join(name)));
+    }
+
+    let mut collected = Vec::new();
+    let mut total_bytes = 0usize;
+    for (relative_path, path) in candidates {
+        if collected.len() >= SIDECAR_MAX_FILES {
+            break;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > SIDECAR_MAX_FILE_BYTES as u64 {
+            continue;
+        }
+        let Ok((bytes, _)) = read_stable_source(&path, SIDECAR_MAX_FILE_BYTES) else {
+            continue;
+        };
+        let Some(next_total) = total_bytes.checked_add(bytes.len()) else {
+            break;
+        };
+        if next_total > SIDECAR_MAX_TOTAL_BYTES {
+            continue;
+        }
+        total_bytes = next_total;
+        collected.push(SidecarFile {
+            relative_path,
+            bytes,
+        });
+    }
+    collected
+}
+
+/// Whether a harness-chosen file name survives Patwari's portable logical-path validation
+/// (ASCII alphanumeric plus `.`/`_`/`-` components that do not end with a dot or space and are
+/// not Windows-reserved device names). Checkpoint names come from the harness, and one
+/// non-portable name would reject the whole snapshot manifest, so anything else is skipped at
+/// capture time; the fixed allowlist names are known-portable.
+fn portable_path_component(name: &str) -> bool {
+    if name.is_empty()
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    !matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+    ) && !(stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit())
 }
 
 /// Finds one extracted output by its content address: streams the transcript exactly as
