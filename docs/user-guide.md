@@ -487,7 +487,12 @@ same applies to every endpoint Munshi dials, including the Notesmith endpoints a
 
 `configure` records the server without turning upload on; `enable` requires a configured server and
 turns upload on; `disable` stops future upload while keeping upload history. `status` shows the
-configuration and per-session upload state. `retry` re-attempts failed uploads (`--force` revives
+configuration and per-session upload state, plus measured transfer accounting (issue #65): a
+lifetime `transfer_bytes_total` — the bytes actually moved on the wire per Patwari's upload
+receipts, which blob dedup makes far smaller than the artifact sizes — and
+`stored_bytes_latest_total`, the compressed footprint of every session's latest snapshot. These
+are the numbers that decide whether delta-upload optimization (issue #24) is ever worth building;
+rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts failed uploads (`--force` revives
 dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
 also retried automatically by the recovery sweep (`munshi hook recover`), so a transient outage
 recovers without a new revision. `backfill` uploads archived sessions the configured server holds
