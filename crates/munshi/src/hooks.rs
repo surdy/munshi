@@ -1315,6 +1315,14 @@ fn process_claim(
             return Err(error.into());
         }
     }
+    // Stage this revision's harness sidecar set beside the Markdown (issue #23). Best-effort by
+    // contract: sidecars are optional snapshot artifacts, so a staging failure never fails the
+    // archive, and the upload path assembles from these staged copies — never the live
+    // session-state files — so a reused capture id re-serializes a byte-identical manifest.
+    if source == SourceKind::Copilot {
+        let sidecars = crate::source::collect_copilot_sidecars(&resolved.events_path);
+        let _ = crate::render::stage_sidecar_files(&output_directory, &relative_path, &sidecars);
+    }
     let summary_json = serde_json::to_vec(&summary)?;
     let persisted = PersistedArchive {
         revision,

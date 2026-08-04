@@ -523,11 +523,15 @@ fn unknown_records_carry_the_raw_record() {
 
 #[test]
 fn unsupported_artifact_set_versions_are_rejected_up_front() {
-    for version in [0, 2, u16::MAX] {
+    for version in [0, 3, u16::MAX] {
         let result = TranscriptStream::new(Source::Codex, version, "".as_bytes());
         assert!(result.is_err(), "version {version} must be rejected");
     }
-    assert!(TranscriptStream::new(Source::Codex, 1, "".as_bytes()).is_ok());
+    // Versions 1 and 2 share one interpreter per source: v2 (munshi issue #23) added optional
+    // sidecar artifacts without changing transcript interpretation.
+    for version in [1, 2] {
+        assert!(TranscriptStream::new(Source::Codex, version, "".as_bytes()).is_ok());
+    }
 }
 
 #[test]

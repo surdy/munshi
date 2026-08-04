@@ -194,6 +194,7 @@ fn an_oversized_output_becomes_a_content_addressed_artifact() {
         Some(transcript),
         SourceKind::Copilot,
         threshold,
+        Vec::new(),
     );
     // Set v1 with one extraction, in canonical (path-sorted) order: the outputs/<sha256> artifact
     // sorts before the fixed roles (issue #33).
@@ -255,6 +256,7 @@ fn multiple_oversized_outputs_are_hash_sorted_with_correct_digests() {
         Some(transcript),
         SourceKind::Copilot,
         threshold,
+        Vec::new(),
     );
     let paths: Vec<String> = sources
         .iter()
@@ -287,6 +289,7 @@ fn under_threshold_events_produce_exactly_transcript_and_summary() {
         Some(transcript),
         SourceKind::Copilot,
         threshold,
+        Vec::new(),
     );
     let paths: Vec<&str> = sources.iter().map(|s| s.logical_path.as_str()).collect();
     assert_eq!(paths, vec!["summary.md", "transcript.jsonl"]);
@@ -306,12 +309,14 @@ fn a_grown_revision_keeps_unchanged_extracted_outputs_stable() {
         Some(first.clone()),
         SourceKind::Copilot,
         threshold,
+        Vec::new(),
     );
     let grown_sources = assemble_artifact_sources(
         Some(b"# rev 2\n".to_vec()),
         Some(grown),
         SourceKind::Copilot,
         threshold,
+        Vec::new(),
     );
 
     // The untouched first extracted output resolves to the same logical path and bytes in the
@@ -359,6 +364,7 @@ fn retry_reuses_capture_with_extracted_outputs_and_identical_manifest() {
             Some(build_transcript()),
             SourceKind::Copilot,
             threshold,
+            Vec::new(),
         );
         assert!(
             sources
@@ -413,6 +419,7 @@ fn a_snapshot_with_extracted_outputs_uploads_every_chunk_and_completes() {
         Some(transcript),
         SourceKind::Copilot,
         threshold,
+        Vec::new(),
     );
     assert!(
         sources

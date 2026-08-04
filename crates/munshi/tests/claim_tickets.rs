@@ -118,7 +118,7 @@ fn ticket_frontmatter_and_artifact_set_agree_on_the_same_addresses() {
     };
     let markdown = render_revision_markdown(&metadata, &summary(), 1, "complete", None);
     let parsed = parse_archive_markdown(&markdown).unwrap();
-    assert_eq!(parsed.artifact_set_version, Some(1));
+    assert_eq!(parsed.artifact_set_version, Some(2));
     assert_eq!(
         parsed.transcript_sha256.as_deref(),
         Some(session.source_hash.as_str()),
@@ -132,6 +132,7 @@ fn ticket_frontmatter_and_artifact_set_agree_on_the_same_addresses() {
         Some(transcript),
         SourceKind::Copilot,
         THRESHOLD,
+        Vec::new(),
     );
     let output_stem = sources
         .iter()

@@ -8,7 +8,7 @@ use tempfile::Builder;
 use thiserror::Error;
 
 use crate::project::{ProjectIdentity, ProjectOrigin};
-use crate::source::{ArtifactIndexEntry, NormalizedSession, SourceKind};
+use crate::source::{ArtifactIndexEntry, NormalizedSession, SidecarFile, SourceKind};
 use crate::summary::{StructuredSummary, validate_structured_summary};
 
 #[derive(Debug)]
@@ -446,6 +446,45 @@ pub fn archive_path(output_directory: &Path, metadata: &ArchiveMetadata<'_>) -> 
 /// resolve to the same Markdown file. Copilot keeps its original
 /// `<component>/<session_id>.md` layout for backward compatibility; every other
 /// source nests its records under a `<source-prefix>/` segment.
+/// The staged-sidecar directory for an archive Markdown path (issue #23): the sibling
+/// `<session-id>.sidecar/` directory, derived by swapping the `.md` extension. Staging lives in
+/// the archive output directory because the sidecar set is part of the durable record (ADR 0002)
+/// and because upload retries must re-serialize a byte-identical manifest — the staged copies, not
+/// the live session-state files, are what snapshots assemble from.
+pub(crate) fn sidecar_directory(output_directory: &Path, markdown_relative: &Path) -> PathBuf {
+    output_directory.join(markdown_relative.with_extension("sidecar"))
+}
+
+/// Replaces the staged sidecar set for one archive revision: the directory is cleared and
+/// rewritten so it holds exactly `files`, never a union across revisions (a checkpoint deleted by
+/// the harness disappears from the next revision's snapshot too). An empty set removes the
+/// directory entirely. Relative paths come from the capture allowlist
+/// ([`crate::source::collect_copilot_sidecars`]), never from arbitrary directory content, so they
+/// cannot traverse outside the sidecar directory.
+pub(crate) fn stage_sidecar_files(
+    output_directory: &Path,
+    markdown_relative: &Path,
+    files: &[SidecarFile],
+) -> io::Result<()> {
+    let directory = sidecar_directory(output_directory, markdown_relative);
+    match fs::remove_dir_all(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if files.is_empty() {
+        return Ok(());
+    }
+    for file in files {
+        let target = directory.join(&file.relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, &file.bytes)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn archive_relative_path(
     source: SourceKind,
     component: &str,
@@ -476,7 +515,7 @@ fn render_artifact_index(output: &mut String, metadata: &ArchiveMetadata<'_>) {
     line_number(
         output,
         "artifact_set_version",
-        crate::patwari::INITIAL_ARTIFACT_SET_VERSION,
+        crate::patwari::CURRENT_ARTIFACT_SET_VERSION,
     );
     line_string(output, "transcript_sha256", &metadata.session.source_hash);
     let outputs = &metadata.session.artifact_index.extracted_outputs;
@@ -830,11 +869,11 @@ mod tests {
             project: &project(),
         };
         let markdown = render_revision_markdown(&metadata, &summary(), 1, "complete", None);
-        assert!(markdown.contains("artifact_set_version: 1\n"));
+        assert!(markdown.contains("artifact_set_version: 2\n"));
         assert!(markdown.contains(&format!("transcript_sha256: \"{}\"\n", hash())));
 
         let parsed = parse_archive_markdown(&markdown).expect("archive with the index re-parses");
-        assert_eq!(parsed.artifact_set_version, Some(1));
+        assert_eq!(parsed.artifact_set_version, Some(2));
         assert_eq!(parsed.transcript_sha256.as_deref(), Some(hash().as_str()));
         assert_eq!(parsed.extracted_outputs, outputs);
     }
@@ -860,7 +899,7 @@ mod tests {
         let markdown = render_revision_markdown(&metadata, &summary(), 1, "complete", None);
         assert!(markdown.contains("extracted_outputs: []\n"));
         let parsed = parse_archive_markdown(&markdown).unwrap();
-        assert_eq!(parsed.artifact_set_version, Some(1));
+        assert_eq!(parsed.artifact_set_version, Some(2));
         assert!(parsed.extracted_outputs.is_empty());
     }
 

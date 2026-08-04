@@ -48,7 +48,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use munshi_transcript::{
-    Classification, Event, Record, RecordError, SUPPORTED_ARTIFACT_SET_VERSION, Source,
+    Classification, Event, MIN_SUPPORTED_ARTIFACT_SET_VERSION, Record, RecordError,
+    SUPPORTED_ARTIFACT_SET_VERSION, Source,
     TranscriptStream,
 };
 use serde::Serialize;
@@ -565,11 +566,14 @@ fn verify_snapshot(client: &VerifyClient, snapshot: &ListedSnapshot, cap: usize)
         };
         return report;
     };
-    if provenance.artifact_set_version != u64::from(SUPPORTED_ARTIFACT_SET_VERSION) {
+    if !(u64::from(MIN_SUPPORTED_ARTIFACT_SET_VERSION)
+        ..=u64::from(SUPPORTED_ARTIFACT_SET_VERSION))
+        .contains(&provenance.artifact_set_version)
+    {
         report.status = SnapshotStatus::Skipped {
             reason: SkipReason::UnsupportedArtifactSetVersion,
             message: format!(
-                "artifact set version {} is not supported by this build (supported: {SUPPORTED_ARTIFACT_SET_VERSION})",
+                "artifact set version {} is not supported by this build (supported: {MIN_SUPPORTED_ARTIFACT_SET_VERSION}..={SUPPORTED_ARTIFACT_SET_VERSION})",
                 provenance.artifact_set_version
             ),
         };

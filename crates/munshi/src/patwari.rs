@@ -40,7 +40,7 @@ use crate::registration::{
     DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS, RegistrationError, StoredConfig, load_stored_config,
     stored_config_exists, update_stored_config,
 };
-use crate::source::{SourceHomes, SourceKind, derive_transcript_path};
+use crate::source::{SidecarFile, SourceHomes, SourceKind, derive_transcript_path};
 use crate::state::{
     ArchiveUploadRecord, ArchiveUploadSuccess, SessionRecord, StateError, StateStore, now_ms,
     try_acquire_session_lock,
@@ -50,9 +50,17 @@ use crate::state::{
 const API_BASE: &str = "/api/v1";
 /// The current manifest schema version Patwari accepts.
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
-/// The initial snapshot artifact-set version. Issue #20 will add artifact kinds under a bumped
-/// version; this is exposed so manifest assembly can be extended without changing the wire shape.
+/// The initial snapshot artifact-set version: `summary.md`, `transcript.jsonl`, and
+/// `outputs/<sha256>` extracted outputs.
 pub const INITIAL_ARTIFACT_SET_VERSION: u16 = 1;
+/// The artifact-set version new snapshots record. Version 2 (issue #23) additionally allows
+/// optional `sidecar/<relative-path>` artifacts carrying harness sidecar state staged at archive
+/// time; presence is per-adapter conditional (Copilot stages an allowlisted set, Claude Code and
+/// Codex stage nothing) and consumers must tolerate absent kinds, so transcript interpretation is
+/// unchanged from v1.
+pub const CURRENT_ARTIFACT_SET_VERSION: u16 = 2;
+/// The logical-path prefix of staged sidecar artifacts (artifact set v2, issue #23).
+const SIDECAR_LOGICAL_PREFIX: &str = "sidecar/";
 /// Custom chunk headers Patwari requires on each artifact chunk PUT.
 const CHUNK_SHA256_HEADER: &str = "x-patwari-chunk-sha256";
 const CHUNK_LENGTH_HEADER: &str = "x-patwari-chunk-length";
@@ -996,6 +1004,7 @@ fn collect_artifacts(
         transcript,
         record.source,
         max_event_text_bytes,
+        read_staged_sidecars(output_directory, record.markdown_relative_path.as_deref()),
     ))
 }
 
@@ -1039,9 +1048,10 @@ fn collect_recoverable_artifacts(
     collect_artifacts(output_directory, &recovered, max_event_text_bytes)
 }
 
-/// Assembles the ordered snapshot artifact set v1 (ADR 0009/0010) from already-read bytes:
-/// `summary.md` (this revision's rendered summary), `transcript.jsonl` (the verbatim source bytes),
-/// and every re-derived `outputs/<sha256>` extracted output.
+/// Assembles the ordered snapshot artifact set (ADR 0009/0010, v2 per issue #23) from
+/// already-read bytes: `summary.md` (this revision's rendered summary), `transcript.jsonl` (the
+/// verbatim source bytes), every re-derived `outputs/<sha256>` extracted output, and any staged
+/// `sidecar/<relative-path>` files.
 ///
 /// Extracted outputs are re-derived from the exact transcript bytes this snapshot uploads
 /// (`extract_outputs`, ADR 0010 option a), so the `outputs/<sha256>` set is always consistent with
@@ -1061,6 +1071,7 @@ pub fn assemble_artifact_sources(
     transcript_jsonl: Option<Vec<u8>>,
     source: SourceKind,
     max_event_text_bytes: usize,
+    sidecars: Vec<SidecarFile>,
 ) -> Vec<ArtifactSource> {
     let mut sources = Vec::new();
     if let Some(summary) = summary_md {
@@ -1068,6 +1079,13 @@ pub fn assemble_artifact_sources(
             logical_path: "summary.md".to_owned(),
             media_type: Some("text/markdown".to_owned()),
             bytes: summary,
+        });
+    }
+    for sidecar in sidecars {
+        sources.push(ArtifactSource {
+            logical_path: format!("{SIDECAR_LOGICAL_PREFIX}{}", sidecar.relative_path),
+            media_type: Some(sidecar_media_type(&sidecar.relative_path).to_owned()),
+            bytes: sidecar.bytes,
         });
     }
     if let Some(transcript) = transcript_jsonl {
@@ -1085,11 +1103,93 @@ pub fn assemble_artifact_sources(
             });
         }
     }
-    // Canonicalize: Patwari sorts `artifacts[]` by logical path (`outputs/…` before `summary.md`
-    // before `transcript.jsonl`). Logical paths are unique here (fixed roles plus content-addressed
-    // outputs), so the sort is a total order and stable across retries.
+    // Canonicalize: Patwari sorts `artifacts[]` by logical path (`outputs/…` before `sidecar/…`
+    // before `summary.md` before `transcript.jsonl`). Logical paths are unique here (fixed roles,
+    // content-addressed outputs, and distinct staged relative paths), so the sort is a total order
+    // and stable across retries.
     sources.sort_by(|a, b| a.logical_path.cmp(&b.logical_path));
     sources
+}
+
+/// Media type of a staged sidecar artifact, keyed by its allowlisted extension.
+fn sidecar_media_type(relative_path: &str) -> &'static str {
+    match relative_path.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("md") => "text/markdown",
+        Some("json") => "application/json",
+        Some("yaml") => "application/yaml",
+        _ => "text/plain; charset=utf-8",
+    }
+}
+
+/// Reads the staged sidecar set for `record`'s current archive Markdown, if any (issue #23).
+///
+/// The staged directory — written by the archive step from the live session-state allowlist — is
+/// the only sidecar source uploads read, so a reused capture id re-serializes the same manifest
+/// even when the live files have since mutated. The read is defensively bounded with the same caps
+/// as capture and refuses symlinked entries; an unreadable or absent directory yields an empty
+/// set, never an error, because sidecars are optional by contract.
+fn read_staged_sidecars(output_directory: &Path, markdown_relative: Option<&Path>) -> Vec<SidecarFile> {
+    let Some(relative) = markdown_relative else {
+        return Vec::new();
+    };
+    let directory = crate::render::sidecar_directory(output_directory, relative);
+    let mut relative_paths = Vec::new();
+    collect_staged_paths(&directory, &directory, 0, &mut relative_paths);
+    relative_paths.sort_unstable();
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+    for relative_path in relative_paths {
+        if files.len() >= crate::source::SIDECAR_MAX_FILES {
+            break;
+        }
+        let Ok(bytes) = std::fs::read(directory.join(&relative_path)) else {
+            continue;
+        };
+        if bytes.len() > crate::source::SIDECAR_MAX_FILE_BYTES {
+            continue;
+        }
+        let Some(next_total) = total_bytes.checked_add(bytes.len()) else {
+            break;
+        };
+        if next_total > crate::source::SIDECAR_MAX_TOTAL_BYTES {
+            continue;
+        }
+        total_bytes = next_total;
+        files.push(SidecarFile {
+            relative_path,
+            bytes,
+        });
+    }
+    files
+}
+
+/// Walks a staged sidecar directory up to two levels deep, collecting forward-slash relative file
+/// paths. Symlinked entries and deeper nesting are ignored — staging never writes either, so
+/// anything else is not ours to upload.
+fn collect_staged_paths(root: &Path, directory: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth > 1 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_staged_paths(root, &path, depth + 1, out);
+        } else if metadata.is_file()
+            && let Ok(relative) = path.strip_prefix(root)
+            && let Some(relative) = relative.to_str()
+        {
+            out.push(relative.replace(std::path::MAIN_SEPARATOR, "/"));
+        }
+    }
 }
 
 /// Uploads one freshly archived summary revision to Patwari, invoked by the archive worker
@@ -1380,7 +1480,7 @@ fn run_upload(
             .as_ref()
             .and_then(|project| project.branch.clone()),
         source_agent_version: None,
-        artifact_set_version: INITIAL_ARTIFACT_SET_VERSION,
+        artifact_set_version: CURRENT_ARTIFACT_SET_VERSION,
         munshi_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
     };
     let manifest = build_manifest(&session, &capture, artifacts);
@@ -1989,7 +2089,7 @@ mod tests {
                 repository: None,
                 branch: None,
                 source_agent_version: None,
-                artifact_set_version: INITIAL_ARTIFACT_SET_VERSION,
+                artifact_set_version: CURRENT_ARTIFACT_SET_VERSION,
                 munshi_version: Some("0.1.0".to_owned()),
             },
             &artifacts,
@@ -2001,6 +2101,83 @@ mod tests {
             .unwrap();
         assert!(digest.starts_with("sha256:"));
         assert_eq!(digest.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn staged_sidecars_round_trip_into_canonical_artifact_order() {
+        use tempfile::TempDir;
+
+        let output_directory = TempDir::new().unwrap();
+        let markdown_relative = Path::new("component/sess-1.md");
+        let staged = vec![
+            SidecarFile {
+                relative_path: "workspace.yaml".to_owned(),
+                bytes: b"cwd: /work\n".to_vec(),
+            },
+            SidecarFile {
+                relative_path: "checkpoints/index.md".to_owned(),
+                bytes: b"# checkpoint\n".to_vec(),
+            },
+        ];
+        crate::render::stage_sidecar_files(output_directory.path(), markdown_relative, &staged)
+            .unwrap();
+        // A symlinked entry dropped into the staged directory is not ours and is never uploaded.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "/etc/hosts",
+            output_directory
+                .path()
+                .join("component/sess-1.sidecar/evil.md"),
+        )
+        .unwrap();
+
+        let read = read_staged_sidecars(output_directory.path(), Some(markdown_relative));
+        assert_eq!(read, {
+            let mut sorted = staged.clone();
+            sorted.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+            sorted
+        });
+
+        // Assembly places sidecars under `sidecar/…` in canonical logical-path order with
+        // extension-derived media types.
+        let sources = assemble_artifact_sources(
+            Some(b"# Summary\n".to_vec()),
+            Some(b"{}\n".to_vec()),
+            SourceKind::Copilot,
+            64,
+            read,
+        );
+        let paths: Vec<&str> = sources
+            .iter()
+            .map(|source| source.logical_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "sidecar/checkpoints/index.md",
+                "sidecar/workspace.yaml",
+                "summary.md",
+                "transcript.jsonl",
+            ]
+        );
+        assert_eq!(
+            sources[0].media_type.as_deref(),
+            Some("text/markdown"),
+            "markdown sidecar media type"
+        );
+        assert_eq!(
+            sources[1].media_type.as_deref(),
+            Some("application/yaml"),
+            "yaml sidecar media type"
+        );
+
+        // Re-staging an empty set removes the directory: the snapshot set never unions revisions.
+        crate::render::stage_sidecar_files(output_directory.path(), markdown_relative, &[])
+            .unwrap();
+        assert!(
+            read_staged_sidecars(output_directory.path(), Some(markdown_relative)).is_empty()
+        );
+        assert!(read_staged_sidecars(output_directory.path(), None).is_empty());
     }
 
     #[test]
@@ -2140,6 +2317,7 @@ mod tests {
             Some(transcript),
             SourceKind::Copilot,
             64,
+            Vec::new(),
         );
         let paths: Vec<&str> = sources
             .iter()
