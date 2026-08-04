@@ -14,6 +14,15 @@ the crate's `Source` — and folds the event stream into `NormalizedSession`. Se
 `run_archive_worker_for_source` for the shared state pipeline) is independent from selecting a
 summarizer: a Copilot summarizer can archive a Claude Code or Codex session and vice versa.
 
+The three adapters are not the same support tier. Copilot and Claude Code are **fully
+operational** sources: `munshi register --harness` accepts exactly these two, installs their
+lifecycle hooks, records their homes in `SourceHomes`, and gives them recovery sweeps and
+transcript-path derivation. **Codex is read-only**: it has no hook integration (a Codex hook
+invocation fails with `unsupported-hook-source`), cannot be registered, has no home in
+`SourceHomes`, and — because rollout files are not named after the session — no session-ID
+path derivation and no origin recovery. A Codex session enters Munshi only through
+[`munshi archive`](manual-archive.md) or an explicit transcript path.
+
 ## Shared normalized model
 
 Every adapter maps its transcript to the same [`NormalizedSession`](../crates/munshi/src/source.rs):
@@ -61,15 +70,27 @@ Interrupted/stale recovery (`munshi hook recover` / `run_recovery`) reads work l
 sources but performs each per-session mutation against a store scoped to that session's own
 `SourceKind`, and validates staleness with that session's adapter envelope. This prevents a
 non-Copilot session from being skipped, mis-routed to the Copilot adapter, or given a duplicate
-Copilot row. Session-ID-only transcript discovery remains intentionally Copilot-only, because only
-Copilot has a safe, version-pinned `session-state/<id>/events.jsonl` fallback; other sources are
-left pending rather than guessed. Path-yielding directory sweeps are a different, permitted
-mechanism: recovery also sweeps the registered Claude Code home's `projects/*/` directories for
+Copilot row. Session-ID-only discovery splits into two distinct mechanisms since issue #53. The
+CLI resolution path (`resolve_session_reference` — what `munshi archive <session-id>` without
+`--events` uses) remains intentionally Copilot-only, because only Copilot has a safe,
+version-pinned `session-state/<id>/events.jsonl` fallback; other sources are left pending rather
+than guessed. The **repair** path (`derive_transcript_path`) re-derives a lost or never-recorded
+transcript path from a session ID for Copilot *and* Claude Code: Copilot through the same
+version-pinned fallback, Claude Code by scanning the registered home's `projects/*/` directories
+for a regular `<session-id>.jsonl` — the recovery sweep's own scan, with the same symlink and
+envelope discipline, so the result is always an explicit in-home path, never a guess. Codex has
+neither mechanism (its rollout files are not named after the session) and never derives.
+Path-yielding directory sweeps are a different, permitted mechanism: recovery also sweeps the registered Claude Code home's `projects/*/` directories for
 stale regular `<session-id>.jsonl` files whose hooks never fired (force-kill emits none). Each
 swept file provides its own explicit transcript path — no ID-to-path guessing occurs — and its
 origin project is read from the transcript's pinned top-level `cwd` key. Sibling `<uuid>/`
 directories, `memory/`, and foreign-envelope files are skipped by file-type, extension, and
-envelope checks.
+envelope checks. Envelope validation itself is read-disciplined: it scans at most 8 MiB of the
+file looking for the first meaningful record (with the single line further clamped), so it is a
+bound on how far Munshi will read to classify a candidate, never a statement about how large a
+transcript may be. Every path the repair mechanism derives must pass the same pinned-envelope
+check before it is trusted, so an unrelated file that merely occupies the expected location is
+rejected.
 
 When optional archive Git history is enabled, each commit subject carries the durable archive
 identity `<source-prefix>:<session_id>` (matching the Markdown frontmatter `id`), and the commit
@@ -222,7 +243,13 @@ archive/state worker pipeline (resumed revisions, interrupted completion reason,
 - Claude Code and Codex stores are **private and undocumented**; both mappings are version-pinned
   evidence for the observed/published schema, not stable contracts. Adapters degrade to ignored
   metadata for unknown record and block types rather than failing.
-- Session-ID-only resolution is supported **only** for the Copilot version-pinned session-state
-  directory. Claude Code and Codex require an explicit transcript path.
+- CLI session-ID-only resolution is supported **only** for the Copilot version-pinned
+  session-state directory; Claude Code and Codex require an explicit transcript path on
+  `munshi archive`. The internal repair path (`derive_transcript_path`, issue #53) additionally
+  re-derives Claude Code paths by scanning the registered home's `projects/*/<session-id>.jsonl`
+  — see [Recovery](#recovery-and-archive-git-history-are-source-scoped) above. Codex has no safe
+  session-ID lookup of any kind.
+- Codex is manual-archive/explicit-path only: no hooks (`unsupported-hook-source`), not
+  accepted by `--harness`, no `SourceHomes` entry, no path derivation, no origin recovery.
 - Codex `originator`/`cli_version` and Claude `version` are recorded structurally in fixtures for
   provenance but are not required for normalization.

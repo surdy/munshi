@@ -214,20 +214,28 @@ failure):
 - **Exactly these eight fields**, nothing else — `deny_unknown_fields` is on, so extra keys
   reject the whole object.
 - `title`: non-empty, single line, ≤200 characters.
-- `goal`: non-empty, ≤4000 characters (newlines allowed, but not a line starting with `## `,
-  which Munshi's Markdown renderer reserves).
+- `goal`: non-empty, ≤4000 characters. Newlines are allowed, but no line *after the first* may
+  start with `## ` (Munshi's Markdown renderer reserves that heading level) — the check is
+  literally on the substring `\n## `, so a goal whose very first line starts with `## ` passes.
 - The six list fields (`work_completed`, `decisions`, `files_changed`,
-  `commands_and_validation`, `open_items`, `tags`) must each be a JSON array of strings, with
-  **at least one item** — if there's genuinely nothing to report, use a placeholder like
-  `"none"` rather than an empty array. Each item is non-empty, single line, ≤4000 characters
-  (≤100 for `tags`), and each list holds at most 200 items.
+  `commands_and_validation`, `open_items`, `tags`) must each be a JSON array of strings.
+  Only **`work_completed` requires at least one item**; the other five may legitimately be
+  empty arrays. Each item present is non-empty, single line, ≤4000 characters (≤100 for
+  `tags`), and each list holds at most 200 items. In practice it is still good hygiene to
+  backfill an empty list with a placeholder like `["none"]` — it is harmless, it heads off
+  models that emit `null` or omit the field instead of `[]`, and it is what both contrib
+  wrappers do — but the contract itself only demands an item in `work_completed`.
 - No control characters other than `\n`/`\t` in any string.
+- Strings are silently normalized before these checks run: each value is trimmed of
+  leading/trailing whitespace and CRLF/CR line endings are converted to `\n`, so a summarizer
+  need not fuss over trailing newlines or Windows line endings. Length limits count Unicode
+  characters (`chars().count()`), not bytes — a 4000-character multibyte string is fine even
+  though it exceeds 4000 bytes.
 - Output must be **valid JSON and only JSON** — a Markdown code fence around it, a leading
   sentence like "Here's the summary:", or trailing commentary all cause a parse failure.
 
 Common rejection causes in practice: the model wraps its answer in a ` ```json ``` ` fence; the
-model returns an empty array for a list it considers not applicable instead of a placeholder;
-the model adds an extra field (like `summary` or `notes`) alongside the required ones; the
+model returns an empty `work_completed` array instead of a placeholder item; the model adds an extra field (like `summary` or `notes`) alongside the required ones; the
 process writes progress/log lines to stdout instead of stderr, corrupting the single JSON
 object Munshi expects; or the process exceeds `--timeout-ms` or `--max-stdout-bytes`.
 
@@ -302,9 +310,10 @@ pausing to ask clarifying questions (there's no user to answer). See
 ## 6. Example: Claude Code via `contrib/claude-summarizer.sh`
 
 Bare `claude -p` is not directly usable as a summarizer: it tends to wrap its JSON answer in a
-` ```json ``` ` Markdown fence, and for small/trivial sessions it sometimes returns empty
-arrays for optional lists — both of which fail validation (fenced output isn't valid JSON on
-its own, and Munshi rejects empty required lists).
+` ```json ``` ` Markdown fence, and for small/trivial sessions it sometimes returns an empty
+`work_completed` array — both of which fail validation (fenced output isn't valid JSON on
+its own, and Munshi rejects an empty `work_completed`; the other lists may be empty, see
+[section 3](#3-the-required-output)).
 
 [`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh) is a verified wrapper that
 fixes both problems: it runs `claude -p` with an appended system prompt asking for a bare JSON
@@ -348,8 +357,9 @@ cares that it is executable and speaks the stdin/stdout contract above. At minim
 2. Ask whatever backend you use to fill in `required_schema`, instructing it to return bare
    JSON (no fence, no commentary) — most stray-output failures come from skipping this.
 3. Post-process the backend's answer defensively: strip any Markdown fence, and backfill any
-   empty required list with a placeholder like `["none"]`, the way
-   `contrib/claude-summarizer.sh` does — don't trust the model to always comply.
+   empty list with a placeholder like `["none"]`, the way
+   `contrib/claude-summarizer.sh` does — only `work_completed` strictly needs it, but the
+   blanket backfill is harmless and don't trust the model to always comply.
 4. Write exactly one JSON object matching `StructuredSummary` to stdout, nothing else. Send
    logs/diagnostics to stderr instead.
 5. Exit 0 on success; any nonzero exit is treated as a failed attempt regardless of what was
@@ -383,7 +393,8 @@ automatic capture, using [`munshi archive`](manual-archive.md).
   Munshi does not filter, sample, or truncate transcript content for privacy before handing it
   over — only for size, and there the operative bound is `--chunk-threshold-bytes` (default
   2621440), which splits an oversized session across invocations rather than dropping content.
-  `--max-input-bytes` (default 8388608) is only a never-exceed backstop above it; see
+  `--max-input-bytes` (default 8388608) is only a never-exceed backstop at or above it
+  (equality is legal); see
   [`configuration.md`](configuration.md#the-size-knob-relation).
 - Invocations are bounded by per-project budgets so a busy project can't cause unbounded spend:
   `--max-calls-per-hour` (default 10) and `--max-calls-per-day` (default 50), plus

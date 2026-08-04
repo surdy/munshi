@@ -98,7 +98,7 @@ disable`/`enable` and survives re-registration (issue #31).
 | --- | --- |
 | `max_calls_per_hour` | Summarizer invocations allowed per project per rolling hour (`10`). |
 | `max_calls_per_day` | Summarizer invocations allowed per project per rolling day (`50`). |
-| `max_concurrency` | Sessions summarized concurrently across all projects (`2`, minimum 1). |
+| `max_concurrency` | Sessions summarized concurrently across all projects (`2`). Minimum 1, enforced as a load-time recognition invariant rather than a clamp: `0` never means "unbounded" or "serial" — a `config.json` carrying it is refused as unrecognized on every read, which blocks all processing (and, because hooks fail open, silently stops capture) until repaired. `register` does not validate the flag itself, so `--max-concurrency 0` writes exactly such a config; `munshi doctor`'s `policy` check reports it as an error. |
 | `disabled_projects` | Canonical project identities excluded from future processing and delivery. Existing archives are untouched. |
 
 Per-project `.munshi.toml` overrides layer on top of this section at resolution time; they are
@@ -106,15 +106,15 @@ never written into `config.json` (see [`user-guide.md`](user-guide.md)).
 
 ## `summary_delivery` — opt-in Notesmith delivery of current summaries
 
-Owned by the `munshi summary-delivery` commands (`configure`, `enable`, `disable`; `delivery`
-remains a deprecated alias). Publishes the *current* summary revision of each archived session to a
+Owned by the `munshi summary-delivery` commands (`configure`, `enable`, `disable`, `history`;
+`delivery` remains a deprecated alias). Publishes the *current* summary revision of each archived session to a
 Notesmith vault, strictly downstream of local archival (ADR 0006). The section is self-contained —
 enablement lives inside it, mirroring `archive_upload`.
 
 | Setting | Meaning |
 | --- | --- |
 | `enabled` | Whether summary delivery runs after a successful local archive. Opt-in; `false` by default. Enabling requires an addressable sink (endpoint + vault). |
-| `endpoint` | Base URL of the Notesmith daemon, e.g. `http://127.0.0.1:27183`. |
+| `endpoint` | Base URL of the Notesmith daemon, e.g. `http://127.0.0.1:27183` or `https://notes.example.net` — every endpoint Munshi dials accepts `https://`, verified through rustls against the system trust store with no TLS policy knobs ([ADR 0013](adr/0013-speak-tls-to-published-endpoints-through-rustls-and-the-system-trust-store.md)). |
 | `vault` | Target Notesmith vault name. |
 | `folder` | Optional vault-relative folder Munshi-owned session notes are filed under. |
 | `credential` | Where the bearer credential is read from at delivery time, or absent for an unauthenticated local daemon. Either `{"source": "env", "var": …}` or `{"source": "keychain", "service": …, "account": …}`. The secret itself is never stored. |
@@ -130,7 +130,7 @@ independent of summary delivery (ADR 0009).
 | Setting | Meaning |
 | --- | --- |
 | `enabled` | Whether archive upload runs after a successful local archive. Opt-in; `false` by default. Enabling requires a configured endpoint. |
-| `endpoint` | Base URL of the Patwari archive server, e.g. `http://127.0.0.1:8080`. |
+| `endpoint` | Base URL of the Patwari archive server, e.g. `http://127.0.0.1:8080` or `https://patwari.example.net` (`https://` per ADR 0013, as above). |
 | `client_id` | The persistent client UUID Munshi registers and uploads under. Minted once by `archive-upload configure`, reused verbatim, and durable across operational-database rebuilds (ADR 0004) — which is why it lives here rather than in SQLite. |
 | `max_attempts` | Bounded upload attempts before a session's upload is parked as a dead letter (`5`). |
 
@@ -145,12 +145,13 @@ in a per-directory `<machine>/<slug>.manifest.md` note and the correlated commit
 `munshi memory <machine>:<slug> revision <n>`. Collection is read-only, change detection is a
 per-file sha256 manifest (an unchanged directory never contacts the sink), and the whole path is
 strictly downstream of archival (ADR 0006): triggered after each archive and drained by
-`munshi tick`, with bounded retries into a dead letter.
+`munshi tick`, with bounded retries into a dead letter. The command walkthrough and operational
+semantics live in [`user-guide.md`](user-guide.md).
 
 | Setting | Meaning |
 | --- | --- |
 | `enabled` | Whether memory directories are mirrored after archival and from the tick. Opt-in; `false` by default. Enabling requires endpoint + vault + machine label. |
-| `endpoint` | Base URL of the Notesmith daemon, e.g. `http://127.0.0.1:27183`. |
+| `endpoint` | Base URL of the Notesmith daemon, e.g. `http://127.0.0.1:27183` (`https://` per ADR 0013, as above). |
 | `vault` | Target Notesmith vault name (a document vault). |
 | `folder` | Optional vault-relative folder the per-machine memory trees are filed under; routes are `[folder/]<machine>/<slug>/<file>`. |
 | `credential` | Where the bearer credential is read from at sync time; same shape as `summary_delivery.credential`. Never the secret itself. |
@@ -184,7 +185,7 @@ Munshi captures from. See [`user-guide.md`](user-guide.md) for the guards and th
 | Setting | Meaning |
 | --- | --- |
 | `home` | Absolute path of the isolated summarizer home whose `session-state/` entries and session store `munshi tick` prunes. Refused at `register`, and reported as a `doctor` error, when it equals, contains, or is contained by a registered harness home or `~/.copilot`. `--summarizer-exhaust-home`. |
-| `retention_days` | Age in whole days above which a `session-state/` entry is deleted. `0` keeps everything, as does an absent `home` (`7`). `--summarizer-exhaust-retention-days`. |
+| `retention_days` | Age in whole days above which a `session-state/` entry is deleted; `0` keeps everything, as does an absent `home`. The two defaults differ deliberately: `7` is the *flag* default — what `munshi register` writes when `--summarizer-exhaust-retention-days` is omitted at register time — while the *schema* default is `0`, because the field is additive with a plain serde default, so a `config.json` written without the key deserializes as keep-everything, not as 7. `--summarizer-exhaust-retention-days`. |
 
 ## Related files
 

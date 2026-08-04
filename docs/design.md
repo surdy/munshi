@@ -44,7 +44,9 @@ above; see [ADR 0007](adr/0007-madari-status-and-actions-over-cli-json-only.md).
 - Supporting Windows.
 - Calling model APIs directly.
 - Providing a central archive server.
-- Building a web dashboard.
+- Building a web dashboard. (A local read-only [backlog dashboard](dashboard.md) has since
+  been adopted as an optional addon in issue #56; it consumes the CLI `--json` contracts
+  only, and Munshi itself still has no UI code path.)
 - Supporting Codex in the initial implementation. (Claude Code capture has since landed: the
   adapter, hook registration, and recovery sweep are implemented; Codex remains adapter-only.)
 

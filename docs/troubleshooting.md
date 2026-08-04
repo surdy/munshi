@@ -40,6 +40,13 @@ of named checks, each `ok`, `warning`, or `error`. The ones worth knowing:
 | `hook-file` / `hook-contract` / `hook-parse` / `hook-read` | Copilot's `hooks/munshi.json` is missing, unparsable, unreadable, or doesn't match the managed contract. |
 | `claude-hook-contract` | Claude Code's `settings.json` is missing Munshi's managed `Stop`/`SessionEnd` entries, has stale entries (pointing at an old binary path), or isn't a JSON settings object Munshi recognizes. |
 | `runtime-compatible` | Roll-up: `warning` here means *something* above isn't right even if each individual check looks close; automatic hook-driven archiving may not work until it clears. |
+| `size-cap-parked` | Sessions are permanently parked on a size cap, split by which one: `source-oversized` (raise `--max-source-bytes`) or `summary-input-limit` (raise `--chunk-threshold-bytes`). Re-register with a larger limit, then `munshi retry-all --force`. |
+| `phantom-invocations-parked` | Parked rows that are phantom CLI invocations, not sessions — no transcript was ever written (see ["My session never appeared"](#my-session-never-appeared)). `munshi retry-all --force` settles them `not-archive-worthy` (issue #58). |
+| `transcript-missing-parked` | Sessions parked because their transcript no longer exists at its recorded path. Restore the file(s), or accept the loss with `munshi settle-lost --all-missing` (issue #58). |
+| `capture-failing` | Five or more source-read failures (`source-missing`/`source-oversized`/`source-failed`) in the last 24 hours — transcripts are vanishing or unreadable *while* sessions are being captured, which deserves attention now, not a line item found later (issues #57/#58). |
+| `input-cap-relation` | A hand-edited `config.json` holds `max_input_bytes` below `chunk_threshold_bytes` — the inverted relation `register`/`archive` reject at the flag. Sessions between the two values floor to placeholder summaries under `summary-input-limit` instead of chunking. Re-register with `--max-input-bytes` at or above `--chunk-threshold-bytes`, then `munshi retry-all --force`. |
+| `summarizer-exhaust-home` | The configured summarizer-exhaust retention home overlaps a registered source home; retention is refused and nothing is ever pruned (issue #60). Point it at a genuinely isolated home. |
+| `summarizer-exhaust-size` | The isolated summarizer home has grown past the size threshold — check that `munshi tick` is actually scheduled to prune it (issue #60). |
 
 See [`docs/user-guide.md`](user-guide.md) for the day-to-day meaning of `munshi sessions --state`
 values and the retry/recovery commands referenced throughout this doc.
@@ -69,10 +76,20 @@ Work through these in order:
    ```bash
    munshi hook recover --state-dir ~/.munshi --stale-after-ms 1800000
    ```
-4. **Check `munshi doctor`'s hook checks.** `claude-hook-contract` (or `hook-contract` for
+   `munshi tick` is the scheduled/manual maintenance entry point that runs this same sweep (plus
+   the park lifts and retention passes) — if you have it on a timer, the sweep is already
+   happening every interval; running `munshi tick` by hand works too.
+4. **A `source-missing` park with nothing behind it is a phantom invocation, not a lost
+   session.** A parked row at revision 0 with no previous read and no transcript on disk is a
+   non-interactive `claude` subcommand that fired the `SessionEnd` hook without ever writing a
+   transcript (issue #58) — there was never a session to archive. The worker settles new ones as
+   `not-archive-worthy` on its own; rows parked before that behavior existed drain through
+   `munshi retry-all --force`, which settles them the same way. `munshi doctor` counts them
+   under `phantom-invocations-parked`.
+5. **Check `munshi doctor`'s hook checks.** `claude-hook-contract` (or `hook-contract` for
    Copilot) failing usually means the hooks aren't installed the way Munshi expects — see
    Registration problems below.
-5. **A moved or rebuilt binary breaks the hook path.** Registration bakes the *absolute path* of
+6. **A moved or rebuilt binary breaks the hook path.** Registration bakes the *absolute path* of
    the `munshi` binary you ran `register` with into the hook entries. If you rebuild or relocate
    that binary, existing hooks still point at the old path and silently no-op. Re-run
    `munshi register` after moving/rebuilding the binary.
@@ -84,8 +101,9 @@ exit) didn't satisfy Munshi's contract. See [`docs/summarizers.md`](summarizers.
 contract; the common causes are:
 
 - The process printed something other than exactly one JSON object matching the required
-  eight-field schema (a Markdown fence, leading commentary, an extra field, an empty required
-  list instead of a placeholder like `"none"`).
+  eight-field schema (a Markdown fence, leading commentary, an extra field, an empty
+  `work_completed` list — the one list that must have at least one item; the other five may be
+  empty).
 - The process exited nonzero.
 - The process ran past `--timeout-ms` (default 300000ms) and was killed.
 - stdout exceeded `--max-stdout-bytes` (default 262144) or stderr exceeded `--max-stderr-bytes`
@@ -103,7 +121,8 @@ cat sample-request.json | /absolute/path/to/your-summarizer | python3 -m json.to
 
 If that doesn't cleanly print all eight fields, fix the summarizer (or its wrapper — see
 `contrib/claude-summarizer.sh` for a reference fix that strips Markdown fences and backfills
-empty lists) before retrying Munshi. Once it's fixed:
+empty lists; only `work_completed` strictly needs the backfill, but blanket backfilling is
+harmless) before retrying Munshi. Once it's fixed:
 
 ```bash
 munshi retry <session-id> --source <copilot|claude-code> --force
@@ -136,6 +155,41 @@ Related failure categories you may see instead of `summary-failed`, all in the s
 retry), `archive-write-failed` (couldn't write the Markdown file — check disk space and output
 directory permissions), and `archive-git-*` (only relevant if you registered with
 `--archive-git-history`; a busy or misconfigured archive Git repository).
+
+Three source-read categories are **not** in that family — they park the session permanently
+rather than scheduling retries, because retrying cannot help until something outside Munshi
+changes. Until issue #57 they were one lumped `source-failed`, which once had doctor advising a
+cap raise while the transcripts had actually been destroyed; the split keeps park behavior
+identical but lets the diagnosis tell the truth:
+
+- `source-missing` — the transcript file vanished from its recorded path. The park lifts once
+  the file is readable again (a `munshi retry <id>` then succeeds), and the operator can instead
+  declare the loss with [`munshi settle-lost`](#transcript-lost-and-munshi-settle-lost), which
+  settles the session as `transcript-lost`.
+- `source-oversized` — the transcript exceeds the configured `--max-source-bytes` cap. Parked
+  until the cap is raised: re-register with a larger limit and the periodic park re-evaluation
+  (or the next `retry-all`) lifts every park whose transcript now fits. `munshi doctor`'s
+  `size-cap-parked` check names the flag to raise.
+- `source-failed` — the residual I/O category (for example a permissions error), and the legacy
+  code still present on rows recorded before the split, which readers keep accepting.
+
+## `transcript-lost` and `munshi settle-lost`
+
+`transcript-lost` is an explicit operator verdict, not a failure category: it says a parked
+`source-missing` session's transcript was destroyed and judged unrecoverable, so the doctor
+warnings stop while everything Munshi recorded about the session is retained (issue #58).
+
+```bash
+munshi sessions --state transcript-lost   # the settled sessions
+munshi settle-lost <session-id>           # settle one (add --source to disambiguate)
+munshi settle-lost --all-missing          # settle every eligible parked session
+```
+
+The verdict lifts automatically: `munshi tick` (and `retry-all`) runs
+`reactivate_regrown_lost_transcripts`, which re-queues any settled session whose transcript has
+reappeared at its recorded path — a restore from backup, another machine, a vendor tool putting
+the file back. See [`docs/user-guide.md`](user-guide.md#munshi-settle-lost) for the full
+command semantics.
 
 ## "Sessions I never started", with a `summarizer-exhaust` diagnostic
 
@@ -254,6 +308,9 @@ This backs the existing `munshi.db` aside, recreates the schema, and rebuilds cu
 metadata and the structured-summary cache by re-reading your validated Munshi-owned Markdown.
 Existing Markdown is never deleted or invalidated by this. Add `--force-retry` in the same call
 to also make any failed-but-retryable work immediately eligible again, bypassing normal backoff.
+For routine maintenance — as opposed to a rebuild — `munshi tick` is the scheduled/manual entry
+point: it runs the same recovery sweep plus the park lifts, upload/delivery retries, and
+exhaust-retention pruning, and is what a launchd/cron timer should invoke.
 
 ## "My session archived but never uploaded to Patwari"
 
@@ -291,6 +348,19 @@ exists, even if no snapshot reached Patwari. Check in order:
    archived sessions (`munshi archive`) never upload; only the hook pipeline does. When the
    session's transcript is still on disk, `munshi retrieve <sha256> --local --session <id>`
    redeems the ticket from the transcript directly, without waiting for the upload.
+
+`munshi retrieve` exits with a distinct, stable code per failure class, so scripts can tell the
+kinds apart without parsing messages:
+
+| Exit code | Meaning |
+| --- | --- |
+| 1 | Local I/O or configuration failure (couldn't write `--output`, unreadable config; also a `--local` session whose transcript path is unknown, missing on disk, or unreadable). |
+| 2 | Invalid input: a malformed hash, or `--output` names an existing file without `--force`. |
+| 3 | No Patwari server configured. |
+| 4 | No matching artifact — including, under `--local`, an unknown `--session` or a hash the transcript doesn't contain. |
+| 5 | Server unreachable, protocol error, or server-side failure. |
+| 6 | Content verification or decompression failed. |
+| 7 | The artifact exceeds the download cap (`--max-download-bytes`). |
 
 ## Getting more signal
 
