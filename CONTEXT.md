@@ -164,6 +164,12 @@ _Avoid_: Record restore, delivery
 **Record restore**:
 Repopulating a machine's local durable record from the archive: each session's newest snapshot
 downloaded into the archive output layout and imported into operational state. It reproduces what
-was already archived and never re-summarizes anything. Making a harness able to resume a restored
-session is a separate, per-adapter operation.
+was already archived and never re-summarizes anything.
 _Avoid_: Retrieval, sync, backup restore
+
+**Resume restore**:
+Placing a restored session back into its harness home so the harness can discover and continue it —
+the per-adapter half of restore, requested with `--resume` and confirmed with `--yes`. Supported for
+Claude Code only, where the resumable state is the transcript; other harnesses are refused with their
+reason rather than guessed at. A differing file already in the harness home is never overwritten.
+_Avoid_: Record restore, rollback
