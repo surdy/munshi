@@ -20,7 +20,10 @@ const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 /// transcript with a realistic sidecar population: allowlisted files, excluded kinds
 /// (`session.db`, `rewind-file-snapshots/backups/`, `files/`), a symlink, and an oversized file.
 fn seeded_session(directory: &TempDir) -> PathBuf {
-    let session_dir = directory.path().join("session-state").join(SESSION_ID);
+    let session_dir = directory
+        .path()
+        .join("session-state")
+        .join(SESSION_ID);
     fs::create_dir_all(&session_dir).unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/manual/copilot")
@@ -39,7 +42,11 @@ fn seeded_session(directory: &TempDir) -> PathBuf {
     fs::write(session_dir.join("checkpoints/has space.md"), "no\n").unwrap();
     fs::write(session_dir.join("checkpoints/CON.md"), "no\n").unwrap();
     fs::create_dir_all(session_dir.join("rewind-file-snapshots/backups")).unwrap();
-    fs::write(session_dir.join("rewind-file-snapshots/index.json"), "{}\n").unwrap();
+    fs::write(
+        session_dir.join("rewind-file-snapshots/index.json"),
+        "{}\n",
+    )
+    .unwrap();
     // Excluded kinds: the live SQLite, bulk rewind backups, arbitrary workspace trees, junk.
     fs::write(session_dir.join("session.db"), b"SQLite format 3\0").unwrap();
     fs::write(

@@ -2348,7 +2348,10 @@ fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveU
         next_attempt_at_ms: row.get(14)?,
         last_error_category: row.get(15)?,
         updated_at_ms: row.get(16)?,
-        transfer_bytes_total: row.get::<_, i64>(17)?.try_into().unwrap_or_default(),
+        transfer_bytes_total: row
+            .get::<_, i64>(17)?
+            .try_into()
+            .unwrap_or_default(),
         last_stored_bytes: revision(18)?,
         last_original_bytes: revision(19)?,
     })

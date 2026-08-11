@@ -591,15 +591,8 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
         )
         .unwrap();
     let second_row = row(&store);
-    assert_eq!(
-        second_row.transfer_bytes_total, 4196,
-        "lifetime accumulates"
-    );
-    assert_eq!(
-        second_row.last_stored_bytes,
-        Some(9000),
-        "latest, not summed"
-    );
+    assert_eq!(second_row.transfer_bytes_total, 4196, "lifetime accumulates");
+    assert_eq!(second_row.last_stored_bytes, Some(9000), "latest, not summed");
     assert_eq!(second_row.last_original_bytes, Some(20000));
 }
 

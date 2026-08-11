@@ -477,14 +477,7 @@ fn local_redeems_a_ticket_from_the_transcript_without_a_server() {
     // Client-side --query works over locally redeemed content too.
     let query = run_raw(
         state.path(),
-        &[
-            &ticket,
-            "--local",
-            "--session",
-            "sess-local",
-            "--query",
-            "xxx",
-        ],
+        &[&ticket, "--local", "--session", "sess-local", "--query", "xxx"],
     );
     assert!(query.status.success(), "stderr: {}", query.stderr());
     assert!(String::from_utf8_lossy(&query.stdout).contains("xxx"));
@@ -496,24 +489,13 @@ fn local_misses_exit_distinctly_without_emitting_bytes() {
 
     // A hash no event carries: exit 4 (no matching artifact), nothing on stdout.
     let absent = "0".repeat(64);
-    let miss = run_raw(
-        state.path(),
-        &[&absent, "--local", "--session", "sess-local"],
-    );
+    let miss = run_raw(state.path(), &[&absent, "--local", "--session", "sess-local"]);
     assert_eq!(miss.status.code(), Some(4), "stderr: {}", miss.stderr());
     assert!(miss.stdout.is_empty());
 
     // An unknown session: exit 4 as well — a script-visible miss, not CLI misuse.
-    let unknown = run_raw(
-        state.path(),
-        &[&ticket, "--local", "--session", "sess-other"],
-    );
-    assert_eq!(
-        unknown.status.code(),
-        Some(4),
-        "stderr: {}",
-        unknown.stderr()
-    );
+    let unknown = run_raw(state.path(), &[&ticket, "--local", "--session", "sess-other"]);
+    assert_eq!(unknown.status.code(), Some(4), "stderr: {}", unknown.stderr());
     assert!(unknown.stdout.is_empty());
 
     // A session prefix contradicting --source is CLI misuse and fails hard.
