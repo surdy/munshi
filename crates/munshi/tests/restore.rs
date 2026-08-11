@@ -448,6 +448,7 @@ fn a_traversing_sidecar_path_is_refused_rather_than_written() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let escaped = artifact(&report["snapshots"][0], "sidecar/../../../escaped.md");
     assert_eq!(escaped["result"], "skipped");
+    assert_eq!(escaped["skip_cause"], "unplaceable");
     assert!(
         escaped["reason"].as_str().unwrap().contains("unsafe"),
         "reason: {escaped}"
@@ -537,9 +538,15 @@ fn skip_outputs_leaves_the_re_derivable_artifacts_in_the_archive() {
     let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
 
     let output = machine.restore(&server, &["--all", "--skip-outputs", "--json"]);
-    assert_eq!(output.status.code(), Some(4), "stderr: {}", output.stderr());
+    // A run that skipped exactly what it was told to skip has done its whole job: exit 0, so a
+    // scripted `--skip-outputs` restore never reads as failed to an exit-code gate.
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["totals"]["artifacts_skipped"], 1);
+    assert_eq!(report["totals"]["artifacts_skipped_by_request"], 1);
+    assert_eq!(
+        report["totals"]["artifacts_skipped"], 0,
+        "a requested skip is not a finding"
+    );
     assert_eq!(report["totals"]["artifacts_written"], 2);
     assert!(
         !machine
@@ -548,8 +555,53 @@ fn skip_outputs_leaves_the_re_derivable_artifacts_in_the_archive() {
             .join("munshi/sess-one.restored/outputs")
             .exists()
     );
+    // The JSON still tells the two causes apart artifact by artifact.
+    let skipped = report["snapshots"][0]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["result"] == "skipped")
+        .expect("the extracted output is reported, not silently dropped");
+    assert_eq!(skipped["skip_cause"], "requested");
+    assert!(
+        skipped["logical_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("outputs/")
+    );
     // Skipping a re-derivable artifact still leaves the record restored, not failed.
     assert_eq!(report["snapshots"][0]["status"]["result"], "restored");
+}
+
+#[test]
+fn an_artifact_past_the_download_cap_is_a_finding_not_a_quiet_skip() {
+    let machine = Machine::new();
+    // A transcript far larger than its summary, so one cap can admit the summary and refuse it.
+    let transcript = b"{\"type\":\"user\",\"padding\":\"xxxxxxxxxxxxxxxx\"}\n".repeat(400);
+    let session = ArchivedSession::copilot_revision("sess-one", "munshi", 2, &transcript);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    // Nobody asked for this skip, so unlike `--skip-outputs` it is a finding and exits 4. The
+    // transcript compresses well, so what refuses it is the declared *original* size — the
+    // amplification half of the gate — before a byte is transferred.
+    let output = machine.restore(
+        &server,
+        &["--all", "--max-download-bytes", "4096", "--json"],
+    );
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["totals"]["artifacts_skipped"].as_u64().unwrap() > 0);
+    assert_eq!(report["totals"]["artifacts_skipped_by_request"], 0);
+    let transcript = artifact(&report["snapshots"][0], "transcript.jsonl");
+    assert_eq!(transcript["result"], "skipped");
+    assert_eq!(transcript["skip_cause"], "too-large");
+    assert!(
+        transcript["reason"]
+            .as_str()
+            .unwrap()
+            .contains("--max-download-bytes"),
+        "reason: {transcript}"
+    );
 }
 
 #[test]

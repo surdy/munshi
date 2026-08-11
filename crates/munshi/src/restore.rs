@@ -80,12 +80,14 @@
 //! | 1 | local error (configuration, or writing the restored record) |
 //! | 2 | invalid input |
 //! | 3 | no archive server configured, or no archive output directory known |
-//! | 4 | findings: refused overwrites, skipped artifacts, or a `--session` that matched nothing |
+//! | 4 | findings: refused overwrites, involuntarily skipped artifacts, or a `--session` that matched nothing |
 //! | 5 | server/transport failure |
 //! | 6 | verification/integrity failure on at least one artifact |
 //!
 //! A completed run that observed several classes reports the most severe: verification (6) over
-//! transport (5) over local (1) over findings (4).
+//! transport (5) over local (1) over findings (4). An artifact the operator asked to skip
+//! (`--skip-outputs`) is not a finding — it is reported and counted, but a run that did exactly
+//! what it was told must not read as failed to a scripted exit-code gate (see [`SkipCause`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -224,11 +226,38 @@ pub enum ArtifactResult {
     WouldWrite,
     /// `--dry-run` with `--force`: a differing local copy a real run would replace.
     WouldReplace,
-    /// Set aside without transfer: past the download cap, an extracted output under
-    /// `--skip-outputs`, or a logical path this build does not know how to place.
+    /// Set aside without transfer. [`ArtifactReport::skip_cause`] says why, and the distinction
+    /// matters: a skip the operator asked for is a non-event, a skip forced on the run is a finding.
     Skipped,
     /// The download, its verification, or the local write failed.
     Failed,
+}
+
+/// Why an artifact was set aside without transferring it.
+///
+/// Split out because the exit code depends on it. A run that skipped exactly what it was told to
+/// skip has done its whole job, and reporting that as a finding would make every scripted
+/// `--skip-outputs` restore read as failed to an exit-code gate — the same reasoning that keeps
+/// `munshi tick` silent when a requested behavior is simply not needed. A skip the operator did
+/// *not* ask for leaves the local record short of the archive, which is exactly a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkipCause {
+    /// The operator asked for it: `--skip-outputs`. Never affects the exit code.
+    Requested,
+    /// The artifact's declared stored or original size exceeds the download cap; rerun with
+    /// `--max-download-bytes`.
+    TooLarge,
+    /// The logical path has no place in the local archive layout, or could not be turned into a
+    /// path safely inside the output directory.
+    Unplaceable,
+}
+
+impl SkipCause {
+    /// Whether this skip leaves the local record short of the archive without anyone asking for it.
+    fn is_finding(self) -> bool {
+        !matches!(self, Self::Requested)
+    }
 }
 
 /// One artifact of one restored snapshot.
@@ -249,6 +278,10 @@ pub struct ArtifactReport {
     /// How a [`ArtifactResult::Failed`] artifact failed, which is what grades its whole snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<FailureClass>,
+    /// Why a [`ArtifactResult::Skipped`] artifact was set aside, which is what decides whether the
+    /// skip counts as a finding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_cause: Option<SkipCause>,
     /// Why, for every outcome that is not a plain success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -380,7 +413,12 @@ pub struct Totals {
     /// Artifacts whose local copy already hashed to the archived original.
     pub artifacts_present: u64,
     pub artifacts_refused: u64,
+    /// Artifacts set aside for a reason nobody asked for — past the download cap, or unplaceable.
+    /// These are findings and feed the exit code; requested skips are counted separately.
     pub artifacts_skipped: u64,
+    /// Artifacts set aside because the operator asked (`--skip-outputs`). Reported so a run is
+    /// fully accounted for, and deliberately kept out of the exit code.
+    pub artifacts_skipped_by_request: u64,
     pub artifacts_failed: u64,
     /// Original bytes written locally this run (or, under `--dry-run`, that would be).
     pub bytes_written: u64,
@@ -427,6 +465,8 @@ impl RestoreReport {
             };
             worst = rank_max(worst, code);
         }
+        // Only involuntary skips. A run that skipped exactly what `--skip-outputs` asked it to has
+        // done its whole job, and must not read as failed to a scripted exit-code gate.
         if self.totals.artifacts_skipped > 0 {
             worst = rank_max(worst, 4);
         }
@@ -452,8 +492,18 @@ impl RestoreReport {
         for snapshot in &self.snapshots {
             print_snapshot_human(snapshot);
         }
+        // Requested skips are appended rather than folded into the skipped count, so the number
+        // that reads as a problem is only ever the one that is one.
+        let by_request = if totals.artifacts_skipped_by_request > 0 {
+            format!(
+                ", {} skipped by request",
+                totals.artifacts_skipped_by_request
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "artifacts: {} written, {} already present, {} refused, {} skipped, {} failed ({} byte(s))",
+            "artifacts: {} written, {} already present, {} refused, {} skipped, {} failed{by_request} ({} byte(s))",
             totals.artifacts_written,
             totals.artifacts_present,
             totals.artifacts_refused,
@@ -666,7 +716,13 @@ fn build_report(
                 }
                 ArtifactResult::Present => totals.artifacts_present += 1,
                 ArtifactResult::RefusedDiffers => totals.artifacts_refused += 1,
-                ArtifactResult::Skipped => totals.artifacts_skipped += 1,
+                ArtifactResult::Skipped => {
+                    if artifact.skip_cause.is_some_and(SkipCause::is_finding) {
+                        totals.artifacts_skipped += 1;
+                    } else {
+                        totals.artifacts_skipped_by_request += 1;
+                    }
+                }
                 ArtifactResult::Failed => totals.artifacts_failed += 1,
             }
         }
@@ -933,8 +989,10 @@ fn parse_restored_summary(bytes: &[u8]) -> Result<RecordIdentity, String> {
 ///
 /// Only Markdown that sits at the path its own frontmatter implies is indexed, which is the same
 /// rule the state rebuild's archive scan applies. A file moved or planted elsewhere therefore never
-/// teaches restore a location, and the worst a stale index can do is cost one download: a digest
-/// that no longer matches the file falls through to [`Placer::place_known`]'s own hash check.
+/// teaches restore a location. A stale entry costs nothing in correctness either: the index decides
+/// only *where* a record belongs, never whether the local copy is current, so an entry whose file
+/// has since changed falls through to [`Placer::place_known`]'s own hash check and converges on the
+/// same outcome a freshly built index would have reached.
 struct LocalRecordIndex {
     by_digest: BTreeMap<String, RecordIdentity>,
 }
@@ -1016,14 +1074,15 @@ impl Placer<'_> {
     fn place(&self, artifact: &SnapshotArtifact) -> ArtifactReport {
         match self.local_relative_path(&artifact.logical_path) {
             Ok(relative) => self.place_known(artifact, &relative, None),
-            Err(reason) => ArtifactReport {
+            Err(refusal) => ArtifactReport {
                 artifact_id: artifact.artifact_id.clone(),
                 logical_path: artifact.logical_path.clone(),
                 relative_path: None,
                 result: ArtifactResult::Skipped,
                 original_size_bytes: artifact.original_size_bytes,
-                reason: Some(reason),
+                reason: Some(refusal.message),
                 failure_class: None,
+                skip_cause: Some(refusal.cause),
             },
         }
     }
@@ -1045,6 +1104,7 @@ impl Placer<'_> {
             original_size_bytes: artifact.original_size_bytes,
             reason: None,
             failure_class: None,
+            skip_cause: None,
         };
 
         // Verify-and-skip, not exists-and-skip: the listing declares the archived original's digest,
@@ -1090,6 +1150,7 @@ impl Placer<'_> {
                 Ok(bytes) => bytes,
                 Err(DownloadFailure::TooLarge(message)) => {
                     report.result = ArtifactResult::Skipped;
+                    report.skip_cause = Some(SkipCause::TooLarge);
                     report.reason = Some(message);
                     return report;
                 }
@@ -1124,7 +1185,10 @@ impl Placer<'_> {
     /// writes to. Every path component comes from an archive server, so each is validated before it
     /// reaches a `join`: a `sidecar/../../…` logical path resolves to a refusal, not to a write
     /// outside the output directory.
-    fn local_relative_path(&self, logical_path: &str) -> Result<PathBuf, String> {
+    ///
+    /// Every refusal carries the cause that decides whether it is a finding, so the one skip an
+    /// operator asked for is never confused with the ones forced on the run.
+    fn local_relative_path(&self, logical_path: &str) -> Result<PathBuf, PlanRefusal> {
         if logical_path == SUMMARY_LOGICAL_PATH {
             return Ok(self.markdown_relative.to_path_buf());
         }
@@ -1134,31 +1198,56 @@ impl Placer<'_> {
             );
         }
         if let Some(relative) = logical_path.strip_prefix(SIDECAR_LOGICAL_PREFIX) {
-            let relative = safe_relative_path(relative)
-                .ok_or_else(|| format!("unsafe sidecar path `{logical_path}`"))?;
+            let relative = safe_relative_path(relative).ok_or_else(|| {
+                PlanRefusal::unplaceable(format!("unsafe sidecar path `{logical_path}`"))
+            })?;
             return Ok(sidecar_relative_directory(self.markdown_relative).join(relative));
         }
         if let Some(digest) = logical_path.strip_prefix(OUTPUTS_LOGICAL_PREFIX) {
-            if self.config.skip_outputs {
-                return Err(
-                    "extracted outputs skipped by --skip-outputs (re-derivable from the transcript)"
-                        .to_owned(),
-                );
-            }
+            // Validity is judged before the flag, so `--skip-outputs` excuses only well-formed
+            // extracted outputs. An archive offering `outputs/../summary.md` is saying something
+            // true about the archive whether or not this run wanted outputs, and reporting it as a
+            // requested skip would hide a finding behind a flag.
             if digest.len() != 64
                 || !digest
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             {
-                return Err(format!("unsafe extracted-output path `{logical_path}`"));
+                return Err(PlanRefusal::unplaceable(format!(
+                    "unsafe extracted-output path `{logical_path}`"
+                )));
+            }
+            if self.config.skip_outputs {
+                return Err(PlanRefusal {
+                    cause: SkipCause::Requested,
+                    message:
+                        "extracted outputs skipped by --skip-outputs (re-derivable from the transcript)"
+                            .to_owned(),
+                });
             }
             return Ok(restored_relative_directory(self.markdown_relative)
                 .join(OUTPUTS_LOGICAL_PREFIX.trim_end_matches('/'))
                 .join(digest));
         }
-        Err(format!(
+        Err(PlanRefusal::unplaceable(format!(
             "logical path `{logical_path}` has no place in the local archive layout"
-        ))
+        )))
+    }
+}
+
+/// Why an artifact could not — or deliberately would not — be placed.
+#[derive(Debug)]
+struct PlanRefusal {
+    cause: SkipCause,
+    message: String,
+}
+
+impl PlanRefusal {
+    fn unplaceable(message: String) -> Self {
+        Self {
+            cause: SkipCause::Unplaceable,
+            message,
+        }
     }
 }
 
@@ -1587,31 +1676,56 @@ mod tests {
     fn unsafe_and_unknown_logical_paths_are_refused() {
         let markdown_relative = PathBuf::from("munshi/sess-1.md");
         let config = test_config(false);
-        let plan = |logical_path: &str| plan_path(&config, &markdown_relative, logical_path);
+        let refuses = |logical_path: &str| {
+            let refusal = plan_path(&config, &markdown_relative, logical_path)
+                .expect_err("an unsafe or unknown logical path is refused");
+            // Nobody asked for these, so every one of them is a finding.
+            assert_eq!(
+                refusal.cause,
+                SkipCause::Unplaceable,
+                "for `{logical_path}`"
+            );
+            assert!(refusal.cause.is_finding(), "for `{logical_path}`");
+        };
 
-        assert!(plan("sidecar/../../escape.md").is_err());
-        assert!(plan("sidecar/").is_err());
-        assert!(plan("sidecar/nested/../../escape.md").is_err());
+        refuses("sidecar/../../escape.md");
+        refuses("sidecar/");
+        refuses("sidecar/nested/../../escape.md");
         // Backslashes are refused outright rather than reasoned about per platform.
-        assert!(plan("sidecar/a\\..\\b.md").is_err());
+        refuses("sidecar/a\\..\\b.md");
         // An extracted output's stem must be the bare digest that addresses it.
-        assert!(plan("outputs/../summary.md").is_err());
-        assert!(plan("outputs/NOTAHASH").is_err());
-        assert!(plan(&format!("outputs/{}", "AB".repeat(32))).is_err());
+        refuses("outputs/../summary.md");
+        refuses("outputs/NOTAHASH");
+        refuses(&format!("outputs/{}", "AB".repeat(32)));
         // A role this build does not know is set aside, never guessed at.
-        assert!(plan("attachments/whatever.bin").is_err());
+        refuses("attachments/whatever.bin");
     }
 
+    /// A skip the operator asked for is a non-event, not a finding: it is reported and counted, but
+    /// it must never make a run that did exactly what it was told read as failed.
     #[test]
-    fn skip_outputs_refuses_the_re_derivable_artifacts_by_name() {
+    fn skip_outputs_sets_the_re_derivable_artifacts_aside_without_a_finding() {
         let markdown_relative = PathBuf::from("munshi/sess-1.md");
         let config = test_config(true);
         let digest = "ab".repeat(32);
         let refusal = plan_path(&config, &markdown_relative, &format!("outputs/{digest}"))
             .expect_err("--skip-outputs sets extracted outputs aside");
-        assert!(refusal.contains("--skip-outputs"), "reason: {refusal}");
+        assert_eq!(refusal.cause, SkipCause::Requested);
+        assert!(!refusal.cause.is_finding());
+        assert!(
+            refusal.message.contains("--skip-outputs"),
+            "reason: {}",
+            refusal.message
+        );
         // Everything else still places normally.
         assert!(plan_path(&config, &markdown_relative, "transcript.jsonl").is_ok());
+        // An unplaceable path is still a finding under the flag: the flag excuses only itself.
+        assert_eq!(
+            plan_path(&config, &markdown_relative, "outputs/NOTAHASH")
+                .expect_err("an unsafe output path is refused whatever the flags say")
+                .cause,
+            SkipCause::Unplaceable
+        );
     }
 
     #[test]
@@ -1711,10 +1825,17 @@ mod tests {
         };
         assert_eq!(failed_state.exit_code(), 1);
 
-        // An artifact set aside without transfer is a finding even when its snapshot is restored.
+        // An artifact set aside against the operator's wishes is a finding even when its snapshot
+        // is otherwise restored...
         let mut skipped_artifact = report(SnapshotStatus::Restored);
         skipped_artifact.totals.artifacts_skipped = 1;
         assert_eq!(skipped_artifact.exit_code(), 4);
+
+        // ...but one set aside *because* the operator asked is not: a scripted `--skip-outputs`
+        // restore that did exactly what it was told must exit clean.
+        let mut by_request = report(SnapshotStatus::Restored);
+        by_request.totals.artifacts_skipped_by_request = 7;
+        assert_eq!(by_request.exit_code(), 0);
     }
 
     #[test]
@@ -1761,7 +1882,7 @@ mod tests {
         config: &RestoreConfig,
         markdown_relative: &Path,
         logical_path: &str,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, PlanRefusal> {
         let client = RestoreClient::connect("http://127.0.0.1:1").unwrap();
         Placer {
             output_directory: Path::new("/tmp/out"),

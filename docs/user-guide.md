@@ -580,7 +580,11 @@ without a byte crossing the wire, a differing file is *reported* rather than ove
 verified stack `retrieve` uses, so no unverified byte ever reaches the output directory.
 `--skip-outputs` omits the `outputs/<sha256>` artifacts, which are re-derivable from the restored
 transcript and therefore cost no recoverable content; `--max-download-bytes` raises the 128 MiB
-per-artifact cap.
+per-artifact cap. A skip you asked for is a non-event, not a finding: `--skip-outputs` still exits
+`0` and reports the omitted artifacts under `artifacts_skipped_by_request` with
+`"skip_cause": "requested"`, so a scripted restore never reads as failed for doing what it was told.
+Skips nobody asked for — an artifact past the cap, or a logical path with no place in the layout —
+count in `artifacts_skipped` and do exit `4`.
 
 A machine with no registration yet is the case this command exists for, so it runs there: pass
 `--endpoint` and `--output-dir` and the files are restored. Importing them into operational state is
