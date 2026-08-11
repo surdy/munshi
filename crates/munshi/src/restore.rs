@@ -18,7 +18,10 @@
 //!
 //! - `summary.md` and `sidecar/<path>` go exactly where archival puts them, so the existing
 //!   rebuild path recognizes them and a later archive upload re-assembles a byte-identical
-//!   snapshot from the restored files.
+//!   snapshot from the restored files. Restore places sidecars file by file and, unlike archival's
+//!   staging, never clears the directory first: archival replaces a revision's whole set and may
+//!   drop a checkpoint the harness deleted, whereas restore is a recovery operation with no
+//!   business deleting local files it was not asked about.
 //! - `transcript.jsonl` and `outputs/<sha256>` have no archival-produced home, so they land in a
 //!   sibling `<session-id>.restored/` directory. Nothing else writes there, which keeps restore
 //!   from ever colliding with the archival path, and the transcript's location is then recorded on
@@ -84,7 +87,7 @@
 //! A completed run that observed several classes reports the most severe: verification (6) over
 //! transport (5) over local (1) over findings (4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -331,7 +334,8 @@ pub struct SnapshotReport {
 pub enum StateOutcome {
     /// Rows imported through the same archive importer `rebuild-state` uses.
     Rebuilt {
-        /// Sessions whose archive Markdown produced or advanced a row.
+        /// Sessions whose restored Markdown was found and imported. The importer never lowers a
+        /// row's revision, so a session already at this revision counts here and changes nothing.
         sessions: usize,
         /// Sessions whose row was additionally pointed at its restored transcript, because it had
         /// no readable transcript of its own.
@@ -623,15 +627,14 @@ fn select_newest_per_session(
     listed: Vec<ListedSnapshot>,
 ) -> (Vec<ListedSnapshot>, BTreeMap<String, u64>) {
     let mut selected: Vec<ListedSnapshot> = Vec::new();
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut superseded: BTreeMap<String, u64> = BTreeMap::new();
     for snapshot in listed {
-        if seen.contains_key(&snapshot.session_id) {
-            *superseded.entry(snapshot.session_id.clone()).or_insert(0) += 1;
-            continue;
+        if seen.insert(snapshot.session_id.clone()) {
+            selected.push(snapshot);
+        } else {
+            *superseded.entry(snapshot.session_id).or_insert(0) += 1;
         }
-        seen.insert(snapshot.session_id.clone(), selected.len());
-        selected.push(snapshot);
     }
     (selected, superseded)
 }
@@ -1231,8 +1234,10 @@ fn rebuild_state(
         );
     };
     // Importing records the registration will never read back would be worse than not importing:
-    // every other Munshi read resolves archives through the registered output directory.
-    if Path::new(&stored.output_directory) != output_directory {
+    // every other Munshi read resolves archives through the registered output directory. Compared
+    // through the filesystem so a differently-spelled path for the same directory — a relative
+    // `--output-dir`, a trailing slash, a symlinked home — is not mistaken for a different one.
+    if !same_directory(Path::new(&stored.output_directory), output_directory) {
         return skipped(
             StateSkip::OutputDirectoryMismatch,
             &format!(
@@ -1250,6 +1255,16 @@ fn rebuild_state(
             transcripts_linked,
         },
         Err(message) => StateOutcome::Failed { message },
+    }
+}
+
+/// Whether two paths name the same directory, resolved through the filesystem when both resolve
+/// and compared literally when they do not (a directory that does not exist yet is still comparable
+/// by name, and nothing here should fail merely because a path is not there).
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 
