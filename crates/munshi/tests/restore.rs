@@ -689,12 +689,25 @@ fn resume_places_a_claude_code_session_into_a_fresh_harness_home() {
     // manifest does not (Munshi records no `source_agent_version` today).
     assert_eq!(resume["archived_harness_version"], "2.1.205");
     // The exact command to continue the conversation, and only because a transcript is in place.
+    // It is scoped to a directory: `project_directory` is where it has to be run, because the
+    // harness looks the session up in the projects directory of the current cwd.
     assert_eq!(resume["resume_command"], "claude --resume sess-one");
+    assert_eq!(resume["project_directory"], ARCHIVED_CWD);
 
     // The transcript is verbatim, at the slugged path the harness reads.
     let target = machine.harness_transcript(ARCHIVED_SLUG, "sess-one");
     assert_eq!(resume["target_path"], target.display().to_string());
     assert_eq!(std::fs::read(&target).unwrap(), session.transcript);
+
+    // The human line never states the command without the directory it only works from.
+    let human = machine.resume(&server, SESSION_A, &["--yes"]);
+    assert_eq!(human.status.code(), Some(0), "stderr: {}", human.stderr());
+    let text = String::from_utf8_lossy(&human.stdout);
+    let guidance = text
+        .lines()
+        .find(|line| line.contains("claude --resume sess-one"))
+        .unwrap_or_else(|| panic!("no resume guidance in {text}"));
+    assert!(guidance.contains(ARCHIVED_CWD), "guidance: {guidance}");
     // The record restore still happened in full: resume extends it, it does not replace it.
     assert_eq!(report["totals"]["restored"], 1);
     assert!(
@@ -718,12 +731,16 @@ fn a_working_directory_missing_on_this_machine_is_a_warning_not_a_refusal() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let warnings = report["resume"]["warnings"].as_array().unwrap();
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.as_str().unwrap().contains(ARCHIVED_CWD)),
-        "warnings: {warnings:?}"
-    );
+    let missing = warnings
+        .iter()
+        .find_map(|warning| {
+            let warning = warning.as_str().unwrap();
+            warning.contains(ARCHIVED_CWD).then_some(warning)
+        })
+        .unwrap_or_else(|| panic!("warnings: {warnings:?}"));
+    // The resume command is run *from* that directory, so the warning has to say to make it exist
+    // — otherwise it reads as cosmetic next to the guidance line that names the same path.
+    assert!(missing.contains("create or clone"), "warning: {missing}");
     assert_eq!(report["resume"]["status"]["result"], "placed");
 
     // A session whose working directory *does* exist says nothing about it.
@@ -766,6 +783,9 @@ fn rerunning_a_resume_is_a_no_op() {
         report["resume"]["resume_command"],
         "claude --resume sess-one"
     );
+    // A no-op rerun still says where the command works, because it is still the answer to "how do
+    // I continue this session".
+    assert_eq!(report["resume"]["project_directory"], ARCHIVED_CWD);
     assert_eq!(
         std::fs::read(machine.harness_transcript(ARCHIVED_SLUG, "sess-one")).unwrap(),
         session.transcript

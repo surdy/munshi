@@ -13,6 +13,14 @@
 //! `claude --resume`. Patwari holds that file verbatim, so restoring resumability means deriving the
 //! slugged path and putting the archived bytes there.
 //!
+//! Because the store is keyed by that slug, `claude --resume <id>` is scoped to the projects
+//! directory of the *current* working directory: the same command run elsewhere does not see the
+//! session. So the transcript's location and the command's location are one fact, and this module
+//! reports both — the guidance names the directory to run from, and the missing-directory warning
+//! says to create it first. That scoping is version-pinned evidence of the same class as
+//! [`claude_project_slug`]'s encoding: if a future harness resolves `--resume` across all projects,
+//! naming the directory becomes redundant rather than wrong.
+//!
 //! Copilot and Codex get a typed refusal instead of a guess. Copilot's `session.db` /
 //! `session-store.db` rows are deliberately unarchived (issue #23's allowlist) and may well be
 //! load-bearing for resumption; whether a restored `session-state/<id>/events.jsonl` plus sidecars
@@ -143,7 +151,7 @@ pub struct ResumeReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_harness_version: Option<String>,
     /// The working directory the archived transcript records, which the projects-directory slug
-    /// encodes.
+    /// encodes — and, because of that, the directory [`Self::resume_command`] has to be run from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_directory: Option<String>,
     /// The `projects/` subdirectory name derived from it.
@@ -154,6 +162,13 @@ pub struct ResumeReport {
     pub target_path: Option<String>,
     /// The exact command that continues the session, reported only once a transcript is actually
     /// in place — never as a promise about a write that has not happened.
+    ///
+    /// **It must be run from [`Self::project_directory`].** `claude --resume <id>` looks the
+    /// session up in the projects directory of the *current* working directory, so the same command
+    /// run anywhere else finds nothing — the transcript this restore placed is filed under the
+    /// session's own cwd slug, not globally. A consumer that shells out has to `cd` first, and if
+    /// that directory does not exist on this machine (a reported warning) it has to be created or
+    /// cloned before the command will work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_command: Option<String>,
     /// Everything true about this resume that is not a refusal: a missing harness, an unknown
@@ -187,24 +202,36 @@ impl ResumeReport {
         .flatten()
     }
 
+    /// How to continue a session that is now in place — the command *and* the directory to run it
+    /// from, because one without the other does not work. Naming only the command would be advice
+    /// that fails everywhere except by luck: the harness resolves `--resume` inside the projects
+    /// directory of the current working directory, and this transcript is filed under the session's
+    /// own cwd.
+    fn continue_guidance(&self) -> String {
+        let command = self
+            .resume_command
+            .as_deref()
+            .unwrap_or(CLAUDE_RESUME_COMMAND);
+        match &self.project_directory {
+            Some(directory) => format!("continue it from {directory} with `{command}`"),
+            None => format!("continue it with `{command}`, run from the session's own directory"),
+        }
+    }
+
     pub(crate) fn print_human(&self) {
         for warning in &self.warnings {
             println!("  resume warning: {warning}");
         }
         match &self.status {
             ResumeStatus::Placed => println!(
-                "resume: placed {} — continue it with `{}`",
+                "resume: placed {} — {}",
                 self.target_path.as_deref().unwrap_or("the transcript"),
-                self.resume_command
-                    .as_deref()
-                    .unwrap_or(CLAUDE_RESUME_COMMAND),
+                self.continue_guidance(),
             ),
             ResumeStatus::AlreadyPresent => println!(
-                "resume: already present at {} — continue it with `{}`",
+                "resume: already present at {} — {}",
                 self.target_path.as_deref().unwrap_or("the harness home"),
-                self.resume_command
-                    .as_deref()
-                    .unwrap_or(CLAUDE_RESUME_COMMAND),
+                self.continue_guidance(),
             ),
             ResumeStatus::Planned { message } => {
                 println!("resume: planned, nothing written — {message}");
@@ -357,12 +384,13 @@ pub(crate) fn resume(input: &ResumeInput<'_>) -> ResumeReport {
             ),
         );
     }
-    // A working directory that no longer exists is expressly not a refusal: Claude Code lists and
-    // resumes a session from its transcript, and the operator may well be restoring onto a machine
-    // where the repository has not been cloned yet.
+    // A working directory that no longer exists is expressly not a refusal: the transcript is
+    // placed either way, and the operator may well be restoring onto a machine where the repository
+    // has not been cloned yet. It does gate the *resume command*, though — which is run from that
+    // directory — so the warning says what to do about it rather than merely noting it.
     if !origin.cwd.is_dir() {
         report.warnings.push(format!(
-            "the session's working directory {cwd} does not exist on this machine; the session will still be listed and resumable, but tools that expect the directory will not find it"
+            "the session's working directory {cwd} does not exist on this machine; the transcript is placed regardless, but the resume command is run from that directory, so create or clone it before resuming — and tools that expect its contents will not find them until you do"
         ));
     }
     report.project_directory = Some(cwd);
@@ -672,6 +700,35 @@ mod tests {
         }
         assert_eq!(base.exit_code(), 0);
         assert_eq!(present.exit_code(), 0);
+    }
+
+    /// The command alone is advice that fails everywhere but one directory, so the guidance never
+    /// states it without saying where to run it.
+    #[test]
+    fn continue_guidance_never_states_the_command_without_its_directory() {
+        let report = |project_directory: Option<&str>| ResumeReport {
+            confirmed: true,
+            harness: Some("claude-code".to_owned()),
+            session_id: Some("sess".to_owned()),
+            archived_harness_version: None,
+            installed_harness_version: None,
+            project_directory: project_directory.map(ToOwned::to_owned),
+            project_slug: None,
+            target_path: None,
+            resume_command: Some("claude --resume sess".to_owned()),
+            warnings: Vec::new(),
+            status: ResumeStatus::Placed,
+        };
+
+        let named = report(Some("/machine-a/repos/thing")).continue_guidance();
+        assert!(named.contains("/machine-a/repos/thing"), "{named}");
+        assert!(named.contains("claude --resume sess"), "{named}");
+
+        // A placement always knows its directory, but the fallback still has to carry the
+        // requirement rather than silently dropping it.
+        let unnamed = report(None).continue_guidance();
+        assert!(unnamed.contains("claude --resume sess"), "{unnamed}");
+        assert!(unnamed.contains("own directory"), "{unnamed}");
     }
 
     /// Every version reading that is not a clean match says something; silence would read as a

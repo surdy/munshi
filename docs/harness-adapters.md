@@ -228,7 +228,11 @@ claimed.
 harness home, because this harness's resumable state is very nearly the transcript itself: the
 archived `transcript.jsonl` is written verbatim to
 `<claude home>/projects/<cwd-slug>/<session-id>.jsonl`, and `claude --resume <session-id>` continues
-the conversation.
+the conversation — **run from the session's own working directory**, because the harness resolves
+`--resume` inside the projects directory of the current cwd and the transcript is filed under that
+cwd's slug. The report names both the command and the directory for exactly this reason. (Like the
+slug encoding, that scoping is version-pinned evidence: were a future version to resolve `--resume`
+across all projects, naming the directory would be redundant rather than wrong.)
 
 **The slug.** The `projects/` subdirectory name encodes the session's working directory: every
 character that is not an ASCII letter or digit becomes `-`, **one `-` per UTF-16 code unit**. So

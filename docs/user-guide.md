@@ -610,7 +610,10 @@ munshi restore --session <patwari-session-id> --resume --yes \
 
 **Claude Code only.** Its resumable state is very nearly the transcript itself, so restore writes the
 verbatim archived `transcript.jsonl` to `<claude home>/projects/<cwd-slug>/<session-id>.jsonl` and
-reports the exact command to continue: `claude --resume <session-id>`. Copilot and Codex are refused
+reports the exact command to continue — `claude --resume <session-id>`, **run from the session's own
+working directory**, which the report names alongside it. That directory is not decoration: the
+harness looks a session up in the projects directory of the current cwd, so the same command run
+anywhere else finds nothing. Copilot and Codex are refused
 with their reason — their resumable state may live in stores Munshi deliberately does not archive,
 and that has to be settled by a spike, not by a guess (see
 [harness adapters](harness-adapters.md)). A refused harness is a *finding* (exit `4`), never a quiet
@@ -629,8 +632,10 @@ Guardrails worth knowing before you run it:
   harness home is not Munshi's to overwrite, and a transcript that differs from the archived one is a
   live conversation the harness continued past the snapshot. A byte-identical file is a no-op, so
   reruns are free.
-- **The working directory may not exist on the new machine.** That is a warning, not a refusal —
-  Claude Code still lists and resumes the session; tools that expect the directory will not find it.
+- **The working directory may not exist on the new machine.** That is a warning, not a refusal: the
+  transcript is placed regardless. But since the resume command is run *from* that directory, create
+  or clone it before resuming — and until you do, tools that expect its contents will not find
+  them.
 - **Version compatibility is reported, not enforced.** The report carries the Claude Code version
   that wrote the archived transcript and the installed version (`claude --version`, best effort);
   either being absent, or the two differing, is a stated warning. Restore never claims a snapshot is
@@ -641,9 +646,10 @@ Guardrails worth knowing before you run it:
   reads and keeps appending to — rather than at the archive-side restored copy.
 
 After a successful placement the report reads `"resume": {"status": {"result": "placed"}, …}` with
-`resume_command`, `target_path`, `project_slug` and any warnings. What is verified is that the
-transcript is readable where the harness looks for it; that the harness *accepted* it is something
-only running `claude --resume` proves.
+`resume_command`, `project_directory`, `target_path`, `project_slug` and any warnings. A scripted
+consumer needs both halves: `cd` to `project_directory`, then run `resume_command`. What is verified
+is that the transcript is readable where the harness looks for it; that the harness *accepted* it is
+something only running `claude --resume` proves.
 
 ## Memory sync (harness auto-memory) in brief
 
