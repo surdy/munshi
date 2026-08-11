@@ -1493,3 +1493,268 @@ fn from_http(error: HttpError) -> RestoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(snapshot_id: &str, session_id: &str) -> ListedSnapshot {
+        ListedSnapshot {
+            snapshot_id: snapshot_id.to_owned(),
+            session_id: session_id.to_owned(),
+            completed_at: None,
+        }
+    }
+
+    /// The newest-wins rule is the whole reason restore reproduces a coherent local record: locally
+    /// only one revision per session has a home, so every older snapshot must be counted and left.
+    #[test]
+    fn selection_keeps_the_first_snapshot_seen_per_session_and_counts_the_rest() {
+        let (selected, superseded) = select_newest_per_session(vec![
+            listed("snap-a2", "sess-a"),
+            listed("snap-b1", "sess-b"),
+            listed("snap-a1", "sess-a"),
+            listed("snap-a0", "sess-a"),
+        ]);
+        let ids: Vec<&str> = selected
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["snap-a2", "snap-b1"],
+            "the server lists newest first, so the first seen wins"
+        );
+        assert_eq!(superseded.get("sess-a"), Some(&2));
+        assert_eq!(superseded.get("sess-b"), None);
+    }
+
+    #[test]
+    fn selection_of_an_empty_archive_yields_nothing_rather_than_failing() {
+        let (selected, superseded) = select_newest_per_session(Vec::new());
+        assert!(selected.is_empty());
+        assert!(superseded.is_empty());
+    }
+
+    /// Every logical path an artifact-set-v2 snapshot can carry maps onto the local layout: the two
+    /// roles archival writes keep their archival homes, and the two it does not go beside them.
+    #[test]
+    fn logical_paths_map_onto_the_local_archive_layout() {
+        let markdown_relative = PathBuf::from("munshi/claude-code/sess-1.md");
+        let config = test_config(false);
+        let plan = |logical_path: &str| plan_path(&config, &markdown_relative, logical_path);
+
+        assert_eq!(
+            plan("summary.md").unwrap(),
+            PathBuf::from("munshi/claude-code/sess-1.md")
+        );
+        assert_eq!(
+            plan("transcript.jsonl").unwrap(),
+            PathBuf::from("munshi/claude-code/sess-1.restored/transcript.jsonl")
+        );
+        assert_eq!(
+            plan("sidecar/checkpoints/one.md").unwrap(),
+            PathBuf::from("munshi/claude-code/sess-1.sidecar/checkpoints/one.md")
+        );
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            plan(&format!("outputs/{digest}")).unwrap(),
+            PathBuf::from(format!(
+                "munshi/claude-code/sess-1.restored/outputs/{digest}"
+            ))
+        );
+    }
+
+    /// Logical paths come from an archive server, so the placement rules are a security boundary,
+    /// not a formatting nicety: anything that could resolve outside the output directory is refused
+    /// rather than written.
+    #[test]
+    fn unsafe_and_unknown_logical_paths_are_refused() {
+        let markdown_relative = PathBuf::from("munshi/sess-1.md");
+        let config = test_config(false);
+        let plan = |logical_path: &str| plan_path(&config, &markdown_relative, logical_path);
+
+        assert!(plan("sidecar/../../escape.md").is_err());
+        assert!(plan("sidecar/").is_err());
+        assert!(plan("sidecar/nested/../../escape.md").is_err());
+        // Backslashes are refused outright rather than reasoned about per platform.
+        assert!(plan("sidecar/a\\..\\b.md").is_err());
+        // An extracted output's stem must be the bare digest that addresses it.
+        assert!(plan("outputs/../summary.md").is_err());
+        assert!(plan("outputs/NOTAHASH").is_err());
+        assert!(plan(&format!("outputs/{}", "AB".repeat(32))).is_err());
+        // A role this build does not know is set aside, never guessed at.
+        assert!(plan("attachments/whatever.bin").is_err());
+    }
+
+    #[test]
+    fn skip_outputs_refuses_the_re_derivable_artifacts_by_name() {
+        let markdown_relative = PathBuf::from("munshi/sess-1.md");
+        let config = test_config(true);
+        let digest = "ab".repeat(32);
+        let refusal = plan_path(&config, &markdown_relative, &format!("outputs/{digest}"))
+            .expect_err("--skip-outputs sets extracted outputs aside");
+        assert!(refusal.contains("--skip-outputs"), "reason: {refusal}");
+        // Everything else still places normally.
+        assert!(plan_path(&config, &markdown_relative, "transcript.jsonl").is_ok());
+    }
+
+    #[test]
+    fn safe_relative_paths_admit_plain_names_only() {
+        assert_eq!(
+            safe_relative_path("checkpoints/one.md"),
+            Some(PathBuf::from("checkpoints/one.md"))
+        );
+        assert_eq!(
+            safe_relative_path("plan.md"),
+            Some(PathBuf::from("plan.md"))
+        );
+        assert_eq!(safe_relative_path(""), None);
+        assert_eq!(safe_relative_path("/absolute"), None);
+        assert_eq!(safe_relative_path("../up"), None);
+        assert_eq!(safe_relative_path("./here"), None);
+        assert_eq!(safe_relative_path("a\\b"), None);
+    }
+
+    /// A summary is only usable if its own frontmatter can name a safe local path; the digest check
+    /// proves the bytes are the archive's, not that the archive's bytes are safe to write by.
+    #[test]
+    fn an_unusable_summary_is_reported_rather_than_placed() {
+        assert!(parse_restored_summary(b"# not an archive").is_err());
+        assert!(parse_restored_summary(&[0xff, 0xfe]).is_err());
+    }
+
+    /// Severity, not numeric order: a run that both refused an overwrite and failed a verification
+    /// must exit on the verification.
+    #[test]
+    fn exit_codes_rank_verification_over_transport_over_local_over_findings() {
+        assert_eq!(rank_max(0, 4), 4);
+        assert_eq!(rank_max(4, 1), 1);
+        assert_eq!(rank_max(1, 5), 5);
+        assert_eq!(rank_max(5, 6), 6);
+        assert_eq!(rank_max(6, 5), 6);
+        assert_eq!(rank_max(6, 4), 6);
+        assert_eq!(rank_max(1, 4), 1);
+    }
+
+    #[test]
+    fn report_exit_code_reflects_the_worst_snapshot_outcome() {
+        let report = |status: SnapshotStatus| RestoreReport {
+            schema_version: 1,
+            command: "restore",
+            session_filter: None,
+            output_directory: "/tmp/out".to_owned(),
+            dry_run: false,
+            force: false,
+            snapshots: vec![SnapshotReport {
+                snapshot_id: "snap".to_owned(),
+                patwari_session_id: "sess".to_owned(),
+                completed_at: None,
+                session_id: None,
+                source_agent: None,
+                artifact_set_version: None,
+                relative_path: None,
+                superseded_snapshots: 0,
+                status,
+                artifacts: Vec::new(),
+            }],
+            state: StateOutcome::Skipped {
+                reason: StateSkip::Disabled,
+                message: String::new(),
+            },
+            totals: Totals::default(),
+        };
+        assert_eq!(report(SnapshotStatus::Restored).exit_code(), 0);
+        assert_eq!(report(SnapshotStatus::Refused).exit_code(), 4);
+        assert_eq!(
+            report(SnapshotStatus::Skipped {
+                reason: SkipReason::NoSummaryArtifact,
+                message: String::new(),
+            })
+            .exit_code(),
+            4
+        );
+        for (class, code) in [
+            (FailureClass::Local, 1),
+            (FailureClass::Transport, 5),
+            (FailureClass::Verification, 6),
+        ] {
+            assert_eq!(
+                report(SnapshotStatus::Failed {
+                    class,
+                    message: String::new(),
+                })
+                .exit_code(),
+                code
+            );
+        }
+
+        // A clean run whose state import failed still reports the local failure.
+        let mut failed_state = report(SnapshotStatus::Restored);
+        failed_state.state = StateOutcome::Failed {
+            message: "database is locked".to_owned(),
+        };
+        assert_eq!(failed_state.exit_code(), 1);
+
+        // An artifact set aside without transfer is a finding even when its snapshot is restored.
+        let mut skipped_artifact = report(SnapshotStatus::Restored);
+        skipped_artifact.totals.artifacts_skipped = 1;
+        assert_eq!(skipped_artifact.exit_code(), 4);
+    }
+
+    #[test]
+    fn error_exit_codes_are_distinct_per_failure_class() {
+        assert_eq!(RestoreError::InvalidInput(String::new()).exit_code(), 2);
+        assert_eq!(RestoreError::NotConfigured.exit_code(), 3);
+        assert_eq!(
+            RestoreError::NotRegistered(PathBuf::from("/tmp")).exit_code(),
+            3
+        );
+        assert_eq!(RestoreError::SessionNotFound(String::new()).exit_code(), 4);
+        assert_eq!(RestoreError::Unreachable(String::new()).exit_code(), 5);
+        assert_eq!(RestoreError::Protocol(String::new()).exit_code(), 5);
+        assert_eq!(
+            RestoreError::Server {
+                status: 500,
+                code: String::new()
+            }
+            .exit_code(),
+            5
+        );
+    }
+
+    /// Builds a config whose only meaningful field for path planning is `skip_outputs`.
+    fn test_config(skip_outputs: bool) -> RestoreConfig {
+        RestoreConfig {
+            state_directory: PathBuf::from("/tmp/state"),
+            endpoint_override: None,
+            output_directory_override: None,
+            session_filter: None,
+            force: false,
+            dry_run: false,
+            skip_outputs,
+            rebuild_state: false,
+            max_download_bytes: None,
+        }
+    }
+
+    /// Runs the placement rules without touching a socket or the filesystem: path planning is pure,
+    /// which is what makes the traversal refusals unit-testable rather than only observable through
+    /// an end-to-end restore. Port 1 on loopback refuses connections, so a plan that accidentally
+    /// reached the network would fail loudly rather than silently pass.
+    fn plan_path(
+        config: &RestoreConfig,
+        markdown_relative: &Path,
+        logical_path: &str,
+    ) -> Result<PathBuf, String> {
+        let client = RestoreClient::connect("http://127.0.0.1:1").unwrap();
+        Placer {
+            output_directory: Path::new("/tmp/out"),
+            markdown_relative,
+            config,
+            client: &client,
+            cap: MAX_ARTIFACT_DOWNLOAD_BYTES,
+        }
+        .local_relative_path(logical_path)
+    }
+}
