@@ -20,13 +20,13 @@ use thiserror::Error;
 
 use crate::http::{self, HttpError};
 use crate::patwari::{self, PatwariError};
-use crate::source::find_extracted_output;
-use crate::state::SessionRecord;
 use crate::patwari_read::{
     API_BASE, DownloadError, LISTING_PAGE_SIZE, ListedArtifact, MAX_ARTIFACT_DOWNLOAD_BYTES,
     ReadClient, ReadError, SizeDimension, SizeRefusal, optional_str, required_str, required_u64,
     strip_digest,
 };
+use crate::source::find_extracted_output;
+use crate::state::SessionRecord;
 
 /// Guards the listing-pagination loop against a misbehaving peer that never stops returning cursors.
 /// A match set that hits the bound is still usable — the newest of a thousand pages of duplicates

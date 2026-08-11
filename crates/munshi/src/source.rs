@@ -1247,12 +1247,10 @@ fn portable_path_component(name: &str) -> bool {
         return false;
     }
     let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    !matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-    ) && !(stem.len() == 4
-        && (stem.starts_with("COM") || stem.starts_with("LPT"))
-        && stem.as_bytes()[3].is_ascii_digit())
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
 }
 
 /// Finds one extracted output by its content address: streams the transcript exactly as
@@ -1319,7 +1317,7 @@ fn content_sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_session_id(value: &str) -> Result<&str, SourceError> {
+pub(crate) fn validate_session_id(value: &str) -> Result<&str, SourceError> {
     if value.is_empty()
         || value.len() > 128
         || value == "."

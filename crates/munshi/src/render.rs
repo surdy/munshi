@@ -452,7 +452,23 @@ pub fn archive_path(output_directory: &Path, metadata: &ArchiveMetadata<'_>) -> 
 /// and because upload retries must re-serialize a byte-identical manifest — the staged copies, not
 /// the live session-state files, are what snapshots assemble from.
 pub(crate) fn sidecar_directory(output_directory: &Path, markdown_relative: &Path) -> PathBuf {
-    output_directory.join(markdown_relative.with_extension("sidecar"))
+    output_directory.join(sidecar_relative_directory(markdown_relative))
+}
+
+/// [`sidecar_directory`] relative to the output directory, for callers that plan paths before they
+/// resolve them (record restore reports every write as an output-relative path).
+pub(crate) fn sidecar_relative_directory(markdown_relative: &Path) -> PathBuf {
+    markdown_relative.with_extension("sidecar")
+}
+
+/// The directory holding the snapshot artifacts a record restore (issue #70) brings back that local
+/// archival never writes: the verbatim `transcript.jsonl` and the `outputs/<sha256>` extracted
+/// outputs, which live in the harness home and in the transcript respectively rather than in the
+/// archive. Derived by swapping the `.md` extension exactly as [`sidecar_relative_directory`] does,
+/// so a session's whole restored set sits together beside its Markdown — and so restore writes into
+/// a directory the archival path never touches, and can never race it.
+pub(crate) fn restored_relative_directory(markdown_relative: &Path) -> PathBuf {
+    markdown_relative.with_extension("restored")
 }
 
 /// Replaces the staged sidecar set for one archive revision: the directory is cleared and

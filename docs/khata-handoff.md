@@ -472,6 +472,13 @@ Destructive operations should require explicit authorization and produce audit r
 
 Khata serves records and artifacts; Munshi performs the agent-specific restore.
 
+> **Since realized (issue #70):** steps 1–5 of the flow below — enumerate, select, download, verify,
+> decompress — are implemented as `munshi restore`, which reproduces the local *record* and imports
+> it into operational state (see the [user guide](user-guide.md#munshi-restore)). Steps 6–10, which
+> place a restored session back into a harness home so it can be resumed, are per-adapter and remain
+> unbuilt (issue #71); the warning below about restorability depending on adapter and harness version
+> is exactly why they were split off.
+
 Proposed flow:
 
 1. Munshi queries sessions and snapshots.

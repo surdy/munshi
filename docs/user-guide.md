@@ -549,6 +549,56 @@ configuration problems (see the module docs' table, and `--json` for the machine
 manually after a harness format bump or new-adapter support — Unknown kinds are interpretation
 gaps to type, not noise.
 
+### `munshi restore`
+
+Disaster recovery (issue #70): repopulate the local durable record from the archive after a disk
+wipe, or on a brand-new machine. Where `retrieve` redeems one artifact whose hash you already know,
+`restore` walks the archive and reproduces the whole local record — the rendered summary, the
+verbatim transcript, the extracted outputs, and any staged sidecars — then imports the restored
+Markdown into operational state.
+
+```bash
+munshi restore --all
+munshi restore --session <patwari-session-id>
+munshi restore --all --dry-run                 # report the writes without making them
+munshi restore --all --force                   # replace local files that differ from the archive
+```
+
+Each session's **newest** snapshot is restored: locally only the current revision has a home
+(`<component>/[<source-prefix>/]<session-id>.md` is replaced in place), so older snapshots are
+counted as superseded rather than given an invented layout. `summary.md` and `sidecar/<path>` land
+exactly where local archival writes them, so a later archive upload re-assembles a byte-identical
+snapshot from the restored files; the transcript and the extracted outputs — which archival keeps in
+the harness home and re-derives on demand respectively, never in the archive — land in a sibling
+`<session-id>.restored/` directory, and the transcript's path is recorded on the session row so the
+record reads as a whole.
+
+Reruns are free and interruptions are harmless: every artifact's archived sha256 is known from the
+listing, so a local copy is compared by **hash**, not by existence. A matching file is skipped
+without a byte crossing the wire, a differing file is *reported* rather than overwritten (pass
+`--force` to replace it), and only absent files are downloaded — through the same three-stage
+verified stack `retrieve` uses, so no unverified byte ever reaches the output directory.
+`--skip-outputs` omits the `outputs/<sha256>` artifacts, which are re-derivable from the restored
+transcript and therefore cost no recoverable content; `--max-download-bytes` raises the 128 MiB
+per-artifact cap. A skip you asked for is a non-event, not a finding: `--skip-outputs` still exits
+`0` and reports the omitted artifacts under `artifacts_skipped_by_request` with
+`"skip_cause": "requested"`, so a scripted restore never reads as failed for doing what it was told.
+Skips nobody asked for — an artifact past the cap, or a logical path with no place in the layout —
+count in `artifacts_skipped` and do exit `4`.
+
+A machine with no registration yet is the case this command exists for, so it runs there: pass
+`--endpoint` and `--output-dir` and the files are restored. Importing them into operational state is
+the part that genuinely needs a registration — the harness homes the importer re-derives from live
+in the stored configuration — so on an unregistered machine it is reported as skipped, and the
+sequence is `munshi restore` → `munshi register` → `munshi hook recover --rebuild-state`. Restored
+rows land `archived` with no pending observation, so they are never re-summarized and never park as
+transcript-missing. `--json` emits the stable report; exit codes follow the same shape as the other
+archive commands (0 clean, 1 local, 2 invalid input, 3 unconfigured, 4 findings such as a refused
+overwrite, 5 transport, 6 verification).
+
+Restore brings back the **record**. Placing a restored session back into a harness home so the
+harness can resume the conversation is per-adapter and deliberately separate (issue #71).
+
 ## Memory sync (harness auto-memory) in brief
 
 Harness auto-memory — the distilled notes Claude Code accumulates under

@@ -362,6 +362,23 @@ kinds apart without parsing messages:
 | 6 | Content verification or decompression failed. |
 | 7 | The artifact exceeds the download cap (`--max-download-bytes`). |
 
+`munshi restore` uses the same idea with its own table. A finished run always prints its report
+before exiting, so a non-zero code here is an accounting outcome, not a lost run:
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Every selected snapshot restored; nothing refused, skipped, or failed. |
+| 1 | Local failure: unreadable configuration, or restored bytes that could not be written. |
+| 2 | Invalid input (the archive server rejected `--session`). |
+| 3 | No Patwari server configured, or no archive output directory known — pass `--endpoint` and `--output-dir` on an unregistered machine. |
+| 4 | Findings: a local file that differs from the archived original was left alone (rerun with `--force`), an artifact was set aside for a reason you did not ask for (past the download cap, or a logical path with no place in the layout), or `--session` matched nothing. Artifacts you asked to skip with `--skip-outputs` are *not* findings and do not appear here. |
+| 5 | Server unreachable, protocol error, or server-side failure. |
+| 6 | Content verification or decompression failed on at least one artifact. |
+
+A restore that reports `refused` wrote nothing for those artifacts: the local file differs from the
+archived original, which is usually a local edit you want to keep. Compare them before reaching for
+`--force` — the archived original is always retrievable by its hash with `munshi retrieve`.
+
 ## Getting more signal
 
 Every inspection command (`status`, `sessions`, `show`) accepts `--json` for the stable

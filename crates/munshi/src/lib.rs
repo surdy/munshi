@@ -12,6 +12,7 @@ mod policy;
 mod project;
 mod registration;
 mod render;
+mod restore;
 mod retrieve;
 mod source;
 mod state;
@@ -47,11 +48,10 @@ pub use memory_sync::{
 };
 pub use patwari::{
     ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
-    ArchiveUploadStatusReport, ArtifactSource, CaptureContext, CURRENT_ARTIFACT_SET_VERSION,
-    INITIAL_ARTIFACT_SET_VERSION,
-    PatwariClient, PatwariError, PreparedArtifact, SessionContext, UploadOutcome, UploadReceipt,
-    assemble_artifact_sources, backfill as archive_upload_backfill, build_manifest,
-    configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
+    ArchiveUploadStatusReport, ArtifactSource, CURRENT_ARTIFACT_SET_VERSION, CaptureContext,
+    INITIAL_ARTIFACT_SET_VERSION, PatwariClient, PatwariError, PreparedArtifact, SessionContext,
+    UploadOutcome, UploadReceipt, assemble_artifact_sources, backfill as archive_upload_backfill,
+    build_manifest, configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
     retry as archive_upload_retry, set_enabled as set_archive_upload_enabled,
     status as archive_upload_status,
 };
@@ -71,6 +71,10 @@ pub use render::{
     ArchiveMetadata, ArchiveVersion, ArchivedCursor, ArchivedMarkdown, atomic_replace,
     content_hash, parse_archive_markdown, render_markdown, render_revision_markdown,
 };
+pub use restore::{
+    ArtifactReport, ArtifactResult, RestoreConfig, RestoreError, RestoreReport, SnapshotReport,
+    StateOutcome, StateSkip, restore,
+};
 pub use retrieve::{
     ArtifactMatch, MatchLine, QUERY_CONTEXT_LINES, RetrieveError, RetrieveResult, RetrievedContent,
     SearchResults, retrieve, retrieve_local, search_content,
@@ -80,8 +84,8 @@ pub use source::{
     ArtifactIndexEntry, ClaudeRecordedOrigin, CursorFallbackReason, DEFAULT_MAX_EVENT_TEXT_BYTES,
     ExtractedOutput, NormalizedEvent, NormalizedSession, PreviousSource, SIDECAR_MAX_FILE_BYTES,
     SIDECAR_MAX_FILES, SIDECAR_MAX_TOTAL_BYTES, SidecarFile, SnapshotArtifactIndex, SourceError,
-    SourceHomes, SourceKind, TranscriptLoadMode, TranscriptUpdate, collect_copilot_sidecars,
-    claude_transcript_origin, claude_transcript_recorded_origin, copilot_workspace_origin,
+    SourceHomes, SourceKind, TranscriptLoadMode, TranscriptUpdate, claude_transcript_origin,
+    claude_transcript_recorded_origin, collect_copilot_sidecars, copilot_workspace_origin,
     derive_transcript_path, extract_outputs, load_session, load_session_update,
     resolve_session_reference, snapshot_artifact_index, validate_transcript_envelope,
 };

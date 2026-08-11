@@ -49,25 +49,19 @@ use std::path::Path;
 
 use munshi_transcript::{
     Classification, Event, MIN_SUPPORTED_ARTIFACT_SET_VERSION, Record, RecordError,
-    SUPPORTED_ARTIFACT_SET_VERSION, Source,
-    TranscriptStream,
+    SUPPORTED_ARTIFACT_SET_VERSION, Source, TranscriptStream,
 };
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::http::{self, HttpError};
+use crate::http::HttpError;
 use crate::patwari::{self, PatwariError};
 use crate::patwari_read::{
-    API_BASE, DownloadError, LISTING_PAGE_SIZE, ListedArtifact, MAX_ARTIFACT_DOWNLOAD_BYTES,
-    ReadClient, ReadError, SizeDimension, SizeRefusal, nested_str, nested_u64, required_str,
-    required_u64, strip_digest,
+    DownloadError, ListedSnapshot, MAX_ARCHIVE_LISTING_PAGES, MAX_ARTIFACT_DOWNLOAD_BYTES,
+    ReadClient, ReadError, SizeDimension, SizeRefusal, SnapshotArtifact,
 };
 
-/// Guards a pagination loop against a misbehaving peer that never stops returning cursors. For an
-/// acceptance tool a silently truncated walk would hide snapshots, so hitting the bound is an
-/// error rather than a partial success.
-const MAX_LISTING_PAGES: usize = 10_000;
 /// The artifact-set-v1 logical path of the transcript artifact.
 const TRANSCRIPT_LOGICAL_PATH: &str = "transcript.jsonl";
 /// At most this many raw `Unknown` records are carried per snapshot as inspection samples.
@@ -566,8 +560,7 @@ fn verify_snapshot(client: &VerifyClient, snapshot: &ListedSnapshot, cap: usize)
         };
         return report;
     };
-    if !(u64::from(MIN_SUPPORTED_ARTIFACT_SET_VERSION)
-        ..=u64::from(SUPPORTED_ARTIFACT_SET_VERSION))
+    if !(u64::from(MIN_SUPPORTED_ARTIFACT_SET_VERSION)..=u64::from(SUPPORTED_ARTIFACT_SET_VERSION))
         .contains(&provenance.artifact_set_version)
     {
         report.status = SnapshotStatus::Skipped {
@@ -698,28 +691,6 @@ fn build_report(
 // Patwari read client (snapshot walking)
 // ---------------------------------------------------------------------------
 
-/// One snapshot from the archive-wide listing.
-struct ListedSnapshot {
-    snapshot_id: String,
-    session_id: String,
-}
-
-/// Capture provenance read from a snapshot's canonical manifest.
-struct SnapshotProvenance {
-    source_agent: String,
-    artifact_set_version: u64,
-}
-
-/// One artifact from a snapshot's artifact listing. Both declared sizes are carried because both
-/// feed the pre-transfer size gate.
-struct SnapshotArtifact {
-    logical_path: String,
-    original_sha256: String,
-    original_size_bytes: u64,
-    stored_size_bytes: u64,
-    content_url: String,
-}
-
 /// A non-fatal per-snapshot problem, mapped onto a [`SnapshotStatus::Failed`] entry.
 struct SnapshotIssue {
     class: FailureClass,
@@ -764,36 +735,16 @@ impl VerifyClient {
         })
     }
 
-    /// Pages through `GET /api/v1/snapshots`, optionally filtered to one session, following the
-    /// returned cursor only (Patwari's traversal contract).
+    /// The archive's snapshots, newest first. The traversal itself lives in the shared read stack;
+    /// what the walk decides here is that a listing which hit the page bound is a hard failure —
+    /// an acceptance walk that silently skipped snapshots is worse than no walk at all.
     fn list_snapshots(
         &self,
         session_id: Option<&str>,
     ) -> Result<Vec<ListedSnapshot>, VerifyArchiveError> {
         let listing = self
             .client
-            .paginate(
-                "snapshot listing",
-                MAX_LISTING_PAGES,
-                |cursor| {
-                    let mut path = format!("{API_BASE}/snapshots?limit={LISTING_PAGE_SIZE}");
-                    if let Some(session_id) = session_id {
-                        path.push_str("&session_id=");
-                        path.push_str(&http::encode_path(session_id));
-                    }
-                    if let Some(cursor) = cursor {
-                        path.push_str("&cursor=");
-                        path.push_str(&http::encode_path(cursor));
-                    }
-                    path
-                },
-                |item| {
-                    Ok(ListedSnapshot {
-                        snapshot_id: required_str(item, "snapshot_id")?,
-                        session_id: required_str(item, "session_id")?,
-                    })
-                },
-            )
+            .list_snapshots(session_id)
             .map_err(|error| match error {
                 // 422 is the server rejecting the walk's own parameters (a malformed --session).
                 ReadError::Status {
@@ -806,85 +757,36 @@ impl VerifyClient {
             })?;
         if !listing.terminated {
             return Err(VerifyArchiveError::Protocol(format!(
-                "snapshot listing did not terminate within {MAX_LISTING_PAGES} pages"
+                "snapshot listing did not terminate within {MAX_ARCHIVE_LISTING_PAGES} pages"
             )));
         }
         Ok(listing.items)
     }
 
-    /// Reads `source_agent` and `artifact_set_version` from the snapshot's canonical manifest.
-    fn snapshot_provenance(&self, snapshot_id: &str) -> Result<SnapshotProvenance, SnapshotIssue> {
-        let path = format!(
-            "{API_BASE}/snapshots/{}/manifest",
-            http::encode_path(snapshot_id)
-        );
-        let value = self.client.get_json(&path).map_err(|error| match error {
-            ReadError::Http(error) => SnapshotIssue::transport(error.to_string()),
-            ReadError::Status { status, code } => SnapshotIssue::transport(format!(
-                "manifest fetch returned status {status}: {}",
-                code.unwrap_or_else(|| "unknown".to_owned())
-            )),
-            ReadError::Protocol(message) => SnapshotIssue::transport(message),
-        })?;
-        if value.get("manifest").is_none() {
-            return Err(SnapshotIssue::transport(
-                "manifest response missing manifest",
-            ));
-        }
-        let source_agent = nested_str(&value, &["manifest", "session", "source_agent"])
-            .ok_or_else(|| SnapshotIssue::transport("manifest missing session.source_agent"))?;
-        let artifact_set_version =
-            nested_u64(&value, &["manifest", "capture", "artifact_set_version"]).ok_or_else(
-                || SnapshotIssue::transport("manifest missing capture.artifact_set_version"),
-            )?;
-        Ok(SnapshotProvenance {
-            source_agent,
-            artifact_set_version,
-        })
+    /// The snapshot's capture provenance, with every read failure graded as a per-snapshot
+    /// transport problem: an unreadable manifest is one snapshot's misfortune, not the walk's.
+    fn snapshot_provenance(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<crate::patwari_read::SnapshotProvenance, SnapshotIssue> {
+        self.client
+            .snapshot_provenance(snapshot_id)
+            .map_err(|error| snapshot_transport("manifest fetch", error))
     }
 
-    /// Pages through `GET /api/v1/artifacts?snapshot_id=…`, collecting the snapshot's artifacts.
+    /// The snapshot's artifacts. An artifact listing that hit the page bound would silently hide
+    /// the transcript, so it is graded as a failure for this snapshot rather than an empty set.
     fn list_snapshot_artifacts(
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<SnapshotArtifact>, SnapshotIssue> {
         let listing = self
             .client
-            .paginate(
-                "artifact listing",
-                MAX_LISTING_PAGES,
-                |cursor| {
-                    let mut path = format!(
-                        "{API_BASE}/artifacts?snapshot_id={}&limit={LISTING_PAGE_SIZE}",
-                        http::encode_path(snapshot_id)
-                    );
-                    if let Some(cursor) = cursor {
-                        path.push_str("&cursor=");
-                        path.push_str(&http::encode_path(cursor));
-                    }
-                    path
-                },
-                |item| {
-                    Ok(SnapshotArtifact {
-                        logical_path: required_str(item, "logical_path")?,
-                        original_sha256: strip_digest(&required_str(item, "original_sha256")?),
-                        original_size_bytes: required_u64(item, "original_size_bytes")?,
-                        stored_size_bytes: required_u64(item, "stored_size_bytes")?,
-                        content_url: required_str(item, "content_url")?,
-                    })
-                },
-            )
-            .map_err(|error| match error {
-                ReadError::Http(error) => SnapshotIssue::transport(error.to_string()),
-                ReadError::Status { status, code } => SnapshotIssue::transport(format!(
-                    "artifact listing returned status {status}: {}",
-                    code.unwrap_or_else(|| "unknown".to_owned())
-                )),
-                ReadError::Protocol(message) => SnapshotIssue::transport(message),
-            })?;
+            .list_snapshot_artifacts(snapshot_id)
+            .map_err(|error| snapshot_transport("artifact listing", error))?;
         if !listing.terminated {
             return Err(SnapshotIssue::transport(format!(
-                "artifact listing did not terminate within {MAX_LISTING_PAGES} pages"
+                "artifact listing did not terminate within {MAX_ARCHIVE_LISTING_PAGES} pages"
             )));
         }
         Ok(listing.items)
@@ -903,15 +805,8 @@ impl VerifyClient {
         artifact: &SnapshotArtifact,
         cap: usize,
     ) -> Result<Vec<u8>, SnapshotStatus> {
-        let listed = ListedArtifact {
-            content_url: &artifact.content_url,
-            stored_size_bytes: artifact.stored_size_bytes,
-            original_size_bytes: artifact.original_size_bytes,
-            expected_original_sha256: &artifact.original_sha256,
-            expected_label: "listing's declared",
-        };
         self.client
-            .download_verified(&listed, cap)
+            .download_verified(&artifact.listed(), cap)
             .map_err(|error| match error {
                 DownloadError::TooLarge(SizeRefusal {
                     dimension,
@@ -990,6 +885,20 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         taken.push(character);
     }
     taken
+}
+
+/// Grades a shared-stack read failure as a per-snapshot transport problem, naming the call that
+/// produced it. Every class collapses to transport here on purpose: from the walk's point of view a
+/// snapshot whose metadata cannot be read is a snapshot it could not reach, whatever the reason.
+fn snapshot_transport(call: &str, error: ReadError) -> SnapshotIssue {
+    match error {
+        ReadError::Http(error) => SnapshotIssue::transport(error.to_string()),
+        ReadError::Status { status, code } => SnapshotIssue::transport(format!(
+            "{call} returned status {status}: {}",
+            code.unwrap_or_else(|| "unknown".to_owned())
+        )),
+        ReadError::Protocol(message) => SnapshotIssue::transport(message),
+    }
 }
 
 /// Maps a shared-stack listing failure onto a walk-aborting error. The 422 case is handled by the

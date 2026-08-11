@@ -159,4 +159,11 @@ _Avoid_: File list, attachment set
 Fetching original content back from Patwari by its original sha256, verified against both stored and
 original hashes and decompressed locally. Search within retrieved content happens client-side;
 Patwari never interprets content.
-_Avoid_: Restore, delivery
+_Avoid_: Record restore, delivery
+
+**Record restore**:
+Repopulating a machine's local durable record from the archive: each session's newest snapshot
+downloaded into the archive output layout and imported into operational state. It reproduces what
+was already archived and never re-summarizes anything. Making a harness able to resume a restored
+session is a separate, per-adapter operation.
+_Avoid_: Retrieval, sync, backup restore
