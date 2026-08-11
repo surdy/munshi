@@ -1113,10 +1113,7 @@ pub fn assemble_artifact_sources(
 
 /// Media type of a staged sidecar artifact, keyed by its allowlisted extension.
 fn sidecar_media_type(relative_path: &str) -> &'static str {
-    match relative_path
-        .rsplit_once('.')
-        .map(|(_, extension)| extension)
-    {
+    match relative_path.rsplit_once('.').map(|(_, extension)| extension) {
         Some("md") => "text/markdown",
         Some("json") => "application/json",
         Some("yaml") => "application/yaml",
@@ -1131,10 +1128,7 @@ fn sidecar_media_type(relative_path: &str) -> &'static str {
 /// even when the live files have since mutated. The read is defensively bounded with the same caps
 /// as capture and refuses symlinked entries; an unreadable or absent directory yields an empty
 /// set, never an error, because sidecars are optional by contract.
-fn read_staged_sidecars(
-    output_directory: &Path,
-    markdown_relative: Option<&Path>,
-) -> Vec<SidecarFile> {
+fn read_staged_sidecars(output_directory: &Path, markdown_relative: Option<&Path>) -> Vec<SidecarFile> {
     let Some(relative) = markdown_relative else {
         return Vec::new();
     };
@@ -1676,7 +1670,8 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
                 "dead-letter" => dead_letter += 1,
                 _ => {}
             }
-            transfer_bytes_total = transfer_bytes_total.saturating_add(record.transfer_bytes_total);
+            transfer_bytes_total =
+                transfer_bytes_total.saturating_add(record.transfer_bytes_total);
             stored_bytes_latest_total =
                 stored_bytes_latest_total.saturating_add(record.last_stored_bytes.unwrap_or(0));
             ArchiveUploadItem {
@@ -2212,7 +2207,9 @@ mod tests {
         // Re-staging an empty set removes the directory: the snapshot set never unions revisions.
         crate::render::stage_sidecar_files(output_directory.path(), markdown_relative, &[])
             .unwrap();
-        assert!(read_staged_sidecars(output_directory.path(), Some(markdown_relative)).is_empty());
+        assert!(
+            read_staged_sidecars(output_directory.path(), Some(markdown_relative)).is_empty()
+        );
         assert!(read_staged_sidecars(output_directory.path(), None).is_empty());
     }
 
