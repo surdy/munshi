@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
     ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
@@ -329,11 +329,11 @@ enum Command {
         resume: bool,
         /// Accept the planned write into the harness home. Without it, `--resume` reports the plan
         /// and writes nothing.
-        #[arg(long, requires = "resume")]
+        #[arg(long)]
         yes: bool,
         /// Resume into this Claude Code home instead of the registered one. Required on a machine
         /// whose registration does not manage a claude-code harness; never inferred from `$HOME`.
-        #[arg(long, requires = "resume")]
+        #[arg(long)]
         claude_home: Option<PathBuf>,
         /// Raise the maximum stored bytes downloaded for one artifact (default 128 MiB). A larger
         /// artifact is otherwise set aside with an accounting line instead of downloaded.
@@ -2072,6 +2072,17 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
         } => {
             // clap guarantees exactly one of --session/--all; `all` needs no further inspection.
             let _ = all;
+            // `requires = "resume"` cannot express this: clap gives a flag an implicit `false`
+            // default, which satisfies its own requirement, so a stray `--yes` would be silently
+            // ignored. Raised as a parser error so a misused flag exits 2 like every other one.
+            if !resume && (yes || claude_home.is_some()) {
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "--yes and --claude-home apply only to --resume",
+                    )
+                    .exit();
+            }
             let state_directory = resolve_state_directory(state_dir)?;
             let result = restore(&RestoreConfig {
                 state_directory,

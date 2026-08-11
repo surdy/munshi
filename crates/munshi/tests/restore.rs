@@ -660,6 +660,291 @@ fn a_summary_that_is_not_a_munshi_archive_is_skipped() {
 }
 
 // ---------------------------------------------------------------------------
+// Resume restore (issue #71)
+// ---------------------------------------------------------------------------
+
+/// The cwd every archived Claude Code fixture records, and the directory name Claude Code derives
+/// from it. Written out rather than computed so a change to the slug rule fails a test that states
+/// the expected directory literally.
+const ARCHIVED_CWD: &str = "/machine-a/repos/thing";
+const ARCHIVED_SLUG: &str = "-machine-a-repos-thing";
+
+#[test]
+fn resume_places_a_claude_code_session_into_a_fresh_harness_home() {
+    let machine = Machine::new();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    let output = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let resume = &report["resume"];
+
+    assert_eq!(resume["status"]["result"], "placed");
+    assert_eq!(resume["harness"], "claude-code");
+    assert_eq!(resume["session_id"], "sess-one");
+    assert_eq!(resume["project_directory"], ARCHIVED_CWD);
+    assert_eq!(resume["project_slug"], ARCHIVED_SLUG);
+    // The archived transcript's own records say which harness version wrote it; the archive
+    // manifest does not (Munshi records no `source_agent_version` today).
+    assert_eq!(resume["archived_harness_version"], "2.1.205");
+    // The exact command to continue the conversation, and only because a transcript is in place.
+    assert_eq!(resume["resume_command"], "claude --resume sess-one");
+
+    // The transcript is verbatim, at the slugged path the harness reads.
+    let target = machine.harness_transcript(ARCHIVED_SLUG, "sess-one");
+    assert_eq!(resume["target_path"], target.display().to_string());
+    assert_eq!(std::fs::read(&target).unwrap(), session.transcript);
+    // The record restore still happened in full: resume extends it, it does not replace it.
+    assert_eq!(report["totals"]["restored"], 1);
+    assert!(
+        machine
+            .output
+            .path()
+            .join("munshi/claude-code/sess-one.md")
+            .is_file()
+    );
+}
+
+#[test]
+fn a_working_directory_missing_on_this_machine_is_a_warning_not_a_refusal() {
+    let machine = Machine::new();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    // `/machine-a/repos/thing` does not exist here — the whole point of restoring onto a new
+    // machine — and Claude Code still lists and resumes the session from its transcript.
+    let output = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = report["resume"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains(ARCHIVED_CWD)),
+        "warnings: {warnings:?}"
+    );
+    assert_eq!(report["resume"]["status"]["result"], "placed");
+
+    // A session whose working directory *does* exist says nothing about it.
+    let present = Machine::new();
+    let existing = present.root.path().join("live-project");
+    std::fs::create_dir_all(&existing).unwrap();
+    let cwd = existing.to_str().unwrap();
+    let session = ArchivedSession::claude_code("sess-two", "munshi", cwd);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_2, SESSION_B)], 50);
+    let output = present.resume(&server, SESSION_B, &["--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = report["resume"]["warnings"].as_array().unwrap();
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("does not exist")),
+        "warnings: {warnings:?}"
+    );
+}
+
+#[test]
+fn rerunning_a_resume_is_a_no_op() {
+    let machine = Machine::new();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    assert_eq!(
+        machine
+            .resume(&server, SESSION_A, &["--yes", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let output = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["result"], "already-present");
+    assert_eq!(
+        report["resume"]["resume_command"],
+        "claude --resume sess-one"
+    );
+    assert_eq!(
+        std::fs::read(machine.harness_transcript(ARCHIVED_SLUG, "sess-one")).unwrap(),
+        session.transcript
+    );
+}
+
+#[test]
+fn a_differing_transcript_in_the_harness_home_is_never_replaced() {
+    let machine = Machine::new();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    // A live session the harness has continued past the snapshot.
+    let target = machine.harness_transcript(ARCHIVED_SLUG, "sess-one");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let live =
+        b"{\"type\":\"user\",\"sessionId\":\"sess-one\",\"note\":\"newer than the archive\"}\n";
+    std::fs::write(&target, live).unwrap();
+
+    let output = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["result"], "refused");
+    assert_eq!(report["resume"]["status"]["reason"], "target-differs");
+    assert!(
+        report["resume"]["status"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--force does not apply"),
+        "message: {}",
+        report["resume"]["status"]["message"]
+    );
+    assert!(report["resume"]["resume_command"].is_null());
+    assert_eq!(std::fs::read(&target).unwrap(), live);
+
+    // `--force` replaces stale *archive* files; a harness home is not Munshi's to overwrite.
+    let forced = machine.resume(&server, SESSION_A, &["--yes", "--force", "--json"]);
+    assert_eq!(forced.status.code(), Some(4), "stderr: {}", forced.stderr());
+    let report: Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["reason"], "target-differs");
+    assert_eq!(std::fs::read(&target).unwrap(), live);
+}
+
+#[test]
+fn resume_without_yes_reports_the_plan_and_writes_nothing() {
+    let machine = Machine::new();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    let output = machine.resume(&server, SESSION_A, &["--json"]);
+    // The operator asked for a resumable session and did not get one: a finding, not a success.
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["result"], "planned");
+    assert_eq!(report["resume"]["confirmed"], false);
+    // The plan names the exact write, in `--json` as well as on the terminal.
+    let target = machine.harness_transcript(ARCHIVED_SLUG, "sess-one");
+    assert_eq!(
+        report["resume"]["target_path"],
+        target.display().to_string()
+    );
+    assert!(report["resume"]["resume_command"].is_null());
+    assert!(!target.exists(), "an unconfirmed resume writes nothing");
+    assert!(!machine.claude_home.join("projects").exists());
+    // The record restore itself still completed.
+    assert_eq!(report["totals"]["restored"], 1);
+
+    let human = machine.resume(&server, SESSION_A, &[]);
+    assert_eq!(human.status.code(), Some(4));
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("would write"), "stdout: {text}");
+    assert!(text.contains("--yes"), "stdout: {text}");
+}
+
+#[test]
+fn resume_refuses_a_harness_it_has_not_learned_to_place() {
+    let machine = Machine::new();
+    let session = ArchivedSession::copilot("sess-one", "munshi");
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    let output = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    // An explicitly named session that cannot be resumed is a finding, never a quiet success.
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["result"], "refused");
+    assert_eq!(report["resume"]["status"]["reason"], "unsupported-harness");
+    let message = report["resume"]["status"]["message"].as_str().unwrap();
+    assert!(message.contains("copilot-cli"), "message: {message}");
+    assert!(
+        message.contains("not supported for this harness yet"),
+        "message: {message}"
+    );
+    // Nothing was written into the harness home, and the record was still restored.
+    assert!(!machine.claude_home.join("projects").exists());
+    assert!(machine.output.path().join("munshi/sess-one.md").is_file());
+    assert_eq!(report["totals"]["restored"], 1);
+}
+
+#[test]
+fn a_registered_machine_points_the_session_row_at_the_harness_home_transcript() {
+    let machine = Machine::new();
+    machine.register_with_claude();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    let output = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["result"], "placed");
+    assert_eq!(report["state"]["result"], "rebuilt");
+
+    // The row reads the copy the harness itself reads and keeps appending to, not the archive-side
+    // copy beside the restored Markdown.
+    let recorded = machine
+        .recorded_transcript_path("sess-one")
+        .expect("the restored row records a transcript");
+    let target = machine.harness_transcript(ARCHIVED_SLUG, "sess-one");
+    assert_eq!(
+        std::fs::canonicalize(&recorded).unwrap(),
+        std::fs::canonicalize(&target).unwrap(),
+        "recorded {recorded}, placed {}",
+        target.display()
+    );
+    assert!(
+        !recorded.contains(".restored"),
+        "the archive-side copy must not win: {recorded}"
+    );
+}
+
+#[test]
+fn a_resume_without_a_registered_claude_home_refuses_rather_than_guessing() {
+    let machine = Machine::new();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    // No `--claude-home`, and a registration that manages Copilot only: there is no harness home
+    // to place into, and `$HOME/.claude` is deliberately not inferred.
+    machine.register();
+    let output = machine.restore(
+        &server,
+        &["--session", SESSION_A, "--resume", "--yes", "--json"],
+    );
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", output.stderr());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["resume"]["status"]["reason"], "harness-home-unknown");
+    assert!(
+        report["resume"]["status"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--claude-home"),
+        "message: {}",
+        report["resume"]["status"]["message"]
+    );
+    assert!(!machine.claude_home.join("projects").exists());
+}
+
+#[test]
+fn the_cli_refuses_a_whole_archive_resume() {
+    let machine = Machine::new();
+    let claude_home = machine.claude_home.to_str().unwrap().to_owned();
+
+    // Resuming is a deliberate, single-session act: `--all` is rejected by the parser itself.
+    let all = machine.run(&["--all", "--resume", "--yes", "--claude-home", &claude_home]);
+    assert_eq!(all.status.code(), Some(2), "stdout: {:?}", all.stdout);
+    assert!(
+        all.stderr().contains("--resume") || all.stderr().contains("--all"),
+        "stderr: {}",
+        all.stderr()
+    );
+
+    // `--yes` and `--claude-home` mean nothing without it, and `--dry-run` would be a second,
+    // divergent spelling of the unconfirmed plan.
+    let stray_yes = machine.run(&["--all", "--yes"]);
+    assert_eq!(stray_yes.status.code(), Some(2));
+    let dry = machine.run(&["--session", SESSION_A, "--resume", "--dry-run"]);
+    assert_eq!(dry.status.code(), Some(2), "stdout: {:?}", dry.stdout);
+}
+
+// ---------------------------------------------------------------------------
 // Harness: an isolated machine
 // ---------------------------------------------------------------------------
 
@@ -704,11 +989,25 @@ impl Machine {
 
     /// Registers the machine so the state-import half of a restore has a configuration to read.
     fn register(&self) {
+        self.register_harnesses(false);
+    }
+
+    /// Registers the machine with its Claude Code home too, which is what makes the registered
+    /// harness home a resume can place into — and what lets state import re-derive the placed
+    /// transcript by itself.
+    fn register_with_claude(&self) {
+        self.register_harnesses(true);
+    }
+
+    fn register_harnesses(&self, claude: bool) {
         let summarizer = self.root.path().join("summarizer.sh");
         std::fs::write(&summarizer, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&summarizer, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let output = self
-            .command("register")
+        let mut command = self.command("register");
+        if claude {
+            command.arg("--claude-home").arg(&self.claude_home);
+        }
+        let output = command
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
             .arg(&self.copilot_home)
@@ -750,6 +1049,43 @@ impl Machine {
             stdout: output.stdout,
             stderr_bytes: output.stderr,
         }
+    }
+
+    /// Runs a resume restore for one session, always through an explicit `--claude-home` so a test
+    /// can never write into a real harness home.
+    fn resume(&self, server: &FakeArchive, session: &str, args: &[&str]) -> RunOutput {
+        let claude_home = self.claude_home.to_str().unwrap().to_owned();
+        let mut full: Vec<&str> = vec![
+            "--session",
+            session,
+            "--resume",
+            "--claude-home",
+            &claude_home,
+        ];
+        full.extend_from_slice(args);
+        self.restore(server, &full)
+    }
+
+    /// Where a Claude Code home keeps one session's transcript.
+    fn harness_transcript(&self, slug: &str, session_id: &str) -> PathBuf {
+        self.claude_home
+            .join("projects")
+            .join(slug)
+            .join(format!("{session_id}.jsonl"))
+    }
+
+    /// The transcript path operational state recorded for a session. Read from the database
+    /// because the `sessions` contract deliberately does not expose it, and *which* copy the row
+    /// points at is exactly what a resume changes.
+    fn recorded_transcript_path(&self, session_id: &str) -> Option<String> {
+        let connection = rusqlite::Connection::open(self.state.join("munshi.db")).unwrap();
+        connection
+            .query_row(
+                "SELECT transcript_path FROM sessions WHERE source_session_id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
     }
 
     fn sessions_json(&self) -> Value {
@@ -823,10 +1159,57 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// One archived session as the archive holds it: the rendered `summary.md` Munshi's own renderer
 /// produces, plus the transcript and the extracted output a snapshot of it would carry.
 struct ArchivedSession {
+    source: SourceKind,
     session_id: String,
     summary: String,
     transcript: Vec<u8>,
     extracted_output: Vec<u8>,
+}
+
+/// A Claude Code transcript shaped like the ones the harness writes: bookkeeping records that carry
+/// no `cwd` or `version` come first (real `queue-operation` records do exactly this), so the scan
+/// that reads the origin has to look past them.
+fn claude_transcript(cwd: &str, version: &str) -> Vec<u8> {
+    let session = "01234567-89ab-4cde-8f01-234567890abc";
+    let records = [
+        json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": "2026-08-01T00:00:00Z",
+            "sessionId": session,
+            "content": "hello",
+        }),
+        json!({
+            "type": "user",
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "parentUuid": Value::Null,
+            "sessionId": session,
+            "timestamp": "2026-08-01T00:00:01Z",
+            "cwd": cwd,
+            "version": version,
+            "gitBranch": "main",
+            "isSidechain": false,
+            "userType": "external",
+            "message": { "role": "user", "content": "hello" },
+        }),
+        json!({
+            "type": "assistant",
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "parentUuid": "11111111-1111-4111-8111-111111111111",
+            "sessionId": session,
+            "timestamp": "2026-08-01T00:00:02Z",
+            "cwd": cwd,
+            "version": version,
+            "gitBranch": "main",
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "hi" }] },
+        }),
+    ];
+    let mut bytes = Vec::new();
+    for record in records {
+        bytes.extend_from_slice(record.to_string().as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes
 }
 
 impl ArchivedSession {
@@ -840,9 +1223,37 @@ impl ArchivedSession {
         revision: u64,
         transcript: &[u8],
     ) -> Self {
+        Self::revision(
+            SourceKind::Copilot,
+            session_id,
+            component,
+            revision,
+            transcript,
+        )
+    }
+
+    /// An archived Claude Code session whose transcript records `cwd` — the value the harness's
+    /// `projects/<slug>` directory name encodes, and the only place a wiped machine can learn it.
+    fn claude_code(session_id: &str, component: &str, cwd: &str) -> Self {
+        Self::revision(
+            SourceKind::ClaudeCode,
+            session_id,
+            component,
+            2,
+            &claude_transcript(cwd, "2.1.205"),
+        )
+    }
+
+    fn revision(
+        source: SourceKind,
+        session_id: &str,
+        component: &str,
+        revision: u64,
+        transcript: &[u8],
+    ) -> Self {
         let hash = content_hash(transcript);
         let session = NormalizedSession {
-            source: SourceKind::Copilot,
+            source,
             session_id: session_id.to_owned(),
             events: Vec::new(),
             user_requests: 1,
@@ -890,6 +1301,7 @@ impl ArchivedSession {
             None,
         );
         Self {
+            source,
             session_id: session_id.to_owned(),
             summary: markdown,
             transcript: transcript.to_vec(),
@@ -908,7 +1320,7 @@ impl ArchivedSession {
         FakeSnapshot {
             snapshot_id: snapshot_id.to_owned(),
             session_id: patwari_session_id.to_owned(),
-            source_agent: "copilot-cli".to_owned(),
+            source_agent: self.source.agent_label().to_owned(),
             artifact_set_version: 2,
             artifacts: vec![
                 FakeArtifact::identity(
