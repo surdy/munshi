@@ -77,17 +77,27 @@
 //! | code | meaning |
 //! |------|---------|
 //! | 0 | every selected snapshot restored; nothing refused, skipped, or failed |
-//! | 1 | local error (configuration, or writing the restored record) |
+//! | 1 | local error (configuration, writing the restored record, or a failed harness-home write) |
 //! | 2 | invalid input |
 //! | 3 | no archive server configured, or no archive output directory known |
-//! | 4 | findings: refused overwrites, involuntarily skipped artifacts, or a `--session` that matched nothing |
+//! | 4 | findings: refused overwrites, involuntarily skipped artifacts, a `--session` that matched nothing, or a refused/unconfirmed `--resume` placement |
 //! | 5 | server/transport failure |
 //! | 6 | verification/integrity failure on at least one artifact |
 //!
 //! A completed run that observed several classes reports the most severe: verification (6) over
 //! transport (5) over local (1) over findings (4). An artifact the operator asked to skip
 //! (`--skip-outputs`) is not a finding — it is reported and counted, but a run that did exactly
-//! what it was told must not read as failed to a scripted exit-code gate (see [`SkipCause`]).
+//! what it was told must not read as failed to a scripted exit-code gate (see [`SkipCause`]). A
+//! `--resume` that placed nothing *is* a finding, including the deliberate cases (no `--yes`, an
+//! unsupported harness): the operator asked for a resumable session and did not get one.
+//!
+//! # Resume
+//!
+//! `--resume` extends this restore rather than duplicating it: the record is restored exactly as
+//! above, and then the verified transcript already on disk is placed into the harness home so the
+//! harness can discover and continue the session. That half lives in [`crate::restore_resume`],
+//! which owns the adapter rules, the slug derivation and the never-overwrite-a-live-session
+//! discipline.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -110,6 +120,7 @@ use crate::render::{
     ArchivedMarkdown, archive_relative_path, atomic_replace, parse_archive_markdown,
     restored_relative_directory, sidecar_relative_directory,
 };
+use crate::restore_resume::{RestoredTranscript, ResumeConfig, ResumeInput, ResumeReport};
 use crate::source::{SourceHomes, SourceKind, validate_session_id};
 use crate::state::StateStore;
 
@@ -117,7 +128,7 @@ use crate::state::StateStore;
 const OUTPUTS_LOGICAL_PREFIX: &str = "outputs/";
 /// The restored transcript's file name inside a session's restored-artifact directory. It keeps the
 /// snapshot's own logical path so the directory reads as what it is — a snapshot mirror.
-const RESTORED_TRANSCRIPT_FILE: &str = "transcript.jsonl";
+pub(crate) const RESTORED_TRANSCRIPT_FILE: &str = "transcript.jsonl";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -149,6 +160,9 @@ pub struct RestoreConfig {
     pub rebuild_state: bool,
     /// Raise the per-artifact stored/original download cap.
     pub max_download_bytes: Option<usize>,
+    /// Also place the restored session back into its harness home so the harness can resume it
+    /// (issue #71). Requires a `session_filter`: resuming is a deliberate, single-session act.
+    pub resume: Option<ResumeConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +363,11 @@ pub struct SnapshotReport {
     /// Manifest `session.source_agent`; `None` when the manifest could not be fetched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_agent: Option<String>,
+    /// Manifest `capture.source_agent_version` — the harness version the capture was taken from.
+    /// Optional in the manifest schema and not recorded by Munshi's own uploads today, so it is
+    /// usually absent; a resume restore falls back to the version the transcript itself records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_agent_version: Option<String>,
     /// Manifest `capture.artifact_set_version`; `None` when the manifest could not be fetched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_set_version: Option<u64>,
@@ -437,6 +456,11 @@ pub struct RestoreReport {
     pub force: bool,
     pub snapshots: Vec<SnapshotReport>,
     pub state: StateOutcome,
+    /// The harness-home placement, present only when `--resume` asked for one. Additive and
+    /// request-gated, so a plain restore's report is byte-for-byte what it always was and
+    /// `schema_version` stays 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeReport>,
     pub totals: Totals,
 }
 
@@ -472,6 +496,11 @@ impl RestoreReport {
         }
         if matches!(self.state, StateOutcome::Failed { .. }) {
             worst = rank_max(worst, 1);
+        }
+        // A refused, unconfirmed or failed harness-home placement grades the whole run: the
+        // operator asked for a resumable session, and a clean record restore is not that.
+        if let Some(resume) = &self.resume {
+            worst = rank_max(worst, resume.exit_code());
         }
         worst
     }
@@ -520,6 +549,9 @@ impl RestoreReport {
             ),
             StateOutcome::Skipped { message, .. } => println!("state: not rebuilt — {message}"),
             StateOutcome::Failed { message } => println!("state: rebuild failed — {message}"),
+        }
+        if let Some(resume) = &self.resume {
+            resume.print_human();
         }
     }
 }
@@ -631,7 +663,7 @@ pub fn restore(config: &RestoreConfig) -> Result<RestoreReport, RestoreError> {
     // Strictly sequential — one manifest fetch, one artifact listing, one download at a time —
     // which keeps a whole-archive restore well under Patwari's download-concurrency permit count.
     let local = LocalRecordIndex::build(&output_directory);
-    let outcomes: Vec<SnapshotOutcome> = selected
+    let mut outcomes: Vec<SnapshotOutcome> = selected
         .iter()
         .map(|snapshot| {
             restore_snapshot(
@@ -646,13 +678,81 @@ pub fn restore(config: &RestoreConfig) -> Result<RestoreReport, RestoreError> {
         })
         .collect();
 
+    // Resume runs before state import, not after: once the transcript sits in the harness home,
+    // that path — not the restored copy beside the archive Markdown — is the readable, canonical
+    // one for the session row to point at.
+    let resume = config.resume.as_ref().map(|options| {
+        resume_into_harness_home(options, &mut outcomes, &output_directory, stored.as_ref())
+    });
+
     let restored: Vec<&RestoredSession> = outcomes
         .iter()
         .filter_map(|outcome| outcome.restored.as_ref())
         .collect();
     let state = rebuild_state(config, &output_directory, stored.as_ref(), &restored);
     let snapshots = outcomes.into_iter().map(|outcome| outcome.report).collect();
-    Ok(build_report(config, &output_directory, snapshots, state))
+    Ok(build_report(
+        config,
+        &output_directory,
+        snapshots,
+        state,
+        resume,
+    ))
+}
+
+/// Places the one selected session back into its harness home and records where it landed.
+///
+/// `--resume` requires `--session`, so at most one snapshot was selected; a resume that found none
+/// still produces a report, because "nothing to resume" is an answer the caller asked for rather
+/// than a reason to say the run succeeded.
+fn resume_into_harness_home(
+    options: &ResumeConfig,
+    outcomes: &mut [SnapshotOutcome],
+    output_directory: &Path,
+    stored: Option<&crate::registration::StoredConfig>,
+) -> ResumeReport {
+    let report = {
+        let outcome = outcomes.first();
+        let input = ResumeInput {
+            config: options,
+            stored,
+            output_directory,
+            source_agent: outcome.and_then(|outcome| outcome.report.source_agent.as_deref()),
+            manifest_agent_version: outcome
+                .and_then(|outcome| outcome.report.source_agent_version.as_deref()),
+            restored: outcome.and_then(|outcome| {
+                outcome
+                    .restored
+                    .as_ref()
+                    .map(|restored| RestoredTranscript {
+                        source: restored.source,
+                        session_id: &restored.session_id,
+                        markdown_relative: &restored.markdown_relative,
+                        // Only a transcript this run proved identical to the archived original may be
+                        // copied into a harness home: an absent, refused or unverified one would put
+                        // bytes nobody checked in front of the harness.
+                        transcript_verified: outcome.report.artifacts.iter().any(|artifact| {
+                            artifact.logical_path == TRANSCRIPT_LOGICAL_PATH
+                                && matches!(
+                                    artifact.result,
+                                    ArtifactResult::Written
+                                        | ArtifactResult::Replaced
+                                        | ArtifactResult::Present
+                                )
+                        }),
+                    })
+            }),
+        };
+        crate::restore_resume::resume(&input)
+    };
+    if let Some(path) = report.placed_transcript()
+        && let Some(restored) = outcomes
+            .first_mut()
+            .and_then(|outcome| outcome.restored.as_mut())
+    {
+        restored.harness_transcript = Some(path);
+    }
+    report
 }
 
 /// Reads the archive-upload endpoint recorded in configuration. Restore reuses upload's endpoint and
@@ -694,6 +794,7 @@ fn build_report(
     output_directory: &Path,
     snapshots: Vec<SnapshotReport>,
     state: StateOutcome,
+    resume: Option<ResumeReport>,
 ) -> RestoreReport {
     let mut totals = Totals::default();
     for snapshot in &snapshots {
@@ -736,6 +837,7 @@ fn build_report(
         force: config.force,
         snapshots,
         state,
+        resume,
         totals,
     }
 }
@@ -748,6 +850,10 @@ struct RestoredSession {
     session_id: String,
     /// The archive Markdown path, relative to the output directory.
     markdown_relative: PathBuf,
+    /// Where `--resume` put the transcript in the harness home, when it did. Set after the
+    /// placement so the session row can be linked to the location the harness itself reads, rather
+    /// than to the archive-side copy.
+    harness_transcript: Option<PathBuf>,
 }
 
 /// One snapshot's restore: what to report, and — when a record reached disk — what to import.
@@ -782,6 +888,7 @@ fn restore_snapshot(
         completed_at: snapshot.completed_at.clone(),
         session_id: None,
         source_agent: None,
+        source_agent_version: None,
         artifact_set_version: None,
         relative_path: None,
         superseded_snapshots,
@@ -796,6 +903,7 @@ fn restore_snapshot(
         }
     };
     report.source_agent = Some(provenance.source_agent);
+    report.source_agent_version = provenance.source_agent_version;
     report.artifact_set_version = Some(provenance.artifact_set_version);
     // The artifact-set version is what gives reserved logical paths their meaning (Patwari's ADR
     // 0005), so a version this build does not know is set aside rather than placed by guesswork.
@@ -901,6 +1009,7 @@ fn restore_snapshot(
         source: identity.source,
         session_id: identity.session_id,
         markdown_relative,
+        harness_transcript: None,
     });
     SnapshotOutcome { report, restored }
 }
@@ -1364,14 +1473,19 @@ fn skipped(reason: StateSkip, message: &str) -> StateOutcome {
     }
 }
 
-/// Imports every restored session, then points rows with no readable transcript at the restored
-/// one.
+/// Imports every restored session, then points rows with no readable transcript at the best
+/// transcript this run produced.
 ///
 /// The link is conditional on purpose. A rebuilt row re-derives its transcript from the harness
 /// home (issue #53), which is exactly right on a machine whose harness still holds the session and
 /// exactly useless on a wiped one. Overwriting a live path with an archived copy would quietly move
 /// every later read — upload, local claim-ticket redemption, recovery — off the file the harness is
-/// still appending to, so the restored path is recorded only when the row has nothing readable.
+/// still appending to, so a path is recorded only when the row has nothing readable.
+///
+/// Which path is preferred is decided by `--resume` (issue #71): a session placed back into its
+/// harness home is linked *there*, because that copy is the one the harness itself reads and keeps
+/// appending to, and the archive-side copy would go stale the moment the conversation continues.
+/// Without a placement the restored copy is all there is, and it is what gets linked.
 fn import_restored_sessions(
     config: &RestoreConfig,
     output_directory: &Path,
@@ -1397,9 +1511,11 @@ fn import_restored_sessions(
         {
             imported += 1;
         }
-        let transcript = output_directory
-            .join(restored_relative_directory(&session.markdown_relative))
-            .join(RESTORED_TRANSCRIPT_FILE);
+        let transcript = session.harness_transcript.clone().unwrap_or_else(|| {
+            output_directory
+                .join(restored_relative_directory(&session.markdown_relative))
+                .join(RESTORED_TRANSCRIPT_FILE)
+        });
         if !transcript.is_file() {
             continue;
         }
@@ -1781,6 +1897,7 @@ mod tests {
                 completed_at: None,
                 session_id: None,
                 source_agent: None,
+                source_agent_version: None,
                 artifact_set_version: None,
                 relative_path: None,
                 superseded_snapshots: 0,
@@ -1791,6 +1908,7 @@ mod tests {
                 reason: StateSkip::Disabled,
                 message: String::new(),
             },
+            resume: None,
             totals: Totals::default(),
         };
         assert_eq!(report(SnapshotStatus::Restored).exit_code(), 0);
@@ -1871,6 +1989,7 @@ mod tests {
             skip_outputs,
             rebuild_state: false,
             max_download_bytes: None,
+            resume: None,
         }
     }
 

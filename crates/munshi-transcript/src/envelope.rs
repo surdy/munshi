@@ -60,6 +60,20 @@ pub fn claude_git_branch(object: &Map<String, Value>) -> Option<&str> {
     (!branch.is_empty()).then_some(branch)
 }
 
+/// The Claude Code version a transcript record declares: its top-level `version` value,
+/// when present and non-empty. Same read discipline as [`claude_origin_cwd`] — only the
+/// pinned key is inspected, record content is never read.
+///
+/// This is the only harness-version evidence an archived Claude Code session carries: a
+/// snapshot manifest's `capture.source_agent_version` is optional and Munshi does not
+/// populate it today, so a resume restore (issue #71) reads the version the *writing*
+/// harness stamped on every turn record here. Stated for the operator to judge against the
+/// installed harness, never used to claim a snapshot is resumable.
+pub fn claude_agent_version(object: &Map<String, Value>) -> Option<&str> {
+    let version = object.get("version")?.as_str()?;
+    (!version.is_empty()).then_some(version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +129,21 @@ mod tests {
         assert_eq!(claude_git_branch(&object(r#"{"gitBranch":""}"#)), None);
         assert_eq!(claude_git_branch(&object(r#"{"gitBranch":7}"#)), None);
         assert_eq!(claude_git_branch(&object(r#"{"type":"user"}"#)), None);
+    }
+
+    /// Bookkeeping records (`queue-operation`, `ai-title`) carry no `version`, so the scan that
+    /// reads it must tolerate their absence rather than treat the first record as authoritative.
+    #[test]
+    fn claude_agent_version_requires_a_non_empty_string() {
+        assert_eq!(
+            claude_agent_version(&object(r#"{"version":"2.1.227"}"#)),
+            Some("2.1.227")
+        );
+        assert_eq!(claude_agent_version(&object(r#"{"version":""}"#)), None);
+        assert_eq!(claude_agent_version(&object(r#"{"version":7}"#)), None);
+        assert_eq!(
+            claude_agent_version(&object(r#"{"type":"queue-operation"}"#)),
+            None
+        );
     }
 }

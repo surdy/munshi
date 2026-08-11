@@ -185,14 +185,19 @@ pub(crate) struct ListedSnapshot {
     pub completed_at: Option<String>,
 }
 
-/// Capture provenance read from a snapshot's canonical manifest. Both fields decide whether a build
-/// can interpret the snapshot at all: `source_agent` names the harness, and `artifact_set_version`
-/// is what gives the reserved logical paths their meaning (Patwari's ADR 0005 — roles are conveyed
-/// by logical path alone, keyed to this version).
+/// Capture provenance read from a snapshot's canonical manifest. The first two fields decide
+/// whether a build can interpret the snapshot at all: `source_agent` names the harness, and
+/// `artifact_set_version` is what gives the reserved logical paths their meaning (Patwari's ADR
+/// 0005 — roles are conveyed by logical path alone, keyed to this version).
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotProvenance {
     pub source_agent: String,
     pub artifact_set_version: u64,
+    /// `capture.source_agent_version`: the harness version the capture was taken from, when the
+    /// uploader recorded one. Optional in the manifest schema and *not* populated by Munshi today
+    /// (see `crate::patwari`'s capture assembly), so a resume restore treats its absence as a
+    /// stated gap rather than as a compatibility verdict.
+    pub source_agent_version: Option<String>,
 }
 
 /// One artifact from a snapshot's artifact listing. Both declared sizes are carried because both
@@ -319,7 +324,8 @@ impl ReadClient {
         )
     }
 
-    /// Reads `source_agent` and `artifact_set_version` from a snapshot's canonical manifest.
+    /// Reads the capture provenance — `source_agent`, `artifact_set_version`, and the optional
+    /// `source_agent_version` — from a snapshot's canonical manifest.
     ///
     /// The manifest is the only place capture provenance is stated; the listings deliberately do
     /// not repeat it. A response without the `manifest` document is treated as unintelligible
@@ -350,6 +356,12 @@ impl ReadClient {
         Ok(SnapshotProvenance {
             source_agent,
             artifact_set_version,
+            // Optional by schema: an absent harness version is a fact about the capture, not a
+            // malformed manifest, so it never fails the read.
+            source_agent_version: nested_str(
+                &value,
+                &["manifest", "capture", "source_agent_version"],
+            ),
         })
     }
 

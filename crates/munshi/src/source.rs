@@ -810,15 +810,68 @@ pub struct ClaudeRecordedOrigin {
 /// carrying both, and a window that yields a `cwd` but no branch still returns the cwd —
 /// branch evidence is optional provenance, never a gate.
 pub fn claude_transcript_recorded_origin(path: &Path) -> Option<ClaudeRecordedOrigin> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return None;
-    }
-    let mut reader = BufReader::new(File::open(path).ok()?);
-    let limit = 256 * 1024;
-    let mut line = Vec::new();
     let mut cwd: Option<PathBuf> = None;
     let mut git_branch: Option<String> = None;
+    for_each_claude_leading_record(path, |object| {
+        if cwd.is_none() {
+            cwd = munshi_transcript::claude_origin_cwd(object).map(PathBuf::from);
+        }
+        if git_branch.is_none() {
+            git_branch = munshi_transcript::claude_git_branch(object).map(ToOwned::to_owned);
+        }
+        if cwd.is_some() && git_branch.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    cwd.map(|cwd| ClaudeRecordedOrigin { cwd, git_branch })
+}
+
+/// The Claude Code version that wrote a transcript, as its own leading records declare it
+/// (`munshi_transcript::claude_agent_version`), or `None` when none of them do.
+///
+/// Shares [`claude_transcript_recorded_origin`]'s bounded read discipline and exists for one
+/// caller: resume restore (issue #71) reports the harness version an archived session was written
+/// by, so an operator can weigh it against the harness they are about to resume it in. It is
+/// evidence to state, never a gate — a transcript whose leading records are all bookkeeping
+/// (`queue-operation`, `ai-title` carry no `version`) simply yields nothing.
+pub fn claude_transcript_recorded_agent_version(path: &Path) -> Option<String> {
+    let mut version: Option<String> = None;
+    for_each_claude_leading_record(path, |object| {
+        version = munshi_transcript::claude_agent_version(object).map(ToOwned::to_owned);
+        if version.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    version
+}
+
+/// The shared bounded, privacy-safe read behind every "what do this Claude Code transcript's
+/// leading records declare" question: symlink rejection, at most 32 leading records, each at most
+/// 256 KiB, parsed as JSON objects and handed to `visit` until it breaks or the window is
+/// exhausted. Only the caller's pinned keys are ever inspected; record content is never read.
+///
+/// Failure is silence, matching every caller's opportunistic contract: an unreadable file, a
+/// non-JSON line, or a non-object record simply ends the scan with whatever was learned so far.
+fn for_each_claude_leading_record<F>(path: &Path, mut visit: F)
+where
+    F: FnMut(&serde_json::Map<String, Value>) -> ControlFlow<()>,
+{
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return;
+    }
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    let mut reader = BufReader::new(file);
+    let limit = 256 * 1024;
+    let mut line = Vec::new();
     for _ in 0..32 {
         line.clear();
         let Ok(read) = reader
@@ -826,10 +879,10 @@ pub fn claude_transcript_recorded_origin(path: &Path) -> Option<ClaudeRecordedOr
             .take(limit as u64 + 1)
             .read_until(b'\n', &mut line)
         else {
-            break;
+            return;
         };
         if read == 0 || line.len() > limit {
-            break;
+            return;
         }
         while line
             .last()
@@ -841,22 +894,15 @@ pub fn claude_transcript_recorded_origin(path: &Path) -> Option<ClaudeRecordedOr
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
-            break;
+            return;
         };
         let Some(object) = value.as_object() else {
-            break;
+            return;
         };
-        if cwd.is_none() {
-            cwd = munshi_transcript::claude_origin_cwd(object).map(PathBuf::from);
-        }
-        if git_branch.is_none() {
-            git_branch = munshi_transcript::claude_git_branch(object).map(ToOwned::to_owned);
-        }
-        if cwd.is_some() && git_branch.is_some() {
-            break;
+        if visit(object).is_break() {
+            return;
         }
     }
-    cwd.map(|cwd| ClaudeRecordedOrigin { cwd, git_branch })
 }
 
 /// Bounded, privacy-safe read of a Copilot session's origin project directory: the top-level
