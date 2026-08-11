@@ -1,10 +1,20 @@
 //! The shared Patwari read stack (issue #42).
 //!
-//! Claim-ticket retrieval ([`crate::retrieve`]) and archive-wide parse verification
-//! ([`crate::verify_archive`]) read the same three Patwari surfaces: cursor-paginated listings,
-//! the artifact-content route with its `x-patwari-*` metadata headers, and the stable
-//! `error.code` error body. Both once carried their own copy of the wire rules, which would
-//! drift apart on the next header or format change; the rules now live here once.
+//! Claim-ticket retrieval ([`crate::retrieve`]), archive-wide parse verification
+//! ([`crate::verify_archive`]) and record restore ([`crate::restore`]) read the same three Patwari
+//! surfaces: cursor-paginated listings, the artifact-content route with its `x-patwari-*` metadata
+//! headers, and the stable `error.code` error body. Each once carried its own copy of the wire
+//! rules, which would drift apart on the next header or format change; the rules now live here
+//! once.
+//!
+//! # The archive walk
+//!
+//! Verification and restore additionally share a *traversal*: snapshots newest-first through
+//! `GET /api/v1/snapshots`, one snapshot's capture provenance through its canonical manifest, and
+//! one snapshot's artifacts through `GET /api/v1/artifacts?snapshot_id=…`. Those three calls
+//! ([`ReadClient::list_snapshots`], [`ReadClient::snapshot_provenance`],
+//! [`ReadClient::list_snapshot_artifacts`]) live here for the same reason the download does:
+//! a third hand-rolled copy of Patwari's cursor discipline would be the one that drifts.
 //!
 //! What is shared is the *verification*, not the error taxonomy. Every helper reports a
 //! classified failure ([`ReadError`], [`DownloadError`]) that its caller maps onto its own error
@@ -45,6 +55,10 @@ pub(crate) const API_BASE: &str = "/api/v1";
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Page size requested from a listing (Patwari's maximum).
 pub(crate) const LISTING_PAGE_SIZE: usize = 100;
+/// Guards an archive-walking pagination loop against a misbehaving peer that never stops returning
+/// cursors. Shared by every whole-archive traversal so one server-side pagination bug reads the
+/// same way to every command; callers still decide what an unterminated walk *means* to them.
+pub(crate) const MAX_ARCHIVE_LISTING_PAGES: usize = 10_000;
 /// Default upper bound on one downloaded artifact, in both its stored and its original form. The
 /// server stores artifacts up to 1 GiB, so this sits below the storage ceiling: an artifact past
 /// it is refused up front rather than truncated into a misleading verification failure. Callers
@@ -155,6 +169,61 @@ pub(crate) struct Listing<T> {
     pub terminated: bool,
 }
 
+/// One snapshot from the archive-wide snapshot listing.
+///
+/// Patwari orders that listing newest-first (`completed_at` descending, snapshot id descending)
+/// and every archive walker depends on the property, so it is stated here rather than rediscovered:
+/// the first entry seen for a session is that session's most recent snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct ListedSnapshot {
+    pub snapshot_id: String,
+    /// Patwari's own session identity — not the harness session ID, which lives in the manifest as
+    /// `session.source_session_id` and in the archived Markdown's frontmatter.
+    pub session_id: String,
+    /// Server-side completion time. Informational: ordering comes from the server's traversal, not
+    /// from parsing this. Optional because a walk must not abort over a cosmetic field.
+    pub completed_at: Option<String>,
+}
+
+/// Capture provenance read from a snapshot's canonical manifest. Both fields decide whether a build
+/// can interpret the snapshot at all: `source_agent` names the harness, and `artifact_set_version`
+/// is what gives the reserved logical paths their meaning (Patwari's ADR 0005 — roles are conveyed
+/// by logical path alone, keyed to this version).
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotProvenance {
+    pub source_agent: String,
+    pub artifact_set_version: u64,
+}
+
+/// One artifact from a snapshot's artifact listing. Both declared sizes are carried because both
+/// feed the pre-transfer size gate, and the digest because it is what a download is cross-checked
+/// against — and what lets a caller decide a local copy is already the archived bytes without
+/// transferring anything.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotArtifact {
+    pub artifact_id: String,
+    pub logical_path: String,
+    /// Bare lowercase hex, with Patwari's `sha256:` document prefix stripped.
+    pub original_sha256: String,
+    pub original_size_bytes: u64,
+    pub stored_size_bytes: u64,
+    pub content_url: String,
+}
+
+impl SnapshotArtifact {
+    /// The shape [`ReadClient::download_verified`] needs, with the listing's declared digest as the
+    /// expectation the recovered original must equal.
+    pub(crate) fn listed(&self) -> ListedArtifact<'_> {
+        ListedArtifact {
+            content_url: &self.content_url,
+            stored_size_bytes: self.stored_size_bytes,
+            original_size_bytes: self.original_size_bytes,
+            expected_original_sha256: &self.original_sha256,
+            expected_label: "listing's declared",
+        }
+    }
+}
+
 /// An artifact as the listing describes it: everything [`ReadClient::download_verified`] needs to
 /// bound, fetch, and cross-check the download. Callers keep their own richer listing types and
 /// build this for the download call.
@@ -211,6 +280,112 @@ impl ReadClient {
             max_pages,
             |cursor| self.get_json(&page_path(cursor)),
             parse_item,
+        )
+    }
+
+    /// Pages through `GET /api/v1/snapshots`, optionally filtered to one Patwari session,
+    /// following only the cursor the server returns (its traversal contract).
+    ///
+    /// The traversal is reported, not resolved: [`Listing::terminated`] tells the caller whether the
+    /// walk ended because the server stopped returning cursors or because it hit
+    /// [`MAX_ARCHIVE_LISTING_PAGES`], and an audit walk and a restore may reasonably disagree about
+    /// whether a truncated archive view is usable.
+    pub(crate) fn list_snapshots(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Listing<ListedSnapshot>, ReadError> {
+        self.paginate(
+            "snapshot listing",
+            MAX_ARCHIVE_LISTING_PAGES,
+            |cursor| {
+                let mut path = format!("{API_BASE}/snapshots?limit={LISTING_PAGE_SIZE}");
+                if let Some(session_id) = session_id {
+                    path.push_str("&session_id=");
+                    path.push_str(&http::encode_path(session_id));
+                }
+                if let Some(cursor) = cursor {
+                    path.push_str("&cursor=");
+                    path.push_str(&http::encode_path(cursor));
+                }
+                path
+            },
+            |item| {
+                Ok(ListedSnapshot {
+                    snapshot_id: required_str(item, "snapshot_id")?,
+                    session_id: required_str(item, "session_id")?,
+                    completed_at: optional_str(item, "completed_at"),
+                })
+            },
+        )
+    }
+
+    /// Reads `source_agent` and `artifact_set_version` from a snapshot's canonical manifest.
+    ///
+    /// The manifest is the only place capture provenance is stated; the listings deliberately do
+    /// not repeat it. A response without the `manifest` document is treated as unintelligible
+    /// rather than as an absent field, because the two mean very different things to a caller
+    /// deciding whether it may interpret the snapshot.
+    pub(crate) fn snapshot_provenance(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<SnapshotProvenance, ReadError> {
+        let path = format!(
+            "{API_BASE}/snapshots/{}/manifest",
+            http::encode_path(snapshot_id)
+        );
+        let value = self.get_json(&path)?;
+        if value.get("manifest").is_none() {
+            return Err(ReadError::Protocol(
+                "manifest response missing manifest".to_owned(),
+            ));
+        }
+        let source_agent = nested_str(&value, &["manifest", "session", "source_agent"])
+            .ok_or_else(|| {
+                ReadError::Protocol("manifest missing session.source_agent".to_owned())
+            })?;
+        let artifact_set_version =
+            nested_u64(&value, &["manifest", "capture", "artifact_set_version"]).ok_or_else(
+                || ReadError::Protocol("manifest missing capture.artifact_set_version".to_owned()),
+            )?;
+        Ok(SnapshotProvenance {
+            source_agent,
+            artifact_set_version,
+        })
+    }
+
+    /// Pages through `GET /api/v1/artifacts?snapshot_id=…`, collecting one snapshot's artifacts.
+    ///
+    /// The server orders this listing by artifact creation, not by the manifest's canonical
+    /// logical-path order, so callers that care about order sort for themselves; callers that
+    /// resolve artifacts by logical path — every caller so far — do not care.
+    pub(crate) fn list_snapshot_artifacts(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Listing<SnapshotArtifact>, ReadError> {
+        self.paginate(
+            "artifact listing",
+            MAX_ARCHIVE_LISTING_PAGES,
+            |cursor| {
+                let mut path = format!(
+                    "{API_BASE}/artifacts?snapshot_id={}&limit={LISTING_PAGE_SIZE}",
+                    http::encode_path(snapshot_id)
+                );
+                if let Some(cursor) = cursor {
+                    path.push_str("&cursor=");
+                    path.push_str(&http::encode_path(cursor));
+                }
+                path
+            },
+            |item| {
+                Ok(SnapshotArtifact {
+                    artifact_id: required_str(item, "artifact_id")?,
+                    logical_path: required_str(item, "logical_path")?,
+                    original_sha256: strip_digest(&required_str(item, "original_sha256")?),
+                    original_size_bytes: required_u64(item, "original_size_bytes")?,
+                    stored_size_bytes: required_u64(item, "stored_size_bytes")?,
+                    content_url: required_str(item, "content_url")?,
+                })
+            },
         )
     }
 

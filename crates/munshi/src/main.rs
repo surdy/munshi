@@ -12,16 +12,16 @@ use munshi::{
     ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
     DeliveryError, DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic,
     EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport, HookEvent, HookFailure, HookResult,
-    MemorySinkConfig, MemorySyncError, PatwariError, ProjectStatus, RegisterConfig, RetrieveError,
-    RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceHomes, SourceKind,
-    StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport, WorkerContext,
-    accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
-    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
-    configure_memory_sync, conflicting_source_home, default_copilot_home, delivery_backfill,
-    delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    MemorySinkConfig, MemorySyncError, PatwariError, ProjectStatus, RegisterConfig, RestoreConfig,
+    RestoreError, RestoreReport, RetrieveError, RetrieveResult, SearchResults, SessionRecord,
+    SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary, VerifyArchiveError,
+    VerifyArchiveReport, WorkerContext, accept_disclosure_from_terminal, archive_session,
+    archive_upload_backfill, archive_upload_retry, archive_upload_status, configure_archive_upload,
+    configure_delivery, configure_memory_sync, conflicting_source_home, default_copilot_home,
+    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
     lift_stale_source_limit_parks, memory_sync_run, memory_sync_status, parse_archive_markdown,
     parse_summarizer_env, project_label, project_status, prune_summarizer_exhaust,
-    reactivate_regrown_lost_transcripts, read_last_failure, register, retrieve,
+    reactivate_regrown_lost_transcripts, read_last_failure, register, restore, retrieve,
     run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
     set_memory_sync_enabled, set_project_enabled, summarizer_exhaust_bytes, tick_recovery_sweep,
     unregister, verify_archive_parse, wait_for_hook_result_for_source,
@@ -281,6 +281,50 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Emit a stable machine-readable contract (for `--list` and `--query`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Repopulate the local durable record from the Patwari archive (issue #70): each session's
+    /// newest snapshot — summary, verbatim transcript, extracted outputs and staged sidecars —
+    /// downloaded through the verified stack into the archive output layout, then imported into
+    /// operational state. Idempotent: artifacts already present are verified by hash and skipped,
+    /// and differing local files are reported rather than overwritten.
+    Restore {
+        /// Restore only this *Patwari* session's snapshots — the identity
+        /// `verify-archive-parse --session` takes, not the harness session ID.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        session: Option<String>,
+        /// Restore every session the archive holds.
+        #[arg(long)]
+        all: bool,
+        /// Restore from this archive server instead of the configured archive-upload endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Write the restored record here instead of the registered archive output directory.
+        /// Required on a machine that is not registered yet.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        /// Replace local files whose content differs from the archived original.
+        #[arg(long)]
+        force: bool,
+        /// Report what would be restored without transferring or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Leave `outputs/<sha256>` extracted outputs in the archive. They are re-derived from the
+        /// restored transcript on demand, so skipping them loses no recoverable content.
+        #[arg(long)]
+        skip_outputs: bool,
+        /// Do not import the restored Markdown into operational state. Run
+        /// `munshi hook recover --rebuild-state` afterwards to import it separately.
+        #[arg(long)]
+        no_rebuild_state: bool,
+        /// Raise the maximum stored bytes downloaded for one artifact (default 128 MiB). A larger
+        /// artifact is otherwise set aside with an accounting line instead of downloaded.
+        #[arg(long)]
+        max_download_bytes: Option<usize>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
         #[arg(long)]
         json: bool,
     },
@@ -808,6 +852,10 @@ enum Outcome {
         query: Option<String>,
         output: Option<PathBuf>,
         force: bool,
+        json: bool,
+    },
+    Restore {
+        result: Box<Result<RestoreReport, RestoreError>>,
         json: bool,
     },
     VerifyArchiveParse {
@@ -1587,6 +1635,7 @@ fn main() -> ExitCode {
             force,
             json,
         }) => emit_retrieve(*result, query, output, force, json),
+        Ok(Outcome::Restore { result, json }) => emit_restore(*result, json),
         Ok(Outcome::VerifyArchiveParse { result, json }) => {
             emit_verify_archive_parse(*result, json)
         }
@@ -1985,6 +2034,38 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 query,
                 output,
                 force,
+                json,
+            })
+        }
+        Command::Restore {
+            session,
+            all,
+            endpoint,
+            output_dir,
+            force,
+            dry_run,
+            skip_outputs,
+            no_rebuild_state,
+            max_download_bytes,
+            state_dir,
+            json,
+        } => {
+            // clap guarantees exactly one of --session/--all; `all` needs no further inspection.
+            let _ = all;
+            let state_directory = resolve_state_directory(state_dir)?;
+            let result = restore(&RestoreConfig {
+                state_directory,
+                endpoint_override: endpoint,
+                output_directory_override: output_dir,
+                session_filter: session,
+                force,
+                dry_run,
+                skip_outputs,
+                rebuild_state: !no_rebuild_state,
+                max_download_bytes,
+            });
+            Ok(Outcome::Restore {
+                result: Box::new(result),
                 json,
             })
         }
@@ -4782,6 +4863,26 @@ fn emit_retrieve(
                 }
                 ExitCode::SUCCESS
             }
+        }
+    }
+}
+
+/// Emits a completed record restore. A finished run always prints its report (human or `--json`)
+/// before exiting with the report's own code, so a refusal to overwrite is visible as a report
+/// rather than as a bare failure; only a restore that could not start at all takes the error path.
+fn emit_restore(result: Result<RestoreReport, RestoreError>, json: bool) -> ExitCode {
+    match result {
+        Ok(report) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            ExitCode::from(report.exit_code())
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(error.exit_code())
         }
     }
 }
