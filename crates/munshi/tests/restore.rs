@@ -896,6 +896,32 @@ fn a_registered_machine_points_the_session_row_at_the_harness_home_transcript() 
 }
 
 #[test]
+fn resuming_after_a_plain_restore_moves_the_row_off_the_archive_side_copy() {
+    let machine = Machine::new();
+    machine.register_with_claude();
+    let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);
+    let server = FakeArchive::start(vec![session.snapshot(SNAPSHOT_1, SESSION_A)], 50);
+
+    // Step one: the record only. With an empty harness home the row can only point at the restored
+    // copy beside the archive Markdown.
+    let first = machine.restore(&server, &["--session", SESSION_A, "--json"]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", first.stderr());
+    let recorded = machine.recorded_transcript_path("sess-one").unwrap();
+    assert!(recorded.contains(".restored"), "recorded {recorded}");
+
+    // Step two: resume. The harness home now holds the session, so the row follows it there — the
+    // restored copy is Munshi's own artifact and goes stale as soon as the conversation continues.
+    let second = machine.resume(&server, SESSION_A, &["--yes", "--json"]);
+    assert_eq!(second.status.code(), Some(0), "stderr: {}", second.stderr());
+    let recorded = machine.recorded_transcript_path("sess-one").unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&recorded).unwrap(),
+        std::fs::canonicalize(machine.harness_transcript(ARCHIVED_SLUG, "sess-one")).unwrap(),
+        "recorded {recorded}"
+    );
+}
+
+#[test]
 fn a_resume_without_a_registered_claude_home_refuses_rather_than_guessing() {
     let machine = Machine::new();
     let session = ArchivedSession::claude_code("sess-one", "munshi", ARCHIVED_CWD);

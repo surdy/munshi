@@ -1511,20 +1511,29 @@ fn import_restored_sessions(
         {
             imported += 1;
         }
-        let transcript = session.harness_transcript.clone().unwrap_or_else(|| {
-            output_directory
-                .join(restored_relative_directory(&session.markdown_relative))
-                .join(RESTORED_TRANSCRIPT_FILE)
-        });
+        let restored_copy = output_directory
+            .join(restored_relative_directory(&session.markdown_relative))
+            .join(RESTORED_TRANSCRIPT_FILE);
+        let transcript = session
+            .harness_transcript
+            .clone()
+            .unwrap_or_else(|| restored_copy.clone());
         if !transcript.is_file() {
             continue;
         }
-        let readable = store
+        let current = store
             .get_session(&session.session_id)
             .map_err(|error| error.to_string())?
-            .and_then(|record| record.transcript_path)
-            .is_some_and(|path| path.is_file());
-        if !readable
+            .and_then(|record| record.transcript_path);
+        let readable = current.as_ref().is_some_and(|path| path.is_file());
+        // One relink is allowed on top of the "only when nothing is readable" guard: a row still
+        // pointing at the archive-side restored copy, once this run has placed the session in the
+        // harness home. That copy is Munshi's own artifact rather than a live harness file, and it
+        // goes stale the moment the conversation continues — so moving off it takes nothing away,
+        // where moving off a *harness* path would.
+        let superseded_by_placement = session.harness_transcript.is_some()
+            && current.as_deref() == Some(restored_copy.as_path());
+        if (!readable || superseded_by_placement)
             && store
                 .record_derived_transcript_path(&session.session_id, &transcript)
                 .map_err(|error| error.to_string())?
