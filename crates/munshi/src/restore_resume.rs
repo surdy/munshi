@@ -267,9 +267,18 @@ pub(crate) fn resume(input: &ResumeInput<'_>) -> ResumeReport {
         status: ResumeStatus::Placed,
     };
 
+    // A snapshot whose manifest never arrived states no harness at all, which is a different thing
+    // from stating one this build cannot place: the record restore's own failure says what went
+    // wrong, and this half simply has nothing to judge.
+    let Some(agent) = input.source_agent else {
+        return refuse(
+            report,
+            ResumeRefusal::NothingToPlace,
+            "the snapshot's manifest could not be read, so the harness that produced it is unknown; see the snapshot's own status".to_owned(),
+        );
+    };
     // The adapter check comes first and is the one hard gate: reserved logical paths and harness
     // layouts only mean what this module thinks they mean for the harness it was written against.
-    let agent = input.source_agent.unwrap_or("unknown");
     if SourceKind::from_agent_label(agent) != Some(SourceKind::ClaudeCode) {
         return refuse(
             report,

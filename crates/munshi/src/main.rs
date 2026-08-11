@@ -289,7 +289,9 @@ enum Command {
     /// newest snapshot — summary, verbatim transcript, extracted outputs and staged sidecars —
     /// downloaded through the verified stack into the archive output layout, then imported into
     /// operational state. Idempotent: artifacts already present are verified by hash and skipped,
-    /// and differing local files are reported rather than overwritten.
+    /// and differing local files are reported rather than overwritten. Add `--resume` to also place
+    /// the session back into its harness home so the harness can continue it (issue #71, Claude
+    /// Code only).
     Restore {
         /// Restore only this *Patwari* session's snapshots — the identity
         /// `verify-archive-parse --session` takes, not the harness session ID.
