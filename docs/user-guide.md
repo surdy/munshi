@@ -596,8 +596,60 @@ transcript-missing. `--json` emits the stable report; exit codes follow the same
 archive commands (0 clean, 1 local, 2 invalid input, 3 unconfigured, 4 findings such as a refused
 overwrite, 5 transport, 6 verification).
 
-Restore brings back the **record**. Placing a restored session back into a harness home so the
-harness can resume the conversation is per-adapter and deliberately separate (issue #71).
+### `munshi restore --resume`
+
+Restore brings back the **record**; `--resume` (issue #71) additionally places the session back into
+its harness home so the harness can discover it and you can continue the conversation:
+
+```bash
+munshi restore --session <patwari-session-id> --resume              # show the plan, write nothing
+munshi restore --session <patwari-session-id> --resume --yes        # place it
+munshi restore --session <patwari-session-id> --resume --yes \
+  --claude-home ~/.claude                                           # unregistered machine
+```
+
+**Claude Code only.** Its resumable state is very nearly the transcript itself, so restore writes the
+verbatim archived `transcript.jsonl` to `<claude home>/projects/<cwd-slug>/<session-id>.jsonl` and
+reports the exact command to continue — `claude --resume <session-id>`, **run from the session's own
+working directory**, which the report names alongside it. That directory is not decoration: the
+harness looks a session up in the projects directory of the current cwd, so the same command run
+anywhere else finds nothing. Copilot and Codex are refused
+with their reason — their resumable state may live in stores Munshi deliberately does not archive,
+and that has to be settled by a spike, not by a guess (see
+[harness adapters](harness-adapters.md)). A refused harness is a *finding* (exit `4`), never a quiet
+success: you asked for a resumable session and did not get one.
+
+It is a single-session act: `--resume` requires `--session`, refuses `--all`, and writes nothing
+without `--yes` — without it, the plan (including the exact target path) is printed, reported under
+`--json`, and the run exits `4`. `--dry-run` is refused as a second spelling of the same thing.
+Nothing is downloaded twice: the placement copies the verified transcript the record restore already
+staged.
+
+Guardrails worth knowing before you run it:
+
+- **A differing transcript already at the target path is never replaced, and `--force` does not
+  apply.** `--force` exists so a restore can replace a stale copy of its own archive Markdown; a
+  harness home is not Munshi's to overwrite, and a transcript that differs from the archived one is a
+  live conversation the harness continued past the snapshot. A byte-identical file is a no-op, so
+  reruns are free.
+- **The working directory may not exist on the new machine.** That is a warning, not a refusal: the
+  transcript is placed regardless. But since the resume command is run *from* that directory, create
+  or clone it before resuming — and until you do, tools that expect its contents will not find
+  them.
+- **Version compatibility is reported, not enforced.** The report carries the Claude Code version
+  that wrote the archived transcript and the installed version (`claude --version`, best effort);
+  either being absent, or the two differing, is a stated warning. Restore never claims a snapshot is
+  resumable merely because it uploaded.
+- **The harness home is never inferred.** It comes from the registration, or from an explicit
+  `--claude-home`; there is no `$HOME/.claude` fallback for a write.
+- Once placed, the session row points at the harness-home transcript — the copy the harness itself
+  reads and keeps appending to — rather than at the archive-side restored copy.
+
+After a successful placement the report reads `"resume": {"status": {"result": "placed"}, …}` with
+`resume_command`, `project_directory`, `target_path`, `project_slug` and any warnings. A scripted
+consumer needs both halves: `cd` to `project_directory`, then run `resume_command`. What is verified
+is that the transcript is readable where the harness looks for it; that the harness *accepted* it is
+something only running `claude --resume` proves.
 
 ## Memory sync (harness auto-memory) in brief
 

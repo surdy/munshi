@@ -139,6 +139,34 @@ rather than failing the archive or upload. Claude Code and Codex contribute no s
 Claude's `todos/` are ephemeral scratch state and its shell snapshots are timestamp-keyed
 environment caches, neither worth archiving.
 
+### Resume restore (issue #71) — not supported, and why
+
+`munshi restore --resume` refuses a Copilot snapshot with a typed
+`unsupported-harness` refusal rather than writing anything into a Copilot home. The record itself
+restores normally; only the harness-home placement is refused.
+
+The reason is honest ignorance, not effort. Copilot's resumable state is not confined to the
+artifacts Munshi archives: the sidecar allowlist above deliberately excludes `session.db`, and
+nothing is ever staged from the monolithic `session-store.db`. Whether `copilot --resume` can
+reconstruct a session from a restored `session-state/<id>/events.jsonl` plus the allowlisted
+sidecars, with no store rows, is **unknown** — and writing a guess into a harness home is the one
+failure mode the [khata handoff](khata-handoff.md) warns about: *"never claim a snapshot is
+restorable merely because upload completed."*
+
+What a spike would have to establish, before any of this is implemented:
+
+1. Restore one archived session by hand into a scratch `COPILOT_HOME` (events + allowlisted
+   sidecars, no store rows) and record what `copilot --resume` does — lists it, refuses it, or
+   silently starts an empty session.
+2. If the store rows are load-bearing: what minimum row set makes a session discoverable, whether it
+   is derivable from the archived artifacts alone, and whether writing into a live SQLite the harness
+   owns is acceptable at all (Munshi has never written to a harness database, and doing so needs its
+   own decision).
+3. Whether the answer is version-pinned to 1.0.7x in the same way the transcript layout is.
+
+Either outcome is publishable here: a supported flow, a degraded "the transcript is readable in
+place" flow, or a recorded "not resumable without upstream support".
+
 The census tail also surfaced four archive-observed **tool-activity** kinds that are content,
 not bookkeeping (issue #51), all normalized as `tool` events: `skill.invoked` (the agent loaded
 a skill — `name` required; `path`, `description`, `source`, `trigger`, `model`, and the full
@@ -194,6 +222,51 @@ Claude Code does not emit an explicit clean-end marker inside the JSONL, so comp
 from the caller, exactly as they do for Copilot's `sessionEnd` hook. No unsupported lifecycle is
 claimed.
 
+### Resume restore (issue #71) — supported
+
+`munshi restore --session <id> --resume --yes` places an archived Claude Code session back into a
+harness home, because this harness's resumable state is very nearly the transcript itself: the
+archived `transcript.jsonl` is written verbatim to
+`<claude home>/projects/<cwd-slug>/<session-id>.jsonl`, and `claude --resume <session-id>` continues
+the conversation — **run from the session's own working directory**, because the harness resolves
+`--resume` inside the projects directory of the current cwd and the transcript is filed under that
+cwd's slug. The report names both the command and the directory for exactly this reason. (Like the
+slug encoding, that scoping is version-pinned evidence: were a future version to resolve `--resume`
+across all projects, naming the directory would be redundant rather than wrong.)
+
+**The slug.** The `projects/` subdirectory name encodes the session's working directory: every
+character that is not an ASCII letter or digit becomes `-`, **one `-` per UTF-16 code unit**. So
+`/Users/x/repos/munshi` → `-Users-x-repos-munshi`; a space, `.`, `_` and `+` each yield one `-`; `ü`
+(one UTF-16 unit) yields one and an emoji (a surrogate pair) yields two. Restore recomputes it from
+the `cwd` the archived transcript's own records carry, because on a wiped machine nothing else knows
+it.
+
+The rule was established empirically against Claude Code 2.1.227 on macOS, and is version-pinned
+evidence like the rest of this adapter: (1) all 29 directories of a real `~/.claude/projects` matched
+it when compared against the `cwd` their transcripts record — including a path containing spaces,
+which rules out a narrower separators-only rule; (2) the harness was run in directories named
+`ünï_x+y` and `a🎉b` under a throwaway `CLAUDE_CONFIG_DIR`, and created `--n--x-y` and `a--b`, which
+is where the per-code-unit detail comes from. If the harness changes its encoding, restore places a
+transcript the harness will not find; the reported target path is what makes that visible.
+
+**Guarantees and their limits.**
+
+- A transcript already at the target path is replaced **never**: byte-identical is a no-op, and
+  differing is a refusal that `--force` does not lift (it is a live session the harness continued
+  past the snapshot).
+- The session's working directory may not exist on the new machine. That is a reported warning, not
+  a refusal — the session still lists and resumes; tools that expect the directory will not find it.
+- Sidecars are expected to be absent: Munshi deliberately archives no Claude Code sidecars (#23), and
+  `todos/` and shell snapshots are ephemeral by design.
+- Version compatibility is **reported, not enforced**. The archived version comes from the `version`
+  key the writing harness stamps on turn records (snapshot manifests carry an optional
+  `capture.source_agent_version` that Munshi does not populate today), and the installed version from
+  a best-effort `claude --version`. Either being absent, or the two differing, is a stated warning.
+  Restore never claims a snapshot is resumable because it uploaded.
+- The post-check verifies that the transcript is readable at the derived path. It does **not** launch
+  the harness to confirm discovery, so "the harness listed it" is not asserted by any automated test;
+  that remains a manual acceptance step.
+
 ## Codex CLI (version-pinned to the rollout schema in openai/codex)
 
 **Source of truth.** Codex CLI appends rollout files at
@@ -227,6 +300,13 @@ Codex does not persist an explicit interruption record in the rollout, so an int
 lifecycle is not claimed as a distinct supported scenario; the normal/resumed rollouts flow through
 the shared pipeline and any completion reason is supplied by the caller.
 
+### Resume restore (issue #71) — not supported
+
+Refused with the same typed `unsupported-harness` refusal as Copilot. Codex contributes no sidecar
+artifacts, has no `SourceHomes` entry to place into, and its rollout files are not named after the
+session, so even the target path would be a guess. Nothing here has been probed; it stays out of
+scope until someone needs it.
+
 ## Fixtures and conformance
 
 Synthetic/sanitized conformance fixtures live under `fixtures/claude-code-2.1.44/` and
@@ -252,4 +332,13 @@ archive/state worker pipeline (resumed revisions, interrupted completion reason,
 - Codex is manual-archive/explicit-path only: no hooks (`unsupported-hook-source`), not
   accepted by `--harness`, no `SourceHomes` entry, no path derivation, no origin recovery.
 - Codex `originator`/`cli_version` and Claude `version` are recorded structurally in fixtures for
-  provenance but are not required for normalization.
+  provenance but are not required for normalization. Claude `version` is additionally *read* by
+  resume restore (issue #71) as the only harness-version evidence an archived session carries — as
+  something to report, never as a gate.
+- Writing into a harness home happens in exactly two places, both deliberate and both
+  Claude Code only: hook installation at `munshi register`, and resume restore's single
+  `projects/<slug>/<session-id>.jsonl` write under `--resume --yes`. Everything else — capture,
+  sidecar staging, memory-sync collection — is strictly read-only.
+- Resume restore's post-check proves the transcript is readable where the harness looks, not that
+  the harness accepted it. "Machine A's session resumes on machine B" is a manual acceptance step;
+  no automated test can drive a real harness.

@@ -103,7 +103,8 @@ interrupted-session recovery, per-project policy and budgets, chunked marathon s
 optional archive Git history, and all three opt-in remote sinks are implemented and tested:
 Notesmith summary delivery, full-snapshot archive upload to Patwari — `archive-upload
 configure`/`enable`/`backfill`/`retry`, claim-ticket redemption via `munshi retrieve`, local-record
-recovery from the archive via `munshi restore` (issue #70), and the
+recovery from the archive via `munshi restore` (issue #70) with Claude Code
+session resumption via `munshi restore --resume` (issue #71), and the
 `verify-archive-parse` acceptance walk, per
 [ADR 0009](docs/adr/0009-archive-full-snapshots-to-patwari.md) and
 [ADR 0010](docs/adr/0010-elide-with-claim-tickets-retrieve-on-demand.md) — and harness

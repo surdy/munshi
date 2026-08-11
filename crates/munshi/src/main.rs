@@ -6,25 +6,26 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use munshi::{
     ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
     ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
     DeliveryError, DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic,
     EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport, HookEvent, HookFailure, HookResult,
     MemorySinkConfig, MemorySyncError, PatwariError, ProjectStatus, RegisterConfig, RestoreConfig,
-    RestoreError, RestoreReport, RetrieveError, RetrieveResult, SearchResults, SessionRecord,
-    SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary, VerifyArchiveError,
-    VerifyArchiveReport, WorkerContext, accept_disclosure_from_terminal, archive_session,
-    archive_upload_backfill, archive_upload_retry, archive_upload_status, configure_archive_upload,
-    configure_delivery, configure_memory_sync, conflicting_source_home, default_copilot_home,
-    delivery_backfill, delivery_retry, delivery_status, delivery_verify_history, handle_hook,
-    lift_stale_source_limit_parks, memory_sync_run, memory_sync_status, parse_archive_markdown,
-    parse_summarizer_env, project_label, project_status, prune_summarizer_exhaust,
-    reactivate_regrown_lost_transcripts, read_last_failure, register, restore, retrieve,
-    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
-    set_memory_sync_enabled, set_project_enabled, summarizer_exhaust_bytes, tick_recovery_sweep,
-    unregister, verify_archive_parse, wait_for_hook_result_for_source,
+    RestoreError, RestoreReport, ResumeConfig, RetrieveError, RetrieveResult, SearchResults,
+    SessionRecord, SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary,
+    VerifyArchiveError, VerifyArchiveReport, WorkerContext, accept_disclosure_from_terminal,
+    archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
+    configure_archive_upload, configure_delivery, configure_memory_sync, conflicting_source_home,
+    default_copilot_home, delivery_backfill, delivery_retry, delivery_status,
+    delivery_verify_history, handle_hook, lift_stale_source_limit_parks, memory_sync_run,
+    memory_sync_status, parse_archive_markdown, parse_summarizer_env, project_label,
+    project_status, prune_summarizer_exhaust, reactivate_regrown_lost_transcripts,
+    read_last_failure, register, restore, retrieve, run_archive_worker_for_source, run_recovery,
+    set_archive_upload_enabled, set_delivery_enabled, set_memory_sync_enabled, set_project_enabled,
+    summarizer_exhaust_bytes, tick_recovery_sweep, unregister, verify_archive_parse,
+    wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -288,7 +289,9 @@ enum Command {
     /// newest snapshot — summary, verbatim transcript, extracted outputs and staged sidecars —
     /// downloaded through the verified stack into the archive output layout, then imported into
     /// operational state. Idempotent: artifacts already present are verified by hash and skipped,
-    /// and differing local files are reported rather than overwritten.
+    /// and differing local files are reported rather than overwritten. Add `--resume` to also place
+    /// the session back into its harness home so the harness can continue it (issue #71, Claude
+    /// Code only).
     Restore {
         /// Restore only this *Patwari* session's snapshots — the identity
         /// `verify-archive-parse --session` takes, not the harness session ID.
@@ -318,6 +321,22 @@ enum Command {
         /// `munshi hook recover --rebuild-state` afterwards to import it separately.
         #[arg(long)]
         no_rebuild_state: bool,
+        /// Also place the restored session back into its Claude Code home so the harness can
+        /// discover and resume it (issue #71). Single-session only, so it requires `--session` and
+        /// refuses `--all`, and it writes nothing without `--yes`. Claude Code only: any other
+        /// harness is refused with its reason. `--force` deliberately does NOT apply to
+        /// harness-home writes — a transcript already there that differs from the archived one is
+        /// a live conversation and is never replaced.
+        #[arg(long, requires = "session", conflicts_with_all = ["all", "dry_run"])]
+        resume: bool,
+        /// Accept the planned write into the harness home. Without it, `--resume` reports the plan
+        /// and writes nothing.
+        #[arg(long)]
+        yes: bool,
+        /// Resume into this Claude Code home instead of the registered one. Required on a machine
+        /// whose registration does not manage a claude-code harness; never inferred from `$HOME`.
+        #[arg(long)]
+        claude_home: Option<PathBuf>,
         /// Raise the maximum stored bytes downloaded for one artifact (default 128 MiB). A larger
         /// artifact is otherwise set aside with an accounting line instead of downloaded.
         #[arg(long)]
@@ -2046,12 +2065,26 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             dry_run,
             skip_outputs,
             no_rebuild_state,
+            resume,
+            yes,
+            claude_home,
             max_download_bytes,
             state_dir,
             json,
         } => {
             // clap guarantees exactly one of --session/--all; `all` needs no further inspection.
             let _ = all;
+            // `requires = "resume"` cannot express this: clap gives a flag an implicit `false`
+            // default, which satisfies its own requirement, so a stray `--yes` would be silently
+            // ignored. Raised as a parser error so a misused flag exits 2 like every other one.
+            if !resume && (yes || claude_home.is_some()) {
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "--yes and --claude-home apply only to --resume",
+                    )
+                    .exit();
+            }
             let state_directory = resolve_state_directory(state_dir)?;
             let result = restore(&RestoreConfig {
                 state_directory,
@@ -2063,6 +2096,12 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
                 skip_outputs,
                 rebuild_state: !no_rebuild_state,
                 max_download_bytes,
+                // clap ties `--yes` and `--claude-home` to `--resume`, so the options exist exactly
+                // when a placement was asked for.
+                resume: resume.then_some(ResumeConfig {
+                    confirmed: yes,
+                    claude_home_override: claude_home,
+                }),
             });
             Ok(Outcome::Restore {
                 result: Box::new(result),

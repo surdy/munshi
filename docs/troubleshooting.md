@@ -368,16 +368,22 @@ before exiting, so a non-zero code here is an accounting outcome, not a lost run
 | Exit code | Meaning |
 | --- | --- |
 | 0 | Every selected snapshot restored; nothing refused, skipped, or failed. |
-| 1 | Local failure: unreadable configuration, or restored bytes that could not be written. |
-| 2 | Invalid input (the archive server rejected `--session`). |
+| 1 | Local failure: unreadable configuration, restored bytes that could not be written, or a `--resume` write into the harness home that failed. |
+| 2 | Invalid input (the archive server rejected `--session`, or `--yes`/`--claude-home` were passed without `--resume`). |
 | 3 | No Patwari server configured, or no archive output directory known — pass `--endpoint` and `--output-dir` on an unregistered machine. |
-| 4 | Findings: a local file that differs from the archived original was left alone (rerun with `--force`), an artifact was set aside for a reason you did not ask for (past the download cap, or a logical path with no place in the layout), or `--session` matched nothing. Artifacts you asked to skip with `--skip-outputs` are *not* findings and do not appear here. |
+| 4 | Findings: a local file that differs from the archived original was left alone (rerun with `--force`), an artifact was set aside for a reason you did not ask for (past the download cap, or a logical path with no place in the layout), `--session` matched nothing, or a `--resume` placed nothing — an unsupported harness, an unknown harness home, a differing transcript already in the harness home, or a plan you have not confirmed with `--yes`. Artifacts you asked to skip with `--skip-outputs` are *not* findings and do not appear here. |
 | 5 | Server unreachable, protocol error, or server-side failure. |
 | 6 | Content verification or decompression failed on at least one artifact. |
 
 A restore that reports `refused` wrote nothing for those artifacts: the local file differs from the
 archived original, which is usually a local edit you want to keep. Compare them before reaching for
 `--force` — the archived original is always retrievable by its hash with `munshi retrieve`.
+
+A `--resume` that reports `"reason": "target-differs"` is a different situation, and `--force` will
+not move it: a transcript already in the harness home that differs from the archived one is a live
+session the harness continued past the snapshot, and overwriting it would destroy conversation that
+was never archived. Read both files (the archived copy sits in `<session-id>.restored/`) and decide
+by hand; the harness home is yours, not Munshi's.
 
 ## Getting more signal
 
