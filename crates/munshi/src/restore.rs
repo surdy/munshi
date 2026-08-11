@@ -39,7 +39,9 @@
 //! local copy is compared by *hash*, not by existence: a matching file is skipped without a byte
 //! crossing the wire, a differing file is refused unless `--force`, and an absent file is
 //! downloaded through the shared three-stage verified stack and written atomically. An interrupted
-//! run therefore resumes by rerunning, and a completed run rerun transfers nothing.
+//! run therefore resumes by rerunning, and a completed run rerun transfers nothing — including the
+//! summary, which would otherwise have to be fetched every time just to learn where its record
+//! belongs (see [`LocalRecordIndex`]).
 //!
 //! # State
 //!
@@ -574,6 +576,7 @@ pub fn restore(config: &RestoreConfig) -> Result<RestoreReport, RestoreError> {
 
     // Strictly sequential — one manifest fetch, one artifact listing, one download at a time —
     // which keeps a whole-archive restore well under Patwari's download-concurrency permit count.
+    let local = LocalRecordIndex::build(&output_directory);
     let outcomes: Vec<SnapshotOutcome> = selected
         .iter()
         .map(|snapshot| {
@@ -581,6 +584,7 @@ pub fn restore(config: &RestoreConfig) -> Result<RestoreReport, RestoreError> {
                 &client,
                 snapshot,
                 &output_directory,
+                &local,
                 config,
                 cap,
                 superseded.get(&snapshot.session_id).copied().unwrap_or(0),
@@ -708,6 +712,7 @@ fn restore_snapshot(
     client: &RestoreClient,
     snapshot: &ListedSnapshot,
     output_directory: &Path,
+    local: &LocalRecordIndex,
     config: &RestoreConfig,
     cap: usize,
     superseded_snapshots: u64,
@@ -766,42 +771,44 @@ fn restore_snapshot(
         return SnapshotOutcome::report_only(report);
     };
 
-    // The summary is fetched first and unconditionally: its frontmatter — not any server-side
-    // metadata — is what names the source, the project component and the harness session ID, and
-    // therefore where in the local layout this whole snapshot belongs.
-    let summary_bytes = match client.download_verified(summary_artifact, cap) {
-        Ok(bytes) => bytes,
-        Err(DownloadFailure::TooLarge(message)) => {
-            report.status = SnapshotStatus::Skipped {
-                reason: SkipReason::SummaryTooLarge,
-                message,
+    // Where the record belongs is stated by the summary's own frontmatter — the source, the project
+    // component and the harness session ID — and by nothing the server holds. It is therefore
+    // resolved before anything else: from the local record that already carries this exact archived
+    // digest when there is one, so a rerun transfers nothing at all, and by fetching it otherwise.
+    let (identity, summary_bytes) = match local.get(&summary_artifact.original_sha256) {
+        Some(identity) => (identity.clone(), None),
+        None => {
+            let bytes = match client.download_verified(summary_artifact, cap) {
+                Ok(bytes) => bytes,
+                Err(DownloadFailure::TooLarge(message)) => {
+                    report.status = SnapshotStatus::Skipped {
+                        reason: SkipReason::SummaryTooLarge,
+                        message,
+                    };
+                    return SnapshotOutcome::report_only(report);
+                }
+                Err(DownloadFailure::Failed(status)) => {
+                    report.status = status;
+                    return SnapshotOutcome::report_only(report);
+                }
             };
-            return SnapshotOutcome::report_only(report);
-        }
-        Err(DownloadFailure::Failed(status)) => {
-            report.status = status;
-            return SnapshotOutcome::report_only(report);
+            match parse_restored_summary(&bytes) {
+                Ok(identity) => (identity, Some(bytes)),
+                Err(message) => {
+                    report.status = SnapshotStatus::Skipped {
+                        reason: SkipReason::UnusableSummary,
+                        message,
+                    };
+                    return SnapshotOutcome::report_only(report);
+                }
+            }
         }
     };
-    let markdown = match parse_restored_summary(&summary_bytes) {
-        Ok(markdown) => markdown,
-        Err(message) => {
-            report.status = SnapshotStatus::Skipped {
-                reason: SkipReason::UnusableSummary,
-                message,
-            };
-            return SnapshotOutcome::report_only(report);
-        }
-    };
-    let markdown_relative = archive_relative_path(
-        markdown.source,
-        &markdown.project.component,
-        &markdown.session_id,
-    );
-    report.session_id = Some(markdown.session_id.clone());
+    let markdown_relative = identity.markdown_relative.clone();
+    report.session_id = Some(identity.session_id.clone());
     report.relative_path = Some(markdown_relative.display().to_string());
 
-    // The summary's bytes are already in hand, so it is placed from memory; everything else is
+    // A freshly downloaded summary is placed from the bytes already in hand; everything else is
     // resolved to a local path first and only transferred if the local copy is absent or differs.
     let placer = Placer {
         output_directory,
@@ -810,11 +817,9 @@ fn restore_snapshot(
         client,
         cap,
     };
-    report.artifacts.push(placer.place_known(
-        summary_artifact,
-        &markdown_relative,
-        Some(summary_bytes),
-    ));
+    report
+        .artifacts
+        .push(placer.place_known(summary_artifact, &markdown_relative, summary_bytes));
     for artifact in &artifacts {
         if artifact.logical_path == SUMMARY_LOGICAL_PATH {
             continue;
@@ -833,9 +838,9 @@ fn restore_snapshot(
                 ArtifactResult::Written | ArtifactResult::Replaced | ArtifactResult::Present
             )
     });
-    let restored = summary_placed.then(|| RestoredSession {
-        source: markdown.source,
-        session_id: markdown.session_id.clone(),
+    let restored = summary_placed.then_some(RestoredSession {
+        source: identity.source,
+        session_id: identity.session_id,
         markdown_relative,
     });
     SnapshotOutcome { report, restored }
@@ -866,17 +871,27 @@ fn snapshot_status(artifacts: &[ArtifactReport]) -> SnapshotStatus {
     SnapshotStatus::Restored
 }
 
-/// Parses a restored `summary.md` into the archive record it claims to be, refusing anything whose
-/// identity could not be turned into a safe local path.
+/// The identity a `summary.md` states about itself: which harness session it records, and therefore
+/// where in the local archive layout it — and the rest of its snapshot — belongs.
+#[derive(Debug, Clone)]
+struct RecordIdentity {
+    source: SourceKind,
+    session_id: String,
+    /// The archive Markdown path, relative to the archive output directory.
+    markdown_relative: PathBuf,
+}
+
+/// Reads a `summary.md` as the archive record it claims to be, refusing anything whose identity
+/// could not be turned into a safe local path.
 ///
-/// The bytes are hash-verified against the archive by the time they arrive here, which proves they
-/// are the archived original — not that the archived original is safe to write by. A session ID or
-/// project component carrying path syntax would escape the output directory, so both are validated
-/// against the same rules the capture path applies before either reaches a `join`.
-fn parse_restored_summary(bytes: &[u8]) -> Result<ArchivedMarkdown, String> {
+/// Downloaded bytes are hash-verified against the archive by the time they arrive here, which proves
+/// they are the archived original — not that the archived original is safe to write *by*. A session
+/// ID or project component carrying path syntax would escape the output directory, so both are
+/// validated against the same rules the capture path applies before either reaches a `join`.
+fn parse_restored_summary(bytes: &[u8]) -> Result<RecordIdentity, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "summary.md is not valid UTF-8 Munshi archive Markdown".to_owned())?;
-    let markdown = parse_archive_markdown(text)
+    let markdown: ArchivedMarkdown = parse_archive_markdown(text)
         .map_err(|_| "summary.md is not a Munshi-owned archive record".to_owned())?;
     validate_session_id(&markdown.session_id).map_err(|_| {
         format!(
@@ -897,7 +912,85 @@ fn parse_restored_summary(bytes: &[u8]) -> Result<ArchivedMarkdown, String> {
             "summary.md names an unusable project component `{component}`"
         ));
     }
-    Ok(markdown)
+    Ok(RecordIdentity {
+        source: markdown.source,
+        markdown_relative: archive_relative_path(markdown.source, component, &markdown.session_id),
+        session_id: markdown.session_id,
+    })
+}
+
+/// The archive Markdown already on disk, indexed by its content digest.
+///
+/// It exists to make a rerun genuinely free. Every other artifact's local copy can be proved
+/// identical to the archived original from the listing alone, but the summary cannot: it is the
+/// artifact that *says* where the record belongs, so resolving a snapshot's location would otherwise
+/// mean downloading it every time — turning "safe to rerun" into "cheap only for the large
+/// artifacts". Indexing the local records by digest first closes that gap: a snapshot whose summary
+/// digest is already on disk resolves its location locally and transfers nothing.
+///
+/// Only Markdown that sits at the path its own frontmatter implies is indexed, which is the same
+/// rule the state rebuild's archive scan applies. A file moved or planted elsewhere therefore never
+/// teaches restore a location, and the worst a stale index can do is cost one download: a digest
+/// that no longer matches the file falls through to [`Placer::place_known`]'s own hash check.
+struct LocalRecordIndex {
+    by_digest: BTreeMap<String, RecordIdentity>,
+}
+
+impl LocalRecordIndex {
+    fn build(output_directory: &Path) -> Self {
+        let mut by_digest = BTreeMap::new();
+        index_archives(output_directory, output_directory, 0, &mut by_digest);
+        Self { by_digest }
+    }
+
+    fn get(&self, original_sha256: &str) -> Option<&RecordIdentity> {
+        self.by_digest.get(original_sha256)
+    }
+}
+
+/// Depth-bounded, symlink-refusing walk of the archive output directory, matching the state
+/// rebuild's own scan: archive Markdown lives at `<component>/[<source-prefix>/]<session-id>.md`, so
+/// three levels reach every record and nothing follows a link out of the tree. Every failure is
+/// silent — an unreadable or unparseable file simply is not a known local record, and the restore it
+/// informs still works, just with one more download.
+fn index_archives(
+    output_directory: &Path,
+    directory: &Path,
+    depth: usize,
+    by_digest: &mut BTreeMap<String, RecordIdentity>,
+) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            index_archives(output_directory, &path, depth + 1, by_digest);
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(identity) = parse_restored_summary(&bytes) else {
+            continue;
+        };
+        if path.strip_prefix(output_directory) != Ok(identity.markdown_relative.as_path()) {
+            continue;
+        }
+        by_digest.insert(sha256_hex(&bytes), identity);
+    }
 }
 
 // ---------------------------------------------------------------------------
