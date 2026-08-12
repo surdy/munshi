@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceHomes, SourceKind, derive_transcript_p
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 /// The `transcript_source` recorded for a path re-derived from a session's ID through its source's
@@ -361,6 +361,11 @@ pub struct ArchiveUploadRecord {
     pub upload_id: Option<String>,
     pub uploaded_revision: Option<u64>,
     pub uploaded_summary_hash: Option<String>,
+    /// The content hash of the markdown the recorded snapshot uploaded. Keyed on alongside the
+    /// revision and summary hash so a cursor-only re-render (same revision and summary, fresh
+    /// markdown) re-uploads instead of being treated as an idempotent no-op. `None` on a row
+    /// written before this was recorded: what markdown it uploaded is unknown, not known-current.
+    pub uploaded_markdown_hash: Option<String>,
     pub snapshot_id: Option<String>,
     /// The artifact logical paths the recorded snapshot contained, in the canonical order they
     /// were uploaded in (issue #47). `None` on a row written before the ledger recorded them: what
@@ -398,6 +403,10 @@ pub struct CapturePrep {
 pub struct ArchiveUploadSuccess {
     pub uploaded_revision: u64,
     pub uploaded_summary_hash: String,
+    /// The content hash of the markdown this upload carried, recorded so a later cursor-only
+    /// re-render (same revision and summary, fresh markdown) is not mistaken for an already-uploaded
+    /// snapshot. `None` only when the session record carried no markdown hash.
+    pub uploaded_markdown_hash: Option<String>,
     pub snapshot_id: String,
     /// Every artifact logical path the uploaded snapshot contained (issue #47), so a later run can
     /// tell a self-contained snapshot from one that predates the full-snapshot guarantee.
@@ -868,6 +877,26 @@ impl StateStore {
                 params![8, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 8)?;
+            transaction.commit()?;
+        }
+        if current < 9 {
+            // Issue #73: a cursor-only re-render (a new source cursor at the same revision and
+            // summary, hooks.rs `cursor_only`) rewrites the markdown but leaves `uploaded_revision`
+            // and `uploaded_summary_hash` unchanged, so the upload idempotency check never re-fires
+            // and the archive's newest snapshot permanently lags the local markdown — which makes
+            // `restore` refuse the session. Record the uploaded markdown hash so the check can key
+            // on it too. Rows written before this migration carry NULL: their uploaded markdown is
+            // unknown, so they re-upload once (blob dedup makes that cheap) and record it after.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction
+                .execute_batch("ALTER TABLE archive_uploads ADD COLUMN uploaded_markdown_hash TEXT;")?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![9, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 9)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -1608,7 +1637,8 @@ impl StateStore {
                     au.uploaded_artifact_paths,
                     au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                     au.updated_at_ms,
-                    au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes
+                    au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes,
+                    au.uploaded_markdown_hash
                  FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
                  WHERE au.session_id=?1 AND au.endpoint=?2",
                 params![database_id, endpoint],
@@ -1628,7 +1658,8 @@ impl StateStore {
                 au.uploaded_artifact_paths,
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                 au.updated_at_ms,
-                au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes
+                au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes,
+                au.uploaded_markdown_hash
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
              ORDER BY au.updated_at_ms DESC,au.id DESC",
         )?;
@@ -1657,7 +1688,8 @@ impl StateStore {
                 au.uploaded_artifact_paths,
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                 au.updated_at_ms,
-                au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes
+                au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes,
+                au.uploaded_markdown_hash
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
              WHERE au.upload_state IN ('pending','failed')
                AND (au.next_attempt_at_ms IS NULL OR au.next_attempt_at_ms <= ?1)
@@ -1793,6 +1825,7 @@ impl StateStore {
                 uploaded_artifact_paths=?6,
                 transfer_bytes_total=transfer_bytes_total+?8,
                 last_stored_bytes=?9,last_original_bytes=?10,
+                uploaded_markdown_hash=?11,
                 upload_state='uploaded',attempts=0,next_attempt_at_ms=NULL,
                 last_error_category=NULL,updated_at_ms=?7
              WHERE session_id=?1 AND endpoint=?2",
@@ -1807,6 +1840,7 @@ impl StateStore {
                 i64::try_from(success.transfer_bytes).unwrap_or(i64::MAX),
                 i64::try_from(success.total_stored_bytes).unwrap_or(i64::MAX),
                 i64::try_from(success.total_original_bytes).unwrap_or(i64::MAX),
+                success.uploaded_markdown_hash,
             ],
         )?;
         Ok(())
@@ -2339,6 +2373,7 @@ fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveU
         upload_id: row.get(7)?,
         uploaded_revision: revision(8)?,
         uploaded_summary_hash: row.get(9)?,
+        uploaded_markdown_hash: row.get(20)?,
         snapshot_id: row.get(10)?,
         uploaded_artifact_paths: row
             .get::<_, Option<String>>(11)?

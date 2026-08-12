@@ -1325,13 +1325,19 @@ pub(crate) fn upload_one(
             reason: "retry-not-due".to_owned(),
         });
     }
-    // Already uploaded this exact revision as a self-contained snapshot: idempotent no-op that never
-    // contacts the server. A recorded snapshot that is not known self-contained (issue #47) falls
-    // through and re-uploads the complete set even though the revision and summary hash match.
+    // Already uploaded this exact revision and markdown as a self-contained snapshot: idempotent
+    // no-op that never contacts the server. Matching the revision and summary hash is not enough
+    // (issue #73) — a cursor-only re-render (hooks.rs `cursor_only`) rewrites the markdown at the
+    // same revision and summary, so the markdown hash must match too or the archive's newest snapshot
+    // silently lags the local markdown and `restore` refuses the session. A recorded snapshot that is
+    // not known self-contained (issue #47), or a row that predates markdown-hash recording (whose
+    // `uploaded_markdown_hash` is `None`), falls through and re-uploads the complete set.
     if existing.upload_state == "uploaded"
         && existing.uploaded_revision == Some(record.current_revision)
         && existing.uploaded_summary_hash == record.current_summary_hash
         && record.current_summary_hash.is_some()
+        && existing.uploaded_markdown_hash == record.markdown_hash
+        && record.markdown_hash.is_some()
         && records_full_snapshot(&existing)
     {
         return Ok(UploadOutcome::AlreadyUploaded {
@@ -1378,6 +1384,7 @@ pub(crate) fn upload_one(
                 &ArchiveUploadSuccess {
                     uploaded_revision: record.current_revision,
                     uploaded_summary_hash: record.current_summary_hash.clone().unwrap_or_default(),
+                    uploaded_markdown_hash: record.markdown_hash.clone(),
                     snapshot_id: receipt.snapshot_id.clone(),
                     uploaded_artifact_paths: artifacts
                         .iter()
@@ -2388,6 +2395,7 @@ mod tests {
             upload_id: None,
             uploaded_revision: None,
             uploaded_summary_hash: None,
+            uploaded_markdown_hash: None,
             snapshot_id: None,
             uploaded_artifact_paths: None,
             upload_state: "dead-letter".to_owned(),
@@ -2448,6 +2456,7 @@ mod tests {
             upload_id: None,
             uploaded_revision: Some(1),
             uploaded_summary_hash: Some("hash".to_owned()),
+            uploaded_markdown_hash: Some("md-hash".to_owned()),
             snapshot_id: Some("snap-1".to_owned()),
             uploaded_artifact_paths: paths
                 .map(|paths| paths.into_iter().map(ToOwned::to_owned).collect()),
@@ -2538,6 +2547,92 @@ mod tests {
             .unwrap();
         assert_eq!(recorded.upload_state, "pending");
         assert_eq!(recorded.attempts, 0);
+    }
+
+    #[test]
+    fn upload_one_reuploads_a_cursor_only_rerender_but_no_ops_an_identical_snapshot() {
+        use crate::registration::StoredArchiveUpload;
+        use crate::source::DEFAULT_MAX_EVENT_TEXT_BYTES;
+        use tempfile::TempDir;
+
+        let directory = TempDir::new().unwrap();
+        let state_dir = directory.path().join("home");
+        let output_dir = directory.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("summary.md"), b"# Title\n\nBody.\n").unwrap();
+
+        let session_id = "55555555-5555-4555-8555-555555555555";
+        let endpoint = "http://127.0.0.1:1";
+        let transcript_path = directory.path().join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{}\n").unwrap();
+        let mut store = StateStore::open(&state_dir).unwrap();
+        store
+            .ingest_agent_stop(session_id, 10_000, Path::new("/tmp/project"), &transcript_path)
+            .unwrap();
+        let settings = StoredArchiveUpload {
+            enabled: true,
+            endpoint: Some(endpoint.to_owned()),
+            client_id: Some("client".to_owned()),
+            max_attempts: 5,
+        };
+
+        // Seed a recorded, self-contained upload at revision 1 whose markdown hash is "md-hash" —
+        // exactly what `archived_record` reports for this session.
+        store
+            .ensure_archive_upload_target(session_id, endpoint)
+            .unwrap();
+        store
+            .record_archive_upload_success(
+                session_id,
+                endpoint,
+                &ArchiveUploadSuccess {
+                    uploaded_revision: 1,
+                    uploaded_summary_hash: "summary-hash".to_owned(),
+                    uploaded_markdown_hash: Some("md-hash".to_owned()),
+                    snapshot_id: "snap-1".to_owned(),
+                    uploaded_artifact_paths: vec![
+                        "summary.md".to_owned(),
+                        "transcript.jsonl".to_owned(),
+                    ],
+                    transfer_bytes: 1,
+                    total_stored_bytes: 1,
+                    total_original_bytes: 1,
+                },
+            )
+            .unwrap();
+
+        let upload = |store: &mut StateStore, record: &SessionRecord| {
+            upload_one(
+                store,
+                &settings,
+                "client",
+                endpoint,
+                &output_dir,
+                record,
+                &SourceHomes::default(),
+                DEFAULT_MAX_EVENT_TEXT_BYTES,
+            )
+            .unwrap()
+        };
+
+        // Same revision, summary, and markdown: an idempotent no-op that never touches the (dead)
+        // server — proven by the outcome, which is decided before any network work.
+        let outcome = upload(&mut store, &archived_record(session_id, &transcript_path));
+        assert!(
+            matches!(outcome, UploadOutcome::AlreadyUploaded { revision: 1, .. }),
+            "an unchanged snapshot must short-circuit, got {outcome:?}"
+        );
+
+        // A cursor-only re-render (hooks.rs `cursor_only`) leaves the revision and summary unchanged
+        // but rewrites the markdown; the new hash must break the short-circuit so the fresh markdown
+        // reaches the archive rather than the snapshot silently lagging the local file.
+        let mut rerendered = archived_record(session_id, &transcript_path);
+        rerendered.markdown_hash = Some("md-hash-after-cursor-move".to_owned());
+        let outcome = upload(&mut store, &rerendered);
+        assert!(
+            !matches!(outcome, UploadOutcome::AlreadyUploaded { .. }),
+            "a cursor-only re-render must not be mistaken for an already-uploaded snapshot, got {outcome:?}"
+        );
     }
 
     /// An archived revision-1 record whose summary is `summary.md` under the output directory and
