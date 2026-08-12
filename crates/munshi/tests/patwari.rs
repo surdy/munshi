@@ -906,6 +906,42 @@ fn backfill_reverifies_a_row_that_predates_the_recorded_artifact_set_exactly_onc
     assert_eq!(server.completed_count(), 2);
 }
 
+const CURSOR_DRIFT_SESSION: &str = "47474747-4747-4747-8747-474747474744";
+
+/// A cursor-only re-render (issue #73) rewrites the archived markdown at the same revision and
+/// summary, which the worker's upload idempotency check treats as an already-uploaded no-op — so the
+/// archive's newest snapshot silently lags the local markdown. Backfill reconciles it: an
+/// `uploaded`, self-contained row whose recorded markdown hash no longer matches the session
+/// re-uploads exactly once and then converges, while a run where they already match stays a no-op.
+#[test]
+fn backfill_reuploads_a_row_whose_markdown_drifted_from_the_archive() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(CURSOR_DRIFT_SESSION);
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+    let (report, _) = harness.backfill();
+    assert_eq!(report["uploaded"], 1);
+
+    // A self-contained snapshot of the current markdown: a second run finds no candidate.
+    let (again, _) = harness.backfill();
+    assert_eq!(again["candidates"], 0, "report: {again}");
+    assert_eq!(server.completed_count(), 1);
+
+    // The drift a cursor-only re-render leaves behind now makes the row a candidate again.
+    harness.drift_archived_markdown_hash(CURSOR_DRIFT_SESSION);
+    let (report, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(report["candidates"], 1, "report: {report}");
+    assert_eq!(report["uploaded"], 1);
+    assert_eq!(server.completed_count(), 2);
+
+    // Convergence: the re-upload recorded the new markdown hash, so the next run is a no-op again.
+    let (again, _) = harness.backfill();
+    assert_eq!(again["candidates"], 0, "report: {again}");
+    assert_eq!(server.completed_count(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Placeholder-summary durability floor (issue #43)
 // ---------------------------------------------------------------------------
@@ -1424,6 +1460,21 @@ impl CliHarness {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    /// Simulates the state a cursor-only re-render leaves behind (issue #73): the session's current
+    /// markdown hash advances while its recorded upload keeps the old one, without disturbing the
+    /// revision or summary.
+    fn drift_archived_markdown_hash(&self, session_id: &str) {
+        let changed = self
+            .database()
+            .execute(
+                "UPDATE sessions SET current_markdown_hash='sha256:cursor-only-drift'
+                 WHERE source_session_id=?1",
+                [session_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
     }
 
     fn backfill(&self) -> (Value, bool) {
