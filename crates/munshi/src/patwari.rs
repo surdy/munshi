@@ -1980,9 +1980,12 @@ pub fn backfill(
         (Vec::new(), Vec::new())
     };
     // Sessions already holding a row for this endpoint belong to the worker and retry paths, with
-    // one exception: an `uploaded` row whose snapshot is not proven self-contained is this run's
-    // to re-upload (issue #47). A row recorded for a different endpoint (e.g. before
-    // reconfiguration) does not count here at all, matching `retry`'s endpoint scoping.
+    // two exceptions this run reconciles: an `uploaded` row whose snapshot is not proven
+    // self-contained (issue #47), and one whose recorded markdown hash no longer matches the
+    // session's current markdown (issue #73) — a cursor-only re-render the worker's idempotency
+    // check left behind, or any pre-migration row whose markdown hash was never recorded. A row
+    // recorded for a different endpoint (e.g. before reconfiguration) does not count here at all,
+    // matching `retry`'s endpoint scoping.
     let recorded: BTreeMap<(SourceKind, &str), &ArchiveUploadRecord> = uploads
         .iter()
         .filter(|record| record.endpoint == endpoint)
@@ -1995,8 +1998,16 @@ pub fn backfill(
             match recorded.get(&(session.source, session.session_id.as_str())) {
                 None => true,
                 // Only a terminal `uploaded` row is re-verified here: `pending`, `failed`, and
-                // `dead-letter` rows are the retry paths' business and are left untouched.
-                Some(record) => record.upload_state == "uploaded" && !records_full_snapshot(record),
+                // `dead-letter` rows are the retry paths' business and are left untouched. It is
+                // re-verified when its snapshot is not proven self-contained, or when its recorded
+                // markdown hash has drifted from the session's current markdown. `upload_one`'s own
+                // idempotency check is the backstop: a candidate that is in fact current still
+                // reports `already-uploaded` and never reaches the server.
+                Some(record) => {
+                    record.upload_state == "uploaded"
+                        && (!records_full_snapshot(record)
+                            || record.uploaded_markdown_hash != session.markdown_hash)
+                }
             }
         })
         .collect();
