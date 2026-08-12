@@ -542,6 +542,7 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
             &munshi::ArchiveUploadSuccess {
                 uploaded_revision: 2,
                 uploaded_summary_hash: "hash2".to_owned(),
+                uploaded_markdown_hash: Some("md-hash2".to_owned()),
                 snapshot_id: "snap-2".to_owned(),
                 uploaded_artifact_paths: vec![
                     "summary.md".to_owned(),
@@ -579,6 +580,7 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
             &munshi::ArchiveUploadSuccess {
                 uploaded_revision: 3,
                 uploaded_summary_hash: "hash3".to_owned(),
+                uploaded_markdown_hash: Some("md-hash3".to_owned()),
                 snapshot_id: "snap-3".to_owned(),
                 uploaded_artifact_paths: vec![
                     "summary.md".to_owned(),
