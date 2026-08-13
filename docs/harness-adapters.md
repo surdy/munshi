@@ -265,7 +265,17 @@ transcript the harness will not find; the reported target path is what makes tha
   Restore never claims a snapshot is resumable because it uploaded.
 - The post-check verifies that the transcript is readable at the derived path. It does **not** launch
   the harness to confirm discovery, so "the harness listed it" is not asserted by any automated test;
-  that remains a manual acceptance step.
+  that remains a manual acceptance step. **Manually accepted against Claude Code 2.1.231 on macOS
+  (2026-08-13, issue #72):** a real archived session (1.5 MB / 644 records) was placed with
+  `restore --session <patwari-id> --resume --yes --claude-home <scratch>`, then resumed with
+  `claude --resume <session-id> --fork-session -p …` run from the recorded working directory. The
+  harness discovered and loaded it — the fork wrote a new transcript carrying the parent conversation
+  verbatim (its first turn, `lets do 353`, is the archived session's topic) — whereas the same command
+  against a bogus session ID in the same home returned `No conversation found with session ID`, which
+  is the control that makes the discovery real rather than a silent fresh start. Not exercised: the
+  first *continued model turn*, which needs an authenticated home; the scratch home stopped at
+  `Not logged in` only after it had already accepted the session and forked it. That last sub-criterion
+  is the cross-machine / authenticated-home step the issue leaves open.
 
 ## Codex CLI (version-pinned to the rollout schema in openai/codex)
 
