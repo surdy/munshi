@@ -8,15 +8,16 @@ use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use munshi::{
-    ArchiveConfig, ArchiveOutcome, ArchiveUploadRunReport, ArchiveUploadSettings,
-    ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord, DeliveryCredentialSource,
-    DeliveryError, DeliveryRunReport, DeliverySinkConfig, DeliveryStatusReport, Diagnostic,
-    EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport, HookEvent, HookFailure, HookResult,
-    MemorySinkConfig, MemorySyncError, PatwariError, ProjectStatus, RegisterConfig, RestoreConfig,
-    RestoreError, RestoreReport, ResumeConfig, RetrieveError, RetrieveResult, SearchResults,
-    SessionRecord, SessionReference, SourceHomes, SourceKind, StateStore, StructuredSummary,
-    VerifyArchiveError, VerifyArchiveReport, WorkerContext, accept_disclosure_from_terminal,
-    archive_session, archive_upload_backfill, archive_upload_retry, archive_upload_status,
+    ArchiveConfig, ArchiveOutcome, ArchiveUploadReconcileReport, ArchiveUploadRunReport,
+    ArchiveUploadSettings, ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord,
+    DeliveryCredentialSource, DeliveryError, DeliveryRunReport, DeliverySinkConfig,
+    DeliveryStatusReport, Diagnostic, EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport,
+    HookEvent, HookFailure, HookResult, MemorySinkConfig, MemorySyncError, PatwariError,
+    ProjectStatus, RegisterConfig, RestoreConfig, RestoreError, RestoreReport, ResumeConfig,
+    RetrieveError, RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceHomes,
+    SourceKind, StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport,
+    WorkerContext, accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
+    archive_upload_reconcile, archive_upload_retry, archive_upload_status,
     configure_archive_upload, configure_delivery, configure_memory_sync, conflicting_source_home,
     default_copilot_home, delivery_backfill, delivery_retry, delivery_status,
     delivery_verify_history, handle_hook, lift_stale_source_limit_parks, memory_sync_run,
@@ -717,6 +718,15 @@ enum ArchiveUploadCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Backfill the Patwari session id (issue #76) onto uploaded rows recorded before it was stored,
+    /// from the server's snapshot listing, so `restore --session` has the id `sessions` shows you.
+    Reconcile {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
     /// Retry failed uploads, or one session's upload.
     Retry {
         /// A single session ID to retry; omit with `--all` to retry every failed upload.
@@ -844,6 +854,10 @@ enum Outcome {
     },
     ArchiveUploadRun {
         report: Box<ArchiveUploadRunReport>,
+        json: bool,
+    },
+    ArchiveUploadReconcile {
+        report: Box<ArchiveUploadReconcileReport>,
         json: bool,
     },
     Status {
@@ -1074,6 +1088,12 @@ struct SessionListItem {
     completion_reason: Option<String>,
     summary_title: Option<String>,
     archive_path: Option<String>,
+    /// Patwari's own session id for this session's uploaded snapshot (issue #76) — the identity
+    /// `munshi restore --session` filters on, surfaced here because the `session_id` above is the
+    /// harness id, which restore does not accept. Additive on the `schema_version: 1` contract.
+    /// `null` when the session was never uploaded, or its upload predates schema 10 and
+    /// `archive-upload reconcile` has not backfilled it.
+    patwari_session_id: Option<String>,
     last_error_code: Option<String>,
     /// The session's display project label (issue #56). Additive on the `schema_version: 1`
     /// contract, like the harness-adapter status fields: a reader pinned to the older shape sees
@@ -1602,6 +1622,14 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::SUCCESS
             }
+        }
+        Ok(Outcome::ArchiveUploadReconcile { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else {
+                report.print_human();
+            }
+            ExitCode::SUCCESS
         }
         Ok(Outcome::Status { report, json }) => {
             if json {
@@ -2516,6 +2544,13 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
                 json,
             })
         }
+        ArchiveUploadCommand::Reconcile { state_dir, json } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::ArchiveUploadReconcile {
+                report: Box::new(archive_upload_reconcile(&state_directory)?),
+                json,
+            })
+        }
         ArchiveUploadCommand::Retry {
             session_id,
             source,
@@ -2596,6 +2631,15 @@ fn build_sessions_report(
     }
     let total = items.len();
     items.truncate(limit);
+    // Surface the Patwari session id restore needs (issue #76), joined from the upload ledger by
+    // (source, harness session id). Done after truncation so a large listing costs one map lookup
+    // per returned row, not per session; absent for a session never uploaded.
+    let patwari = load_patwari_session_ids(state_directory);
+    for item in &mut items {
+        item.patwari_session_id = patwari
+            .get(&(item.source.clone(), item.session_id.clone()))
+            .cloned();
+    }
     Ok(SessionsReport {
         schema_version: 1,
         command: "sessions",
@@ -2604,6 +2648,32 @@ fn build_sessions_report(
         returned: items.len(),
         items,
     })
+}
+
+/// Maps `(source selector, harness session id)` to the Patwari session id `restore --session`
+/// filters on, read from the upload ledger (issue #76). Best-effort: an unreadable state store or
+/// listing yields an empty map, so `sessions` still reports without the field rather than failing.
+/// Only rows carrying a recorded Patwari id contribute — the rest surface as `null`.
+fn load_patwari_session_ids(
+    state_directory: &Path,
+) -> std::collections::HashMap<(String, String), String> {
+    let Ok(state) = StateStore::open(state_directory) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(uploads) = state.list_archive_uploads() else {
+        return std::collections::HashMap::new();
+    };
+    uploads
+        .into_iter()
+        .filter_map(|record| {
+            record.patwari_session_id.map(|patwari| {
+                (
+                    (record.source.as_selector().to_owned(), record.session_id),
+                    patwari,
+                )
+            })
+        })
+        .collect()
 }
 
 fn build_attempts_report(
@@ -4040,6 +4110,7 @@ fn build_session_item(record: &SessionRecord) -> SessionListItem {
             .markdown_relative_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
+        patwari_session_id: None,
         last_error_code: record.last_error_category.clone(),
         project: project_label(
             record

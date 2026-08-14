@@ -22,6 +22,7 @@ use munshi::{
     SessionContext, SourceKind, StateStore, assemble_artifact_sources, build_manifest,
     extract_outputs, prepare_artifacts,
 };
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -544,6 +545,7 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
                 uploaded_summary_hash: "hash2".to_owned(),
                 uploaded_markdown_hash: Some("md-hash2".to_owned()),
                 snapshot_id: "snap-2".to_owned(),
+                patwari_session_id: "patwari-2".to_owned(),
                 uploaded_artifact_paths: vec![
                     "summary.md".to_owned(),
                     "transcript.jsonl".to_owned(),
@@ -573,6 +575,11 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
     assert_eq!(first_row.transfer_bytes_total, 4096);
     assert_eq!(first_row.last_stored_bytes, Some(8192));
     assert_eq!(first_row.last_original_bytes, Some(16384));
+    assert_eq!(
+        first_row.patwari_session_id.as_deref(),
+        Some("patwari-2"),
+        "the receipt's session id is persisted (issue #76)"
+    );
     store
         .record_archive_upload_success(
             session,
@@ -582,6 +589,7 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
                 uploaded_summary_hash: "hash3".to_owned(),
                 uploaded_markdown_hash: Some("md-hash3".to_owned()),
                 snapshot_id: "snap-3".to_owned(),
+                patwari_session_id: "patwari-3".to_owned(),
                 uploaded_artifact_paths: vec![
                     "summary.md".to_owned(),
                     "transcript.jsonl".to_owned(),
@@ -603,6 +611,95 @@ fn state_reuses_capture_on_retry_and_mints_fresh_for_a_new_revision() {
         "latest, not summed"
     );
     assert_eq!(second_row.last_original_bytes, Some(20000));
+    assert_eq!(
+        second_row.patwari_session_id.as_deref(),
+        Some("patwari-3"),
+        "the latest upload's Patwari session id replaces the prior one"
+    );
+}
+
+/// The `archive-upload reconcile` state primitive (issue #76): fill the Patwari session id onto an
+/// uploaded row from its snapshot id, but only when the id is still missing, scoped to one endpoint,
+/// and never overwriting a recorded id.
+#[test]
+fn backfill_patwari_session_id_fills_only_a_missing_id_and_is_endpoint_scoped() {
+    let directory = TempDir::new().unwrap();
+    let state_dir = directory.path().join("munshi-home");
+    let session = "44444444-4444-4444-8444-444444444444";
+    let endpoint = "http://127.0.0.1:1";
+    let other_endpoint = "http://127.0.0.1:2";
+
+    let mut store = StateStore::open(&state_dir).unwrap();
+    store
+        .ingest_agent_stop(
+            session,
+            10_000,
+            Path::new("/tmp/project"),
+            Path::new("/tmp/t.jsonl"),
+        )
+        .unwrap();
+    store
+        .prepare_archive_capture(session, endpoint, 1, "capture-A", "2026-07-25T00:00:00Z")
+        .unwrap();
+    store
+        .record_archive_upload_success(
+            session,
+            endpoint,
+            &munshi::ArchiveUploadSuccess {
+                uploaded_revision: 1,
+                uploaded_summary_hash: "hash".to_owned(),
+                uploaded_markdown_hash: Some("md-hash".to_owned()),
+                snapshot_id: "snap-1".to_owned(),
+                patwari_session_id: "patwari-original".to_owned(),
+                uploaded_artifact_paths: vec!["summary.md".to_owned()],
+                transfer_bytes: 1,
+                total_stored_bytes: 1,
+                total_original_bytes: 1,
+            },
+        )
+        .unwrap();
+
+    // Simulate a row uploaded before schema 10, whose Patwari id was never recorded.
+    drop(store);
+    {
+        let connection = Connection::open(StateStore::database_path(&state_dir)).unwrap();
+        connection
+            .execute("UPDATE archive_uploads SET patwari_session_id=NULL", [])
+            .unwrap();
+    }
+    let mut store = StateStore::open(&state_dir).unwrap();
+
+    // A snapshot the listing does not carry is left alone, and the wrong endpoint never matches.
+    assert!(
+        !store
+            .backfill_patwari_session_id(endpoint, "snap-unrelated", "patwari-x")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .backfill_patwari_session_id(other_endpoint, "snap-1", "patwari-1")
+            .unwrap()
+    );
+    // The right (endpoint, snapshot) fills the missing id.
+    assert!(
+        store
+            .backfill_patwari_session_id(endpoint, "snap-1", "patwari-1")
+            .unwrap()
+    );
+    // Idempotent and non-destructive: a second call never overwrites the now-present id.
+    assert!(
+        !store
+            .backfill_patwari_session_id(endpoint, "snap-1", "patwari-DIFFERENT")
+            .unwrap()
+    );
+
+    let row = store
+        .list_archive_uploads()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.endpoint == endpoint)
+        .unwrap();
+    assert_eq!(row.patwari_session_id.as_deref(), Some("patwari-1"));
 }
 
 // ---------------------------------------------------------------------------

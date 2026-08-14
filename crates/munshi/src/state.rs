@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceHomes, SourceKind, derive_transcript_p
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 /// The `transcript_source` recorded for a path re-derived from a session's ID through its source's
@@ -367,6 +367,11 @@ pub struct ArchiveUploadRecord {
     /// written before this was recorded: what markdown it uploaded is unknown, not known-current.
     pub uploaded_markdown_hash: Option<String>,
     pub snapshot_id: Option<String>,
+    /// Patwari's own session id for the uploaded snapshot (the receipt's `session_id`, issue #76) —
+    /// the identity `restore --session` filters on, distinct from `snapshot_id` and from the harness
+    /// `source_session_id`. `None` on a row written before it was recorded, or one whose only uploads
+    /// predate schema 10, until `archive-upload reconcile` backfills it.
+    pub patwari_session_id: Option<String>,
     /// The artifact logical paths the recorded snapshot contained, in the canonical order they
     /// were uploaded in (issue #47). `None` on a row written before the ledger recorded them: what
     /// that snapshot contained is unknown, not known-complete.
@@ -408,6 +413,9 @@ pub struct ArchiveUploadSuccess {
     /// snapshot. `None` only when the session record carried no markdown hash.
     pub uploaded_markdown_hash: Option<String>,
     pub snapshot_id: String,
+    /// Patwari's own session id from the upload receipt (issue #76) — the identity `restore --session`
+    /// filters on, recorded so `sessions`/`archive-upload status` can surface the id restore needs.
+    pub patwari_session_id: String,
     /// Every artifact logical path the uploaded snapshot contained (issue #47), so a later run can
     /// tell a self-contained snapshot from one that predates the full-snapshot guarantee.
     pub uploaded_artifact_paths: Vec<String>,
@@ -890,13 +898,34 @@ impl StateStore {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction
-                .execute_batch("ALTER TABLE archive_uploads ADD COLUMN uploaded_markdown_hash TEXT;")?;
+            transaction.execute_batch(
+                "ALTER TABLE archive_uploads ADD COLUMN uploaded_markdown_hash TEXT;",
+            )?;
             transaction.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
                 params![9, now_ms()],
             )?;
             transaction.pragma_update(None, "user_version", 9)?;
+            transaction.commit()?;
+        }
+        if current < 10 {
+            // Issue #76: record Patwari's own session id (the receipt's `session_id`, distinct from
+            // the snapshot id and from the harness `source_session_id`) alongside each uploaded
+            // snapshot, because `munshi restore --session` filters on exactly that id and nothing a
+            // user reaches — `munshi sessions`, `archive-upload status` — surfaced it, leaving the
+            // harness id the listings *do* show a dead end against restore. Rows written before this
+            // migration carry NULL until a later upload records it or `archive-upload reconcile`
+            // backfills them from the server's snapshot listing.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction
+                .execute_batch("ALTER TABLE archive_uploads ADD COLUMN patwari_session_id TEXT;")?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![10, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 10)?;
             transaction.commit()?;
         }
         let user_version: i64 =
@@ -1638,7 +1667,7 @@ impl StateStore {
                     au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                     au.updated_at_ms,
                     au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes,
-                    au.uploaded_markdown_hash
+                    au.uploaded_markdown_hash,au.patwari_session_id
                  FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
                  WHERE au.session_id=?1 AND au.endpoint=?2",
                 params![database_id, endpoint],
@@ -1659,7 +1688,7 @@ impl StateStore {
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                 au.updated_at_ms,
                 au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes,
-                au.uploaded_markdown_hash
+                au.uploaded_markdown_hash,au.patwari_session_id
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
              ORDER BY au.updated_at_ms DESC,au.id DESC",
         )?;
@@ -1689,7 +1718,7 @@ impl StateStore {
                 au.upload_state,au.attempts,au.next_attempt_at_ms,au.last_error_category,
                 au.updated_at_ms,
                 au.transfer_bytes_total,au.last_stored_bytes,au.last_original_bytes,
-                au.uploaded_markdown_hash
+                au.uploaded_markdown_hash,au.patwari_session_id
              FROM archive_uploads au JOIN sessions s ON s.id=au.session_id
              WHERE au.upload_state IN ('pending','failed')
                AND (au.next_attempt_at_ms IS NULL OR au.next_attempt_at_ms <= ?1)
@@ -1825,7 +1854,7 @@ impl StateStore {
                 uploaded_artifact_paths=?6,
                 transfer_bytes_total=transfer_bytes_total+?8,
                 last_stored_bytes=?9,last_original_bytes=?10,
-                uploaded_markdown_hash=?11,
+                uploaded_markdown_hash=?11,patwari_session_id=?12,
                 upload_state='uploaded',attempts=0,next_attempt_at_ms=NULL,
                 last_error_category=NULL,updated_at_ms=?7
              WHERE session_id=?1 AND endpoint=?2",
@@ -1841,9 +1870,28 @@ impl StateStore {
                 i64::try_from(success.total_stored_bytes).unwrap_or(i64::MAX),
                 i64::try_from(success.total_original_bytes).unwrap_or(i64::MAX),
                 success.uploaded_markdown_hash,
+                success.patwari_session_id,
             ],
         )?;
         Ok(())
+    }
+
+    /// Backfills a row's Patwari session id from its snapshot id, only while it is still missing
+    /// (issue #76 `archive-upload reconcile`). Scoped to one endpoint, because the snapshot→session
+    /// mapping comes from one server's listing. Never overwrites a recorded id, and does not disturb
+    /// `updated_at_ms` — filling metadata is not an upload event. Returns whether a row changed.
+    pub fn backfill_patwari_session_id(
+        &mut self,
+        endpoint: &str,
+        snapshot_id: &str,
+        patwari_session_id: &str,
+    ) -> Result<bool, StateError> {
+        let updated = self.connection.execute(
+            "UPDATE archive_uploads SET patwari_session_id=?3
+             WHERE endpoint=?1 AND snapshot_id=?2 AND patwari_session_id IS NULL",
+            params![endpoint, snapshot_id, patwari_session_id],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Records a failed archive-upload attempt. Increments the attempt count, then either schedules
@@ -2374,6 +2422,7 @@ fn archive_upload_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveU
         uploaded_revision: revision(8)?,
         uploaded_summary_hash: row.get(9)?,
         uploaded_markdown_hash: row.get(20)?,
+        patwari_session_id: row.get(21)?,
         snapshot_id: row.get(10)?,
         uploaded_artifact_paths: row
             .get::<_, Option<String>>(11)?
