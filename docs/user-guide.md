@@ -475,6 +475,7 @@ munshi archive-upload status
 munshi archive-upload retry --all
 munshi archive-upload retry <session-id> --force
 munshi archive-upload backfill
+munshi archive-upload reconcile
 ```
 
 Endpoints may be `https://` (issue #35): Munshi speaks TLS through rustls, verifying against the
@@ -487,8 +488,10 @@ same applies to every endpoint Munshi dials, including the Notesmith endpoints a
 
 `configure` records the server without turning upload on; `enable` requires a configured server and
 turns upload on; `disable` stops future upload while keeping upload history. `status` shows the
-configuration and per-session upload state, plus measured transfer accounting (issue #65): a
-lifetime `transfer_bytes_total` — the bytes actually moved on the wire per Patwari's upload
+configuration and per-session upload state — including each uploaded session's `patwari_session_id`
+(issue #76), the identity `restore --session` filters on, so the id restore needs is read straight
+off the row keyed by the harness id you already have — plus measured transfer accounting (issue #65):
+a lifetime `transfer_bytes_total` — the bytes actually moved on the wire per Patwari's upload
 receipts, which blob dedup makes far smaller than the artifact sizes — and
 `stored_bytes_latest_total`, the compressed footprint of every session's latest snapshot. These
 are the numbers that decide whether delta-upload optimization (issue #24) is ever worth building;
@@ -498,7 +501,13 @@ also retried automatically by the recovery sweep (`munshi hook recover`), so a t
 recovers without a new revision. `backfill` uploads archived sessions the configured server holds
 no self-contained snapshot for — sessions archived while upload was disabled or unconfigured, and
 sessions whose recorded snapshot is not known to carry both `summary.md` and `transcript.jsonl` —
-running each through the normal upload path (`--limit` bounds one run, default 200).
+running each through the normal upload path (`--limit` bounds one run, default 200). `reconcile`
+(issue #76) is a one-time metadata backfill, not an upload: it lists the server's snapshots once and
+fills the `patwari_session_id` onto uploaded rows recorded before that id was stored, matching by
+snapshot id. It is idempotent (a row that already carries the id is left untouched), endpoint-scoped,
+never overwrites a recorded id, and needs only a configured, addressable endpoint — not an enabled
+one — so historical rows reconcile even after upload has been disabled. A snapshot the listing no
+longer holds is reported `unmatched` rather than guessed.
 
 Every snapshot is self-contained by contract, so a session whose transcript munshi cannot read is
 reported `skipped` rather than uploaded as a summary-only snapshot. Before skipping, munshi tries to
@@ -563,6 +572,13 @@ munshi restore --session <patwari-session-id>
 munshi restore --all --dry-run                 # report the writes without making them
 munshi restore --all --force                   # replace local files that differ from the archive
 ```
+
+`--session` filters on the **Patwari** session id, not the harness session id the CLI otherwise
+speaks (issue #76). Find it next to the harness id: `munshi sessions --json` carries it as
+`patwari_session_id`, and `munshi archive-upload status` prints it as the `patwari=` field. Both read
+it from the upload ledger, so a session uploaded before the id was recorded shows none until
+`munshi archive-upload reconcile` backfills it. On a machine with no local record at all — the disaster
+`--all` exists for — `munshi restore --all --dry-run` still reports both ids per snapshot.
 
 Each session's **newest** snapshot is restored: locally only the current revision has a home
 (`<component>/[<source-prefix>/]<session-id>.md` is replaced in place), so older snapshots are

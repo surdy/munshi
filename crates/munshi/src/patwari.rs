@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::http::{self, Header, HttpError};
+use crate::patwari_read::{ReadClient, ReadError};
 use crate::registration::{
     DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS, RegistrationError, StoredConfig, load_stored_config,
     stored_config_exists, update_stored_config,
@@ -1386,6 +1387,7 @@ pub(crate) fn upload_one(
                     uploaded_summary_hash: record.current_summary_hash.clone().unwrap_or_default(),
                     uploaded_markdown_hash: record.markdown_hash.clone(),
                     snapshot_id: receipt.snapshot_id.clone(),
+                    patwari_session_id: receipt.session_id.clone(),
                     uploaded_artifact_paths: artifacts
                         .iter()
                         .map(|artifact| artifact.logical_path.clone())
@@ -1568,6 +1570,10 @@ pub struct ArchiveUploadItem {
     pub session_id: String,
     pub state: String,
     pub snapshot_id: Option<String>,
+    /// Patwari's own session id (issue #76) — the identity `restore --session` filters on, surfaced
+    /// here because the harness `session_id` this row is keyed by is not what restore accepts.
+    /// `null` on a row whose upload predates schema 10 until `archive-upload reconcile` fills it.
+    pub patwari_session_id: Option<String>,
     pub uploaded_revision: Option<u64>,
     pub attempts: u32,
     pub next_attempt_at_ms: Option<i64>,
@@ -1691,6 +1697,7 @@ pub fn status(state_directory: &Path) -> Result<ArchiveUploadStatusReport, Patwa
                 session_id: record.session_id.clone(),
                 state: record.upload_state.clone(),
                 snapshot_id: record.snapshot_id.clone(),
+                patwari_session_id: record.patwari_session_id.clone(),
                 uploaded_revision: record.uploaded_revision,
                 attempts: record.attempts,
                 next_attempt_at_ms: record.next_attempt_at_ms,
@@ -1729,10 +1736,14 @@ impl ArchiveUploadStatusReport {
         );
         for item in &self.items {
             println!(
-                "{}  {}  {}{}{}",
+                "{}  {}  {}{}{}{}",
                 item.session_id,
                 item.state,
                 item.snapshot_id.as_deref().unwrap_or("<no-snapshot>"),
+                item.patwari_session_id
+                    .as_deref()
+                    .map(|id| format!(" patwari={id}"))
+                    .unwrap_or_default(),
                 item.uploaded_revision
                     .map(|revision| format!(" rev={revision}"))
                     .unwrap_or_default(),
@@ -1743,6 +1754,144 @@ impl ArchiveUploadStatusReport {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile (issue #76)
+// ---------------------------------------------------------------------------
+
+/// One upload row `archive-upload reconcile` filled a Patwari session id into (issue #76).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconciledUpload {
+    pub source: String,
+    /// The harness session id the row is keyed by.
+    pub session_id: String,
+    pub snapshot_id: String,
+    /// The Patwari session id filled from the server's snapshot listing — the identity
+    /// `restore --session` filters on.
+    pub patwari_session_id: String,
+}
+
+/// The `archive-upload reconcile` contract (issue #76): a one-time backfill of the Patwari session
+/// id onto uploaded rows recorded before schema 10, read from the server's snapshot listing and
+/// matched by snapshot id.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveUploadReconcileReport {
+    pub schema_version: u32,
+    pub command: &'static str,
+    pub settings: ArchiveUploadSettings,
+    /// Uploaded rows that already carried a Patwari session id, left untouched.
+    pub already_present: usize,
+    /// Rows missing the id that this run filled from the listing.
+    pub filled: usize,
+    /// Rows missing the id whose snapshot the listing did not contain — pruned server-side, or
+    /// belonging to a different server — left `null` for a later run.
+    pub unmatched: usize,
+    /// Rows that never recorded a snapshot id (no successful upload); nothing to reconcile.
+    pub no_snapshot: usize,
+    /// The rows filled this run.
+    pub reconciled: Vec<ReconciledUpload>,
+}
+
+impl ArchiveUploadReconcileReport {
+    pub fn print_human(&self) {
+        print_settings(&self.settings);
+        println!(
+            "archive reconcile filled={} already-present={} unmatched={} no-snapshot={}",
+            self.filled, self.already_present, self.unmatched, self.no_snapshot
+        );
+        for row in &self.reconciled {
+            println!(
+                "{}  {} -> patwari={}",
+                row.session_id, row.snapshot_id, row.patwari_session_id
+            );
+        }
+    }
+}
+
+/// Maps a read-time listing error onto the archive-upload error type, reusing the upload path's
+/// HTTP mapping for transport faults so a caller sees one error vocabulary.
+fn from_read(error: ReadError) -> PatwariError {
+    match error {
+        ReadError::Http(http) => from_http(http),
+        ReadError::Status { status, code } => PatwariError::Protocol(format!(
+            "archive snapshot listing returned status {status}{}",
+            code.map(|code| format!(" ({code})")).unwrap_or_default()
+        )),
+        ReadError::Protocol(message) => PatwariError::Protocol(message),
+    }
+}
+
+/// Backfills the Patwari session id (issue #76) onto uploaded rows that predate schema 10, so the
+/// id `restore --session` filters on is discoverable from `sessions`/`archive-upload status`
+/// without a full-archive dry run. Lists the server's snapshots once, matches each local row's
+/// recorded `snapshot_id`, and fills the id where it is still missing. Idempotent: a row that
+/// already carries the id is left untouched, and a snapshot the listing does not hold is reported
+/// unmatched rather than guessed. Needs a configured, addressable endpoint but not an enabled one —
+/// reconciling historical rows is useful after upload has been disabled. Never contacts the server
+/// for anything but the listing, and never mutates archival lifecycle.
+pub fn reconcile(state_directory: &Path) -> Result<ArchiveUploadReconcileReport, PatwariError> {
+    let config = load_stored_config(state_directory)?;
+    let settings = ArchiveUploadSettings::from_config(&config);
+    if !config.archive_upload.is_addressable() {
+        return Err(PatwariError::NotConfigured);
+    }
+    let endpoint = config.archive_upload.endpoint.clone().unwrap();
+
+    let client = ReadClient::connect(&endpoint).map_err(from_http)?;
+    let listing = client.list_snapshots(None).map_err(from_read)?;
+    let mapping: BTreeMap<String, String> = listing
+        .items
+        .into_iter()
+        .map(|snapshot| (snapshot.snapshot_id, snapshot.session_id))
+        .collect();
+
+    let mut already_present = 0usize;
+    let mut unmatched = 0usize;
+    let mut no_snapshot = 0usize;
+    let mut reconciled = Vec::new();
+
+    if StateStore::database_path(state_directory).exists() {
+        let mut store = StateStore::open(state_directory)?;
+        let uploads = store.list_archive_uploads()?;
+        for record in &uploads {
+            if record.endpoint != endpoint {
+                continue;
+            }
+            if record.patwari_session_id.is_some() {
+                already_present += 1;
+                continue;
+            }
+            let Some(snapshot_id) = record.snapshot_id.as_deref() else {
+                no_snapshot += 1;
+                continue;
+            };
+            match mapping.get(snapshot_id) {
+                Some(patwari) => {
+                    if store.backfill_patwari_session_id(&endpoint, snapshot_id, patwari)? {
+                        reconciled.push(ReconciledUpload {
+                            source: record.source.as_selector().to_owned(),
+                            session_id: record.session_id.clone(),
+                            snapshot_id: snapshot_id.to_owned(),
+                            patwari_session_id: patwari.clone(),
+                        });
+                    }
+                }
+                None => unmatched += 1,
+            }
+        }
+    }
+
+    Ok(ArchiveUploadReconcileReport {
+        schema_version: 1,
+        command: "archive-upload-reconcile",
+        settings,
+        already_present,
+        filled: reconciled.len(),
+        unmatched,
+        no_snapshot,
+        reconciled,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2407,6 +2556,7 @@ mod tests {
             uploaded_revision: None,
             uploaded_summary_hash: None,
             uploaded_markdown_hash: None,
+            patwari_session_id: None,
             snapshot_id: None,
             uploaded_artifact_paths: None,
             upload_state: "dead-letter".to_owned(),
@@ -2468,6 +2618,7 @@ mod tests {
             uploaded_revision: Some(1),
             uploaded_summary_hash: Some("hash".to_owned()),
             uploaded_markdown_hash: Some("md-hash".to_owned()),
+            patwari_session_id: Some("patwari-session".to_owned()),
             snapshot_id: Some("snap-1".to_owned()),
             uploaded_artifact_paths: paths
                 .map(|paths| paths.into_iter().map(ToOwned::to_owned).collect()),
@@ -2578,7 +2729,12 @@ mod tests {
         std::fs::write(&transcript_path, b"{}\n").unwrap();
         let mut store = StateStore::open(&state_dir).unwrap();
         store
-            .ingest_agent_stop(session_id, 10_000, Path::new("/tmp/project"), &transcript_path)
+            .ingest_agent_stop(
+                session_id,
+                10_000,
+                Path::new("/tmp/project"),
+                &transcript_path,
+            )
             .unwrap();
         let settings = StoredArchiveUpload {
             enabled: true,
@@ -2601,6 +2757,7 @@ mod tests {
                     uploaded_summary_hash: "summary-hash".to_owned(),
                     uploaded_markdown_hash: Some("md-hash".to_owned()),
                     snapshot_id: "snap-1".to_owned(),
+                    patwari_session_id: "patwari-session".to_owned(),
                     uploaded_artifact_paths: vec![
                         "summary.md".to_owned(),
                         "transcript.jsonl".to_owned(),

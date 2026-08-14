@@ -48,11 +48,12 @@ pub use memory_sync::{
     run as memory_sync_run, set_enabled as set_memory_sync_enabled, status as memory_sync_status,
 };
 pub use patwari::{
-    ArchiveUploadItem, ArchiveUploadRunItem, ArchiveUploadRunReport, ArchiveUploadSettings,
-    ArchiveUploadStatusReport, ArtifactSource, CURRENT_ARTIFACT_SET_VERSION, CaptureContext,
-    INITIAL_ARTIFACT_SET_VERSION, PatwariClient, PatwariError, PreparedArtifact, SessionContext,
-    UploadOutcome, UploadReceipt, assemble_artifact_sources, backfill as archive_upload_backfill,
-    build_manifest, configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
+    ArchiveUploadItem, ArchiveUploadReconcileReport, ArchiveUploadRunItem, ArchiveUploadRunReport,
+    ArchiveUploadSettings, ArchiveUploadStatusReport, ArtifactSource, CURRENT_ARTIFACT_SET_VERSION,
+    CaptureContext, INITIAL_ARTIFACT_SET_VERSION, PatwariClient, PatwariError, PreparedArtifact,
+    ReconciledUpload, SessionContext, UploadOutcome, UploadReceipt, assemble_artifact_sources,
+    backfill as archive_upload_backfill, build_manifest, configure as configure_archive_upload,
+    prepare_artifact, prepare_artifacts, reconcile as archive_upload_reconcile,
     retry as archive_upload_retry, set_enabled as set_archive_upload_enabled,
     status as archive_upload_status,
 };
