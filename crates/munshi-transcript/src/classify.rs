@@ -90,6 +90,19 @@ const COPILOT_BOOKKEEPING: &[&str] = &[
     "system.notification",
 ];
 
+/// Copilot built-in tool names whose `arguments.command` is a shell command line, and
+/// nothing else (issue #77). `bash` is the CLI's terminal tool — every one of the archive's
+/// tens of thousands of `tool.execution_start` `bash` records carries a string `command` —
+/// and `local_shell` is the user-requested sibling the archive records under
+/// `tool.user_requested`.
+///
+/// Deliberately *not* listed, because their `command` would mean something else or nothing:
+/// `str_replace_editor`, whose `command` argument names an editor operation (`view`,
+/// `str_replace`) rather than anything a shell runs; and the shell-management tools
+/// `read_bash` / `stop_bash` / `list_bash`, which address a running shell by `shellId` and
+/// carry no command at all.
+const COPILOT_SHELL_TOOLS: &[&str] = &["bash", "local_shell"];
+
 fn classify_copilot(object: &Map<String, Value>) -> Class {
     let Some(event_type) = object.get("type").and_then(Value::as_str) else {
         return Class::Unknown;
@@ -123,7 +136,9 @@ fn classify_copilot(object: &Map<String, Value>) -> Class {
             }
         }
         "tool.execution_start" => match event_data(object).filter(|data| valid_tool_start(data)) {
-            Some(data) => Class::event(Event::Tool(extract_tool_invocation(event_type, data))),
+            Some(data) => Class::event(Event::Tool(extract_builtin_tool_invocation(
+                event_type, data,
+            ))),
             None => Class::ignored(event_type),
         },
         "tool.execution_complete" => {
@@ -136,7 +151,9 @@ fn classify_copilot(object: &Map<String, Value>) -> Class {
         // bookkeeping. `tool.user_requested` is a user-initiated sibling of
         // `tool.execution_start` with the identical payload shape.
         "tool.user_requested" => match event_data(object).filter(|data| valid_tool_start(data)) {
-            Some(data) => Class::event(Event::Tool(extract_tool_invocation(event_type, data))),
+            Some(data) => Class::event(Event::Tool(extract_builtin_tool_invocation(
+                event_type, data,
+            ))),
             None => Class::ignored(event_type),
         },
         "skill.invoked" => match event_data(object).and_then(extract_skill_invoked) {
@@ -231,7 +248,30 @@ fn extract_tool_invocation(event_type: &str, data: &Map<String, Value>) -> ToolE
     if let Some(arguments) = data.get("arguments").and_then(compact_value) {
         insert(&mut fields, "arguments", arguments);
     }
-    ToolEvent { fields }
+    ToolEvent::legacy(fields)
+}
+
+/// [`extract_tool_invocation`] for the CLI's *built-in* tools (`tool.execution_start` and
+/// its user-initiated sibling `tool.user_requested`), which additionally promotes the
+/// shell command out of the `arguments` blob (issue #77). The blob itself is untouched.
+///
+/// `external_tool.requested` deliberately does not go through here: its names come from
+/// the MCP/extension namespace, where a tool called `bash` is somebody else's tool and not
+/// the CLI shell, so the name would no longer certify the meaning of `arguments.command`.
+fn extract_builtin_tool_invocation(event_type: &str, data: &Map<String, Value>) -> ToolEvent {
+    let mut tool = extract_tool_invocation(event_type, data);
+    if tool
+        .name()
+        .is_some_and(|name| COPILOT_SHELL_TOOLS.contains(&name))
+        && let Some(command) = data
+            .get("arguments")
+            .and_then(Value::as_object)
+            .and_then(|arguments| arguments.get("command"))
+            .and_then(compact_value)
+    {
+        tool.insert_derived("command", command);
+    }
+    tool
 }
 
 /// `skill.invoked` (issue #51): the agent loaded a skill — activity comparable to Claude
@@ -257,7 +297,7 @@ fn extract_skill_invoked(data: &Map<String, Value>) -> Option<ToolEvent> {
             insert(&mut fields, key, value);
         }
     }
-    Some(ToolEvent { fields })
+    Some(ToolEvent::legacy(fields))
 }
 
 /// `external_tool.requested` (issue #51): an MCP/external tool invocation. The payload is
@@ -286,7 +326,7 @@ fn extract_external_tool_completed(data: &Map<String, Value>) -> Option<ToolEven
     let mut fields = BTreeMap::new();
     insert(&mut fields, "event", "external_tool.completed".to_owned());
     insert(&mut fields, "request_id", request_id);
-    Some(ToolEvent { fields })
+    Some(ToolEvent::legacy(fields))
 }
 
 fn extract_tool_complete(data: &Map<String, Value>) -> ToolEvent {
@@ -333,7 +373,7 @@ fn extract_tool_complete(data: &Map<String, Value>) -> ToolEvent {
             insert(&mut fields, "output", output.join("\n"));
         }
     }
-    ToolEvent { fields }
+    ToolEvent::legacy(fields)
 }
 
 fn extract_tool_result_text(value: &Value) -> Option<String> {
@@ -375,6 +415,12 @@ fn extract_tool_result_text(value: &Value) -> Option<String> {
 /// and the newer session-bookkeeping kinds observed in live archives (issue #30:
 /// `file-history-delta`, `frame-link`, `permission-mode`, `pr-link`; issue #46:
 /// `agent-name`).
+/// The Claude Code tool whose `tool_use.input` carries a shell command (issue #77), and the
+/// only one: across the archive every `Bash` invocation records a string `input.command`,
+/// and no other tool name records one at all. `BashOutput` / `KillShell` address an
+/// already-running shell by id, so there is no command of theirs to promote.
+const CLAUDE_SHELL_TOOL: &str = "Bash";
+
 const CLAUDE_BOOKKEEPING: &[&str] = &[
     "agent-name",
     "ai-title",
@@ -471,6 +517,7 @@ fn extract_claude_tool_use(block: &Map<String, Value>) -> Option<Event> {
         .get("name")
         .and_then(Value::as_str)
         .and_then(nonempty)?;
+    let shell = name == CLAUDE_SHELL_TOOL;
     let mut fields = BTreeMap::new();
     insert(&mut fields, "event", "tool_use".to_owned());
     if let Some(id) = block.get("id").and_then(Value::as_str).and_then(nonempty) {
@@ -480,7 +527,20 @@ fn extract_claude_tool_use(block: &Map<String, Value>) -> Option<Event> {
     if let Some(input) = block.get("input").and_then(compact_value) {
         insert(&mut fields, "input", input);
     }
-    Some(Event::Tool(ToolEvent { fields }))
+    let mut tool = ToolEvent::legacy(fields);
+    // Issue #77: the shell command is promoted out of the `input` blob, which is kept
+    // beside it verbatim. Only `Bash` is read; every other tool's `input` keys mean
+    // whatever that tool decides.
+    if shell
+        && let Some(command) = block
+            .get("input")
+            .and_then(Value::as_object)
+            .and_then(|input| input.get("command"))
+            .and_then(compact_value)
+    {
+        tool.insert_derived("command", command);
+    }
+    Some(Event::Tool(tool))
 }
 
 fn extract_claude_tool_result(block: &Map<String, Value>) -> Option<Event> {
@@ -504,7 +564,7 @@ fn extract_claude_tool_result(block: &Map<String, Value>) -> Option<Event> {
     if fields.len() == 1 {
         return None;
     }
-    Some(Event::Tool(ToolEvent { fields }))
+    Some(Event::Tool(ToolEvent::legacy(fields)))
 }
 
 fn extract_claude_result_text(value: &Value) -> Option<String> {
@@ -539,6 +599,11 @@ const CODEX_METADATA: &[&str] = &["compacted", "event_msg", "session_meta", "tur
 /// `response_item` payload types the pinned rollout schema defines but Munshi
 /// deliberately does not archive (model reasoning and web-search activity).
 const CODEX_IGNORED_ITEMS: &[&str] = &["reasoning", "web_search_call"];
+
+/// The Codex `function_call` tool name whose `arguments` is the pinned shell schema
+/// (issue #77) — the rollout's more common shell shape than `local_shell_call`. Every other
+/// function name carries a tool-defined argument object this crate makes no claims about.
+const CODEX_SHELL_TOOL: &str = "shell";
 
 fn classify_codex(object: &Map<String, Value>) -> Class {
     let Some(record_type) = object.get("type").and_then(Value::as_str) else {
@@ -617,18 +682,18 @@ fn codex_tool_call(payload: &Map<String, Value>, item_type: &str) -> Option<Even
     let mut fields = BTreeMap::new();
     insert(&mut fields, "event", item_type.to_owned());
     insert(&mut fields, "call_id", call_id);
-    if let Some(name) = payload
+    let name = payload
         .get("name")
         .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
+        .and_then(nonempty);
+    if let Some(name) = name.clone() {
         insert(&mut fields, "name", name);
     }
-    if let Some(arguments) = payload
+    let arguments = payload
         .get("arguments")
         .and_then(Value::as_str)
-        .and_then(nonempty)
-    {
+        .and_then(nonempty);
+    if let Some(arguments) = arguments.clone() {
         insert(&mut fields, "arguments", arguments);
     } else if let Some(input) = payload
         .get("input")
@@ -637,7 +702,27 @@ fn codex_tool_call(payload: &Map<String, Value>, item_type: &str) -> Option<Even
     {
         insert(&mut fields, "input", input);
     }
-    Some(Event::Tool(ToolEvent { fields }))
+    let mut tool = ToolEvent::legacy(fields);
+    // Issue #77: the shell tool's `arguments` is a JSON *string*; only that one name's
+    // encoding is pinned, so only it is read. `custom_tool_call`'s free-form `input`
+    // stays where it is.
+    if item_type == "function_call"
+        && name.as_deref() == Some(CODEX_SHELL_TOOL)
+        && let Some(command) = arguments.as_deref().and_then(codex_shell_command)
+    {
+        tool.insert_derived("command", command);
+    }
+    Some(Event::Tool(tool))
+}
+
+/// The `command` inside a Codex `shell` `function_call`'s `arguments`, which the rollout
+/// records as a JSON string encoding `{"command": [...], "workdir": ..., "timeout_ms": ...}`.
+/// The command is argv, rendered exactly as [`codex_local_shell_call`] renders
+/// `action.command` — compact JSON array text — so the two Codex shapes agree with each
+/// other. Arguments that are not a JSON object, or carry no `command`, yield nothing.
+fn codex_shell_command(arguments: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    parsed.as_object()?.get("command").and_then(compact_value)
 }
 
 fn codex_tool_output(payload: &Map<String, Value>) -> Option<Event> {
@@ -653,7 +738,7 @@ fn codex_tool_output(payload: &Map<String, Value>) -> Option<Event> {
     if let Some(output) = payload.get("output").and_then(extract_codex_output_text) {
         insert(&mut fields, "output", output);
     }
-    Some(Event::Tool(ToolEvent { fields }))
+    Some(Event::Tool(ToolEvent::legacy(fields)))
 }
 
 fn extract_codex_output_text(value: &Value) -> Option<String> {
@@ -678,6 +763,10 @@ fn extract_codex_output_text(value: &Value) -> Option<String> {
     }
 }
 
+/// `local_shell_call`: the rollout's other shell shape, whose `action.command` this crate
+/// has always typed as `command`. That key predates the derived-field split (issue #77), so
+/// it stays part of the legacy rendering — see [`crate::ToolEvent`]; nothing already inside
+/// `rendered()` is ever moved out of it.
 fn codex_local_shell_call(payload: &Map<String, Value>) -> Option<Event> {
     let mut fields = BTreeMap::new();
     insert(&mut fields, "event", "local_shell_call".to_owned());
@@ -699,7 +788,7 @@ fn codex_local_shell_call(payload: &Map<String, Value>) -> Option<Event> {
     if fields.len() == 1 {
         return None;
     }
-    Some(Event::Tool(ToolEvent { fields }))
+    Some(Event::Tool(ToolEvent::legacy(fields)))
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +834,31 @@ mod tests {
     fn classify_json(source: Source, json: &str) -> Class {
         let value: Value = serde_json::from_str(json).unwrap();
         classify(source, value.as_object().unwrap())
+    }
+
+    /// The single tool event a record classifies to, for the `command`-promotion tests.
+    fn tool_of(source: Source, json: &str) -> ToolEvent {
+        let Class::Content(events) = classify_json(source, json) else {
+            panic!("expected content: {json}");
+        };
+        let [Event::Tool(tool)] = events.as_slice() else {
+            panic!("expected one tool event: {json}");
+        };
+        tool.clone()
+    }
+
+    /// Asserts what a record promotes as `command` (or that it promotes nothing), and — in
+    /// every case — that the promotion stayed out of the legacy rendering while the blob it
+    /// came from stayed in it untouched.
+    fn assert_command(source: Source, json: &str, expected: Option<&str>, rendered: &str) {
+        let tool = tool_of(source, json);
+        assert_eq!(tool.command(), expected, "command for {json}");
+        assert_eq!(
+            tool.derived.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected.map(|_| vec!["command"]).unwrap_or_default(),
+            "derived keys for {json}"
+        );
+        assert_eq!(tool.rendered(), rendered, "legacy rendering for {json}");
     }
 
     #[test]
@@ -925,5 +1039,148 @@ mod tests {
             classify_json(Source::Codex, r#"{"type":"world_state_2","payload":{}}"#),
             Class::Unknown
         ));
+    }
+
+    #[test]
+    fn claude_bash_tool_use_promotes_its_command_and_no_other_tool_does() {
+        // The shell tool: the command is promoted, and `input` is kept verbatim beside it.
+        assert_command(
+            Source::ClaudeCode,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test --all","description":"Run the suite"}}]}}"#,
+            Some("cargo test --all"),
+            "event=tool_use input={\"command\":\"cargo test --all\",\
+             \"description\":\"Run the suite\"} name=Bash tool_use_id=toolu_1",
+        );
+        // A non-shell tool whose input happens to carry a `command` key promotes nothing:
+        // the name, not the key, certifies the meaning.
+        assert_command(
+            Source::ClaudeCode,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Skill","input":{"command":"/review","skill":"code-review"}}]}}"#,
+            None,
+            "event=tool_use input={\"command\":\"/review\",\"skill\":\"code-review\"} \
+             name=Skill tool_use_id=toolu_2",
+        );
+        // Absent, blank, and non-object inputs all leave the field off; the record still
+        // classifies as the same tool event it always did.
+        assert_command(
+            Source::ClaudeCode,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"description":"no command key"}}]}}"#,
+            None,
+            "event=tool_use input={\"description\":\"no command key\"} name=Bash \
+             tool_use_id=toolu_3",
+        );
+        assert_command(
+            Source::ClaudeCode,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_4","name":"Bash","input":{"command":"   "}}]}}"#,
+            None,
+            "event=tool_use input={\"command\":\"   \"} name=Bash tool_use_id=toolu_4",
+        );
+        assert_command(
+            Source::ClaudeCode,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_5","name":"Bash","input":"cargo test"}]}}"#,
+            None,
+            "event=tool_use input=cargo test name=Bash tool_use_id=toolu_5",
+        );
+    }
+
+    #[test]
+    fn copilot_shell_tools_promote_their_command_and_editor_subcommands_do_not() {
+        assert_command(
+            Source::Copilot,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"c1","toolName":"bash","arguments":{"command":"cargo fmt --check","description":"Check formatting"}}}"#,
+            Some("cargo fmt --check"),
+            "arguments={\"command\":\"cargo fmt --check\",\"description\":\"Check formatting\"} \
+             event=tool.execution_start name=bash tool_call_id=c1",
+        );
+        assert_command(
+            Source::Copilot,
+            r#"{"type":"tool.user_requested","data":{"toolCallId":"c2","toolName":"local_shell","arguments":{"command":"git remote -v"}}}"#,
+            Some("git remote -v"),
+            "arguments={\"command\":\"git remote -v\"} event=tool.user_requested \
+             name=local_shell tool_call_id=c2",
+        );
+        // `str_replace_editor`'s `command` names an editor operation, not a shell command:
+        // deliberately not promoted.
+        assert_command(
+            Source::Copilot,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"c3","toolName":"str_replace_editor","arguments":{"command":"view","path":"src/lib.rs"}}}"#,
+            None,
+            "arguments={\"command\":\"view\",\"path\":\"src/lib.rs\"} \
+             event=tool.execution_start name=str_replace_editor tool_call_id=c3",
+        );
+        // A non-shell tool, and a shell tool whose arguments are not an object.
+        assert_command(
+            Source::Copilot,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"c4","toolName":"view","arguments":{"path":"src/lib.rs"}}}"#,
+            None,
+            "arguments={\"path\":\"src/lib.rs\"} event=tool.execution_start name=view \
+             tool_call_id=c4",
+        );
+        assert_command(
+            Source::Copilot,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"c5","toolName":"bash","arguments":"cargo test"}}"#,
+            None,
+            "arguments=cargo test event=tool.execution_start name=bash tool_call_id=c5",
+        );
+        // `external_tool.requested` names MCP/extension tools, where `bash` would be
+        // somebody else's tool: the name no longer certifies the argument shape.
+        assert_command(
+            Source::Copilot,
+            r#"{"type":"external_tool.requested","data":{"requestId":"r1","toolCallId":"c6","toolName":"bash","arguments":{"command":"echo hi"}}}"#,
+            None,
+            "arguments={\"command\":\"echo hi\"} event=external_tool.requested name=bash \
+             request_id=r1 tool_call_id=c6",
+        );
+    }
+
+    #[test]
+    fn codex_shell_function_calls_promote_their_argv_command() {
+        // Argv, rendered as `local_shell_call` renders it: compact JSON array text.
+        assert_command(
+            Source::Codex,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls -la\"],\"workdir\":\"/work\"}","call_id":"call_1"}}"#,
+            Some(r#"["bash","-lc","ls -la"]"#),
+            "arguments={\"command\":[\"bash\",\"-lc\",\"ls -la\"],\"workdir\":\"/work\"} \
+             call_id=call_1 event=function_call name=shell",
+        );
+        // Another function's arguments are that tool's business, even with a `command` key.
+        assert_command(
+            Source::Codex,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"command\":\"step 1\"}","call_id":"call_2"}}"#,
+            None,
+            "arguments={\"command\":\"step 1\"} call_id=call_2 event=function_call \
+             name=update_plan",
+        );
+        // Arguments that do not parse, or parse to something other than an object with a
+        // command, leave the field off.
+        for (arguments, rendered) in [
+            ("not json", "arguments=not json"),
+            ("[1,2]", "arguments=[1,2]"),
+            (
+                r#"{\"workdir\":\"/work\"}"#,
+                "arguments={\"workdir\":\"/work\"}",
+            ),
+        ] {
+            let json = format!(
+                r#"{{"type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{arguments}","call_id":"call_3"}}}}"#
+            );
+            assert_command(
+                Source::Codex,
+                &json,
+                None,
+                &format!("{rendered} call_id=call_3 event=function_call name=shell"),
+            );
+        }
+        // `local_shell_call`'s `command` predates the split: it stays in the rendering.
+        let tool = tool_of(
+            Source::Codex,
+            r#"{"type":"response_item","payload":{"type":"local_shell_call","call_id":"call_4","action":{"type":"exec","command":["bash","-lc","echo hi"]}}}"#,
+        );
+        assert_eq!(tool.command(), Some(r#"["bash","-lc","echo hi"]"#));
+        assert!(tool.derived.is_empty());
+        assert_eq!(
+            tool.rendered(),
+            "call_id=call_4 command=[\"bash\",\"-lc\",\"echo hi\"] event=local_shell_call"
+        );
     }
 }

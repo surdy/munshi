@@ -28,12 +28,17 @@
 //! [`Classification::Unknown`] records (matching the historical lumped count), and
 //! `started_at` / `updated_at` are the minimum/maximum top-level record `timestamp`.
 //!
+//! Typed signals grow one field at a time, pulled by a named consumer metric (issue #77).
+//! A field promoted after the legacy contract froze is *additive*: the raw blob it came
+//! from is kept verbatim beside it, and it is named in [`ToolEvent::derived`] so it stays
+//! out of the byte-identical legacy rendering. See [`ToolEvent`] for why that matters.
+//!
 //! [`envelope_matches`], [`claude_origin_cwd`], [`claude_git_branch`], and
 //! [`claude_agent_version`] expose the pure, privacy-safe envelope predicates behind `munshi`'s
 //! transcript validation, Claude Code origin recovery (issues #27, #40), and resume restore
 //! (issue #71); the bounded-I/O wrappers around them stay in `munshi`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -183,7 +188,8 @@ impl Event {
 
     /// The exact content string the legacy `munshi` normalizer builds for this event:
     /// the message text for user/assistant events, and the sorted `key=value` rendering
-    /// for tool events. Byte-identical to `NormalizedEvent.content` (pre-elision).
+    /// for tool events, excluding [`ToolEvent::derived`] keys. Byte-identical to
+    /// `NormalizedEvent.content` (pre-elision).
     pub fn legacy_content(&self) -> String {
         match self {
             Self::User { text } | Self::Assistant { text } => text.clone(),
@@ -199,12 +205,44 @@ impl Event {
 /// `external_tool.completed`, and the `skill.invoked` card fields `path`, `description`,
 /// `source`, `trigger`, `model`, `content`). The map is ordered so the legacy rendering
 /// is reproducible byte-for-byte.
+///
+/// # Derived fields
+///
+/// `derived` names the subset of `fields` promoted *after* that legacy rendering was
+/// frozen — the read-time signals this crate types for analysis consumers (issue #77,
+/// starting with `command` on shell-tool events). They are read exactly like every other
+/// field, so `fields["command"]` means the same thing whichever harness supplied it, but
+/// [`Self::rendered`] deliberately leaves them out.
+///
+/// Excluding them is not tidiness, it is the losslessness rule: `rendered()` is capture's
+/// `NormalizedEvent.content`, which is (a) what the summarizer reads, so a new key inside
+/// it would silently redraft every re-captured session's summary, and (b) what oversized
+/// events are content-addressed by, so a new key would change the sha256 behind every
+/// already-minted claim ticket and orphan it in the archive. A derived field is added to
+/// `fields` and named in `derived`; nothing already in the legacy rendering is ever moved
+/// there (Codex `local_shell_call`'s `command`, which predates the split, keeps rendering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolEvent {
     pub fields: BTreeMap<String, String>,
+    /// Keys of `fields` that are read-time-only signals, excluded from [`Self::rendered`].
+    pub derived: BTreeSet<String>,
 }
 
 impl ToolEvent {
+    /// A tool event whose every field belongs to the legacy rendering.
+    pub(crate) fn legacy(fields: BTreeMap<String, String>) -> Self {
+        Self {
+            fields,
+            derived: BTreeSet::new(),
+        }
+    }
+
+    /// Records a post-legacy typed field: readable through [`Self::fields`] like any
+    /// other, absent from [`Self::rendered`]. See the type's "Derived fields" note.
+    pub(crate) fn insert_derived(&mut self, key: &str, value: String) {
+        self.fields.insert(key.to_owned(), value);
+        self.derived.insert(key.to_owned());
+    }
     /// The source-specific event discriminator (`tool_use`, `tool_result`,
     /// `tool.execution_start`, `tool.user_requested`, `skill.invoked`,
     /// `external_tool.requested`, `external_tool.completed`, `function_call`,
@@ -225,11 +263,23 @@ impl ToolEvent {
             .find_map(|key| self.fields.get(*key).map(String::as_str))
     }
 
+    /// The shell command line a shell-tool event carries, when its source records one and
+    /// this crate can read it unambiguously (issue #77). Rendered as the harness itself
+    /// represents it: a command string stays a string, an argv array stays its compact
+    /// JSON array text — normalizing *across* harnesses is a consumer's job, not this
+    /// crate's.
+    pub fn command(&self) -> Option<&str> {
+        self.fields.get("command").map(String::as_str)
+    }
+
     /// The legacy space-joined `key=value` rendering, sorted by key — byte-identical to
-    /// the `NormalizedEvent.content` string the `munshi` normalizer produces.
+    /// the `NormalizedEvent.content` string the `munshi` normalizer produces. [`Self::derived`]
+    /// keys are excluded so promoting a new typed field never moves this string; see the
+    /// type's "Derived fields" note.
     pub fn rendered(&self) -> String {
         self.fields
             .iter()
+            .filter(|(key, _)| !self.derived.contains(*key))
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join(" ")

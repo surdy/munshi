@@ -73,11 +73,26 @@ const CASES: &[(SourceKind, Source, &str, &str)] = &[
         "claude-code-2.1.205/transcript/0c1a0de0-0000-4000-8000-000000000205.jsonl",
         "0c1a0de0-0000-4000-8000-000000000205",
     ),
+    // Issue #77: the shell-command fixtures. A promoted `command` is a read-time field
+    // only, so these must reproduce the legacy `(kind, content)` strings unchanged —
+    // that equivalence is the whole reason the field stays out of `rendered()`.
+    (
+        SourceKind::ClaudeCode,
+        Source::ClaudeCode,
+        "claude-code-shell-command/transcript/0c1a0de0-0000-4000-8000-000000000077.jsonl",
+        "0c1a0de0-0000-4000-8000-000000000077",
+    ),
     (
         SourceKind::Codex,
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
         "c0de0000-0000-4000-8000-000000000001",
+    ),
+    (
+        SourceKind::Codex,
+        Source::Codex,
+        "codex-rollout-0.x/shell-command/c0de0000-0000-4000-8000-000000000077.jsonl",
+        "c0de0000-0000-4000-8000-000000000077",
     ),
     (
         SourceKind::Codex,
@@ -132,6 +147,12 @@ const CASES: &[(SourceKind, Source, &str, &str)] = &[
         Source::Copilot,
         "copilot-tool-activity/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events.jsonl",
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ),
+    (
+        SourceKind::Copilot,
+        Source::Copilot,
+        "copilot-shell-command/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/events.jsonl",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     ),
 ];
 

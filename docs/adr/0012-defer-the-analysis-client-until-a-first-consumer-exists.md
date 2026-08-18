@@ -24,3 +24,6 @@ a tag. Its derived store stays a disposable private implementation detail — re
 and resync — not a stable contract; Patwari remains the only stable interface. Analysis features
 land there as commands over the event store, and curated prose output goes to Notesmith,
 preserving the existing boundary in which Patwari never interprets, ranks, or searches content.
+
+The working name held: that consumer now exists as the repository `surdy/qanungo`, and its
+metrics pull typed fields into `munshi-transcript` one at a time (issue #77).

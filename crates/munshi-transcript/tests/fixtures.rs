@@ -80,9 +80,19 @@ const FIXTURES: &[Fixture] = &[
         Source::ClaudeCode,
         "claude-code-2.1.2xx-bookkeeping/transcript/0c1a0de0-0000-4000-8000-000000000231.jsonl",
     ),
+    // Issue #77: the shell shapes each harness records a command in, including the ones
+    // whose command is deliberately not promoted.
+    well_formed(
+        Source::ClaudeCode,
+        "claude-code-shell-command/transcript/0c1a0de0-0000-4000-8000-000000000077.jsonl",
+    ),
     well_formed(
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
+    ),
+    well_formed(
+        Source::Codex,
+        "codex-rollout-0.x/shell-command/c0de0000-0000-4000-8000-000000000077.jsonl",
     ),
     well_formed(
         Source::Codex,
@@ -144,6 +154,10 @@ const FIXTURES: &[Fixture] = &[
     well_formed(
         Source::Copilot,
         "copilot-tool-activity/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events.jsonl",
+    ),
+    well_formed(
+        Source::Copilot,
+        "copilot-shell-command/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/events.jsonl",
     ),
     well_formed(
         Source::Copilot,
@@ -519,6 +533,129 @@ fn unknown_records_carry_the_raw_record() {
         .collect();
     assert_eq!(raws.len(), 1);
     assert!(raws[0].contains("\"future.private_event\""));
+}
+
+/// Every tool event in a fixture, as `(name, promoted command)`.
+fn tool_commands(source: Source, relative: &str) -> Vec<(Option<String>, Option<String>)> {
+    stream_fixture(source, relative)
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Content { events },
+                ..
+            }) => Some(events.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|event| match event {
+            Event::Tool(tool) => Some((
+                tool.name().map(ToOwned::to_owned),
+                tool.command().map(ToOwned::to_owned),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Issue #77: shell-tool events carry a typed `command`, per source, for exactly the shapes
+/// whose command location is certain — and nothing else gains one.
+#[test]
+fn shell_tool_events_carry_a_typed_command_per_source() {
+    // Claude Code: `Bash`, from `tool_use.input.command`. `Read` is not a shell tool; the
+    // last two `Bash` calls carry no readable command (no `command` key, non-object input).
+    assert_eq!(
+        tool_commands(
+            Source::ClaudeCode,
+            "claude-code-shell-command/transcript/0c1a0de0-0000-4000-8000-000000000077.jsonl",
+        ),
+        [
+            (Some("Bash".to_owned()), Some("cargo test --all".to_owned())),
+            (None, None), // the tool_result correlating the first call
+            (Some("Bash".to_owned()), Some("cargo test --all".to_owned())),
+            (Some("Read".to_owned()), None),
+            (Some("Bash".to_owned()), None),
+            (Some("Bash".to_owned()), None),
+        ]
+    );
+
+    // Copilot: `bash` and `local_shell`, from `arguments.command`. `str_replace_editor`'s
+    // `command` is an editor operation and `external_tool.requested` names an extension
+    // tool, so neither is promoted.
+    assert_eq!(
+        tool_commands(
+            Source::Copilot,
+            "copilot-shell-command/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/events.jsonl",
+        ),
+        [
+            (
+                Some("bash".to_owned()),
+                Some("cargo fmt --check".to_owned())
+            ),
+            (None, None), // tool.execution_complete
+            (
+                Some("local_shell".to_owned()),
+                Some("git status --short".to_owned())
+            ),
+            (Some("str_replace_editor".to_owned()), None),
+            (Some("view".to_owned()), None),
+            (Some("bash".to_owned()), None), // non-object arguments
+            (Some("bash".to_owned()), None), // external_tool.requested
+            (None, None),                    // external_tool.completed
+        ]
+    );
+
+    // Codex: `function_call` named `shell`, from the JSON-string `arguments`, as argv —
+    // the same rendering `local_shell_call` has always given `action.command`.
+    assert_eq!(
+        tool_commands(
+            Source::Codex,
+            "codex-rollout-0.x/shell-command/c0de0000-0000-4000-8000-000000000077.jsonl",
+        ),
+        [
+            (
+                Some("shell".to_owned()),
+                Some(r#"["bash","-lc","ls -la"]"#.to_owned())
+            ),
+            (None, None), // function_call_output
+            (Some("update_plan".to_owned()), None),
+            (Some("shell".to_owned()), None), // unparseable arguments
+            (None, Some(r#"["bash","-lc","echo hi"]"#.to_owned())), // local_shell_call
+        ]
+    );
+}
+
+/// The promotion is additive: it never moves the legacy `key=value` rendering, which is
+/// capture's `NormalizedEvent.content` — what summaries are written from and what claim
+/// tickets are content-addressed by. Codex `local_shell_call`'s `command` predates the
+/// derived-field split and is the one `command` that does render.
+#[test]
+fn promoted_commands_stay_out_of_the_legacy_rendering() {
+    for fixture in FIXTURES {
+        for item in stream_fixture(fixture.source, fixture.path) {
+            let Ok(Record {
+                classification: Classification::Content { events },
+                ..
+            }) = item
+            else {
+                continue;
+            };
+            for event in events {
+                let Event::Tool(tool) = &event else { continue };
+                for key in &tool.derived {
+                    assert!(tool.fields.contains_key(key), "{}: {key}", fixture.path);
+                    assert!(
+                        !tool.rendered().contains(&format!("{key}=")),
+                        "{}: derived {key} leaked into the legacy rendering",
+                        fixture.path
+                    );
+                }
+                if tool.event() == Some("local_shell_call") && tool.command().is_some() {
+                    assert!(tool.derived.is_empty(), "{}", fixture.path);
+                    assert!(tool.rendered().contains("command="), "{}", fixture.path);
+                }
+            }
+        }
+    }
 }
 
 #[test]
