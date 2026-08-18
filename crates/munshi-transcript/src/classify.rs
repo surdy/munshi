@@ -409,18 +409,18 @@ fn extract_tool_result_text(value: &Value) -> Option<String> {
 // Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 // ---------------------------------------------------------------------------
 
-/// Claude Code record types known to be metadata/bookkeeping with no archive-worthy
-/// content: the 2.1.44 `summary`/`system` records, the 2.1.205 additions (`ai-title`,
-/// `attachment`, `last-prompt`, `mode`, `queue-operation`), `file-history-snapshot`,
-/// and the newer session-bookkeeping kinds observed in live archives (issue #30:
-/// `file-history-delta`, `frame-link`, `permission-mode`, `pr-link`; issue #46:
-/// `agent-name`).
 /// The Claude Code tool whose `tool_use.input` carries a shell command (issue #77), and the
 /// only one: across the archive every `Bash` invocation records a string `input.command`,
 /// and no other tool name records one at all. `BashOutput` / `KillShell` address an
 /// already-running shell by id, so there is no command of theirs to promote.
 const CLAUDE_SHELL_TOOL: &str = "Bash";
 
+/// Claude Code record types known to be metadata/bookkeeping with no archive-worthy
+/// content: the 2.1.44 `summary`/`system` records, the 2.1.205 additions (`ai-title`,
+/// `attachment`, `last-prompt`, `mode`, `queue-operation`), `file-history-snapshot`,
+/// and the newer session-bookkeeping kinds observed in live archives (issue #30:
+/// `file-history-delta`, `frame-link`, `permission-mode`, `pr-link`; issue #46:
+/// `agent-name`).
 const CLAUDE_BOOKKEEPING: &[&str] = &[
     "agent-name",
     "ai-title",

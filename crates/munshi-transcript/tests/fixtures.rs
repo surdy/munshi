@@ -643,12 +643,23 @@ fn promoted_commands_stay_out_of_the_legacy_rendering() {
                 let Event::Tool(tool) = &event else { continue };
                 for key in &tool.derived {
                     assert!(tool.fields.contains_key(key), "{}: {key}", fixture.path);
-                    assert!(
-                        !tool.rendered().contains(&format!("{key}=")),
-                        "{}: derived {key} leaked into the legacy rendering",
-                        fixture.path
-                    );
                 }
+                // Exact, not substring: the rendering must equal the join over the
+                // non-derived fields, so a derived key leaking in (or a legacy field
+                // dropping out) fails even when a field's *value* contains `key=` text.
+                let expected = tool
+                    .fields
+                    .iter()
+                    .filter(|(key, _)| !tool.derived.contains(*key))
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(
+                    tool.rendered(),
+                    expected,
+                    "{}: derived fields leaked into the legacy rendering",
+                    fixture.path
+                );
                 if tool.event() == Some("local_shell_call") && tool.command().is_some() {
                     assert!(tool.derived.is_empty(), "{}", fixture.path);
                     assert!(tool.rendered().contains("command="), "{}", fixture.path);

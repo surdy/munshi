@@ -239,10 +239,20 @@ impl ToolEvent {
 
     /// Records a post-legacy typed field: readable through [`Self::fields`] like any
     /// other, absent from [`Self::rendered`]. See the type's "Derived fields" note.
+    ///
+    /// Never call this with a key the legacy rendering already carries: that would
+    /// silently replace the legacy value *and* drop it from the rendering — exactly the
+    /// drift the `derived` split exists to prevent. The assert makes the type's
+    /// "nothing already in the rendering is ever moved out" claim self-enforcing.
     pub(crate) fn insert_derived(&mut self, key: &str, value: String) {
+        debug_assert!(
+            !self.fields.contains_key(key),
+            "insert_derived would shadow legacy field {key:?}"
+        );
         self.fields.insert(key.to_owned(), value);
         self.derived.insert(key.to_owned());
     }
+
     /// The source-specific event discriminator (`tool_use`, `tool_result`,
     /// `tool.execution_start`, `tool.user_requested`, `skill.invoked`,
     /// `external_tool.requested`, `external_tool.completed`, `function_call`,
