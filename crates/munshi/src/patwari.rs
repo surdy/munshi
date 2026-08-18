@@ -2101,7 +2101,15 @@ pub fn retry(
 /// attempts, and failure recording behave exactly like a post-archive upload — so a re-upload
 /// candidate whose transcript is still unreadable is reported skipped rather than re-uploaded
 /// incomplete. The old summary-only snapshot stays in the archive as historical provenance
-/// (Patwari snapshots are immutable); the fresh capture adds the complete one beside it.
+/// (Patwari snapshots are immutable). A re-upload only *adds* a snapshot when its content is
+/// genuinely new: Patwari's snapshot fingerprint covers session identity, artifact-set version,
+/// and the artifacts' logical paths/sizes/hashes, so an identical set coalesces into whichever
+/// snapshot already carries that fingerprint — adding a capture row but never advancing the
+/// snapshot's `completed_at`, and therefore never advancing the session's `latest_snapshot`.
+/// If a *newer* degenerate snapshot shadows an older complete one, a backfill re-upload cannot
+/// displace it (munshi#78: the 2026-07-28 burst left 56 sessions in exactly that state, repaired
+/// by tombstoning the degenerate snapshots archive-side). Superseding a published snapshot
+/// requires changing something inside the fingerprint — i.e. re-archiving genuinely new content.
 ///
 /// Requires archive upload to be enabled and addressable; candidates are bounded by `limit`; a
 /// session whose advisory lock is held (an archive worker is on it) is reported skipped this run.

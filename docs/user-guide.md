@@ -521,7 +521,10 @@ after the session) stays `skipped`; it uploads normally once the transcript is r
 Snapshots recorded before munshi tracked which artifacts it
 uploaded are re-verified by the first `backfill` after upgrading: re-uploading an identical set
 transfers nothing (Patwari deduplicates blobs by content hash and coalesces the identical snapshot
-fingerprint), and a snapshot that really was summary-only gains a complete sibling. The incomplete
+fingerprint). Note the coalescing cuts both ways: if the complete snapshot already exists, the
+re-upload folds into it without advancing its completion time, so it can never displace a *newer*
+summary-only snapshot from the session's `latest_snapshot` pointer — that repair is archive-side
+(tombstone the degenerate snapshot; see munshi#78). The incomplete
 snapshot itself is never rewritten — Patwari snapshots are immutable, so it stays as historical
 provenance of what was captured then. Once a snapshot is uploaded, `munshi retrieve <sha256>` redeems a
 claim ticket for the original content (`--max-download-bytes` raises the 128 MiB per-artifact
