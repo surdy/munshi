@@ -27,91 +27,22 @@ pub const NORMALIZER_VERSION: u32 = 3;
 /// labels it (`munshi_transcript::ContentEvent::kind`).
 const USER_EVENT_KIND: &str = "user";
 
-/// Vendor-neutral identity of the coding-agent harness that produced a session.
+/// Vendor-neutral identity of the coding-agent harness that produced a session, together with the
+/// index entry describing one extracted output of a revision's snapshot artifact set.
 ///
-/// The variants form the adapter boundary: each maps a source-specific transcript
-/// envelope to the same [`NormalizedSession`] model so that summarizer, renderer,
-/// state, and delivery paths remain independent from the capturing harness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SourceKind {
-    /// GitHub Copilot CLI (`events.jsonl`), the version-pinned default adapter.
-    #[default]
-    Copilot,
-    /// Anthropic Claude Code session transcripts (`<uuid>.jsonl`).
-    ClaudeCode,
-    /// OpenAI Codex CLI rollout files (`rollout-*.jsonl`).
-    Codex,
-}
+/// Both moved to `munshi-transcript` with the archive-Markdown parser (issue #79): the `agent`
+/// frontmatter key spells a [`SourceKind`] and the `extracted_outputs` block spells
+/// [`ArtifactIndexEntry`]s, so reading an archive means naming both. Everything that *produces*
+/// them — normalization, extraction, the transcript re-derivation below — stays here, along with
+/// [`supports_session_id_lookup`], which is a fact about this crate's transcript-resolution
+/// fallbacks rather than about the harness identity itself.
+pub use munshi_transcript::{ArtifactIndexEntry, SourceKind};
 
-impl SourceKind {
-    /// Stable identity prefix used in the durable archive `id` (`<prefix>:<session>`).
-    pub fn id_prefix(self) -> &'static str {
-        match self {
-            Self::Copilot => "copilot",
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-        }
-    }
-
-    /// Human- and machine-readable agent label recorded in archive frontmatter,
-    /// summarizer input, and the SQLite `source_kind` column.
-    pub fn agent_label(self) -> &'static str {
-        match self {
-            Self::Copilot => "copilot-cli",
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex-cli",
-        }
-    }
-
-    /// Selector accepted on the command line and in configuration.
-    pub fn as_selector(self) -> &'static str {
-        match self {
-            Self::Copilot => "copilot",
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-        }
-    }
-
-    /// Parse a user- or config-provided selector into a source kind.
-    pub fn parse_selector(value: &str) -> Option<Self> {
-        match value {
-            "copilot" | "copilot-cli" => Some(Self::Copilot),
-            "claude-code" | "claude" => Some(Self::ClaudeCode),
-            "codex" | "codex-cli" => Some(Self::Codex),
-            _ => None,
-        }
-    }
-
-    /// Recover the source kind from a persisted agent label.
-    pub fn from_agent_label(label: &str) -> Option<Self> {
-        match label {
-            "copilot-cli" => Some(Self::Copilot),
-            "claude-code" => Some(Self::ClaudeCode),
-            "codex-cli" => Some(Self::Codex),
-            _ => None,
-        }
-    }
-
-    /// Whether the source supports resolving a transcript from a session ID alone.
-    /// Only the version-pinned Copilot session-state fallback is supported; other
-    /// harnesses require an explicit transcript path.
-    fn supports_session_id_lookup(self) -> bool {
-        matches!(self, Self::Copilot)
-    }
-}
-
-/// The capture-side [`SourceKind`] and the read-time [`munshi_transcript::Source`] name
-/// the same three-harness identity; the crate defines its own copy so it never depends on
-/// `munshi` (ADR 0011).
-impl From<SourceKind> for munshi_transcript::Source {
-    fn from(source: SourceKind) -> Self {
-        match source {
-            SourceKind::Copilot => Self::Copilot,
-            SourceKind::ClaudeCode => Self::ClaudeCode,
-            SourceKind::Codex => Self::Codex,
-        }
-    }
+/// Whether the source supports resolving a transcript from a session ID alone.
+/// Only the version-pinned Copilot session-state fallback is supported; other
+/// harnesses require an explicit transcript path.
+fn supports_session_id_lookup(source: SourceKind) -> bool {
+    matches!(source, SourceKind::Copilot)
 }
 
 #[derive(Debug, Clone)]
@@ -164,20 +95,6 @@ pub struct ExtractedOutput {
     pub label: String,
     /// The complete original content bytes.
     pub content: Vec<u8>,
-}
-
-/// One entry in a revision's snapshot artifact index (ADR 0010, CONTEXT.md "snapshot artifact set"):
-/// the content address, original size, and short label of one extracted output. Mirrors the
-/// claim-ticket marker the summarizer saw in its place, and points at the `outputs/<sha256>` artifact
-/// the snapshot uploads. Derived purely from local extraction, never from any upload result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactIndexEntry {
-    /// Bare lowercase-hex sha256, matching the `outputs/<sha256>` logical path and the claim ticket.
-    pub sha256: String,
-    /// The original (uncompressed) content size in bytes.
-    pub bytes: u64,
-    /// The extracted event's kind label (`user`/`assistant`/`tool`).
-    pub label: String,
 }
 
 /// A revision's snapshot artifact index, derived from the transcript bytes read during
@@ -392,7 +309,7 @@ pub fn resolve_session_reference(
     }
 
     let session_id = supplied_id.expect("a session ID is present when no path was supplied");
-    if !source.supports_session_id_lookup() {
+    if !supports_session_id_lookup(source) {
         // Only the version-pinned Copilot session-state directory is a supported
         // session-ID fallback; other harnesses require an explicit transcript path.
         return Err(SourceError::TranscriptNotFound);

@@ -4,39 +4,14 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// How a session's project identity was derived (issue #40): from the live origin directory
-/// (canonicalization plus git inspection) or, when that directory no longer exists, from the
-/// origin evidence the source records themselves carry. The distinction is provenance only —
-/// a recorded identity routes and archives exactly like a live one — but it is preserved in
-/// state, archive frontmatter (`project_origin: "recorded"`), and upload metadata so a
-/// recorded-evidence identity stays distinguishable from a live-resolved one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProjectOrigin {
-    #[default]
-    Live,
-    Recorded,
-}
-
-impl ProjectOrigin {
-    /// The marker persisted for a recorded identity; a live identity stores nothing, so
-    /// records written before issue #40 keep meaning "live" unchanged.
-    pub fn recorded_marker(self) -> Option<&'static str> {
-        match self {
-            Self::Live => None,
-            Self::Recorded => Some("recorded"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectIdentity {
-    pub identity: String,
-    pub component: String,
-    pub project: String,
-    pub repository: Option<String>,
-    pub branch: Option<String>,
-    pub origin: ProjectOrigin,
-}
+/// The identity a session's project is recorded under, and how that identity was derived.
+///
+/// Both types live in `munshi-transcript` since issue #79: an archive's frontmatter states them
+/// (`project_identity`, `project_origin: "recorded"`), so a reader parsing that frontmatter must
+/// be able to name them without depending on this crate. What stays here is the *deriving* —
+/// [`inspect_project`] and [`recorded_project_identity`] need git, the filesystem, and a hash of
+/// the origin path, none of which a reader has or wants.
+pub use munshi_transcript::{ProjectIdentity, ProjectOrigin};
 
 #[derive(Debug, Error)]
 pub enum ProjectIdentityError {

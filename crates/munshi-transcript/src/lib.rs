@@ -41,6 +41,17 @@
 //! [`claude_agent_version`] expose the pure, privacy-safe envelope predicates behind `munshi`'s
 //! transcript validation, Claude Code origin recovery (issues #27, #40), and resume restore
 //! (issue #71); the bounded-I/O wrappers around them stay in `munshi`.
+//!
+//! # Reading the archive record itself
+//!
+//! A transcript is only half of what a snapshot preserves; the other half is the `summary.md`
+//! Munshi writes beside it. [`parse_archive_markdown`] reads one back into an
+//! [`ArchivedMarkdown`] — session and [`ProjectIdentity`], cursor, snapshot artifact index, and
+//! the [`StructuredSummary`] itself — for the same reason the transcript interpreters live here:
+//! the format belongs to the crate its readers pin, so there is never a second copy of it
+//! downstream (issue #79). Writing archives stays in `munshi`, the only place the capture-side
+//! state a render reads from exists; [`RenderError`] carries both directions' failures, and the
+//! `archive` module explains where that seam falls and why.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead};
@@ -50,10 +61,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod archive;
 mod classify;
 mod envelope;
+mod summary;
 
+pub use archive::{
+    ArchivedCursor, ArchivedMarkdown, ArtifactIndexEntry, ProjectIdentity, ProjectOrigin,
+    RenderError, SourceKind, parse_archive_markdown,
+};
 pub use envelope::{claude_agent_version, claude_git_branch, claude_origin_cwd, envelope_matches};
+pub use summary::{
+    PLACEHOLDER_SUMMARY_TAG, StructuredSummary, SummaryValidationError, validate_structured_summary,
+};
 
 /// The oldest artifact-set version any source supports.
 pub const MIN_SUPPORTED_ARTIFACT_SET_VERSION: u16 = 1;
@@ -73,7 +93,8 @@ pub const NON_OBJECT_JSON_KIND: &str = "non-object-json";
 ///
 /// Deliberately defined here rather than borrowed from the `munshi` crate so that this
 /// crate stays standalone for external consumers; the serialized form (kebab-case) matches
-/// `munshi::SourceKind`.
+/// [`SourceKind`], the capture-side identity an archive's `agent` key spells, which since
+/// issue #79 also lives here and converts into this one.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]

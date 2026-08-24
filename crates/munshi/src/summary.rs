@@ -3,17 +3,22 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use munshi_runner::{RunnerConfig, RunnerError, run_bounded};
-use serde::{Deserialize, Serialize};
+use munshi_transcript::SummaryValidationError;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::project::ProjectIdentity;
 use crate::source::NormalizedSession;
 
-const TITLE_LIMIT: usize = 200;
-const GOAL_LIMIT: usize = 4_000;
-const ITEM_LIMIT: usize = 4_000;
-const TAG_LIMIT: usize = 100;
-const LIST_LIMIT: usize = 200;
+/// The summary a session is archived with, its placeholder marker, and the validation that
+/// normalizes both. All three moved to `munshi-transcript` with the archive-Markdown parser
+/// (issue #79): a reader that parses `summary.md` back out of an archive must rebuild exactly the
+/// summary the writer emitted, and the validation *is* that definition — trimming, newline
+/// folding, control-character and length rules — not a courtesy check layered over it.
+///
+/// What stays here is everything about *obtaining* a summary: building and measuring the request
+/// envelopes, the chunked map-reduce path, running the summarizer, and the placeholder floor.
+pub use munshi_transcript::{PLACEHOLDER_SUMMARY_TAG, StructuredSummary};
 
 /// Current summarizer request-envelope version (issue #48). Version 2 added `contract_version`,
 /// `phase`, and the chunked map-reduce fields (`chunk`, `chunk_summaries`) as a strictly additive
@@ -94,31 +99,6 @@ pub struct SummarizerConfig {
     pub timeout: Duration,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
-}
-
-/// Tag carried by every machine-generated placeholder summary (issue #43), so a placeholder is
-/// recognizable from the summary alone — in the archive frontmatter, the state database, and any
-/// delivered note — without consulting operational state.
-pub const PLACEHOLDER_SUMMARY_TAG: &str = "munshi-placeholder-summary";
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructuredSummary {
-    pub title: String,
-    pub goal: String,
-    pub work_completed: Vec<String>,
-    pub decisions: Vec<String>,
-    pub files_changed: Vec<String>,
-    pub commands_and_validation: Vec<String>,
-    pub open_items: Vec<String>,
-    pub tags: Vec<String>,
-}
-
-impl StructuredSummary {
-    /// Whether this is a machine-generated placeholder (issue #43) rather than a real summary.
-    pub fn is_placeholder(&self) -> bool {
-        self.tags.iter().any(|tag| tag == PLACEHOLDER_SUMMARY_TAG)
-    }
 }
 
 /// The deterministic input-capacity class that triggered a placeholder archival (issue #43):
@@ -277,6 +257,26 @@ pub enum SummaryError {
     InvalidListLength { field: &'static str, max: usize },
     #[error("summary list {field} must contain at least one item")]
     MissingListItems { field: &'static str },
+}
+
+/// Restates a validation verdict as this crate's error.
+///
+/// The enum could not follow [`validate_structured_summary`] across the crate seam: four of its
+/// variants name failure modes only an app-side summarizer *invocation* has — a non-zero exit
+/// from `munshi-runner`, unparseable stdout, an input over the configured byte cap — and carrying
+/// them into `munshi-transcript` would have dragged those dependencies with them. Keeping the
+/// three validation variants here, rather than replacing them with one wrapping variant, keeps
+/// `SummaryError`'s shape and every message it prints exactly what they were.
+impl From<SummaryValidationError> for SummaryError {
+    fn from(error: SummaryValidationError) -> Self {
+        match error {
+            SummaryValidationError::InvalidText { field, max } => Self::InvalidText { field, max },
+            SummaryValidationError::InvalidListLength { field, max } => {
+                Self::InvalidListLength { field, max }
+            }
+            SummaryValidationError::MissingListItems { field } => Self::MissingListItems { field },
+        }
+    }
 }
 
 pub fn build_summary_input(
@@ -701,65 +701,13 @@ pub fn run_summary(
     validate_structured_summary(summary)
 }
 
+/// Normalizes and accepts a candidate summary, or says why it is not one.
+///
+/// The rule itself lives in `munshi-transcript` so the archive-Markdown parser applies the same
+/// one when it reads a summary back (issue #79); this restates its verdict as [`SummaryError`],
+/// which is what every caller on the summarizer path already handles.
 pub fn validate_structured_summary(
-    mut summary: StructuredSummary,
+    summary: StructuredSummary,
 ) -> Result<StructuredSummary, SummaryError> {
-    summary.title = validate_text("title", summary.title, TITLE_LIMIT, true)?;
-    summary.goal = validate_text("goal", summary.goal, GOAL_LIMIT, false)?;
-    summary.work_completed = validate_list("work_completed", summary.work_completed, ITEM_LIMIT)?;
-    if summary.work_completed.is_empty() {
-        return Err(SummaryError::MissingListItems {
-            field: "work_completed",
-        });
-    }
-    summary.decisions = validate_list("decisions", summary.decisions, ITEM_LIMIT)?;
-    summary.files_changed = validate_list("files_changed", summary.files_changed, ITEM_LIMIT)?;
-    summary.commands_and_validation = validate_list(
-        "commands_and_validation",
-        summary.commands_and_validation,
-        ITEM_LIMIT,
-    )?;
-    summary.open_items = validate_list("open_items", summary.open_items, ITEM_LIMIT)?;
-    summary.tags = validate_list("tags", summary.tags, TAG_LIMIT)?;
-    Ok(summary)
-}
-
-fn validate_list(
-    field: &'static str,
-    values: Vec<String>,
-    item_limit: usize,
-) -> Result<Vec<String>, SummaryError> {
-    if values.len() > LIST_LIMIT {
-        return Err(SummaryError::InvalidListLength {
-            field,
-            max: LIST_LIMIT,
-        });
-    }
-    values
-        .into_iter()
-        .map(|value| validate_text(field, value, item_limit, true))
-        .collect()
-}
-
-fn validate_text(
-    field: &'static str,
-    value: String,
-    max: usize,
-    single_line: bool,
-) -> Result<String, SummaryError> {
-    let value = value.trim().replace("\r\n", "\n").replace('\r', "\n");
-    let valid_controls = value
-        .chars()
-        .all(|character| !character.is_control() || matches!(character, '\n' | '\t'));
-    let length = value.chars().count();
-    if length == 0
-        || length > max
-        || !valid_controls
-        || (single_line && value.contains('\n'))
-        || (!single_line && value.contains("\n## "))
-    {
-        Err(SummaryError::InvalidText { field, max })
-    } else {
-        Ok(value)
-    }
+    munshi_transcript::validate_structured_summary(summary).map_err(SummaryError::from)
 }
