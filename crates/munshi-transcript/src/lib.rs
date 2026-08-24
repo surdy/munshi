@@ -250,11 +250,13 @@ impl Event {
 /// is the one case where a consumer must choose between over- and under-counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AssistantMeta {
-    /// The model id exactly as the transcript spells it, never normalized and never mapped
-    /// onto a pricing family — including Claude Code's `<synthetic>` placeholder for
-    /// locally-generated messages, whose tokens no vendor billed. Harnesses spell the same
-    /// model differently (`claude-opus-4-8` in Claude Code, `claude-opus-4.8` in Copilot);
-    /// reconciling those spellings is a consumer's job, not this crate's.
+    /// The model id as the transcript spells it — verbatim modulo edge whitespace, which
+    /// is trimmed, a blank string reading as absent — never normalized and never mapped
+    /// onto a pricing family, Claude Code's `<synthetic>` placeholder for locally-generated
+    /// messages included, whose tokens no vendor billed. Harnesses spell the same model
+    /// differently (`claude-opus-4-8` in Claude Code, `claude-opus-4.8` in Copilot);
+    /// reconciling those spellings is a consumer's job, not this crate's. Every other
+    /// string promoted onto this type or [`TokenUsage`] passes through on the same terms.
     pub model: Option<String>,
     /// The message's token figures, when the source records any.
     pub usage: Option<TokenUsage>,

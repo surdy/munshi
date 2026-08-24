@@ -940,6 +940,23 @@ fn copilot_records_carry_the_model_and_output_token_count() {
                     }),
                 ),
             ),
+            // The shape that record-level meta exists for: a turn that only called tools,
+            // which the CLI records as an `assistant.message` with blank `content` and a
+            // separate `tool.execution_*` record for the call itself. It classifies
+            // `Empty` — the `ignored_kinds` assertion below pins that it is not `Ignored` —
+            // so it yields no event of any kind, and its 96 output tokens are reachable
+            // only because the meta hangs off the record.
+            (
+                Vec::new(),
+                meta(
+                    "claude-synthetic-opus",
+                    "cccccccc-0000-4000-8000-0000000000a5",
+                    Some(TokenUsage {
+                        output_tokens: Some(96),
+                        ..TokenUsage::default()
+                    }),
+                ),
+            ),
             // No `outputTokens` key: the model and id are still promoted, the usage is not
             // invented as zero.
             (
@@ -1016,6 +1033,8 @@ fn codex_records_carry_no_meta() {
 /// are written from and what an oversized event's claim ticket is content-addressed by.
 #[test]
 fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
+    // `serde_json` is the crate's own dependency, so a fixture record can be edited here
+    // and re-streamed rather than only read.
     let mut stripped_records = 0;
     for fixture in FIXTURES {
         let bytes = fs::read(fixture_root().join(fixture.path)).unwrap();
@@ -1030,13 +1049,17 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
                 stripped.push('\n');
                 continue;
             };
-            // The keys `AssistantMeta` is read from, on the record types it reads them
-            // from, and nothing else: Copilot's `skill.invoked` renders a `model` of its
-            // own as a legacy card field, and stripping *that* would prove nothing about
-            // this promotion. Copilot's `messageId` is likewise left in place — the
-            // envelope requires it for the record to be content at all.
+            // Every key `AssistantMeta` is read from, on the record types it reads them
+            // from — `message.id` included, which the classification never touches, so
+            // removing it must not move a single byte of the rendering.
+            //
+            // Two deliberate exceptions, both keys this promotion does not read: Copilot's
+            // `skill.invoked` renders a `model` card field of its own, and Copilot's
+            // `messageId` is what makes an `assistant.message` content at all. Stripping
+            // either would change the rendering for reasons that have nothing to do with
+            // the promotion, proving nothing.
             let stripped_keys = match value.get("type").and_then(serde_json::Value::as_str) {
-                Some("assistant") => Some(("message", ["model", "usage"].as_slice())),
+                Some("assistant") => Some(("message", ["id", "model", "usage"].as_slice())),
                 Some("assistant.message") => Some(("data", ["model", "outputTokens"].as_slice())),
                 _ => None,
             };

@@ -10,8 +10,3 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-# The fixture walk rewrites records before re-streaming them, to prove that the keys a
-# promotion reads cannot influence the legacy rendering (issue #77).
-serde_json.workspace = true
