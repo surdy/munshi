@@ -998,7 +998,7 @@ fn cache_tiers_are_promoted_beside_their_total_and_never_reconciled() {
     // 1024 + 4096 + 0 against 1024 + 4096 + 2277: `msg_bucket_drift`'s total reads 0 while
     // its 1-hour bucket reads 2,277, exactly as one archived message does.
     assert_eq!((totals, tiers), (5120, 7397));
-    assert_eq!(tiers - totals, 2277);
+    assert_eq!(tiers, totals + 2277);
 }
 
 /// Copilot records one output-token count per message and no input, cache, thinking, tier,

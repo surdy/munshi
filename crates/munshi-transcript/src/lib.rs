@@ -162,7 +162,7 @@ pub struct Record {
     /// assistant events would therefore have left 30.5M of the mirror cache's 78.8M
     /// deduplicated output tokens — 39% — unreachable at any price.
     ///
-    /// Boxed because it is eight `Option`s wide (200 bytes) against a record that is
+    /// Boxed because it is ten `Option`s wide (232 bytes) against a record that is
     /// otherwise 136, most records are not assistant records, and
     /// [`TranscriptStream::collect_records`] buffers every record of a transcript at once.
     pub assistant_meta: Option<Box<AssistantMeta>>,
@@ -289,7 +289,8 @@ pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     /// Tokens written to the prompt cache, as `usage.cache_creation_input_tokens` states
-    /// the total.
+    /// the total. Can disagree with the per-tier buckets, which win when present — see
+    /// [`Self::cache_5m_input_tokens`].
     pub cache_creation_input_tokens: Option<u64>,
     /// Tokens written to the 5-minute cache tier, from Claude Code's
     /// `usage.cache_creation.ephemeral_5m_input_tokens`.
