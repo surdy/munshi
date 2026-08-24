@@ -6,6 +6,7 @@
 //! records, a synthetic future event type) must surface as per-record `Unknown`/error
 //! items without aborting the stream.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -691,12 +692,20 @@ const CLAUDE_USAGE_FIXTURE: &str =
 const COPILOT_USAGE_FIXTURE: &str =
     "copilot-assistant-usage/cccccccc-cccc-4ccc-8ccc-cccccccccccc/events.jsonl";
 
-/// Every assistant event in a fixture, with the meta promoted onto it.
-fn assistant_metas(source: Source, relative: &str) -> Vec<Option<AssistantMeta>> {
-    content_events(source, relative)
+/// Every record of a fixture, as `(the kinds of the events it yielded, its promoted meta)`.
+/// Records are the unit here because the meta is: a record's usage does not depend on what
+/// its content classified as.
+fn record_metas(source: Source, relative: &str) -> Vec<(Vec<&'static str>, Option<AssistantMeta>)> {
+    stream_fixture(source, relative)
         .iter()
-        .filter(|event| event.kind() == "assistant")
-        .map(|event| event.assistant_meta().cloned())
+        .filter_map(|item| item.as_ref().ok())
+        .map(|record| {
+            let kinds = match &record.classification {
+                Classification::Content { events } => events.iter().map(Event::kind).collect(),
+                _ => Vec::new(),
+            };
+            (kinds, record.assistant_meta.as_deref().cloned())
+        })
         .collect()
 }
 
@@ -709,13 +718,12 @@ fn meta(model: &str, message_id: &str, usage: Option<TokenUsage>) -> Option<Assi
     })
 }
 
-/// Issue #77: an assistant event carries the model and token figures its record records —
-/// every figure the pinned key set names, and no figure it does not.
+/// Issue #77: a claude-code record carries the model and token figures it records — every
+/// figure the pinned key set names, no figure it does not — whatever its content yields.
 #[test]
-fn claude_assistant_events_carry_the_model_and_usage_their_record_records() {
-    // The two records of `msg_split` are one API message: each repeats the message's usage
-    // verbatim, and the second splits into two assistant events that both carry it. Summing
-    // these four rows would treble a 16-token message — hence the `message_id` dedup rule.
+fn claude_records_carry_the_model_and_usage_they_record() {
+    // `msg_split`'s two records are one API message, each repeating that message's usage
+    // verbatim; `msg_toolonly` and `msg_thinking` yield no assistant event at all.
     let split = Some(TokenUsage {
         input_tokens: Some(64),
         output_tokens: Some(16),
@@ -727,126 +735,244 @@ fn claude_assistant_events_carry_the_model_and_usage_their_record_records() {
         inference_geo: Some("not_available".to_owned()),
     });
     assert_eq!(
-        assistant_metas(Source::ClaudeCode, CLAUDE_USAGE_FIXTURE),
+        record_metas(Source::ClaudeCode, CLAUDE_USAGE_FIXTURE),
         [
+            // A user record is not an assistant record, whatever it carries.
+            (vec!["user"], None),
             // The modern key set, whole: the promoted figures sit beside `cache_creation`,
             // `server_tool_use`, and `iterations`, which stay in the raw record.
-            meta(
-                "claude-synthetic-opus",
-                "msg_full",
-                Some(TokenUsage {
-                    input_tokens: Some(120),
-                    output_tokens: Some(48),
-                    cache_creation_input_tokens: Some(1024),
-                    cache_read_input_tokens: Some(8192),
-                    thinking_tokens: Some(32),
-                    service_tier: Some("standard".to_owned()),
-                    speed: Some("fast".to_owned()),
-                    inference_geo: Some("us".to_owned()),
-                }),
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-opus",
+                    "msg_full",
+                    Some(TokenUsage {
+                        input_tokens: Some(120),
+                        output_tokens: Some(48),
+                        cache_creation_input_tokens: Some(1024),
+                        cache_read_input_tokens: Some(8192),
+                        thinking_tokens: Some(32),
+                        service_tier: Some("standard".to_owned()),
+                        speed: Some("fast".to_owned()),
+                        inference_geo: Some("us".to_owned()),
+                    }),
+                ),
             ),
-            meta("claude-synthetic-opus", "msg_split", split.clone()),
-            meta("claude-synthetic-opus", "msg_split", split.clone()),
-            meta("claude-synthetic-opus", "msg_split", split),
+            (
+                vec!["assistant"],
+                meta("claude-synthetic-opus", "msg_split", split.clone()),
+            ),
+            (
+                vec!["assistant", "tool", "assistant"],
+                meta("claude-synthetic-opus", "msg_split", split),
+            ),
+            // A message that only called a tool: no assistant event, and 8 output tokens
+            // that a fold over assistant events would never see.
+            (
+                vec!["tool"],
+                meta(
+                    "claude-synthetic-opus",
+                    "msg_toolonly",
+                    Some(TokenUsage {
+                        input_tokens: Some(32),
+                        output_tokens: Some(8),
+                        service_tier: Some("standard".to_owned()),
+                        ..TokenUsage::default()
+                    }),
+                ),
+            ),
+            // A thinking-only message: recognized, empty, and billed for 64 output tokens,
+            // all of them thinking.
+            (
+                Vec::new(),
+                meta(
+                    "claude-synthetic-opus",
+                    "msg_thinking",
+                    Some(TokenUsage {
+                        input_tokens: Some(16),
+                        output_tokens: Some(64),
+                        thinking_tokens: Some(64),
+                        ..TokenUsage::default()
+                    }),
+                ),
+            ),
+            // The tool result: a user record, so no meta, though it yields a tool event.
+            (vec!["tool"], None),
             // `<synthetic>` is a model id like any other: passed through verbatim, never
             // resolved. Its null tier/speed/geo/details keys read as absent, while its zero
             // counts are real counts.
-            meta(
-                "<synthetic>",
-                "msg_synthetic",
-                Some(TokenUsage {
-                    input_tokens: Some(0),
-                    output_tokens: Some(5),
-                    cache_creation_input_tokens: Some(0),
-                    cache_read_input_tokens: Some(0),
-                    ..TokenUsage::default()
-                }),
+            (
+                vec!["assistant"],
+                meta(
+                    "<synthetic>",
+                    "msg_synthetic",
+                    Some(TokenUsage {
+                        input_tokens: Some(0),
+                        output_tokens: Some(5),
+                        cache_creation_input_tokens: Some(0),
+                        cache_read_input_tokens: Some(0),
+                        ..TokenUsage::default()
+                    }),
+                ),
             ),
             // An older key set predating the cache, thinking, tier, speed, and geo keys.
-            meta(
-                "claude-synthetic-legacy",
-                "msg_old",
-                Some(TokenUsage {
-                    input_tokens: Some(7),
-                    output_tokens: Some(3),
-                    ..TokenUsage::default()
-                }),
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-legacy",
+                    "msg_old",
+                    Some(TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        ..TokenUsage::default()
+                    }),
+                ),
             ),
             // A stringified count, a negative, a float, and a null: none is read as a
             // number, leaving the usage carrying only the tier it did record.
-            meta(
-                "claude-synthetic-legacy",
-                "msg_unreadable",
-                Some(TokenUsage {
-                    service_tier: Some("standard".to_owned()),
-                    ..TokenUsage::default()
-                }),
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-legacy",
+                    "msg_unreadable",
+                    Some(TokenUsage {
+                        service_tier: Some("standard".to_owned()),
+                        ..TokenUsage::default()
+                    }),
+                ),
             ),
             // A record naming no model, no id, and no usage claims nothing at all.
-            None,
+            (vec!["assistant"], None),
         ]
     );
 
-    // The pinned 2.1.44 fixtures predate the promotion and were not touched by it: the
-    // same reading gives them the old two-key usage, inventing none of the rest. Their
-    // `msg_a2` record is a `tool_use`-only message, so its usage reaches no assistant
-    // event at all — another reason a cost fold cannot be a per-event sum.
+    // The pinned 2.1.44 fixtures predate the promotion and were not touched by it: the same
+    // reading gives them the old two-key usage, inventing none of the rest — including for
+    // `msg_a2`, whose content is a lone `tool_use`.
     let old_keyset = Some(TokenUsage {
         input_tokens: Some(10),
         output_tokens: Some(5),
         ..TokenUsage::default()
     });
     assert_eq!(
-        assistant_metas(
+        record_metas(
             Source::ClaudeCode,
             "claude-code-2.1.44/normal/0c1a0de0-0000-4000-8000-000000000001.jsonl",
         ),
         [
-            meta("claude-synthetic", "msg_a1", old_keyset.clone()),
-            meta("claude-synthetic", "msg_a3", old_keyset),
+            (vec!["user"], None),
+            (
+                vec!["assistant"],
+                meta("claude-synthetic", "msg_a1", old_keyset.clone()),
+            ),
+            (
+                vec!["tool"],
+                meta("claude-synthetic", "msg_a2", old_keyset.clone()),
+            ),
+            (vec!["tool"], None),
+            (
+                vec!["assistant"],
+                meta("claude-synthetic", "msg_a3", old_keyset),
+            ),
         ]
     );
 }
 
-/// Copilot records one output-token count per message and no input, cache, thinking, tier,
-/// speed, or geo figure, so its usage carries that count alone.
+/// The gap that keeping the meta on the record closes, priced on the fixture: a fold over
+/// assistant events cannot see a tool-calling or thinking-only message, and a fold that
+/// forgets to deduplicate charges a split message twice.
 #[test]
-fn copilot_assistant_events_carry_the_model_and_output_token_count() {
+fn every_billed_record_is_reachable_and_summing_records_double_counts() {
+    let rows = record_metas(Source::ClaudeCode, CLAUDE_USAGE_FIXTURE);
+    let output = |meta: &Option<AssistantMeta>| {
+        meta.as_ref()
+            .and_then(|meta| meta.usage.as_ref())
+            .and_then(|usage| usage.output_tokens)
+            .unwrap_or(0)
+    };
+
+    // What a consumer must compute: one usage per message id.
+    let mut per_message: BTreeMap<&str, u64> = BTreeMap::new();
+    for (_, meta) in &rows {
+        if let Some(id) = meta.as_ref().and_then(|meta| meta.message_id.as_deref()) {
+            per_message.insert(id, output(meta));
+        }
+    }
+    assert_eq!(per_message.values().sum::<u64>(), 144);
+
+    // Summing records instead double-charges `msg_split`, which two records both carry.
+    let per_record: u64 = rows.iter().map(|(_, meta)| output(meta)).sum();
+    assert_eq!(per_record, 160);
+
+    // And what the same fold would have reached had the meta hung off assistant events:
+    // nothing of `msg_toolonly` (8) or `msg_thinking` (64), the shapes that dominate a real
+    // agentic session.
+    let reachable_from_assistant_events: u64 = rows
+        .iter()
+        .filter(|(kinds, _)| kinds.contains(&"assistant"))
+        .filter_map(|(_, meta)| meta.as_ref().and_then(|meta| meta.message_id.as_deref()))
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .filter_map(|id| per_message.get(id))
+        .sum();
+    assert_eq!(reachable_from_assistant_events, 72);
+}
+
+/// Copilot records one output-token count per message and no input, cache, thinking, tier,
+/// speed, or geo figure, so its usage carries that count alone. Its tool records carry no
+/// usage of their own and are not scraped for one.
+#[test]
+fn copilot_records_carry_the_model_and_output_token_count() {
     assert_eq!(
-        assistant_metas(Source::Copilot, COPILOT_USAGE_FIXTURE),
+        record_metas(Source::Copilot, COPILOT_USAGE_FIXTURE),
         [
-            meta(
-                "claude-synthetic-opus",
-                "cccccccc-0000-4000-8000-0000000000a1",
-                Some(TokenUsage {
-                    output_tokens: Some(128),
-                    ..TokenUsage::default()
-                }),
+            (Vec::new(), None), // session.start
+            (vec!["user"], None),
+            (Vec::new(), None), // session.model_change: a session fact, not a message's
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-opus",
+                    "cccccccc-0000-4000-8000-0000000000a1",
+                    Some(TokenUsage {
+                        output_tokens: Some(128),
+                        ..TokenUsage::default()
+                    }),
+                ),
             ),
             // No `outputTokens` key: the model and id are still promoted, the usage is not
             // invented as zero.
-            meta(
-                "claude-synthetic-opus",
-                "cccccccc-0000-4000-8000-0000000000a2",
-                None,
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-opus",
+                    "cccccccc-0000-4000-8000-0000000000a2",
+                    None,
+                ),
             ),
-            Some(AssistantMeta {
-                model: None,
-                usage: None,
-                message_id: Some("cccccccc-0000-4000-8000-0000000000a3".to_owned()),
-            }),
+            (
+                vec!["assistant"],
+                Some(AssistantMeta {
+                    model: None,
+                    usage: None,
+                    message_id: Some("cccccccc-0000-4000-8000-0000000000a3".to_owned()),
+                }),
+            ),
             // A stringified count is not read as a number.
-            meta(
-                "claude-synthetic-opus",
-                "cccccccc-0000-4000-8000-0000000000a4",
-                None,
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-opus",
+                    "cccccccc-0000-4000-8000-0000000000a4",
+                    None,
+                ),
             ),
+            // session.shutdown, whose `modelMetrics` rolls the whole session's tokens up:
+            // bookkeeping, because it attributes to no message.
+            (Vec::new(), None),
         ]
     );
 
-    // The session-level kinds that also name a model — `session.model_change` and
-    // `session.shutdown`, whose `modelMetrics` rolls the whole session's tokens up — stay
-    // bookkeeping: neither attributes a cost to a message.
     let ignored_kinds: Vec<_> = stream_fixture(Source::Copilot, COPILOT_USAGE_FIXTURE)
         .iter()
         .filter_map(|item| match item {
@@ -863,65 +989,109 @@ fn copilot_assistant_events_carry_the_model_and_output_token_count() {
     );
 }
 
-/// The negative half: a source that records no per-message model or usage, and the event
-/// kinds that never carry one.
+/// The negative half: a source that records no per-message model or usage anywhere.
 #[test]
-fn events_whose_records_report_no_usage_carry_no_meta() {
-    // Codex rollout `message` payloads name neither model nor usage (the model they run
-    // under sits on the turn-level `turn_context` record), so no Codex assistant event
-    // gains meta.
-    let codex = assistant_metas(
-        Source::Codex,
-        "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
-    );
-    assert!(!codex.is_empty(), "the codex fixture must have assistants");
-    assert!(codex.iter().all(Option::is_none));
-
-    // User and tool events have no meta to carry, in any fixture.
+fn codex_records_carry_no_meta() {
+    // Rollout `message` payloads name neither model nor usage — the model they run under
+    // sits on the turn-level `turn_context` record, which describes a turn and not a
+    // message — so nothing in a Codex transcript is promoted.
     for fixture in FIXTURES {
-        for event in content_events(fixture.source, fixture.path) {
-            if event.kind() != "assistant" {
-                assert!(
-                    event.assistant_meta().is_none(),
-                    "{}: {} event",
-                    fixture.path,
-                    event.kind()
-                );
-            }
+        if fixture.source != Source::Codex {
+            continue;
         }
+        let rows = record_metas(fixture.source, fixture.path);
+        assert!(!rows.is_empty(), "{}", fixture.path);
+        assert!(
+            rows.iter().all(|(_, meta)| meta.is_none()),
+            "{}",
+            fixture.path
+        );
     }
 }
 
-/// The promotion is additive on the assistant side too: an assistant event's
-/// `legacy_content()` is its message text and nothing else, whatever meta rides beside it.
-/// That string is capture's `NormalizedEvent.content` — what summaries are written from and
-/// what an oversized event's claim ticket is content-addressed by — so meta that reached it
-/// would redraft summaries and orphan tickets.
+/// The promotion is additive: what it reads may not change what an event renders as. Strip
+/// the promoted keys out of every record of every fixture and the whole stream — record
+/// accounting and the ordered `(kind, legacy content)` pairs alike — must come back
+/// identical, because that rendering is capture's `NormalizedEvent.content`: what summaries
+/// are written from and what an oversized event's claim ticket is content-addressed by.
 #[test]
-fn promoted_assistant_meta_stays_out_of_the_legacy_content() {
-    let mut promoted = 0;
+fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
+    let mut stripped_records = 0;
     for fixture in FIXTURES {
-        for event in content_events(fixture.source, fixture.path) {
-            let Event::Assistant { text, meta } = &event else {
+        let bytes = fs::read(fixture_root().join(fixture.path)).unwrap();
+        let mut stripped = String::new();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(line) else {
+                // Malformed lines are left exactly as they are, errors and all.
+                stripped.push_str(&String::from_utf8_lossy(line));
+                stripped.push('\n');
                 continue;
             };
-            assert_eq!(event.legacy_content(), *text, "{}", fixture.path);
-            // The same event stripped of its meta renders identically: nothing about the
-            // content depends on what was promoted beside it.
-            let stripped = Event::Assistant {
-                text: text.clone(),
-                meta: None,
+            // The keys `AssistantMeta` is read from, on the record types it reads them
+            // from, and nothing else: Copilot's `skill.invoked` renders a `model` of its
+            // own as a legacy card field, and stripping *that* would prove nothing about
+            // this promotion. Copilot's `messageId` is likewise left in place — the
+            // envelope requires it for the record to be content at all.
+            let stripped_keys = match value.get("type").and_then(serde_json::Value::as_str) {
+                Some("assistant") => Some(("message", ["model", "usage"].as_slice())),
+                Some("assistant.message") => Some(("data", ["model", "outputTokens"].as_slice())),
+                _ => None,
             };
-            assert_eq!(
-                event.legacy_content(),
-                stripped.legacy_content(),
-                "{}: meta reached the legacy content",
-                fixture.path
-            );
-            promoted += usize::from(meta.is_some());
+            if let Some((parent, keys)) = stripped_keys
+                && let Some(object) = value
+                    .get_mut(parent)
+                    .and_then(|value| value.as_object_mut())
+            {
+                for key in keys {
+                    stripped_records += usize::from(object.remove(*key).is_some());
+                }
+            }
+            stripped.push_str(&value.to_string());
+            stripped.push('\n');
         }
+
+        let before = legacy_shape(stream_fixture(fixture.source, fixture.path));
+        let after = legacy_shape(
+            TranscriptStream::new(fixture.source, 1, stripped.as_bytes())
+                .unwrap()
+                .collect_records(),
+        );
+        assert_eq!(before, after, "{}", fixture.path);
     }
-    assert!(promoted > 0, "the walk must see promoted meta to guard it");
+    assert!(
+        stripped_records > 0,
+        "the walk must strip something to prove anything"
+    );
+}
+
+/// A stream reduced to what the legacy contract promises: per record, its classification
+/// and the ordered `(kind, content)` pairs of the events it yielded.
+fn legacy_shape(items: Vec<Result<Record, RecordError>>) -> Vec<(String, Vec<(String, String)>)> {
+    items
+        .iter()
+        .map(|item| match item {
+            Err(error) => (format!("error:{}", error.line()), Vec::new()),
+            Ok(record) => {
+                let class = match &record.classification {
+                    Classification::Content { .. } => "content".to_owned(),
+                    Classification::Empty => "empty".to_owned(),
+                    Classification::Ignored { kind } => format!("ignored:{kind}"),
+                    Classification::Unknown { raw } => format!("unknown:{raw}"),
+                };
+                let events = match &record.classification {
+                    Classification::Content { events } => events
+                        .iter()
+                        .map(|event| (event.kind().to_owned(), event.legacy_content()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                (class, events)
+            }
+        })
+        .collect()
 }
 
 #[test]

@@ -33,9 +33,9 @@
 //! from is read again, never rewritten, and the promotion is invisible to
 //! [`Event::legacy_content`]. Tool fields are named in [`ToolEvent::derived`] so they stay
 //! out of the byte-identical legacy rendering (see [`ToolEvent`] for why that matters);
-//! [`AssistantMeta`], which carries per-message model and token usage, sits beside the
-//! assistant text rather than inside it, so that text — the whole of an assistant event's
-//! legacy content — cannot move either.
+//! [`AssistantMeta`], which carries per-message model and token usage, hangs off
+//! [`Record`] rather than off any event, because it describes the record — what one API
+//! message was billed — and not the text or tool calls that record splits into.
 //!
 //! [`envelope_matches`], [`claude_origin_cwd`], [`claude_git_branch`], and
 //! [`claude_agent_version`] expose the pure, privacy-safe envelope predicates behind `munshi`'s
@@ -150,6 +150,22 @@ pub struct Record {
     pub timestamp: Option<DateTime<Utc>>,
     /// What the record means to the source's version-pinned envelope.
     pub classification: Classification,
+    /// What the record says about the API message behind it — model, token usage, message
+    /// id — when it is an assistant record whose source records any (issue #77).
+    ///
+    /// It hangs off the record and not off [`Event::Assistant`] because that is the unit it
+    /// describes: one record is one message's worth of usage, whatever mixture of text and
+    /// tool-call events its content splits into, and *whether or not it splits into any*.
+    /// A Claude Code message that only calls tools yields tool events and no assistant
+    /// event; a Copilot message that only calls tools records blank `content` and yields no
+    /// event at all ([`Classification::Empty`]); both were billed. Carrying the figures on
+    /// assistant events would therefore have left 30.5M of the mirror cache's 78.8M
+    /// deduplicated output tokens — 39% — unreachable at any price.
+    ///
+    /// Boxed because it is eight `Option`s wide (200 bytes) against a record that is
+    /// otherwise 136, most records are not assistant records, and
+    /// [`TranscriptStream::collect_records`] buffers every record of a transcript at once.
+    pub assistant_meta: Option<Box<AssistantMeta>>,
 }
 
 /// The read-time meaning of one transcript record.
@@ -174,16 +190,10 @@ pub enum Classification {
 pub enum Event {
     /// A user request; `text` is the complete user-authored content.
     User { text: String },
-    /// An assistant reply; `text` is the complete assistant-authored content.
-    Assistant {
-        text: String,
-        /// The record's promoted model and token usage, when its source records any
-        /// (issue #77). Boxed because the meta is eight `Option`s wide (200 bytes) against
-        /// a 56-byte enum, and the stream buffers a `Vec<Event>` per record in which most
-        /// events are tool and user events carrying none: inline, it would quadruple the
-        /// size of every event in every transcript to hold one variant's field.
-        meta: Option<Box<AssistantMeta>>,
-    },
+    /// An assistant reply; `text` is the complete assistant-authored content. What the
+    /// message behind it cost belongs to the record, not to this event — see
+    /// [`Record::assistant_meta`].
+    Assistant { text: String },
     /// Tool activity (invocation or result), with structured fields.
     Tool(ToolEvent),
 }
@@ -204,51 +214,40 @@ impl Event {
     /// `NormalizedEvent.content` (pre-elision).
     pub fn legacy_content(&self) -> String {
         match self {
-            Self::User { text } | Self::Assistant { text, .. } => text.clone(),
+            Self::User { text } | Self::Assistant { text } => text.clone(),
             Self::Tool(tool) => tool.rendered(),
-        }
-    }
-
-    /// The promoted per-message model and usage of an assistant event, when its source
-    /// recorded any. `None` for user and tool events, and for assistant events whose
-    /// record carried nothing readable.
-    pub fn assistant_meta(&self) -> Option<&AssistantMeta> {
-        match self {
-            Self::Assistant { meta, .. } => meta.as_deref(),
-            Self::User { .. } | Self::Tool(_) => None,
         }
     }
 }
 
 /// What an assistant record says about the API message behind it: which model produced it,
 /// what it cost in tokens, and the id that identifies it (issue #77, for qanungo's cost
-/// lane). Promoted read-time only — it rides *beside* [`Event::Assistant`]'s text, never
-/// inside it, so the legacy content the archive is addressed by cannot move.
+/// lane). Promoted read-time only, onto [`Record`] — never into any event's
+/// [`Event::legacy_content`], which is what the archive is addressed by.
 ///
 /// Only present when the source recorded at least one of the three. An absent field is an
 /// under-claim the consumer can see and handle; a guessed one silently corrupts a total.
 ///
-/// # Deduplicate by `message_id` before summing
+/// # Summing without deduplicating by `message_id` is wrong, not merely imprecise
 ///
 /// One Claude API message reaches the transcript as *several* records — the assistant
-/// text, then each tool call — sharing one `message.id` and repeating that message's
-/// `usage` verbatim on every one of them. The figures describe the message, not the
-/// record: summing the mirror cache's 61,184 assistant records rather than its 29,591
-/// message ids over-counts output tokens by 2.6x. Fold over distinct `message_id`s,
-/// taking one copy per id.
+/// text, then each of its tool calls — that share one `message.id` and repeat that
+/// message's `usage` verbatim on every one of them. Every one of those records carries
+/// this meta, because every one of them is that message. Adding them up counts the same
+/// message two or three times over: the mirror cache holds 61,184 claude-code assistant
+/// records for 29,591 message ids, and summing records rather than ids over-counts output
+/// tokens 2.6-fold (68.0M against the true 26.2M).
 ///
-/// The rule is stated on the type rather than per source because it holds event-wise too:
-/// a record that splits into several assistant events (several `text` blocks) gives each
-/// of them an identical copy of its meta, there being no principled way to divide a
-/// message's cost among its content blocks. Copilot records one message per event, so
-/// deduplicating its `messageId` is a no-op.
+/// So a cost fold is over *distinct message ids*, taking one record's usage per id, and
+/// this is a correctness requirement rather than a refinement — the crate cannot do it for
+/// the consumer, because deduplication needs the whole transcript and the stream hands out
+/// one record at a time. Copilot records one message per record, so deduplicating its
+/// `messageId` changes nothing there; the rule is stated once, for the type, because a
+/// consumer folding both sources must apply it to both.
 ///
-/// # These events are not a billing ledger
-///
-/// A record whose content is only tool calls produces no assistant event at all, so its
-/// message's usage is unreachable through this type: in the same cache, the messages that
-/// do carry assistant text account for 16.4M of 26.2M deduplicated output tokens. What a
-/// consumer can total here is a lower bound on what a session was billed, not the bill.
+/// A record whose usage this crate reads but whose `message_id` it does not (no source in
+/// the archive omits one, but a future envelope might) cannot be deduplicated at all, and
+/// is the one case where a consumer must choose between over- and under-counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AssistantMeta {
     /// The model id exactly as the transcript spells it, never normalized and never mapped
@@ -512,6 +511,7 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
                     classification: Classification::Ignored {
                         kind: NON_OBJECT_JSON_KIND.to_owned(),
                     },
+                    assistant_meta: None,
                 }));
             };
             let raw_timestamp = object.get("timestamp").cloned();
@@ -525,12 +525,16 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
                     raw: String::from_utf8_lossy(&self.buffer).into_owned(),
                 },
             };
+            // Read independently of the classification: a record's usage is what it was
+            // billed, whether its content classified as events, as empty, or as ignored.
+            let assistant_meta = classify::assistant_meta(self.source, object).map(Box::new);
             return Some(Ok(Record {
                 line,
                 record,
                 raw_timestamp,
                 timestamp,
                 classification,
+                assistant_meta,
             }));
         }
     }

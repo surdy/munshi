@@ -42,6 +42,32 @@ pub(crate) fn classify(source: crate::Source, object: &Map<String, Value>) -> Cl
     }
 }
 
+/// What a record says about the API message behind it (issue #77): the model, the token
+/// usage, and the message id, read from the one record shape per source that records them.
+///
+/// Deliberately a second pass over the record rather than an output of [`classify`]: what a
+/// message was billed does not depend on what its content classified as, and reading it
+/// separately is what lets an assistant record whose content is only tool calls — or is
+/// empty, or is unreadable — still account for its tokens. Codex records no per-message
+/// model or usage anywhere, so nothing is read for it.
+pub(crate) fn assistant_meta(
+    source: crate::Source,
+    object: &Map<String, Value>,
+) -> Option<AssistantMeta> {
+    let record_type = object.get("type").and_then(Value::as_str)?;
+    match source {
+        crate::Source::Copilot => (record_type == "assistant.message")
+            .then(|| event_data(object))
+            .flatten()
+            .and_then(copilot_assistant_meta),
+        crate::Source::ClaudeCode => (record_type == "assistant")
+            .then(|| object.get("message").and_then(Value::as_object))
+            .flatten()
+            .and_then(claude_assistant_meta),
+        crate::Source::Codex => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Copilot CLI (version-pinned to 1.0.70)
 // ---------------------------------------------------------------------------
@@ -131,10 +157,7 @@ fn classify_copilot(object: &Map<String, Value>) -> Class {
                 return Class::ignored(event_type);
             };
             match nonempty(content) {
-                Some(text) => Class::event(Event::Assistant {
-                    text,
-                    meta: copilot_assistant_meta(data).map(Box::new),
-                }),
+                Some(text) => Class::event(Event::Assistant { text }),
                 None => Class::Empty,
             }
         }
@@ -478,11 +501,7 @@ fn classify_claude(object: &Map<String, Value>) -> Class {
             let Some(content) = message.get("content") else {
                 return Class::ignored(record_type);
             };
-            let mut class = classify_claude_content(content, assistant, record_type);
-            if assistant && let Class::Content(events) = &mut class {
-                attach_claude_assistant_meta(events, message);
-            }
-            class
+            classify_claude_content(content, assistant, record_type)
         }
         _ if CLAUDE_BOOKKEEPING.contains(&record_type) => Class::ignored(record_type),
         _ => Class::Unknown,
@@ -541,23 +560,6 @@ fn classify_claude_content(content: &Value, assistant: bool, record_type: &str) 
             }
         }
         _ => Class::ignored(record_type),
-    }
-}
-
-/// Gives *every* assistant event a record produced the model and usage that record carries
-/// (issue #77). `message.usage` describes the whole API message, so a record that splits
-/// into several assistant events (several `text` blocks) hands each of them an identical
-/// copy rather than a share: there is no first-event-only rule to get wrong, and the
-/// `message_id` deduplication [`AssistantMeta`] documents is what makes summing safe.
-/// Tool events the same record produced are untouched — cost is a property of the message.
-fn attach_claude_assistant_meta(events: &mut [Event], message: &Map<String, Value>) {
-    let Some(meta) = claude_assistant_meta(message) else {
-        return;
-    };
-    for event in events {
-        if let Event::Assistant { meta: slot, .. } = event {
-            *slot = Some(Box::new(meta.clone()));
-        }
     }
 }
 
@@ -747,10 +749,7 @@ fn classify_codex(object: &Map<String, Value>) -> Class {
             match nonempty(&text) {
                 Some(text) => match role {
                     "user" => Class::event(Event::User { text }),
-                    // Issue #77: a rollout `message` payload records neither model nor usage
-                    // — the model it names sits on the turn-level `turn_context` record —
-                    // so no Codex assistant event carries meta.
-                    "assistant" => Class::event(Event::Assistant { text, meta: None }),
+                    "assistant" => Class::event(Event::Assistant { text }),
                     _ => Class::ignored(item_type),
                 },
                 None => Class::Empty,
@@ -911,12 +910,9 @@ fn codex_local_shell_call(payload: &Map<String, Value>) -> Option<Event> {
 // Shared helpers (ported verbatim from the legacy normalizer)
 // ---------------------------------------------------------------------------
 
-/// A user or assistant message event. Assistant events are built without meta and filled in
-/// per record by [`attach_claude_assistant_meta`]; Codex, whose rollout records no
-/// per-message model or usage this crate reads, leaves them empty.
 fn message_event(assistant: bool, text: String) -> Event {
     if assistant {
-        Event::Assistant { text, meta: None }
+        Event::Assistant { text }
     } else {
         Event::User { text }
     }
@@ -1303,20 +1299,20 @@ mod tests {
         );
     }
 
-    /// Every assistant event a record classifies to, as `(text, promoted meta)`, for the
-    /// usage-promotion tests. The text is carried along so each case also witnesses that
-    /// the legacy content is what it always was.
-    fn assistant_events(source: Source, json: &str) -> Vec<(String, Option<AssistantMeta>)> {
-        let Class::Content(events) = classify_json(source, json) else {
-            panic!("expected content: {json}");
-        };
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Assistant { text, meta } => Some((text.clone(), meta.as_deref().cloned())),
-                _ => None,
-            })
-            .collect()
+    /// The meta a record promotes, read the way the stream reads it: independently of what
+    /// the record's content classified as.
+    fn meta_of(source: Source, json: &str) -> Option<AssistantMeta> {
+        let value: Value = serde_json::from_str(json).unwrap();
+        assistant_meta(source, value.as_object().unwrap())
+    }
+
+    /// The kinds of the events a record classifies to, for the cases that pin what its
+    /// content became alongside what it was billed.
+    fn event_kinds(source: Source, json: &str) -> Vec<&'static str> {
+        match classify_json(source, json) {
+            Class::Content(events) => events.iter().map(Event::kind).collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The meta a record is expected to promote, for the cases naming a model and an id.
@@ -1331,48 +1327,42 @@ mod tests {
     #[test]
     fn claude_assistant_records_promote_the_whole_pinned_usage_key_set() {
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::ClaudeCode,
                 r#"{"type":"assistant","message":{"role":"assistant","id":"msg_1","model":"claude-opus-synthetic","content":[{"type":"text","text":"Priced."}],"usage":{"input_tokens":120,"output_tokens":48,"cache_creation_input_tokens":1024,"cache_read_input_tokens":8192,"service_tier":"standard","speed":"fast","inference_geo":"us","cache_creation":{"ephemeral_5m_input_tokens":1024},"server_tool_use":{"web_search_requests":2},"iterations":[{"duration_ms":900}],"output_tokens_details":{"thinking_tokens":32}}}}"#,
             ),
-            [(
-                "Priced.".to_owned(),
-                meta(
-                    "claude-opus-synthetic",
-                    "msg_1",
-                    Some(TokenUsage {
-                        input_tokens: Some(120),
-                        output_tokens: Some(48),
-                        cache_creation_input_tokens: Some(1024),
-                        cache_read_input_tokens: Some(8192),
-                        thinking_tokens: Some(32),
-                        service_tier: Some("standard".to_owned()),
-                        speed: Some("fast".to_owned()),
-                        inference_geo: Some("us".to_owned()),
-                    }),
-                ),
-            )]
+            meta(
+                "claude-opus-synthetic",
+                "msg_1",
+                Some(TokenUsage {
+                    input_tokens: Some(120),
+                    output_tokens: Some(48),
+                    cache_creation_input_tokens: Some(1024),
+                    cache_read_input_tokens: Some(8192),
+                    thinking_tokens: Some(32),
+                    service_tier: Some("standard".to_owned()),
+                    speed: Some("fast".to_owned()),
+                    inference_geo: Some("us".to_owned()),
+                }),
+            )
         );
 
         // An older key set, and the `<synthetic>` model placeholder passed through as the
         // model id it is. Nulls read as absent; zeroes are counts the source did report.
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::ClaudeCode,
                 r#"{"type":"assistant","message":{"role":"assistant","id":"msg_2","model":"<synthetic>","content":[{"type":"text","text":"Local."}],"usage":{"input_tokens":0,"output_tokens":5,"service_tier":null,"speed":null,"output_tokens_details":null}}}"#,
             ),
-            [(
-                "Local.".to_owned(),
-                meta(
-                    "<synthetic>",
-                    "msg_2",
-                    Some(TokenUsage {
-                        input_tokens: Some(0),
-                        output_tokens: Some(5),
-                        ..TokenUsage::default()
-                    }),
-                ),
-            )]
+            meta(
+                "<synthetic>",
+                "msg_2",
+                Some(TokenUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(5),
+                    ..TokenUsage::default()
+                }),
+            )
         );
     }
 
@@ -1381,146 +1371,135 @@ mod tests {
         // A stringified count, a negative, a float, a null, and a details object that is
         // not an object: each field is dropped on its own, leaving the readable ones.
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::ClaudeCode,
                 r#"{"type":"assistant","message":{"role":"assistant","id":"msg_3","model":"claude-opus-synthetic","content":[{"type":"text","text":"Odd."}],"usage":{"input_tokens":"120","output_tokens":-5,"cache_creation_input_tokens":1.5,"cache_read_input_tokens":null,"service_tier":"  ","output_tokens_details":7,"speed":"standard"}}}"#,
             ),
-            [(
-                "Odd.".to_owned(),
-                meta(
-                    "claude-opus-synthetic",
-                    "msg_3",
-                    Some(TokenUsage {
-                        speed: Some("standard".to_owned()),
-                        ..TokenUsage::default()
-                    }),
-                ),
-            )]
+            meta(
+                "claude-opus-synthetic",
+                "msg_3",
+                Some(TokenUsage {
+                    speed: Some("standard".to_owned()),
+                    ..TokenUsage::default()
+                }),
+            )
         );
 
         // A usage carrying nothing readable is no usage; a record carrying nothing at all
         // is no meta, which is how a consumer tells "not recorded" from "recorded as zero".
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::ClaudeCode,
                 r#"{"type":"assistant","message":{"role":"assistant","id":"msg_4","model":"claude-opus-synthetic","content":[{"type":"text","text":"Empty."}],"usage":{}}}"#,
             ),
-            [(
-                "Empty.".to_owned(),
-                meta("claude-opus-synthetic", "msg_4", None),
-            )]
+            meta("claude-opus-synthetic", "msg_4", None)
         );
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::ClaudeCode,
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Bare."}],"usage":"none"}}"#,
             ),
-            [("Bare.".to_owned(), None)]
+            None
         );
     }
 
+    /// The reason the meta hangs off the record: a message is billed for producing its
+    /// content, whatever that content turns out to be, so nothing about how the content
+    /// classifies may gate whether its tokens are reachable.
     #[test]
-    fn every_assistant_event_of_a_record_carries_that_message_s_usage() {
-        // One record, three content blocks, two assistant events: the usage describes the
-        // whole message, so both events carry an identical copy of it and the tool event
-        // between them carries none. Summing per event would double this message.
-        let events = assistant_events(
-            Source::ClaudeCode,
-            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_5","model":"claude-opus-synthetic","content":[{"type":"text","text":"First."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}},{"type":"text","text":"Second."}],"usage":{"input_tokens":64,"output_tokens":16}}}"#,
-        );
-        let expected = meta(
-            "claude-opus-synthetic",
-            "msg_5",
-            Some(TokenUsage {
-                input_tokens: Some(64),
-                output_tokens: Some(16),
-                ..TokenUsage::default()
-            }),
-        );
-        assert_eq!(
-            events,
-            [
-                ("First.".to_owned(), expected.clone()),
-                ("Second.".to_owned(), expected),
-            ]
-        );
-
-        // A record whose content is a bare string is the same message read the same way.
-        assert_eq!(
-            assistant_events(
-                Source::ClaudeCode,
-                r#"{"type":"assistant","message":{"role":"assistant","id":"msg_6","model":"claude-opus-synthetic","content":"Plain text.","usage":{"output_tokens":3}}}"#,
+    fn a_records_usage_is_reachable_whatever_its_content_classifies_as() {
+        let usage = Some(TokenUsage {
+            input_tokens: Some(64),
+            output_tokens: Some(16),
+            ..TokenUsage::default()
+        });
+        for (json, kinds) in [
+            // Text, a tool call, and more text: three events, one message, one meta. There
+            // is no principled way to divide a message's cost across its content blocks,
+            // and with the meta on the record there is nothing to divide.
+            (
+                r#"{"type":"assistant","message":{"role":"assistant","id":"msg_5","model":"claude-opus-synthetic","content":[{"type":"text","text":"First."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}},{"type":"text","text":"Second."}],"usage":{"input_tokens":64,"output_tokens":16}}}"#,
+                vec!["assistant", "tool", "assistant"],
             ),
-            [(
-                "Plain text.".to_owned(),
-                meta(
-                    "claude-opus-synthetic",
-                    "msg_6",
-                    Some(TokenUsage {
-                        output_tokens: Some(3),
-                        ..TokenUsage::default()
-                    }),
-                ),
-            )]
-        );
-
-        // A user record is read as a user record: `message.usage` on it, if a future
-        // envelope ever writes one, describes no assistant message.
-        assert!(matches!(
-            classify_json(
-                Source::ClaudeCode,
-                r#"{"type":"user","message":{"role":"user","id":"msg_7","model":"claude-opus-synthetic","content":"Do it.","usage":{"input_tokens":9}}}"#,
+            // The common agentic shape: a message that only calls tools. It yields no
+            // assistant event at all, and messages like it hold most of the archive's
+            // token mass.
+            (
+                r#"{"type":"assistant","message":{"role":"assistant","id":"msg_5","model":"claude-opus-synthetic","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/lib.rs"}}],"usage":{"input_tokens":64,"output_tokens":16}}}"#,
+                vec!["tool"],
             ),
-            Class::Content(events)
-                if events == [Event::User { text: "Do it.".to_owned() }]
-        ));
+            // Recognized but empty (a thinking-only message), and unreadable content: no
+            // events either way, and both were still billed.
+            (
+                r#"{"type":"assistant","message":{"role":"assistant","id":"msg_5","model":"claude-opus-synthetic","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":64,"output_tokens":16}}}"#,
+                vec![],
+            ),
+            (
+                r#"{"type":"assistant","message":{"role":"assistant","id":"msg_5","model":"claude-opus-synthetic","content":7,"usage":{"input_tokens":64,"output_tokens":16}}}"#,
+                vec![],
+            ),
+        ] {
+            assert_eq!(event_kinds(Source::ClaudeCode, json), kinds, "{json}");
+            // Every one of the four is the same `msg_5` repeating its usage: a consumer
+            // adding them up bills 64 input tokens four times over.
+            assert_eq!(
+                meta_of(Source::ClaudeCode, json),
+                meta("claude-opus-synthetic", "msg_5", usage.clone()),
+                "{json}"
+            );
+        }
+
+        // A user record is read as a user record, whatever its message names: usage on it,
+        // if a future envelope ever writes one, describes no assistant message.
+        assert_eq!(
+            meta_of(
+                Source::ClaudeCode,
+                r#"{"type":"user","message":{"role":"user","id":"msg_6","model":"claude-opus-synthetic","content":"Do it.","usage":{"input_tokens":9}}}"#,
+            ),
+            None
+        );
     }
 
     #[test]
     fn copilot_assistant_messages_promote_the_model_and_the_one_count_they_record() {
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::Copilot,
                 r#"{"type":"assistant.message","data":{"content":"Priced.","messageId":"m1","model":"claude-opus-4.8","outputTokens":128,"turnId":"t1"}}"#,
             ),
-            [(
-                "Priced.".to_owned(),
-                meta(
-                    "claude-opus-4.8",
-                    "m1",
-                    Some(TokenUsage {
-                        output_tokens: Some(128),
-                        ..TokenUsage::default()
-                    }),
-                ),
-            )]
+            meta(
+                "claude-opus-4.8",
+                "m1",
+                Some(TokenUsage {
+                    output_tokens: Some(128),
+                    ..TokenUsage::default()
+                }),
+            )
         );
         // No count, and a count that is not a number: the message id still identifies the
         // message, and no input or cache figure is invented for an envelope that has none.
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::Copilot,
                 r#"{"type":"assistant.message","data":{"content":"Uncounted.","messageId":"m2","model":"gpt-5.6-sol"}}"#,
             ),
-            [("Uncounted.".to_owned(), meta("gpt-5.6-sol", "m2", None))]
+            meta("gpt-5.6-sol", "m2", None)
         );
         assert_eq!(
-            assistant_events(
+            meta_of(
                 Source::Copilot,
                 r#"{"type":"assistant.message","data":{"content":"Stringy.","messageId":"m3","outputTokens":"128"}}"#,
             ),
-            [(
-                "Stringy.".to_owned(),
-                Some(AssistantMeta {
-                    model: None,
-                    usage: None,
-                    message_id: Some("m3".to_owned()),
-                }),
-            )]
+            Some(AssistantMeta {
+                model: None,
+                usage: None,
+                message_id: Some("m3".to_owned()),
+            })
         );
 
-        // The session-level kinds naming a model stay bookkeeping: a session-wide token
-        // roll-up attributes to no message, so promoting from it would invent attribution.
+        // The kinds that also name a model stay bookkeeping *and* promote nothing: a
+        // session-wide token roll-up attributes to no message, and the tool records the CLI
+        // writes between messages carry no usage of their own to read.
         for json in [
             r#"{"type":"session.model_change","data":{"model":"claude-opus-4.8","previousModel":"gpt-5.6-sol"}}"#,
             r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"claude-opus-4.8":{"outputTokens":900}}}}"#,
@@ -1529,19 +1508,26 @@ mod tests {
                 classify_json(Source::Copilot, json),
                 Class::Ignored(_)
             ));
+            assert_eq!(meta_of(Source::Copilot, json), None, "{json}");
         }
+        assert_eq!(
+            meta_of(
+                Source::Copilot,
+                r#"{"type":"tool.execution_start","data":{"toolCallId":"c1","toolName":"bash","arguments":{"command":"ls"},"model":"claude-opus-4.8"}}"#,
+            ),
+            None
+        );
     }
 
     #[test]
-    fn codex_assistant_messages_promote_nothing() {
+    fn codex_records_promote_nothing() {
         // The rollout records its model on `turn_context`, a turn-level record this crate
         // ignores, and no per-message usage anywhere: nothing attributes to a message.
-        assert_eq!(
-            assistant_events(
-                Source::Codex,
-                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
-            ),
-            [("Done.".to_owned(), None)]
-        );
+        for json in [
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"/work","model":"gpt-synthetic","effort":"medium"}}"#,
+        ] {
+            assert_eq!(meta_of(Source::Codex, json), None, "{json}");
+        }
     }
 }
