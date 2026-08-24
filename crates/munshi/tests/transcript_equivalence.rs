@@ -82,6 +82,14 @@ const CASES: &[(SourceKind, Source, &str, &str)] = &[
         "claude-code-shell-command/transcript/0c1a0de0-0000-4000-8000-000000000077.jsonl",
         "0c1a0de0-0000-4000-8000-000000000077",
     ),
+    // Issue #77: the assistant model/usage fixture. Meta rides beside the assistant text
+    // rather than inside it, so the legacy `(kind, content)` strings must be untouched.
+    (
+        SourceKind::ClaudeCode,
+        Source::ClaudeCode,
+        "claude-code-assistant-usage/transcript/0c1a0de0-0000-4000-8000-000000077002.jsonl",
+        "0c1a0de0-0000-4000-8000-000000077002",
+    ),
     (
         SourceKind::Codex,
         Source::Codex,
@@ -153,6 +161,12 @@ const CASES: &[(SourceKind, Source, &str, &str)] = &[
         Source::Copilot,
         "copilot-shell-command/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/events.jsonl",
         "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    ),
+    (
+        SourceKind::Copilot,
+        Source::Copilot,
+        "copilot-assistant-usage/cccccccc-cccc-4ccc-8ccc-cccccccccccc/events.jsonl",
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     ),
 ];
 

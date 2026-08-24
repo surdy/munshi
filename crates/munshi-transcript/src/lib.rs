@@ -29,9 +29,13 @@
 //! `started_at` / `updated_at` are the minimum/maximum top-level record `timestamp`.
 //!
 //! Typed signals grow one field at a time, pulled by a named consumer metric (issue #77).
-//! A field promoted after the legacy contract froze is *additive*: the raw blob it came
-//! from is kept verbatim beside it, and it is named in [`ToolEvent::derived`] so it stays
-//! out of the byte-identical legacy rendering. See [`ToolEvent`] for why that matters.
+//! A field promoted after the legacy contract froze is *additive*: the raw record it came
+//! from is read again, never rewritten, and the promotion is invisible to
+//! [`Event::legacy_content`]. Tool fields are named in [`ToolEvent::derived`] so they stay
+//! out of the byte-identical legacy rendering (see [`ToolEvent`] for why that matters);
+//! [`AssistantMeta`], which carries per-message model and token usage, sits beside the
+//! assistant text rather than inside it, so that text — the whole of an assistant event's
+//! legacy content — cannot move either.
 //!
 //! [`envelope_matches`], [`claude_origin_cwd`], [`claude_git_branch`], and
 //! [`claude_agent_version`] expose the pure, privacy-safe envelope predicates behind `munshi`'s
@@ -171,7 +175,15 @@ pub enum Event {
     /// A user request; `text` is the complete user-authored content.
     User { text: String },
     /// An assistant reply; `text` is the complete assistant-authored content.
-    Assistant { text: String },
+    Assistant {
+        text: String,
+        /// The record's promoted model and token usage, when its source records any
+        /// (issue #77). Boxed because the meta is eight `Option`s wide (200 bytes) against
+        /// a 56-byte enum, and the stream buffers a `Vec<Event>` per record in which most
+        /// events are tool and user events carrying none: inline, it would quadruple the
+        /// size of every event in every transcript to hold one variant's field.
+        meta: Option<Box<AssistantMeta>>,
+    },
     /// Tool activity (invocation or result), with structured fields.
     Tool(ToolEvent),
 }
@@ -192,9 +204,116 @@ impl Event {
     /// `NormalizedEvent.content` (pre-elision).
     pub fn legacy_content(&self) -> String {
         match self {
-            Self::User { text } | Self::Assistant { text } => text.clone(),
+            Self::User { text } | Self::Assistant { text, .. } => text.clone(),
             Self::Tool(tool) => tool.rendered(),
         }
+    }
+
+    /// The promoted per-message model and usage of an assistant event, when its source
+    /// recorded any. `None` for user and tool events, and for assistant events whose
+    /// record carried nothing readable.
+    pub fn assistant_meta(&self) -> Option<&AssistantMeta> {
+        match self {
+            Self::Assistant { meta, .. } => meta.as_deref(),
+            Self::User { .. } | Self::Tool(_) => None,
+        }
+    }
+}
+
+/// What an assistant record says about the API message behind it: which model produced it,
+/// what it cost in tokens, and the id that identifies it (issue #77, for qanungo's cost
+/// lane). Promoted read-time only — it rides *beside* [`Event::Assistant`]'s text, never
+/// inside it, so the legacy content the archive is addressed by cannot move.
+///
+/// Only present when the source recorded at least one of the three. An absent field is an
+/// under-claim the consumer can see and handle; a guessed one silently corrupts a total.
+///
+/// # Deduplicate by `message_id` before summing
+///
+/// One Claude API message reaches the transcript as *several* records — the assistant
+/// text, then each tool call — sharing one `message.id` and repeating that message's
+/// `usage` verbatim on every one of them. The figures describe the message, not the
+/// record: summing the mirror cache's 61,184 assistant records rather than its 29,591
+/// message ids over-counts output tokens by 2.6x. Fold over distinct `message_id`s,
+/// taking one copy per id.
+///
+/// The rule is stated on the type rather than per source because it holds event-wise too:
+/// a record that splits into several assistant events (several `text` blocks) gives each
+/// of them an identical copy of its meta, there being no principled way to divide a
+/// message's cost among its content blocks. Copilot records one message per event, so
+/// deduplicating its `messageId` is a no-op.
+///
+/// # These events are not a billing ledger
+///
+/// A record whose content is only tool calls produces no assistant event at all, so its
+/// message's usage is unreachable through this type: in the same cache, the messages that
+/// do carry assistant text account for 16.4M of 26.2M deduplicated output tokens. What a
+/// consumer can total here is a lower bound on what a session was billed, not the bill.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssistantMeta {
+    /// The model id exactly as the transcript spells it, never normalized and never mapped
+    /// onto a pricing family — including Claude Code's `<synthetic>` placeholder for
+    /// locally-generated messages, whose tokens no vendor billed. Harnesses spell the same
+    /// model differently (`claude-opus-4-8` in Claude Code, `claude-opus-4.8` in Copilot);
+    /// reconciling those spellings is a consumer's job, not this crate's.
+    pub model: Option<String>,
+    /// The message's token figures, when the source records any.
+    pub usage: Option<TokenUsage>,
+    /// The source's own per-message id (Claude `message.id`, Copilot `data.messageId`) —
+    /// the key `usage` must be deduplicated by, per this type's note.
+    pub message_id: Option<String>,
+}
+
+impl AssistantMeta {
+    /// `Some` only when the record said something: a meta with all three fields absent is
+    /// no claim at all, and consumers distinguish "no meta" from "meta with no usage".
+    pub(crate) fn recorded(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
+    }
+}
+
+/// The token figures of one assistant message, each present only where the source records
+/// it as a non-negative integer (issue #77).
+///
+/// A field is `None` when the source did not record it *or* recorded something this crate
+/// will not read as a count — the old Claude Code key sets predate the cache and thinking
+/// figures entirely, and Copilot records no per-message input or cache figures at all.
+/// `None` is never a zero: `Some(0)` is a real count a source reported, and treating
+/// absence as zero turns an under-claim into a wrong total.
+///
+/// These figures are per *message*, not per event: see [`AssistantMeta`] for the
+/// `message_id` deduplication a consumer must do before summing them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Tokens written to the prompt cache. Only the total is promoted; Claude Code's
+    /// `cache_creation` breakdown by TTL bucket is left in the raw record.
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Tokens served from the prompt cache.
+    pub cache_read_input_tokens: Option<u64>,
+    /// Claude Code's `usage.output_tokens_details.thinking_tokens`: the share of
+    /// `output_tokens` spent on extended thinking, so never added to them.
+    pub thinking_tokens: Option<u64>,
+    /// The service tier the message was billed at, verbatim (`standard`, ...).
+    pub service_tier: Option<String>,
+    /// Claude Code's `usage.speed`, verbatim: the serving mode the message was billed at.
+    /// Promoted because it is a rate multiplier and not a description — fast mode bills the
+    /// same model at a higher per-token rate — and this is the only place a transcript says
+    /// which mode a message ran in, so dropping it silently understates a session's cost.
+    pub speed: Option<String>,
+    /// Claude Code's `usage.inference_geo`, verbatim: the inference region, a further
+    /// billing modifier. Promoted for the same reason as `speed`; like every other field
+    /// here it is passed through, never mapped onto a rate — pricing tables belong to the
+    /// consumer.
+    pub inference_geo: Option<String>,
+}
+
+impl TokenUsage {
+    /// `Some` only when the source recorded at least one figure, so an empty or entirely
+    /// unreadable `usage` object reads as no usage rather than as a set of zeroes.
+    pub(crate) fn recorded(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
     }
 }
 

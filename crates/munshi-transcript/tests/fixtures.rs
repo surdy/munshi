@@ -11,8 +11,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use munshi_transcript::{
-    Classification, Event, NON_OBJECT_JSON_KIND, Record, RecordError, SessionSummary, Source,
-    TranscriptStream,
+    AssistantMeta, Classification, Event, NON_OBJECT_JSON_KIND, Record, RecordError,
+    SessionSummary, Source, TokenUsage, TranscriptStream,
 };
 
 fn fixture_root() -> PathBuf {
@@ -86,6 +86,12 @@ const FIXTURES: &[Fixture] = &[
         Source::ClaudeCode,
         "claude-code-shell-command/transcript/0c1a0de0-0000-4000-8000-000000000077.jsonl",
     ),
+    // Issue #77: the assistant key sets a model and token usage are read from, old and new,
+    // including a message split across two records and figures that must not be read.
+    well_formed(
+        Source::ClaudeCode,
+        "claude-code-assistant-usage/transcript/0c1a0de0-0000-4000-8000-000000077002.jsonl",
+    ),
     well_formed(
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
@@ -158,6 +164,10 @@ const FIXTURES: &[Fixture] = &[
     well_formed(
         Source::Copilot,
         "copilot-shell-command/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/events.jsonl",
+    ),
+    well_formed(
+        Source::Copilot,
+        "copilot-assistant-usage/cccccccc-cccc-4ccc-8ccc-cccccccccccc/events.jsonl",
     ),
     well_formed(
         Source::Copilot,
@@ -535,8 +545,8 @@ fn unknown_records_carry_the_raw_record() {
     assert!(raws[0].contains("\"future.private_event\""));
 }
 
-/// Every tool event in a fixture, as `(name, promoted command)`.
-fn tool_commands(source: Source, relative: &str) -> Vec<(Option<String>, Option<String>)> {
+/// Every content event a fixture yields, in order.
+fn content_events(source: Source, relative: &str) -> Vec<Event> {
     stream_fixture(source, relative)
         .iter()
         .filter_map(|item| match item {
@@ -547,6 +557,13 @@ fn tool_commands(source: Source, relative: &str) -> Vec<(Option<String>, Option<
             _ => None,
         })
         .flatten()
+        .collect()
+}
+
+/// Every tool event in a fixture, as `(name, promoted command)`.
+fn tool_commands(source: Source, relative: &str) -> Vec<(Option<String>, Option<String>)> {
+    content_events(source, relative)
+        .into_iter()
         .filter_map(|event| match event {
             Event::Tool(tool) => Some((
                 tool.name().map(ToOwned::to_owned),
@@ -667,6 +684,244 @@ fn promoted_commands_stay_out_of_the_legacy_rendering() {
             }
         }
     }
+}
+
+const CLAUDE_USAGE_FIXTURE: &str =
+    "claude-code-assistant-usage/transcript/0c1a0de0-0000-4000-8000-000000077002.jsonl";
+const COPILOT_USAGE_FIXTURE: &str =
+    "copilot-assistant-usage/cccccccc-cccc-4ccc-8ccc-cccccccccccc/events.jsonl";
+
+/// Every assistant event in a fixture, with the meta promoted onto it.
+fn assistant_metas(source: Source, relative: &str) -> Vec<Option<AssistantMeta>> {
+    content_events(source, relative)
+        .iter()
+        .filter(|event| event.kind() == "assistant")
+        .map(|event| event.assistant_meta().cloned())
+        .collect()
+}
+
+/// The expected meta of a record naming both a model and a message id.
+fn meta(model: &str, message_id: &str, usage: Option<TokenUsage>) -> Option<AssistantMeta> {
+    Some(AssistantMeta {
+        model: Some(model.to_owned()),
+        usage,
+        message_id: Some(message_id.to_owned()),
+    })
+}
+
+/// Issue #77: an assistant event carries the model and token figures its record records —
+/// every figure the pinned key set names, and no figure it does not.
+#[test]
+fn claude_assistant_events_carry_the_model_and_usage_their_record_records() {
+    // The two records of `msg_split` are one API message: each repeats the message's usage
+    // verbatim, and the second splits into two assistant events that both carry it. Summing
+    // these four rows would treble a 16-token message — hence the `message_id` dedup rule.
+    let split = Some(TokenUsage {
+        input_tokens: Some(64),
+        output_tokens: Some(16),
+        cache_creation_input_tokens: Some(0),
+        cache_read_input_tokens: Some(4096),
+        thinking_tokens: Some(0),
+        service_tier: Some("standard".to_owned()),
+        speed: Some("standard".to_owned()),
+        inference_geo: Some("not_available".to_owned()),
+    });
+    assert_eq!(
+        assistant_metas(Source::ClaudeCode, CLAUDE_USAGE_FIXTURE),
+        [
+            // The modern key set, whole: the promoted figures sit beside `cache_creation`,
+            // `server_tool_use`, and `iterations`, which stay in the raw record.
+            meta(
+                "claude-synthetic-opus",
+                "msg_full",
+                Some(TokenUsage {
+                    input_tokens: Some(120),
+                    output_tokens: Some(48),
+                    cache_creation_input_tokens: Some(1024),
+                    cache_read_input_tokens: Some(8192),
+                    thinking_tokens: Some(32),
+                    service_tier: Some("standard".to_owned()),
+                    speed: Some("fast".to_owned()),
+                    inference_geo: Some("us".to_owned()),
+                }),
+            ),
+            meta("claude-synthetic-opus", "msg_split", split.clone()),
+            meta("claude-synthetic-opus", "msg_split", split.clone()),
+            meta("claude-synthetic-opus", "msg_split", split),
+            // `<synthetic>` is a model id like any other: passed through verbatim, never
+            // resolved. Its null tier/speed/geo/details keys read as absent, while its zero
+            // counts are real counts.
+            meta(
+                "<synthetic>",
+                "msg_synthetic",
+                Some(TokenUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(5),
+                    cache_creation_input_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    ..TokenUsage::default()
+                }),
+            ),
+            // An older key set predating the cache, thinking, tier, speed, and geo keys.
+            meta(
+                "claude-synthetic-legacy",
+                "msg_old",
+                Some(TokenUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(3),
+                    ..TokenUsage::default()
+                }),
+            ),
+            // A stringified count, a negative, a float, and a null: none is read as a
+            // number, leaving the usage carrying only the tier it did record.
+            meta(
+                "claude-synthetic-legacy",
+                "msg_unreadable",
+                Some(TokenUsage {
+                    service_tier: Some("standard".to_owned()),
+                    ..TokenUsage::default()
+                }),
+            ),
+            // A record naming no model, no id, and no usage claims nothing at all.
+            None,
+        ]
+    );
+
+    // The pinned 2.1.44 fixtures predate the promotion and were not touched by it: the
+    // same reading gives them the old two-key usage, inventing none of the rest. Their
+    // `msg_a2` record is a `tool_use`-only message, so its usage reaches no assistant
+    // event at all — another reason a cost fold cannot be a per-event sum.
+    let old_keyset = Some(TokenUsage {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        ..TokenUsage::default()
+    });
+    assert_eq!(
+        assistant_metas(
+            Source::ClaudeCode,
+            "claude-code-2.1.44/normal/0c1a0de0-0000-4000-8000-000000000001.jsonl",
+        ),
+        [
+            meta("claude-synthetic", "msg_a1", old_keyset.clone()),
+            meta("claude-synthetic", "msg_a3", old_keyset),
+        ]
+    );
+}
+
+/// Copilot records one output-token count per message and no input, cache, thinking, tier,
+/// speed, or geo figure, so its usage carries that count alone.
+#[test]
+fn copilot_assistant_events_carry_the_model_and_output_token_count() {
+    assert_eq!(
+        assistant_metas(Source::Copilot, COPILOT_USAGE_FIXTURE),
+        [
+            meta(
+                "claude-synthetic-opus",
+                "cccccccc-0000-4000-8000-0000000000a1",
+                Some(TokenUsage {
+                    output_tokens: Some(128),
+                    ..TokenUsage::default()
+                }),
+            ),
+            // No `outputTokens` key: the model and id are still promoted, the usage is not
+            // invented as zero.
+            meta(
+                "claude-synthetic-opus",
+                "cccccccc-0000-4000-8000-0000000000a2",
+                None,
+            ),
+            Some(AssistantMeta {
+                model: None,
+                usage: None,
+                message_id: Some("cccccccc-0000-4000-8000-0000000000a3".to_owned()),
+            }),
+            // A stringified count is not read as a number.
+            meta(
+                "claude-synthetic-opus",
+                "cccccccc-0000-4000-8000-0000000000a4",
+                None,
+            ),
+        ]
+    );
+
+    // The session-level kinds that also name a model — `session.model_change` and
+    // `session.shutdown`, whose `modelMetrics` rolls the whole session's tokens up — stay
+    // bookkeeping: neither attributes a cost to a message.
+    let ignored_kinds: Vec<_> = stream_fixture(Source::Copilot, COPILOT_USAGE_FIXTURE)
+        .iter()
+        .filter_map(|item| match item {
+            Ok(Record {
+                classification: Classification::Ignored { kind },
+                ..
+            }) => Some(kind.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ignored_kinds,
+        ["session.start", "session.model_change", "session.shutdown"]
+    );
+}
+
+/// The negative half: a source that records no per-message model or usage, and the event
+/// kinds that never carry one.
+#[test]
+fn events_whose_records_report_no_usage_carry_no_meta() {
+    // Codex rollout `message` payloads name neither model nor usage (the model they run
+    // under sits on the turn-level `turn_context` record), so no Codex assistant event
+    // gains meta.
+    let codex = assistant_metas(
+        Source::Codex,
+        "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
+    );
+    assert!(!codex.is_empty(), "the codex fixture must have assistants");
+    assert!(codex.iter().all(Option::is_none));
+
+    // User and tool events have no meta to carry, in any fixture.
+    for fixture in FIXTURES {
+        for event in content_events(fixture.source, fixture.path) {
+            if event.kind() != "assistant" {
+                assert!(
+                    event.assistant_meta().is_none(),
+                    "{}: {} event",
+                    fixture.path,
+                    event.kind()
+                );
+            }
+        }
+    }
+}
+
+/// The promotion is additive on the assistant side too: an assistant event's
+/// `legacy_content()` is its message text and nothing else, whatever meta rides beside it.
+/// That string is capture's `NormalizedEvent.content` — what summaries are written from and
+/// what an oversized event's claim ticket is content-addressed by — so meta that reached it
+/// would redraft summaries and orphan tickets.
+#[test]
+fn promoted_assistant_meta_stays_out_of_the_legacy_content() {
+    let mut promoted = 0;
+    for fixture in FIXTURES {
+        for event in content_events(fixture.source, fixture.path) {
+            let Event::Assistant { text, meta } = &event else {
+                continue;
+            };
+            assert_eq!(event.legacy_content(), *text, "{}", fixture.path);
+            // The same event stripped of its meta renders identically: nothing about the
+            // content depends on what was promoted beside it.
+            let stripped = Event::Assistant {
+                text: text.clone(),
+                meta: None,
+            };
+            assert_eq!(
+                event.legacy_content(),
+                stripped.legacy_content(),
+                "{}: meta reached the legacy content",
+                fixture.path
+            );
+            promoted += usize::from(meta.is_some());
+        }
+    }
+    assert!(promoted > 0, "the walk must see promoted meta to guard it");
 }
 
 #[test]

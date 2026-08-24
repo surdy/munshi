@@ -26,4 +26,7 @@ land there as commands over the event store, and curated prose output goes to No
 preserving the existing boundary in which Patwari never interprets, ranks, or searches content.
 
 The working name held: that consumer now exists as the repository `surdy/qanungo`, and its
-metrics pull typed fields into `munshi-transcript` one at a time (issue #77).
+metrics pull typed fields into `munshi-transcript` one at a time (issue #77): a shell `command` for
+the churn metric, then per-message model and token usage for the cost lane. Each promotion re-reads
+the same immutable record rather than rewriting one, which is what lets typed signals keep growing
+under ADR 0011's read-time rule without touching anything already archived.
