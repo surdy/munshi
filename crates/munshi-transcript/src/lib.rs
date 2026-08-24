@@ -288,9 +288,30 @@ impl AssistantMeta {
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    /// Tokens written to the prompt cache. Only the total is promoted; Claude Code's
-    /// `cache_creation` breakdown by TTL bucket is left in the raw record.
+    /// Tokens written to the prompt cache, as `usage.cache_creation_input_tokens` states
+    /// the total.
     pub cache_creation_input_tokens: Option<u64>,
+    /// Tokens written to the 5-minute cache tier, from Claude Code's
+    /// `usage.cache_creation.ephemeral_5m_input_tokens`.
+    ///
+    /// This and [`Self::cache_1h_input_tokens`] are the billing-tier split of
+    /// `cache_creation_input_tokens`: the two TTLs bill at different multiples of the base
+    /// input rate, so a cache write cannot be priced from the total alone. Promoted for
+    /// that reason and no other — the rest of the `cache_creation` object, and the
+    /// `server_tool_use` and `iterations` figures beside it, stay in the raw record.
+    ///
+    /// The buckets are read as a second, independent statement of the same quantity, never
+    /// derived from the total nor it from them, because the archive shows the two can
+    /// disagree: across its 61,184 usage records every one carries both, and they agree on
+    /// all but a single message (repeated over four records) whose total reads 0 while its
+    /// 1-hour bucket reads 2,277 — a per-record sum 9,108 tokens above the total. Prefer
+    /// the buckets where they are present, since the tiers are what bill; treat a
+    /// disagreement as the source's, not this crate's.
+    pub cache_5m_input_tokens: Option<u64>,
+    /// Tokens written to the 1-hour cache tier, from Claude Code's
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`. See [`Self::cache_5m_input_tokens`]
+    /// for why both halves are promoted and how they relate to the total.
+    pub cache_1h_input_tokens: Option<u64>,
     /// Tokens served from the prompt cache.
     pub cache_read_input_tokens: Option<u64>,
     /// Claude Code's `usage.output_tokens_details.thinking_tokens`: the share of

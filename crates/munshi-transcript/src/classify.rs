@@ -584,24 +584,32 @@ fn claude_assistant_meta(message: &Map<String, Value>) -> Option<AssistantMeta> 
 /// The token figures of a Claude Code `message.usage`, taking exactly the keys whose
 /// meaning is pinned across every key set the archive holds.
 ///
-/// Deliberately left in the raw record: `cache_creation`, whose per-TTL ephemeral buckets
-/// re-split the `cache_creation_input_tokens` already promoted; `server_tool_use`, which
-/// counts vendor tool invocations rather than this message's tokens; and `iterations`,
-/// which describes how the message was served rather than what it was billed at. `speed`
-/// and `inference_geo` *are* promoted, despite reading like serving detail, because both
-/// are rate multipliers a cost consumer cannot recover from anywhere else.
+/// Deliberately left in the raw record: `server_tool_use`, which counts vendor tool
+/// invocations rather than this message's tokens, and `iterations`, which describes how the
+/// message was served rather than what it was billed at. `speed` and `inference_geo` *are*
+/// promoted, despite reading like serving detail, because both are rate multipliers a cost
+/// consumer cannot recover from anywhere else — as are `cache_creation`'s two ephemeral
+/// buckets, which the two cache TTLs bill at different rates and which therefore price a
+/// cache write that its total cannot.
 ///
 /// Nothing here is summed or derived — a figure is promoted as recorded or not at all, and
-/// the older key sets that predate a key (no `output_tokens_details`; no `speed`) simply
-/// leave it absent.
+/// the older key sets that predate a key (no `output_tokens_details`; no `cache_creation`;
+/// no `speed`) simply leave it absent. In particular the buckets are not reconciled against
+/// `cache_creation_input_tokens`, nor it against them: they are two statements the source
+/// makes, and the archive holds a message where they disagree.
 fn claude_token_usage(usage: &Map<String, Value>) -> Option<TokenUsage> {
     let details = usage
         .get("output_tokens_details")
         .and_then(Value::as_object);
+    let cache_creation = usage.get("cache_creation").and_then(Value::as_object);
     TokenUsage {
         input_tokens: token_count(usage.get("input_tokens")),
         output_tokens: token_count(usage.get("output_tokens")),
         cache_creation_input_tokens: token_count(usage.get("cache_creation_input_tokens")),
+        cache_5m_input_tokens: cache_creation
+            .and_then(|buckets| token_count(buckets.get("ephemeral_5m_input_tokens"))),
+        cache_1h_input_tokens: cache_creation
+            .and_then(|buckets| token_count(buckets.get("ephemeral_1h_input_tokens"))),
         cache_read_input_tokens: token_count(usage.get("cache_read_input_tokens")),
         thinking_tokens: details.and_then(|details| token_count(details.get("thinking_tokens"))),
         service_tier: usage
@@ -1338,6 +1346,10 @@ mod tests {
                     input_tokens: Some(120),
                     output_tokens: Some(48),
                     cache_creation_input_tokens: Some(1024),
+                    // This record's `cache_creation` names only the 5-minute tier, so the
+                    // 1-hour half stays absent rather than being inferred as the remainder.
+                    cache_5m_input_tokens: Some(1024),
+                    cache_1h_input_tokens: None,
                     cache_read_input_tokens: Some(8192),
                     thinking_tokens: Some(32),
                     service_tier: Some("standard".to_owned()),
@@ -1401,6 +1413,80 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The two cache tiers bill at different multiples of the base input rate, so both
+    /// halves of `usage.cache_creation` are read — under the same discipline as every other
+    /// figure, one key at a time, and never reconciled against their total.
+    #[test]
+    fn claude_cache_creation_buckets_are_read_per_tier() {
+        let usage = |json: &str| {
+            meta_of(Source::ClaudeCode, json)
+                .and_then(|meta| meta.usage)
+                .unwrap_or_default()
+        };
+        let with_cache_creation = |buckets: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","id":"msg_1","model":"claude-opus-synthetic","content":[{{"type":"text","text":"Cached."}}],"usage":{{"cache_creation_input_tokens":1024{buckets}}}}}}}"#
+            )
+        };
+
+        // Both tiers, each from its own key: a transposition fails this.
+        let both = usage(&with_cache_creation(
+            r#","cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":724}"#,
+        ));
+        assert_eq!(both.cache_creation_input_tokens, Some(1024));
+        assert_eq!(both.cache_5m_input_tokens, Some(300));
+        assert_eq!(both.cache_1h_input_tokens, Some(724));
+
+        // The archive's own shape — every write on the 1-hour tier — where the 5-minute
+        // zero is a figure the source reported and not an absence.
+        let archive_shape = usage(&with_cache_creation(
+            r#","cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1024}"#,
+        ));
+        assert_eq!(archive_shape.cache_5m_input_tokens, Some(0));
+        assert_eq!(archive_shape.cache_1h_input_tokens, Some(1024));
+
+        // The buckets are never reconciled with the total, in either direction: a message
+        // whose total says 0 and whose 1-hour bucket says 2,277 is promoted as it stands,
+        // which is a shape the archive holds.
+        let drift = usage(
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_2","model":"claude-opus-synthetic","content":[{"type":"text","text":"Drift."}],"usage":{"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2277}}}}"#,
+        );
+        assert_eq!(drift.cache_creation_input_tokens, Some(0));
+        assert_eq!(drift.cache_1h_input_tokens, Some(2277));
+
+        // An absent object, an object missing a key, values that are not counts, and a
+        // `cache_creation` that is not an object at all: each unreadable half is left
+        // absent on its own, and the total beside it is unaffected.
+        for buckets in [
+            "",
+            r#","cache_creation":{}"#,
+            r#","cache_creation":{"ephemeral_5m_input_tokens":null,"ephemeral_1h_input_tokens":"724"}"#,
+            r#","cache_creation":{"ephemeral_5m_input_tokens":-1,"ephemeral_1h_input_tokens":1.5}"#,
+            r#","cache_creation":7"#,
+            r#","cache_creation":null"#,
+        ] {
+            let usage = usage(&with_cache_creation(buckets));
+            assert_eq!(usage.cache_creation_input_tokens, Some(1024), "{buckets}");
+            assert_eq!(usage.cache_5m_input_tokens, None, "{buckets}");
+            assert_eq!(usage.cache_1h_input_tokens, None, "{buckets}");
+        }
+
+        // One readable half does not require the other.
+        let half = usage(&with_cache_creation(
+            r#","cache_creation":{"ephemeral_1h_input_tokens":724}"#,
+        ));
+        assert_eq!(half.cache_5m_input_tokens, None);
+        assert_eq!(half.cache_1h_input_tokens, Some(724));
+
+        // Buckets alone, with no total, are still a reading: the two are independent.
+        let bucketed = usage(
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_3","model":"claude-opus-synthetic","content":[{"type":"text","text":"Bucketed."}],"usage":{"cache_creation":{"ephemeral_5m_input_tokens":16,"ephemeral_1h_input_tokens":0}}}}"#,
+        );
+        assert_eq!(bucketed.cache_creation_input_tokens, None);
+        assert_eq!(bucketed.cache_5m_input_tokens, Some(16));
+        assert_eq!(bucketed.cache_1h_input_tokens, Some(0));
     }
 
     /// The reason the meta hangs off the record: a message is billed for producing its

@@ -723,7 +723,9 @@ fn meta(model: &str, message_id: &str, usage: Option<TokenUsage>) -> Option<Assi
 #[test]
 fn claude_records_carry_the_model_and_usage_they_record() {
     // `msg_split`'s two records are one API message, each repeating that message's usage
-    // verbatim; `msg_toolonly` and `msg_thinking` yield no assistant event at all.
+    // verbatim; `msg_toolonly` and `msg_thinking` yield no assistant event at all. The
+    // split message predates `cache_creation`, so its buckets are absent while its total
+    // is present — the shape that makes the two independent readings.
     let split = Some(TokenUsage {
         input_tokens: Some(64),
         output_tokens: Some(16),
@@ -733,14 +735,17 @@ fn claude_records_carry_the_model_and_usage_they_record() {
         service_tier: Some("standard".to_owned()),
         speed: Some("standard".to_owned()),
         inference_geo: Some("not_available".to_owned()),
+        ..TokenUsage::default()
     });
     assert_eq!(
         record_metas(Source::ClaudeCode, CLAUDE_USAGE_FIXTURE),
         [
             // A user record is not an assistant record, whatever it carries.
             (vec!["user"], None),
-            // The modern key set, whole: the promoted figures sit beside `cache_creation`,
-            // `server_tool_use`, and `iterations`, which stay in the raw record.
+            // The modern key set, whole: both cache tiers beside their total, and the
+            // `server_tool_use` and `iterations` figures left in the raw record. The write
+            // went to the 5-minute tier here and to the 1-hour tier in the next record, so
+            // a transposed bucket key cannot pass both rows.
             (
                 vec!["assistant"],
                 meta(
@@ -750,11 +755,53 @@ fn claude_records_carry_the_model_and_usage_they_record() {
                         input_tokens: Some(120),
                         output_tokens: Some(48),
                         cache_creation_input_tokens: Some(1024),
+                        cache_5m_input_tokens: Some(1024),
+                        cache_1h_input_tokens: Some(0),
                         cache_read_input_tokens: Some(8192),
                         thinking_tokens: Some(32),
                         service_tier: Some("standard".to_owned()),
                         speed: Some("fast".to_owned()),
                         inference_geo: Some("us".to_owned()),
+                    }),
+                ),
+            ),
+            // The shape the archive actually holds: every cache write on the 1-hour tier.
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-opus",
+                    "msg_buckets",
+                    Some(TokenUsage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(10),
+                        cache_creation_input_tokens: Some(4096),
+                        cache_5m_input_tokens: Some(0),
+                        cache_1h_input_tokens: Some(4096),
+                        cache_read_input_tokens: Some(0),
+                        service_tier: Some("standard".to_owned()),
+                        speed: Some("standard".to_owned()),
+                        inference_geo: Some("not_available".to_owned()),
+                        ..TokenUsage::default()
+                    }),
+                ),
+            ),
+            // The one disagreement the archive holds, reproduced: a total of 0 against a
+            // 1-hour bucket of 2,277. Both are promoted exactly as recorded — reconciling
+            // them would be inventing a figure the source never wrote.
+            (
+                vec!["assistant"],
+                meta(
+                    "claude-synthetic-opus",
+                    "msg_bucket_drift",
+                    Some(TokenUsage {
+                        input_tokens: Some(40),
+                        output_tokens: Some(20),
+                        cache_creation_input_tokens: Some(0),
+                        cache_5m_input_tokens: Some(0),
+                        cache_1h_input_tokens: Some(2277),
+                        cache_read_input_tokens: Some(0),
+                        service_tier: Some("standard".to_owned()),
+                        ..TokenUsage::default()
                     }),
                 ),
             ),
@@ -828,8 +875,10 @@ fn claude_records_carry_the_model_and_usage_they_record() {
                     }),
                 ),
             ),
-            // A stringified count, a negative, a float, and a null: none is read as a
-            // number, leaving the usage carrying only the tier it did record.
+            // A stringified count, a negative, a float, a null, and a `cache_creation`
+            // whose buckets are a string and a null: none is read as a number, leaving the
+            // usage carrying only the tier it did record. A present-but-unreadable bucket
+            // reads exactly like an absent one, since neither is a figure.
             (
                 vec!["assistant"],
                 meta(
@@ -898,11 +947,11 @@ fn every_billed_record_is_reachable_and_summing_records_double_counts() {
             per_message.insert(id, output(meta));
         }
     }
-    assert_eq!(per_message.values().sum::<u64>(), 144);
+    assert_eq!(per_message.values().sum::<u64>(), 174);
 
     // Summing records instead double-charges `msg_split`, which two records both carry.
     let per_record: u64 = rows.iter().map(|(_, meta)| output(meta)).sum();
-    assert_eq!(per_record, 160);
+    assert_eq!(per_record, 190);
 
     // And what the same fold would have reached had the meta hung off assistant events:
     // nothing of `msg_toolonly` (8) or `msg_thinking` (64), the shapes that dominate a real
@@ -915,7 +964,41 @@ fn every_billed_record_is_reachable_and_summing_records_double_counts() {
         .iter()
         .filter_map(|id| per_message.get(id))
         .sum();
-    assert_eq!(reachable_from_assistant_events, 72);
+    assert_eq!(reachable_from_assistant_events, 102);
+}
+
+/// The cache tiers are a second reading of the cache write, not a re-derivation of the
+/// total: across the fixture the two disagree by exactly the drift the archive holds, and
+/// the crate reports both rather than choosing between them.
+#[test]
+fn cache_tiers_are_promoted_beside_their_total_and_never_reconciled() {
+    let mut totals = 0;
+    let mut tiers = 0;
+    let mut with_tiers = 0;
+    let mut total_without_tiers = 0;
+    for (_, meta) in record_metas(Source::ClaudeCode, CLAUDE_USAGE_FIXTURE) {
+        let Some(usage) = meta.and_then(|meta| meta.usage) else {
+            continue;
+        };
+        totals += usage.cache_creation_input_tokens.unwrap_or(0);
+        match (usage.cache_5m_input_tokens, usage.cache_1h_input_tokens) {
+            (None, None) => {
+                total_without_tiers += usize::from(usage.cache_creation_input_tokens.is_some());
+            }
+            (five_minute, one_hour) => {
+                with_tiers += 1;
+                tiers += five_minute.unwrap_or(0) + one_hour.unwrap_or(0);
+            }
+        }
+    }
+    // Three records split their write by tier; three state a total with no split at all —
+    // what the key set looked like before `cache_creation` existed, and what an unreadable
+    // `cache_creation` degrades to.
+    assert_eq!((with_tiers, total_without_tiers), (3, 3));
+    // 1024 + 4096 + 0 against 1024 + 4096 + 2277: `msg_bucket_drift`'s total reads 0 while
+    // its 1-hour bucket reads 2,277, exactly as one archived message does.
+    assert_eq!((totals, tiers), (5120, 7397));
+    assert_eq!(tiers - totals, 2277);
 }
 
 /// Copilot records one output-token count per message and no input, cache, thinking, tier,
@@ -1051,7 +1134,9 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
             };
             // Every key `AssistantMeta` is read from, on the record types it reads them
             // from — `message.id` included, which the classification never touches, so
-            // removing it must not move a single byte of the rendering.
+            // removing it must not move a single byte of the rendering. Nested keys need
+            // no entry of their own: deleting `message.usage` takes `cache_creation`'s
+            // per-tier buckets and `output_tokens_details` with it.
             //
             // Two deliberate exceptions, both keys this promotion does not read: Copilot's
             // `skill.invoked` renders a `model` card field of its own, and Copilot's
