@@ -878,10 +878,14 @@ fn capture_hostname() -> Option<String> {
 /// The capture machine's UTC offset at `captured_at`, as RFC3339 spells it (`+05:30`, `-08:00`,
 /// `+00:00`).
 ///
-/// Computed at that persisted instant rather than at "now" so it stays deterministic across retries
-/// of one attempt, honoring `CaptureContext`'s contract that a reused `capture_id` re-serializes to
-/// the same canonical manifest — a retry that crossed a DST boundary would otherwise report a
-/// different offset than the capture it is retrying.
+/// Computed at that persisted instant rather than at "now", honoring `CaptureContext`'s contract
+/// that a reused `capture_id` re-serializes to the same canonical manifest: a retry that crossed a
+/// DST boundary would otherwise report a different offset than the capture it is retrying. The
+/// determinism is in `(record, captured_at)`, not in the ambient environment — a zone-identity
+/// change (a machine that travels) or a hostname change between attempts still alters the manifest.
+/// That window is narrow by construction: the normal retry path resumes the persisted upload id and
+/// never re-sends the manifest, so surfacing it as a `capture_id_conflict` also takes a lost or
+/// expired upload.
 ///
 /// Capture-time offset stands in for the whole session by consumer decision: the heatmap is about
 /// habits, so a session that spans a DST change or a flight is close enough. We record honestly what
@@ -912,9 +916,9 @@ fn local_gmtoff_seconds(unix_seconds: i64) -> Option<i64> {
 
 /// Renders seconds east of UTC as `[+-]HH:MM`, or `None` when that shape cannot represent them.
 fn format_utc_offset(gmtoff_seconds: i64) -> Option<String> {
-    // A zone offset at sub-minute precision has no RFC3339 spelling, and one past 99 hours has no
-    // two-digit one. Both are refused rather than truncated: a consumer's parse must not have to
-    // distinguish a real offset from a rounded one.
+    // A zone offset at sub-minute precision has no RFC3339 spelling, and one past 23 hours has no
+    // RFC3339 spelling either (offsets cap at +/-23:59). Both are refused rather than truncated: a
+    // consumer's parse must not have to distinguish a real offset from a rounded one.
     if gmtoff_seconds % 60 != 0 {
         return None;
     }
