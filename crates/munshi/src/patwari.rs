@@ -241,6 +241,12 @@ pub struct CaptureContext {
     pub captured_at: String,
     pub source_cursor: Option<String>,
     pub source_state_hash: Option<String>,
+    /// Opaque capture provenance, returned verbatim by Patwari and never interpreted by it. Keys
+    /// are lowercase snake with short sanitized values; today `origin` (issue #40) plus the
+    /// capture machine's `utc_offset` and `hostname` (issue #77, consumed by qanungo's activity
+    /// heatmap and per-device scope). Every key is individually optional and readers ignore ones
+    /// they do not know, so this map extends without a schema change and older captures that lack
+    /// a key stay readable. See `capture_source_metadata`.
     pub source_metadata: BTreeMap<String, String>,
     pub project: Option<String>,
     pub repository: Option<String>,
@@ -842,6 +848,84 @@ fn now_rfc3339() -> String {
     DateTime::<Utc>::from_timestamp(secs, 0)
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is representable"))
         .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+// ---------------------------------------------------------------------------
+// Capture-machine provenance (issue #77)
+// ---------------------------------------------------------------------------
+//
+// Two keys ride the opaque `source_metadata` map so they need no Patwari change: the server returns
+// the map verbatim through the manifest qanungo already parses. Both are absence-tolerant by
+// construction — the map is opaque and readers ignore keys they do not know — so a capture from an
+// older munshi, or one whose machine could not answer, simply lacks them and every consumer keeps
+// working. Consumers are qanungo's activity heatmap (`utc_offset`, to place a session in the
+// operator's own day rather than in UTC) and its per-device scope (`hostname`).
+//
+// Their value accrues only from ship time: a session captured without them stays heatmap-blind
+// forever, since nothing outside the capture machine can reconstruct what its clock read.
+
+/// The capture machine's hostname, sanitized to the same slug memory-sync already persists as the
+/// machine label. Deliberately reuses `memory_sync`'s pair rather than re-deriving: a machine must
+/// present one spelling of itself across the whole system, so qanungo can scope by device and have
+/// it line up with everything else munshi labels. `None` when the OS declines to answer or the
+/// hostname sanitizes away to nothing — better an absent key than an empty one.
+fn capture_hostname() -> Option<String> {
+    let sanitized =
+        crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string());
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+/// The capture machine's UTC offset at `captured_at`, as RFC3339 spells it (`+05:30`, `-08:00`,
+/// `+00:00`).
+///
+/// Computed at that persisted instant rather than at "now" so it stays deterministic across retries
+/// of one attempt, honoring `CaptureContext`'s contract that a reused `capture_id` re-serializes to
+/// the same canonical manifest — a retry that crossed a DST boundary would otherwise report a
+/// different offset than the capture it is retrying.
+///
+/// Capture-time offset stands in for the whole session by consumer decision: the heatmap is about
+/// habits, so a session that spans a DST change or a flight is close enough. We record honestly what
+/// the clock said and interpret no further.
+///
+/// `None` rather than a malformed value whenever the platform hands back something that will not
+/// spell as `[+-]HH:MM` — a zone at sub-minute precision (the pre-standardization LMT entries still
+/// in the tz database) or an hour count too large to render in two digits. A consumer parsing this
+/// key may assume the shape or assume nothing.
+fn capture_utc_offset(captured_at: &str) -> Option<String> {
+    let instant = DateTime::parse_from_rfc3339(captured_at).ok()?;
+    format_utc_offset(local_gmtoff_seconds(instant.timestamp())?)
+}
+
+/// Seconds east of UTC that the machine's local zone applied at `unix_seconds`, via the platform's
+/// own tz database. `None` if the C library rejects the instant.
+fn local_gmtoff_seconds(unix_seconds: i64) -> Option<i64> {
+    let time = unix_seconds as libc::time_t;
+    // SAFETY: `localtime_r` fills the caller-owned `tm` (a plain integer struct, sound to zero) and
+    // returns null on failure. It is the reentrant variant precisely so it holds no shared state.
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::localtime_r(&time, &mut parts) };
+    if result.is_null() {
+        return None;
+    }
+    Some(parts.tm_gmtoff as i64)
+}
+
+/// Renders seconds east of UTC as `[+-]HH:MM`, or `None` when that shape cannot represent them.
+fn format_utc_offset(gmtoff_seconds: i64) -> Option<String> {
+    // A zone offset at sub-minute precision has no RFC3339 spelling, and one past 99 hours has no
+    // two-digit one. Both are refused rather than truncated: a consumer's parse must not have to
+    // distinguish a real offset from a rounded one.
+    if gmtoff_seconds % 60 != 0 {
+        return None;
+    }
+    let sign = if gmtoff_seconds < 0 { '-' } else { '+' };
+    let magnitude = gmtoff_seconds.unsigned_abs();
+    let hours = magnitude / 3600;
+    let minutes = (magnitude % 3600) / 60;
+    if hours > 23 {
+        return None;
+    }
+    Some(format!("{sign}{hours:02}:{minutes:02}"))
 }
 
 /// Generates a version-4 UUID string from operating-system randomness, used for the persistent
@@ -1450,6 +1534,31 @@ fn record_upload_failure(
     })
 }
 
+/// Builds the capture's opaque `source_metadata` map: everything munshi knows about *this
+/// observation* that has no typed home in the manifest. Every key is lowercase snake, every value a
+/// short sanitized string, and every one of them is optional — the map is opaque to Patwari, which
+/// returns it verbatim, so a reader that does not recognize a key ignores it.
+fn capture_source_metadata(record: &SessionRecord, captured_at: &str) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    // A recorded-evidence identity (issue #40) is flagged in the capture metadata so a consumer can
+    // distinguish it from a live-resolved one; live identities add nothing.
+    if let Some(marker) = record
+        .project
+        .as_ref()
+        .and_then(|project| project.origin.recorded_marker())
+    {
+        metadata.insert("origin".to_owned(), marker.to_owned());
+    }
+    // Capture-machine provenance (issue #77), each omitted rather than guessed when unavailable.
+    if let Some(offset) = capture_utc_offset(captured_at) {
+        metadata.insert("utc_offset".to_owned(), offset);
+    }
+    if let Some(hostname) = capture_hostname() {
+        metadata.insert("hostname".to_owned(), hostname);
+    }
+    metadata
+}
+
 /// Performs the network upload for one revision: resolve the capture identity, assemble the
 /// manifest, connect, and run the resumable upload, persisting the server upload id for resume.
 fn run_upload(
@@ -1477,14 +1586,7 @@ fn run_upload(
         captured_at: prep.captured_at.clone(),
         source_cursor: Some(record.current_revision.to_string()),
         source_state_hash: record.current_summary_hash.clone(),
-        // A recorded-evidence identity (issue #40) is flagged in the capture metadata so a
-        // consumer can distinguish it from a live-resolved one; live identities add nothing.
-        source_metadata: record
-            .project
-            .as_ref()
-            .and_then(|project| project.origin.recorded_marker())
-            .map(|marker| BTreeMap::from([("origin".to_owned(), marker.to_owned())]))
-            .unwrap_or_default(),
+        source_metadata: capture_source_metadata(record, &prep.captured_at),
         project: record
             .project
             .as_ref()
@@ -2314,6 +2416,192 @@ mod tests {
             .unwrap();
         assert!(digest.starts_with("sha256:"));
         assert_eq!(digest.len(), "sha256:".len() + 64);
+    }
+
+    /// The shape contract consumers may rely on: `[+-]HH:MM`, always two-digit, never anything else.
+    fn assert_rfc3339_offset_shape(offset: &str) {
+        let bytes = offset.as_bytes();
+        assert_eq!(offset.len(), 6, "offset {offset:?} is not six characters");
+        assert!(
+            bytes[0] == b'+' || bytes[0] == b'-',
+            "offset {offset:?} lacks a leading sign"
+        );
+        assert_eq!(bytes[3], b':', "offset {offset:?} lacks the HH:MM colon");
+        assert!(
+            offset[1..3].chars().all(|c| c.is_ascii_digit())
+                && offset[4..6].chars().all(|c| c.is_ascii_digit()),
+            "offset {offset:?} has non-digit fields"
+        );
+    }
+
+    #[test]
+    fn utc_offset_renders_every_real_zone_as_rfc3339() {
+        // Whole hours either side of UTC, plus the half- and quarter-hour zones that exist precisely
+        // to catch an implementation that assumed offsets are integral hours.
+        assert_eq!(format_utc_offset(5 * 3600 + 30 * 60).unwrap(), "+05:30"); // Kolkata
+        assert_eq!(format_utc_offset(-8 * 3600).unwrap(), "-08:00"); // Los Angeles
+        assert_eq!(format_utc_offset(0).unwrap(), "+00:00"); // UTC renders positive
+        assert_eq!(format_utc_offset(5 * 3600 + 45 * 60).unwrap(), "+05:45"); // Kathmandu
+        assert_eq!(format_utc_offset(12 * 3600 + 45 * 60).unwrap(), "+12:45"); // Chatham
+        assert_eq!(format_utc_offset(-(9 * 3600 + 30 * 60)).unwrap(), "-09:30"); // Marquesas
+        assert_eq!(format_utc_offset(14 * 3600).unwrap(), "+14:00"); // Kiritimati, the maximum
+        assert_eq!(format_utc_offset(-(60 * 60) - 30 * 60).unwrap(), "-01:30");
+        for offset in [
+            format_utc_offset(5 * 3600 + 30 * 60).unwrap(),
+            format_utc_offset(-8 * 3600).unwrap(),
+            format_utc_offset(0).unwrap(),
+        ] {
+            assert_rfc3339_offset_shape(&offset);
+        }
+    }
+
+    #[test]
+    fn utc_offset_is_omitted_rather_than_rendered_malformed() {
+        // Amsterdam's pre-1937 LMT was +00:19:32. A zone at sub-minute precision has no RFC3339
+        // spelling at all, so the key is dropped rather than silently rounded to +00:19.
+        assert_eq!(format_utc_offset(19 * 60 + 32), None);
+        assert_eq!(format_utc_offset(-1), None);
+        // An hour count that will not fit two digits would break the shape contract.
+        assert_eq!(format_utc_offset(24 * 3600), None);
+        assert_eq!(format_utc_offset(-100 * 3600), None);
+    }
+
+    #[test]
+    fn capture_utc_offset_is_stable_across_retries_of_one_attempt() {
+        // `captured_at` is minted once and persisted, so resolving the offset at that instant (not
+        // at "now") is what keeps a reused capture id re-serializing to the same manifest.
+        let captured_at = "2026-07-25T00:00:00Z";
+        let first = capture_utc_offset(captured_at);
+        let second = capture_utc_offset(captured_at);
+        assert_eq!(first, second);
+        if let Some(offset) = first {
+            assert_rfc3339_offset_shape(&offset);
+        }
+        // A `captured_at` that is not RFC3339 yields no key rather than a guess.
+        assert_eq!(capture_utc_offset("not a timestamp"), None);
+    }
+
+    #[test]
+    fn capture_hostname_reuses_the_memory_sync_sanitizer() {
+        // The point of sharing is that a machine spells itself one way everywhere. These are the
+        // rules memory-sync's own label test pins; asserting them here would be circular if the
+        // function were forked, which is exactly why it is not.
+        assert_eq!(
+            crate::memory_sync::sanitize_machine_label("Surdys-MacBook-Pro.local"),
+            "surdys-macbook-pro"
+        );
+        assert_eq!(
+            crate::memory_sync::sanitize_machine_label("test's MacBook Pro"),
+            "test-s-macbook-pro"
+        );
+        assert_eq!(
+            crate::memory_sync::sanitize_machine_label("BOX.Example.COM"),
+            "box.example.com"
+        );
+
+        // Whatever this machine is called, the capture key is that same sanitized label.
+        let expected =
+            crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string());
+        if expected.is_empty() {
+            assert_eq!(capture_hostname(), None);
+        } else {
+            assert_eq!(capture_hostname().as_deref(), Some(expected.as_str()));
+            // Sanitized means routing-safe: no whitespace, no uppercase, no shell-hostile bytes.
+            assert!(
+                expected.chars().all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, '.' | '_' | '-')),
+                "sanitized hostname {expected:?} leaked an unsafe character"
+            );
+        }
+    }
+
+    #[test]
+    fn built_manifest_carries_capture_machine_provenance() {
+        use tempfile::TempDir;
+
+        // Go through the real construction path — a `SessionRecord` into `capture_source_metadata`
+        // into `build_manifest` — so this fails if the wiring is dropped, not just the helpers.
+        let directory = TempDir::new().unwrap();
+        let transcript_path = directory.path().join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = archived_record("11111111-1111-1111-8111-111111111111", &transcript_path);
+
+        let captured_at = "2026-07-25T00:00:00Z";
+        let metadata = capture_source_metadata(&record, captured_at);
+        let artifacts = prepare_artifacts(vec![ArtifactSource {
+            logical_path: "summary.md".to_owned(),
+            media_type: Some("text/markdown".to_owned()),
+            bytes: b"# Title\n".to_vec(),
+        }]);
+        let manifest = build_manifest(
+            &SessionContext {
+                source_agent: "claude-code".to_owned(),
+                source_session_id: record.session_id.clone(),
+            },
+            &CaptureContext {
+                captured_at: captured_at.to_owned(),
+                source_cursor: Some("1".to_owned()),
+                source_state_hash: None,
+                source_metadata: metadata,
+                project: None,
+                repository: None,
+                branch: None,
+                source_agent_version: None,
+                artifact_set_version: CURRENT_ARTIFACT_SET_VERSION,
+                munshi_version: Some("0.1.0".to_owned()),
+            },
+            &artifacts,
+        );
+
+        let source_metadata = &manifest["capture"]["source_metadata"];
+        let offset = source_metadata["utc_offset"]
+            .as_str()
+            .expect("capture carries a utc_offset");
+        assert_rfc3339_offset_shape(offset);
+        let hostname = source_metadata["hostname"]
+            .as_str()
+            .expect("capture carries a hostname");
+        assert!(!hostname.is_empty());
+        assert_eq!(
+            hostname,
+            crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string())
+        );
+        // This record has a live-resolved identity, so `origin` stays absent — the machine keys do
+        // not drag an unrelated marker in with them.
+        assert!(source_metadata.get("origin").is_none());
+    }
+
+    #[test]
+    fn capture_metadata_keeps_origin_beside_the_machine_keys() {
+        use munshi_transcript::{ProjectIdentity, ProjectOrigin};
+        use tempfile::TempDir;
+
+        let directory = TempDir::new().unwrap();
+        let transcript_path = directory.path().join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let mut record = archived_record("22222222-2222-2222-8222-222222222222", &transcript_path);
+        record.project = Some(ProjectIdentity {
+            identity: "github.com/o/r".to_owned(),
+            component: "r".to_owned(),
+            project: "o/r".to_owned(),
+            repository: Some("github.com/o/r".to_owned()),
+            branch: Some("main".to_owned()),
+            origin: ProjectOrigin::Recorded,
+        });
+
+        let metadata = capture_source_metadata(&record, "2026-07-25T00:00:00Z");
+        assert_eq!(metadata.get("origin").map(String::as_str), Some("recorded"));
+        assert!(metadata.contains_key("utc_offset"));
+        assert!(metadata.contains_key("hostname"));
+        // Keys are lowercase snake and values stay short enough to be provenance, not payload.
+        for (key, value) in &metadata {
+            assert!(
+                key.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "metadata key {key:?} is not lowercase snake"
+            );
+            assert!(value.len() <= 64, "metadata value {value:?} is too long");
+        }
     }
 
     #[test]

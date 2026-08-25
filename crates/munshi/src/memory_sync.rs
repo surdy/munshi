@@ -221,7 +221,10 @@ fn default_machine_label() -> String {
     }
 }
 
-fn hostname_string() -> String {
+/// The machine's hostname as the OS reports it, unsanitized. Shared with capture provenance
+/// (`patwari::capture_hostname`) rather than re-derived there: the one-machine-mirrored-as-two
+/// defect noted above is exactly what a second, differently-spelled lookup would reintroduce.
+pub(crate) fn hostname_string() -> String {
     let mut buffer = [0u8; 256];
     let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
     if result != 0 {
@@ -232,8 +235,9 @@ fn hostname_string() -> String {
 }
 
 /// Reduces a label to a routing-safe slug: ASCII alphanumerics, `.`, `_`, and `-`; everything
-/// else becomes `-`; a trailing `.local` (macOS mDNS suffix) is dropped.
-fn sanitize_machine_label(label: &str) -> String {
+/// else becomes `-`; a trailing `.local` (macOS mDNS suffix) is dropped. Shared with capture
+/// provenance so a machine's `hostname` key and its memory-sync label are the same string.
+pub(crate) fn sanitize_machine_label(label: &str) -> String {
     let trimmed = label
         .trim()
         .trim_end_matches(".local")
