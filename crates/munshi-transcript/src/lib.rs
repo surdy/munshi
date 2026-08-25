@@ -417,8 +417,25 @@ pub enum CompactionPhase {
 /// between the two records leaves a `Start` a `Complete`-fold does not see; the archive holds
 /// no such session, but a transcript captured mid-compaction could. And a `Complete` may have
 /// failed — [`Self::succeeded`] is `Some(false)` on 3 of the cache's 367 — so a fold counting
-/// *effective* compactions must filter on it, while a fold counting how often the operator
-/// hit the context wall should not.
+/// *effective* compactions excludes those, while a fold counting how often the operator hit
+/// the context wall keeps them.
+///
+/// That exclusion is spelled `succeeded != Some(false)`, never `succeeded == Some(true)`. The
+/// two differ on every Claude Code compaction: that envelope states no outcome at all, so
+/// `succeeded` is `None` on all 9 of the cache's boundaries and the `== Some(true)` spelling
+/// silently scores the whole harness zero. The rule that reads the same in both is "not known
+/// to have failed", which is what `None` means here.
+///
+/// # Summing the figures needs the same phase filter as counting the records
+///
+/// The rule above is about counting, and it applies unchanged to adding up. Both halves of a
+/// Copilot compaction can state [`Self::pre_tokens`] — `currentTokens` on the start and
+/// `preCompactionTokens` on the completion — and on the 5 newer pairs those are one quantity
+/// written twice, exactly as the two records are one compaction written twice. So a total of
+/// "context compacted away", or a mean pre-compaction size, is folded over one phase too;
+/// summing every marker double-counts Copilot and leaves Claude Code alone, which is the same
+/// wrong number in a different unit. [`Self::token_limit`] repeats across the halves the same
+/// way.
 ///
 /// # Absence is not "no compaction"
 ///
@@ -433,9 +450,14 @@ pub struct Compaction {
     /// Why the harness compacted, verbatim: Claude Code's `compactMetadata.trigger`
     /// (`manual` on all 9 of the cache's boundary records) and Copilot's `trigger` (`threshold`,
     /// on 5 of its 367 pairs). **Nearly always absent for Copilot** — the key is a recent
-    /// addition to that envelope — so a consumer that splits sessions by manual against
-    /// automatic compaction can do it for Claude Code and must report the Copilot split as
-    /// unknown rather than defaulting it either way.
+    /// addition to that envelope — so a consumer splitting sessions by manual against
+    /// automatic compaction must report the Copilot split as unknown rather than defaulting
+    /// it either way.
+    ///
+    /// The Claude Code split is available but, on this archive, degenerate: the key is
+    /// present on every boundary and every one of them reads `manual`. So a split computed
+    /// today is not evidence that automatic compaction is rare — it is a window in which it
+    /// was never observed, and a consumer should say which of those it is claiming.
     pub trigger: Option<String>,
     /// Copilot's `success`. `None` where the source states nothing, which is every
     /// [`CompactionPhase::Start`] (the outcome is not known yet) and every Claude Code
@@ -450,10 +472,10 @@ pub struct Compaction {
     /// succeeded, but on only 5 Copilot starts. A start that lacks it still states the
     /// three components below, whose sum the archive shows equal to the paired completion's
     /// `preCompactionTokens` in 363 of the 364 pairs both figures exist for — and *unequal*
-    /// in the remaining one (400,754 against 403,971). So a consumer may add the components
-    /// up knowing what it is doing; this crate will not do the addition for it, because a
-    /// derived figure that disagrees with a recorded one in one case out of 364 is a figure
-    /// no source ever wrote.
+    /// in the remaining one, where the components sum to 430,754 against a recorded 403,971,
+    /// a 26,783-token gap. So a consumer may add the components up knowing what it is doing;
+    /// this crate will not do the addition for it, because a derived figure that overstates a
+    /// recorded one by 6.6% in one case out of 364 is a figure no source ever wrote.
     pub pre_tokens: Option<u64>,
     /// How large the context was left, from Claude Code's `compactMetadata.postTokens` and
     /// Copilot's `postCompactionTokens`. Copilot records it on only 3 of 367 completions,

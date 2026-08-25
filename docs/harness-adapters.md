@@ -223,7 +223,10 @@ plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `c
 - **Normal** — user prompt, assistant replies, and paired `tool_use`/`tool_result` blocks.
 - **Resumed** — the transcript opens with a `summary` record and continues appending to
   the same session; Munshi reprocesses it as a delta into a new summary revision on the stable
-  archive path.
+  archive path. The `summary` record is a phase-0 observation that the current mirror cache no
+  longer reproduces — it holds zero of them across 346 Claude Code transcripts, the same
+  measurement that corrected the record-mapping table above — so treat the shape as historical
+  rather than current. The kind stays in the ignored table either way; nothing depends on it.
 - **Compacted** — mid-session, the CLI writes a `system` record with `subtype: "compact_boundary"`
   whose `compactMetadata` states the trigger and the context size on either side of the boundary,
   followed by a `user` record flagged `isCompactSummary` carrying the summary it produced (a

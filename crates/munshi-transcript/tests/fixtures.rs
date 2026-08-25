@@ -1373,19 +1373,25 @@ fn every_compaction_marker_stays_in_the_census_it_was_already_in() {
     // The whole byte-identity argument for this promotion, stated as a test: nothing it
     // reads is content, so no record it touches can gain, lose or change an event. A future
     // change that typed a marker as an event would fail here before it reached the archive.
-    for (source, relative) in [
-        (Source::ClaudeCode, CLAUDE_COMPACTION_FIXTURE),
-        (Source::Copilot, COPILOT_COMPACTION_FIXTURE),
-    ] {
-        for (tag, compaction) in record_compactions(source, relative) {
+    //
+    // Walked over every fixture rather than the two compaction ones, because the record this
+    // design most plausibly grows to read is Claude Code's `isCompactSummary` user message —
+    // which is content, appears in fixtures of its own, and is declined on purpose. Reading
+    // it would have to fail somewhere, and this is where.
+    let mut markers = 0;
+    for fixture in FIXTURES {
+        for (tag, compaction) in record_compactions(fixture.source, fixture.path) {
             if compaction.is_some() {
+                markers += 1;
                 assert!(
                     tag.starts_with("ignored:"),
-                    "{relative}: a compaction marker left its census as {tag}"
+                    "{}: a compaction marker left its census as {tag}",
+                    fixture.path
                 );
             }
         }
     }
+    assert!(markers > 0, "the walk must find a marker to prove anything");
 }
 
 #[test]
@@ -1453,12 +1459,14 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
             // either would change the rendering for reasons that have nothing to do with
             // the promotion, proving nothing.
             //
-            // The compaction promotion (issue #77) strips alongside it. `compactMetadata`
-            // is nested, so deleting it takes every figure with it; the Copilot markers keep
-            // their whole `data` object, since the promotion reads keys straight off it and
-            // the classification reads nothing there at all. `subtype` is the one key held
-            // back on purpose: it is what tells a `compact_boundary` from the other `system`
-            // records, and removing it would test the fixture rather than the rendering.
+            // The compaction promotion (issue #77) strips alongside it, and needs no
+            // exception at all: `compactMetadata` is nested, so deleting it takes every
+            // figure with it, and the Copilot markers lose their whole `data` object, since
+            // the promotion reads keys straight off it and the classification reads nothing
+            // there. `subtype` goes too, and that is the sharpest case in the walk — it is
+            // the key that tells a `compact_boundary` from every other `system` record, yet
+            // a `system` record classifies `Ignored { kind: "system" }` whatever its subtype
+            // says, so its removal must not move a byte either.
             let stripped_keys = match value.get("type").and_then(serde_json::Value::as_str) {
                 Some("assistant") => Some(("message", ["id", "model", "usage"].as_slice())),
                 Some("assistant.message") => Some(("data", ["model", "outputTokens"].as_slice())),
@@ -1474,15 +1482,26 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
                 }
             }
             if let Some(object) = value.as_object_mut() {
-                let compaction_key = match object.get("type").and_then(serde_json::Value::as_str) {
-                    Some("system") => Some("compactMetadata"),
-                    Some("session.compaction_start" | "session.compaction_complete") => {
-                        Some("data")
-                    }
-                    _ => None,
-                };
-                if let Some(key) = compaction_key {
-                    stripped_compactions += usize::from(object.remove(key).is_some());
+                // Counted only where the record really is a marker, so the deliberate decoys
+                // — a `system` record of another subtype carrying a `compactMetadata`-shaped
+                // key — cannot keep the counter above zero while every real marker has
+                // quietly stopped being stripped.
+                let boundary = object.get("subtype").and_then(serde_json::Value::as_str)
+                    == Some("compact_boundary");
+                let (keys, marker): (&[&str], bool) =
+                    match object.get("type").and_then(serde_json::Value::as_str) {
+                        Some("system") => (["compactMetadata", "subtype"].as_slice(), boundary),
+                        Some("session.compaction_start" | "session.compaction_complete") => {
+                            (["data"].as_slice(), true)
+                        }
+                        _ => (&[], false),
+                    };
+                let mut removed = 0;
+                for key in keys {
+                    removed += usize::from(object.remove(*key).is_some());
+                }
+                if marker && removed > 0 {
+                    stripped_compactions += 1;
                 }
             }
             stripped.push_str(&value.to_string());

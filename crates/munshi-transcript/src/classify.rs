@@ -270,16 +270,22 @@ fn copilot_assistant_meta(data: &Map<String, Value>) -> Option<AssistantMeta> {
 /// `session.compaction_start` states the pre-compaction context as a three-way breakdown
 /// (`systemTokens` / `conversationTokens` / `toolDefinitionsTokens`, on all 367 of the mirror
 /// cache's starts) and, in the newer envelope only, that breakdown's total as
-/// `currentTokens` alongside a `tokenLimit` and a `trigger` (5 of 367). The total is read as
-/// `pre_tokens` where the source writes it, and never computed from the components where it
-/// does not — the archive holds a pair whose components sum to 400,754 against a recorded
-/// 403,971.
+/// `currentTokens` (5 of 367). The total is read as `pre_tokens` where the source writes it,
+/// and never computed from the components where it does not — the archive holds a pair whose
+/// components sum to 430,754 against a recorded 403,971.
 ///
 /// `session.compaction_complete` states `preCompactionTokens` and `success`, plus
 /// `postCompactionTokens` on 3 records. Its `systemTokens` / `conversationTokens` /
 /// `toolDefinitionsTokens` — spelled identically, present on 1 record — describe the context
 /// the compaction *left*, so they are deliberately not read: filing them as the pre-compaction
 /// breakdown would report a post-compaction figure as its own opposite.
+///
+/// `trigger` and `tokenLimit` are the two keys read *outside* the phase split, because they
+/// are the two whose meaning does not turn on it: a trigger names why this compaction
+/// happened and a limit names the window it happened against, and both halves state the same
+/// answer. The newer envelope writes them on the start and the completion alike — 5 of each
+/// across the cache, the same 5 pairs — which is why the promoted figures repeat across a
+/// pair and a consumer folds them over one phase (see [`crate::Compaction`]).
 ///
 /// Deliberately left in the raw record. `summaryContent`, the compaction summary itself:
 /// this promotion types the *fact and size* of a compaction, and hanging a multi-kilobyte
@@ -1900,6 +1906,25 @@ mod tests {
                 post_tokens: Some(11193),
                 ..marker(CompactionPhase::Complete)
             })
+        );
+
+        // The phase split holds in the directions no source writes, too, so a fallback added
+        // to either arm fails here rather than surviving: a start carrying a completion's
+        // `preCompactionTokens`, `postCompactionTokens` and `success` reads none of them, and
+        // a completion carrying a start's `currentTokens` reads that neither.
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_start","data":{"preCompactionTokens":999999,"postCompactionTokens":888888,"success":true}}"#,
+            ),
+            Some(marker(CompactionPhase::Start))
+        );
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_complete","data":{"currentTokens":999999}}"#,
+            ),
+            Some(marker(CompactionPhase::Complete))
         );
 
         // Symmetrically, a start's `preCompactionTokens` is not a key that envelope writes,
