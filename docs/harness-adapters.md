@@ -187,6 +187,20 @@ ADR 0010), `tool.user_requested` (a user-initiated tool call with the exact
 `requestId` and is required to have one). Typing these was count-affecting —
 `tool_activities` grows for sessions containing them — hence normalizer version 3.
 
+`skill.invoked` additionally promotes a derived `skill` key (issue #77), which restates the
+record's own `name`. The duplication is deliberate: on Claude Code's side of a cross-harness
+fold every skill invocation is a `tool_use` whose `name` reads `Skill`, so `name` answers two
+different questions and `skill` answers one. 19 records across the mirror cache, in 19 of its
+388 Copilot transcripts, naming 3 distinct skills.
+
+**Slash commands are not typed for this harness, and that is a survey finding rather than a
+gap.** The CLI records one as `user.message` prose — `data.content` reading `/chronicle
+improve` — with no marker, no name key, and no structure. The mirror cache holds 4
+`user.message` records opening with a `/`, one of which is `"/tmp/mode-mock.png does not
+exist"`: a sentence about a file, in the identical shape. Nothing in the envelope separates
+them, so nothing is read and a consumer must treat Copilot's slash-command rate as *unknown*
+rather than as zero.
+
 ## Claude Code (version-pinned to 2.1.44, re-validated structurally at 2.1.205)
 
 **Source of truth.** Claude Code stores each session as JSONL at
@@ -214,9 +228,38 @@ plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `c
 | `type: "user"`, `message.content` `tool_result` blocks | `tool` event (`event=tool_result`) |
 | `type: "assistant"`, `text` blocks | `assistant` event |
 | `type: "assistant"`, `tool_use` blocks | `tool` event (`event=tool_use`) |
+| `type: "assistant"`, `tool_use` named `Skill` | the same `tool` event, plus promoted `skill` / `skill_args` keys (issue #77) |
+| `type: "user"`, `message.content` that is *wholly* a `<command-name>` block | the same `user` event, plus a promoted `Record.slash_command` (issue #77) |
 | `type: "summary"`, `type: "system"`, queue bookkeeping | ignored metadata |
 | `type: "system"`, `subtype: "compact_boundary"` (context compaction) | ignored metadata, plus a promoted `Record.compaction` (issue #77) |
+| `type: "system"`, `subtype: "local_command"` (the other slash-command carrier) | ignored metadata, plus a promoted `Record.slash_command` (issue #77) |
 | `type: "permission-mode"` / `"pr-link"` / `"file-history-delta"` / `"frame-link"` / `"agent-name"` (archive-observed session bookkeeping) | ignored metadata |
+
+**Invocations (issue #77).** Skills and slash commands reach this envelope as two unrelated
+record shapes, which is why they are promoted onto two different surfaces.
+
+A skill is invoked through the `Skill` tool: a `tool_use` whose `name` is `Skill` and whose
+`input` carries a string `skill` and an optional string `args`. 102 such blocks across 69 of
+the mirror cache's 350 Claude Code transcripts, naming 10 distinct skills, 62 of them with
+arguments. The `SlashCommand` tool exists in the harness's vocabulary and has zero uses in the
+archive, so nothing is read for it.
+
+A slash command is recorded as a fenced block — `<command-name>` beside an optional
+`<command-message>` and `<command-args>` — on either of two carriers: a `user` record (154
+across the cache) or a `system`/`local_command` record (21). Both are read, and they are not
+one invocation written twice: 11 transcripts carry both carriers, no `(name, timestamp)` pair
+occurs in both, and the per-transcript counts differ. The two are distinguishable without a
+discriminant, because the `user` carrier classifies as content and the `system` one as ignored.
+
+The block is read only where the record's whole content *is* the block. That rule is against a
+trap the archive holds rather than a hypothetical one: Munshi's own summarizer prompt arrives
+as a `user` record quoting a transcript back with its tags intact, and the cache holds 3 of
+them. Bare `/compact` typed as plain text is refused for the mirror-image reason: the cache
+holds 20 user messages opening with a `/` and no block, 14 of them `/compact` and 6 of them a
+file path in the identical shape. Those stay unread, so a consumer sees an under-count instead
+of invented commands. In this archive all 11 observed command names are built-in CLI commands
+(`/model` dominating at 127 of 175); the review commands qanungo's Code Review lane looks for
+appear only as `Skill` tool uses.
 
 **Lifecycles.**
 

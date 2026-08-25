@@ -39,6 +39,10 @@
 //! [`Compaction`] hangs off [`Record`] for a stronger version of the same reason: the
 //! records marking a compaction are bookkeeping this crate has always set aside, and typing
 //! them as [`Event`]s would move them out of their census into a rendering they never had.
+//! *Invocations* — which skill an agent tool call loaded, which slash command the operator
+//! ran — are promoted onto both surfaces at once, because the archive writes the two as
+//! different kinds of record: [`ToolEvent::skill`] on the tool event that did the invoking,
+//! and [`Record::slash_command`] on the record that *is* the command line.
 //!
 //! [`envelope_matches`], [`claude_origin_cwd`], [`claude_git_branch`], and
 //! [`claude_agent_version`] expose the pure, privacy-safe envelope predicates behind `munshi`'s
@@ -203,6 +207,22 @@ pub struct Record {
     /// come to 128 bytes, which unboxed would take [`Record`] from 152 to 272, and 743
     /// records of the mirror cache's 689,160 carry one.
     pub compaction: Option<Box<Compaction>>,
+    /// The slash command the operator ran, when the record is the one a harness writes to
+    /// mark one (issue #77, for qanungo's Code Review lane).
+    ///
+    /// A fourth independent read-pass, and the first one whose records are *not* all of one
+    /// census: Claude Code writes the same command block onto a `user` record — already
+    /// [`Classification::Content`], already rendered verbatim — in most versions, and onto a
+    /// `system`/`local_command` record — [`Classification::Ignored`] bookkeeping — in some.
+    /// Reading it beside the classification rather than out of it is what lets one field
+    /// cover both without moving either: the content record keeps the exact text it always
+    /// rendered, and the bookkeeping record stays bookkeeping. A consumer that needs to tell
+    /// the two carriers apart reads [`Self::classification`], which already says which it is.
+    ///
+    /// Boxed like the two promotions beside it: a `String` and an `Option<String>` come to 48
+    /// bytes against a [`Record`] that is otherwise 160, and 175 records of the mirror
+    /// cache's 693,030 carry one.
+    pub slash_command: Option<Box<SlashCommand>>,
 }
 
 /// The read-time meaning of one transcript record.
@@ -508,6 +528,59 @@ pub struct Compaction {
     pub token_limit: Option<u64>,
 }
 
+/// One slash command the operator ran, as the harness recorded it (issue #77, for qanungo's
+/// Code Review lane, which scores how often a session that shipped code ran a review pass
+/// before ending).
+///
+/// This type carries the invocation's *name* and the text that followed it, and takes no
+/// view on what any name means. Deciding that `/security-review` is a review pass and
+/// `/model` is not is a classification a consumer owns, because it is a judgement about the
+/// operator's workflow rather than a fact the transcript states — and it changes as people
+/// add commands, while this crate's reading of the envelope does not.
+///
+/// # Only the block form is read, and that is a deliberate under-claim
+///
+/// A slash command reaches the archive as a fenced block — `<command-name>` beside an
+/// optional `<command-message>` and `<command-args>` — and it is read only where the record's
+/// whole content *is* that block. This is a rule against a trap the archive actually holds:
+/// Munshi's own summarizer prompt is a `user` record quoting a transcript, `<command-name>`
+/// tags and all, and three of the mirror cache's records are exactly that. A scan for the tag
+/// anywhere in a record promotes those three as invocations of whatever command the quoted
+/// session happened to run.
+///
+/// Bare `/compact` typed as plain text is refused for the mirror-image reason: the archive
+/// holds 20 user messages that open with a `/` and no block, 14 of them `/compact` and the
+/// other 6 a *file path* — `/Users/...`, `/tmp/...` — in the identical shape. No rule
+/// separates them that is not a guess about prose, so all 20 stay unread, and a consumer sees
+/// an under-count it can reason about instead of invented commands it cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommand {
+    /// The command as the harness spells it, verbatim modulo edge whitespace — never
+    /// lower-cased, never stripped of its leading `/`. All 175 of the mirror cache's
+    /// invocations begin with one, so a consumer matching names should expect it; passing the
+    /// string through unchanged is what keeps that the *archive's* fact rather than this
+    /// crate's assumption.
+    ///
+    /// The names this archive actually holds are 11, and every one of them is a built-in CLI
+    /// command — `/model` alone is 127 of the 175, beside `/effort`, `/compact`, `/exit`,
+    /// `/tasks`, `/context`, `/status`, `/login`, `/statusline`, `/claude-api`,
+    /// `/auto-mode-setup`. A consumer looking here for review passes will find none: in this
+    /// harness a review skill is invoked through the `Skill` tool, so it arrives as
+    /// [`ToolEvent::skill`] and not as a slash command at all.
+    pub name: String,
+    /// The `<command-args>` text, when the record carries a non-blank one (34 of the cache's
+    /// 175; a further 139 carry the tag empty and 2 omit it, and the two are not
+    /// distinguished here — both read as `None`).
+    ///
+    /// **Verbatim-class content, unlike [`Self::name`].** A command name is schema metadata
+    /// the harness chose from a fixed vocabulary; its arguments are whatever the operator
+    /// typed, and `/review <prose>` puts prose here. Nothing new is exposed by promoting it —
+    /// the block is already, in full, the [`Event::legacy_content`] of the `user` record it
+    /// came from — but a surface that renders `args` on its own is rendering user text and
+    /// owes it the redaction layer, which a surface rendering only names does not.
+    pub args: Option<String>,
+}
+
 /// Structured fields of a tool event, keyed exactly as the legacy renderer keys them
 /// (`event`, `name`, `tool_use_id` / `tool_call_id` / `call_id`, `arguments` / `input`,
 /// `output`, `success`, `error`, `is_error`, `command`), plus the Copilot tool-activity
@@ -519,10 +592,11 @@ pub struct Compaction {
 /// # Derived fields
 ///
 /// `derived` names the subset of `fields` promoted *after* that legacy rendering was
-/// frozen — the read-time signals this crate types for analysis consumers (issue #77,
-/// starting with `command` on shell-tool events). They are read exactly like every other
-/// field, so `fields["command"]` means the same thing whichever harness supplied it, but
-/// [`Self::rendered`] deliberately leaves them out.
+/// frozen — the read-time signals this crate types for analysis consumers (issue #77:
+/// `command` on shell-tool events, then `skill` and `skill_args` on the events that invoke a
+/// skill). They are read exactly like every other field, so `fields["command"]` means the
+/// same thing whichever harness supplied it, but [`Self::rendered`] deliberately leaves them
+/// out.
 ///
 /// Excluding them is not tidiness, it is the losslessness rule: `rendered()` is capture's
 /// `NormalizedEvent.content`, which is (a) what the summarizer reads, so a new key inside
@@ -590,6 +664,35 @@ impl ToolEvent {
     /// crate's.
     pub fn command(&self) -> Option<&str> {
         self.fields.get("command").map(String::as_str)
+    }
+
+    /// The name of the *skill* this event invoked, when it is an invocation and the source
+    /// names one (issue #77, for qanungo's Code Review lane).
+    ///
+    /// Distinct from [`Self::name`], which names the **tool**, and the difference is the
+    /// whole reason this accessor exists: a Claude Code skill invocation is a `tool_use`
+    /// whose `name` reads `Skill` with the skill buried in its `input` blob, while a Copilot
+    /// `skill.invoked` record *is* the skill, its `name` already being the skill's. Reading
+    /// `name` across both would silently score every Claude Code invocation as one skill
+    /// called `Skill`. `skill()` is the one question — "which skill ran?" — with one answer
+    /// per harness, which is what a cross-harness fold needs.
+    ///
+    /// Names pass through verbatim, and what a name *means* is a consumer's judgement: this
+    /// crate does not decide that `code-review` is a review pass and `run` is not. That
+    /// classification belongs where the metric is, because it is a statement about how the
+    /// operator works rather than about what the transcript said.
+    pub fn skill(&self) -> Option<&str> {
+        self.fields.get("skill").map(String::as_str)
+    }
+
+    /// The arguments the skill was invoked with, when the source records any (Claude Code's
+    /// `input.args`; Copilot's `skill.invoked` carries none).
+    ///
+    /// **Verbatim-class content**, on the same terms as [`SlashCommand::args`]: the operator's
+    /// own text, already present in full inside this event's rendered `input` blob, and owed
+    /// the redaction layer by anything that renders it.
+    pub fn skill_args(&self) -> Option<&str> {
+        self.fields.get("skill_args").map(String::as_str)
     }
 
     /// The legacy space-joined `key=value` rendering, sorted by key — byte-identical to
@@ -705,6 +808,7 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
                     },
                     assistant_meta: None,
                     compaction: None,
+                    slash_command: None,
                 }));
             };
             let raw_timestamp = object.get("timestamp").cloned();
@@ -725,6 +829,11 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
             // compaction are bookkeeping this crate deliberately does not archive, so the
             // only way to type them without moving them out of their census is beside it.
             let compaction = classify::compaction(self.source, object).map(Box::new);
+            // Read independently for both reasons at once: the same command block reaches the
+            // archive on a content record in one harness version and on a bookkeeping record
+            // in another, so no single census owns it and reading it out of the
+            // classification would have to move one of them.
+            let slash_command = classify::slash_command(self.source, object).map(Box::new);
             return Some(Ok(Record {
                 line,
                 record,
@@ -733,6 +842,7 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
                 classification,
                 assistant_meta,
                 compaction,
+                slash_command,
             }));
         }
     }

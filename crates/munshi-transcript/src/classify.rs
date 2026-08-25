@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::{AssistantMeta, Compaction, CompactionPhase, Event, TokenUsage, ToolEvent};
+use crate::{
+    AssistantMeta, Compaction, CompactionPhase, Event, SlashCommand, TokenUsage, ToolEvent,
+};
 
 /// Classification outcome before the raw record is attached by the stream.
 pub(crate) enum Class {
@@ -101,6 +103,36 @@ pub(crate) fn compaction(source: crate::Source, object: &Map<String, Value>) -> 
             .then(|| claude_compaction(object))
             .flatten(),
         crate::Source::Codex => None,
+    }
+}
+
+/// The slash command a record marks, when it is one of the records a harness writes to record
+/// that the operator ran one (issue #77, for qanungo's Code Review lane).
+///
+/// A fourth independent pass, and the only one whose records span two censuses: Claude Code
+/// writes the same command block onto a `user` record (already content, already rendered
+/// verbatim) in most of the versions the archive holds, and onto a `system`/`local_command`
+/// record (ignored bookkeeping) in some. Reading it out of the classification would force one
+/// of those two to move; reading it beside the classification moves neither.
+///
+/// **Copilot records nothing readable, and this is the survey's finding rather than a gap
+/// left for later.** That CLI writes a slash command as `user.message` prose — `data.content`
+/// reading `/chronicle improve` — with no marker, no name key, and no structure of any kind.
+/// The mirror cache holds 4 `user.message` records opening with a `/`, and one of them is
+/// `"/tmp/mode-mock.png does not exist"`: a sentence about a file. Nothing in the envelope
+/// separates the command from the file path, so nothing is read, and a consumer must treat
+/// Copilot's slash-command rate as *unknown* rather than as zero. Copilot's skills are a
+/// different story and *are* typed — see [`extract_skill_invoked`].
+///
+/// Codex records nothing here either, for the reason every Codex gap in this crate has: the
+/// archive holds zero Codex sessions.
+pub(crate) fn slash_command(
+    source: crate::Source,
+    object: &Map<String, Value>,
+) -> Option<SlashCommand> {
+    match source {
+        crate::Source::ClaudeCode => claude_slash_command(object),
+        crate::Source::Copilot | crate::Source::Codex => None,
     }
 }
 
@@ -438,6 +470,18 @@ fn extract_builtin_tool_invocation(event_type: &str, data: &Map<String, Value>) 
 /// `skill.invoked` (issue #51): the agent loaded a skill — activity comparable to Claude
 /// Code's `Skill` tool use. Requires a nonempty skill `name`; carries the skill's path,
 /// card metadata, and full SKILL.md `content` (size policy belongs to consumers).
+///
+/// Issue #77 additionally promotes that same name as the derived `skill` key, and the
+/// duplication is the point rather than an oversight. `name` means *the tool* on Claude
+/// Code's side of the fold — every skill invocation there is a `tool_use` named `Skill` — and
+/// *the skill* here, so a cross-harness fold reading `name` scores 100 distinct Claude Code
+/// invocations as one skill called `Skill`. `skill` is the key that means the same thing in
+/// both envelopes; it costs one short string on 19 of the mirror cache's records, and it
+/// keeps [`crate::ToolEvent::skill`] a lookup rather than a per-source special case that a
+/// future envelope would have to be remembered in.
+///
+/// The card fields around it stay exactly where they were, in the legacy rendering: this
+/// promotion adds a key, and moves none.
 fn extract_skill_invoked(data: &Map<String, Value>) -> Option<ToolEvent> {
     let name = data
         .get("name")
@@ -445,7 +489,7 @@ fn extract_skill_invoked(data: &Map<String, Value>) -> Option<ToolEvent> {
         .and_then(nonempty)?;
     let mut fields = BTreeMap::new();
     insert(&mut fields, "event", "skill.invoked".to_owned());
-    insert(&mut fields, "name", name);
+    insert(&mut fields, "name", name.clone());
     for key in [
         "path",
         "description",
@@ -458,7 +502,9 @@ fn extract_skill_invoked(data: &Map<String, Value>) -> Option<ToolEvent> {
             insert(&mut fields, key, value);
         }
     }
-    Some(ToolEvent::legacy(fields))
+    let mut tool = ToolEvent::legacy(fields);
+    tool.insert_derived("skill", name);
+    Some(tool)
 }
 
 /// `external_tool.requested` (issue #51): an MCP/external tool invocation. The payload is
@@ -575,6 +621,18 @@ fn extract_tool_result_text(value: &Value) -> Option<String> {
 /// and no other tool name records one at all. `BashOutput` / `KillShell` address an
 /// already-running shell by id, so there is no command of theirs to promote.
 const CLAUDE_SHELL_TOOL: &str = "Bash";
+
+/// The Claude Code tool that invokes a skill (issue #77), and — across this archive — the only
+/// way a skill is invoked in that harness at all: 102 `tool_use` blocks named `Skill` in 69 of
+/// the mirror cache's 350 Claude Code transcripts, naming 10 distinct skills. Every one of
+/// them records an object `input` with a string `skill`, 62 of them a string `args`, and no
+/// other key at all.
+///
+/// A `SlashCommand` tool exists in that harness's vocabulary and would be the other candidate;
+/// the archive holds zero uses of it, so nothing is read for it. That is the same under-claim
+/// this crate's Codex gaps are, at a smaller scale: a name it has never seen a payload of is a
+/// name it cannot certify the shape of.
+const CLAUDE_SKILL_TOOL: &str = "Skill";
 
 /// Claude Code record types known to be metadata/bookkeeping with no archive-worthy
 /// content: the 2.1.44 `summary`/`system` records, the 2.1.205 additions (`ai-title`,
@@ -756,6 +814,98 @@ fn claude_compaction(object: &Map<String, Value>) -> Option<Compaction> {
     })
 }
 
+/// The `system` record subtype Claude Code writes a slash command onto (issue #77), gated for
+/// exactly the reason [`CLAUDE_COMPACT_BOUNDARY`] is: `system` is a general bookkeeping kind
+/// whose other subtypes are free to spell anything, and this is the one that carries a
+/// command block. All 21 of the mirror cache's `system`-carried invocations are this subtype.
+/// The gate is not a formality the data makes redundant: the cache holds 44 records of the
+/// subtype, only 21 of which carry a block, and it holds `system` records of *other* subtypes
+/// whose `content` is a command block's own output rather than an invocation.
+const CLAUDE_LOCAL_COMMAND: &str = "local_command";
+
+/// The three tags a Claude Code slash-command block is built from. A record's content must
+/// consist of these and nothing else for it to be read as an invocation — see
+/// [`claude_command_block`].
+const CLAUDE_COMMAND_TAGS: [&str; 3] = ["command-name", "command-message", "command-args"];
+
+/// The slash command a Claude Code record records, from the two carriers the archive holds
+/// (issue #77).
+///
+/// Both are read, and the archive says they are not the same invocation written twice — the
+/// question the compaction promotion had to answer for Copilot's paired markers, asked again
+/// here and answered the other way. 11 of the cache's transcripts carry both carriers; across
+/// them no `(name, timestamp)` pair occurs in both, the per-transcript counts differ, and the
+/// records interleave seconds apart. So a fold counting invocations counts records, with no
+/// phase filter and no deduplication — and the two carriers *are* distinguishable, without a
+/// discriminant of their own, because a `user` carrier classifies
+/// [`crate::Classification::Content`] and a `system` one classifies
+/// [`crate::Classification::Ignored`].
+///
+/// Only the string form of `message.content` is read on the `user` carrier. All 154 of the
+/// cache's `user`-carried invocations are strings; a block form would be an under-claim, and
+/// a guessed reading of one would be an interpretation this crate has never seen evidence for.
+///
+/// Deliberately left in the raw record: `<command-message>`, the harness's own display label
+/// for the command (`model` for `/model`), which restates the name with the slash removed and
+/// so adds nothing a consumer classifying by name can use; and everything the surrounding
+/// records say — the `<local-command-caveat>` preamble and the `<local-command-stdout>` reply,
+/// which are the harness's framing and the command's *output*, neither of which is the
+/// invocation.
+fn claude_slash_command(object: &Map<String, Value>) -> Option<SlashCommand> {
+    let content = match object.get("type").and_then(Value::as_str)? {
+        "user" => object
+            .get("message")
+            .and_then(Value::as_object)
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)?,
+        "system" if object.get("subtype").and_then(Value::as_str) == Some(CLAUDE_LOCAL_COMMAND) => {
+            object.get("content").and_then(Value::as_str)?
+        }
+        _ => return None,
+    };
+    let [name, _message, args] = claude_command_block(content)?;
+    Some(SlashCommand {
+        name: nonempty(name?)?,
+        args: args.and_then(nonempty),
+    })
+}
+
+/// Parses a Claude Code slash-command block, returning each of [`CLAUDE_COMMAND_TAGS`]'
+/// contents in order, or nothing at all if the content is not *entirely* such a block.
+///
+/// "Entirely" is the safety rule, and it earns its strictness against a trap in the archive
+/// rather than against a hypothetical one. Munshi's own summarizer prompt arrives as a `user`
+/// record that quotes a transcript back — `<command-name>` tags included — and the mirror
+/// cache holds 3 of them. A parser that searched for the tag anywhere would promote those as
+/// invocations of whatever command the quoted session ran; this one rejects them, because
+/// what surrounds the block is not whitespace.
+///
+/// Order is not fixed, and must not be: 173 of the cache's 175 blocks open with
+/// `<command-name>` and 2 open with `<command-message>`, and both spellings are real
+/// invocations. A repeated tag is refused, since a block with two names states no single one.
+fn claude_command_block(content: &str) -> Option<[Option<&str>; 3]> {
+    let mut found: [Option<&str>; 3] = [None; 3];
+    let mut rest = content.trim();
+    while !rest.is_empty() {
+        let (index, body, tail) =
+            CLAUDE_COMMAND_TAGS
+                .iter()
+                .enumerate()
+                .find_map(|(index, tag)| {
+                    let after = rest.strip_prefix(&format!("<{tag}>"))?;
+                    let close = format!("</{tag}>");
+                    let end = after.find(&close)?;
+                    Some((index, &after[..end], &after[end + close.len()..]))
+                })?;
+        if found[index].is_some() {
+            return None;
+        }
+        found[index] = Some(body);
+        rest = tail.trim_start();
+    }
+    found[0].is_some().then_some(found)
+}
+
 /// The token figures of a Claude Code `message.usage`, taking exactly the keys whose
 /// meaning is pinned across every key set the archive holds.
 ///
@@ -816,6 +966,7 @@ fn extract_claude_tool_use(block: &Map<String, Value>) -> Option<Event> {
         .and_then(Value::as_str)
         .and_then(nonempty)?;
     let shell = name == CLAUDE_SHELL_TOOL;
+    let skill_tool = name == CLAUDE_SKILL_TOOL;
     let mut fields = BTreeMap::new();
     insert(&mut fields, "event", "tool_use".to_owned());
     if let Some(id) = block.get("id").and_then(Value::as_str).and_then(nonempty) {
@@ -837,6 +988,27 @@ fn extract_claude_tool_use(block: &Map<String, Value>) -> Option<Event> {
             .and_then(compact_value)
     {
         tool.insert_derived("command", command);
+    }
+    // Issue #77: the invoked skill's name is promoted out of the same `input` blob, on the
+    // same terms — the blob stays beside it verbatim, and only the one tool whose `input`
+    // keys this crate can certify is read.
+    //
+    // Both keys are required to be *strings*, where the shell promotion above accepts any
+    // JSON (Codex spells a command as an argv array, so `compact_value` is the right reading
+    // there). A skill name that is not a string is not a name, and reading `{"a":1}` as one
+    // would put a JSON blob into a field a consumer classifies by equality. `args` rides on
+    // `skill`: an invocation this crate cannot name is not one it will attribute arguments to.
+    if skill_tool
+        && let Some(input) = block.get("input").and_then(Value::as_object)
+        && let Some(skill) = input
+            .get("skill")
+            .and_then(Value::as_str)
+            .and_then(nonempty)
+    {
+        tool.insert_derived("skill", skill);
+        if let Some(args) = input.get("args").and_then(Value::as_str).and_then(nonempty) {
+            tool.insert_derived("skill_args", args);
+        }
     }
     Some(Event::Tool(tool))
 }
@@ -1148,12 +1320,26 @@ mod tests {
     /// Asserts what a record promotes as `command` (or that it promotes nothing), and — in
     /// every case — that the promotion stayed out of the legacy rendering while the blob it
     /// came from stayed in it untouched.
-    fn assert_command(source: Source, json: &str, expected: Option<&str>, rendered: &str) {
+    ///
+    /// `others` names the derived keys the record promotes for *other* reasons, so the set is
+    /// still pinned exactly. It is non-empty in one place only, and that place is the point:
+    /// a `Skill` tool use carrying an `input.command` promotes a skill and no command, which
+    /// is what keeps `fields["command"]` meaning a shell command line in every harness.
+    fn assert_command(
+        source: Source,
+        json: &str,
+        expected: Option<&str>,
+        others: &[&str],
+        rendered: &str,
+    ) {
         let tool = tool_of(source, json);
         assert_eq!(tool.command(), expected, "command for {json}");
+        let mut keys: Vec<&str> = expected.map(|_| vec!["command"]).unwrap_or_default();
+        keys.extend_from_slice(others);
+        keys.sort_unstable();
         assert_eq!(
             tool.derived.iter().map(String::as_str).collect::<Vec<_>>(),
-            expected.map(|_| vec!["command"]).unwrap_or_default(),
+            keys,
             "derived keys for {json}"
         );
         assert_eq!(tool.rendered(), rendered, "legacy rendering for {json}");
@@ -1346,6 +1532,7 @@ mod tests {
             Source::ClaudeCode,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test --all","description":"Run the suite"}}]}}"#,
             Some("cargo test --all"),
+            &[],
             "event=tool_use input={\"command\":\"cargo test --all\",\
              \"description\":\"Run the suite\"} name=Bash tool_use_id=toolu_1",
         );
@@ -1355,6 +1542,7 @@ mod tests {
             Source::ClaudeCode,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Skill","input":{"command":"/review","skill":"code-review"}}]}}"#,
             None,
+            &["skill"],
             "event=tool_use input={\"command\":\"/review\",\"skill\":\"code-review\"} \
              name=Skill tool_use_id=toolu_2",
         );
@@ -1364,6 +1552,7 @@ mod tests {
             Source::ClaudeCode,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"description":"no command key"}}]}}"#,
             None,
+            &[],
             "event=tool_use input={\"description\":\"no command key\"} name=Bash \
              tool_use_id=toolu_3",
         );
@@ -1371,12 +1560,14 @@ mod tests {
             Source::ClaudeCode,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_4","name":"Bash","input":{"command":"   "}}]}}"#,
             None,
+            &[],
             "event=tool_use input={\"command\":\"   \"} name=Bash tool_use_id=toolu_4",
         );
         assert_command(
             Source::ClaudeCode,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_5","name":"Bash","input":"cargo test"}]}}"#,
             None,
+            &[],
             "event=tool_use input=cargo test name=Bash tool_use_id=toolu_5",
         );
     }
@@ -1387,6 +1578,7 @@ mod tests {
             Source::Copilot,
             r#"{"type":"tool.execution_start","data":{"toolCallId":"c1","toolName":"bash","arguments":{"command":"cargo fmt --check","description":"Check formatting"}}}"#,
             Some("cargo fmt --check"),
+            &[],
             "arguments={\"command\":\"cargo fmt --check\",\"description\":\"Check formatting\"} \
              event=tool.execution_start name=bash tool_call_id=c1",
         );
@@ -1394,6 +1586,7 @@ mod tests {
             Source::Copilot,
             r#"{"type":"tool.user_requested","data":{"toolCallId":"c2","toolName":"local_shell","arguments":{"command":"git remote -v"}}}"#,
             Some("git remote -v"),
+            &[],
             "arguments={\"command\":\"git remote -v\"} event=tool.user_requested \
              name=local_shell tool_call_id=c2",
         );
@@ -1403,6 +1596,7 @@ mod tests {
             Source::Copilot,
             r#"{"type":"tool.execution_start","data":{"toolCallId":"c3","toolName":"str_replace_editor","arguments":{"command":"view","path":"src/lib.rs"}}}"#,
             None,
+            &[],
             "arguments={\"command\":\"view\",\"path\":\"src/lib.rs\"} \
              event=tool.execution_start name=str_replace_editor tool_call_id=c3",
         );
@@ -1411,6 +1605,7 @@ mod tests {
             Source::Copilot,
             r#"{"type":"tool.execution_start","data":{"toolCallId":"c4","toolName":"view","arguments":{"path":"src/lib.rs"}}}"#,
             None,
+            &[],
             "arguments={\"path\":\"src/lib.rs\"} event=tool.execution_start name=view \
              tool_call_id=c4",
         );
@@ -1418,6 +1613,7 @@ mod tests {
             Source::Copilot,
             r#"{"type":"tool.execution_start","data":{"toolCallId":"c5","toolName":"bash","arguments":"cargo test"}}"#,
             None,
+            &[],
             "arguments=cargo test event=tool.execution_start name=bash tool_call_id=c5",
         );
         // `external_tool.requested` names MCP/extension tools, where `bash` would be
@@ -1426,6 +1622,7 @@ mod tests {
             Source::Copilot,
             r#"{"type":"external_tool.requested","data":{"requestId":"r1","toolCallId":"c6","toolName":"bash","arguments":{"command":"echo hi"}}}"#,
             None,
+            &[],
             "arguments={\"command\":\"echo hi\"} event=external_tool.requested name=bash \
              request_id=r1 tool_call_id=c6",
         );
@@ -1438,6 +1635,7 @@ mod tests {
             Source::Codex,
             r#"{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls -la\"],\"workdir\":\"/work\"}","call_id":"call_1"}}"#,
             Some(r#"["bash","-lc","ls -la"]"#),
+            &[],
             "arguments={\"command\":[\"bash\",\"-lc\",\"ls -la\"],\"workdir\":\"/work\"} \
              call_id=call_1 event=function_call name=shell",
         );
@@ -1446,6 +1644,7 @@ mod tests {
             Source::Codex,
             r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"command\":\"step 1\"}","call_id":"call_2"}}"#,
             None,
+            &[],
             "arguments={\"command\":\"step 1\"} call_id=call_2 event=function_call \
              name=update_plan",
         );
@@ -1466,6 +1665,7 @@ mod tests {
                 Source::Codex,
                 &json,
                 None,
+                &[],
                 &format!("{rendered} call_id=call_3 event=function_call name=shell"),
             );
         }
@@ -1505,6 +1705,104 @@ mod tests {
             usage,
             message_id: Some(message_id.to_owned()),
         })
+    }
+
+    /// The command block a record parses to, as `(name, args)`.
+    fn block_of(json: &str) -> Option<(String, Option<String>)> {
+        let value: Value = serde_json::from_str(json).unwrap();
+        slash_command(Source::ClaudeCode, value.as_object().unwrap())
+            .map(|command| (command.name, command.args))
+    }
+
+    /// A `user` record whose whole content is `content`, for the block-parser cases.
+    fn user_content(content: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":{}}}}}"#,
+            serde_json::to_string(content).unwrap()
+        )
+    }
+
+    #[test]
+    fn the_command_block_parser_accepts_only_a_whole_block_in_any_tag_order() {
+        // The archive's own formatting: newline-and-indent separators, and the two tag
+        // orders it really holds.
+        assert_eq!(
+            block_of(&user_content(
+                "<command-name>/model</command-name>\n            \
+                 <command-message>model</command-message>\n            \
+                 <command-args></command-args>"
+            )),
+            Some(("/model".to_owned(), None))
+        );
+        assert_eq!(
+            block_of(&user_content(
+                "<command-message>claude-api</command-message>\n<command-name>/claude-api</command-name>"
+            )),
+            Some(("/claude-api".to_owned(), None))
+        );
+        // Leading and trailing whitespace around the whole block is not "something else".
+        assert_eq!(
+            block_of(&user_content(
+                "  \n<command-name>/effort</command-name>\t<command-args> fable </command-args>\n "
+            )),
+            Some(("/effort".to_owned(), Some("fable".to_owned())))
+        );
+        // Args are passed through verbatim modulo edge whitespace, angle brackets and all —
+        // this is operator text, not a vocabulary.
+        assert_eq!(
+            block_of(&user_content(
+                "<command-name>/review</command-name><command-args>the <b>whole</b> diff</command-args>"
+            )),
+            Some((
+                "/review".to_owned(),
+                Some("the <b>whole</b> diff".to_owned())
+            ))
+        );
+
+        for content in [
+            // Anything at all outside the block, on either side. The first is the shape of
+            // the summarizer prompt the mirror cache holds three of.
+            "{\"transcript\":\"<command-name>/compact</command-name>\"}",
+            "please run <command-name>/compact</command-name>",
+            "<command-name>/compact</command-name> and then ship it",
+            // A repeated tag states no single name.
+            "<command-name>/model</command-name><command-name>/effort</command-name>",
+            // An unclosed tag parses as nothing, not as everything after it.
+            "<command-name>/model",
+            // A tag this crate does not know is "something else" by definition.
+            "<command-name>/model</command-name><command-extra>x</command-extra>",
+            // A blank name is not a name; a block with no name states no invocation.
+            "<command-name>   </command-name><command-args>fable</command-args>",
+            "<command-message>model</command-message><command-args></command-args>",
+            // Bare slash prose, and the file path of the identical shape.
+            "/compact",
+            "/tmp/mode-mock.png does not exist",
+        ] {
+            assert_eq!(block_of(&user_content(content)), None, "for {content:?}");
+        }
+
+        // Only the string form of `message.content` is read, and only on the two carriers.
+        assert_eq!(
+            block_of(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/model</command-name>"}]}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            block_of(
+                r#"{"type":"system","subtype":"local_command","content":"<command-name>/context</command-name>"}"#
+            ),
+            Some(("/context".to_owned(), None))
+        );
+        // The subtype gate, for the same reason the compaction promotion has one: `system`
+        // is a general bookkeeping kind whose other subtypes may spell anything.
+        for json in [
+            r#"{"type":"system","subtype":"local_command_stdout","content":"<command-name>/status</command-name>"}"#,
+            r#"{"type":"system","content":"<command-name>/login</command-name>"}"#,
+            r#"{"type":"queue-operation","content":"<command-name>/compact</command-name>"}"#,
+        ] {
+            assert_eq!(block_of(json), None, "for {json}");
+        }
     }
 
     #[test]

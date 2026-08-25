@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use munshi_transcript::{
     AssistantMeta, Classification, Compaction, CompactionPhase, Event, NON_OBJECT_JSON_KIND,
-    Record, RecordError, SessionSummary, Source, TokenUsage, TranscriptStream,
+    Record, RecordError, SessionSummary, SlashCommand, Source, TokenUsage, TranscriptStream,
 };
 
 fn fixture_root() -> PathBuf {
@@ -99,6 +99,12 @@ const FIXTURES: &[Fixture] = &[
         Source::ClaudeCode,
         "claude-code-compaction/transcript/0c1a0de0-0000-4000-8000-000000077003.jsonl",
     ),
+    // Issue #77: the skill and slash-command shapes each harness records an invocation in,
+    // the near-miss shapes that must not be read as one, and the prose that is not a command.
+    well_formed(
+        Source::ClaudeCode,
+        "claude-code-invocation/transcript/0c1a0de0-0000-4000-8000-000000077004.jsonl",
+    ),
     well_formed(
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
@@ -179,6 +185,10 @@ const FIXTURES: &[Fixture] = &[
     well_formed(
         Source::Copilot,
         "copilot-compaction/dddddddd-dddd-4ddd-8ddd-dddddddddddd/events.jsonl",
+    ),
+    well_formed(
+        Source::Copilot,
+        "copilot-invocation/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee/events.jsonl",
     ),
     well_formed(
         Source::Copilot,
@@ -658,6 +668,12 @@ fn shell_tool_events_carry_a_typed_command_per_source() {
 /// derived-field split and is the one `command` that does render.
 #[test]
 fn promoted_commands_stay_out_of_the_legacy_rendering() {
+    // Counted per promoted key, because this is the *only* guard the two blob-embedded
+    // promotions have: `command`, `skill` and `skill_args` are all read out of a blob the
+    // legacy rendering carries verbatim, so no leak guard can strip them without deleting
+    // the rendering itself. If a walk quietly stopped covering one of the three, the other
+    // two would keep this test green.
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for fixture in FIXTURES {
         for item in stream_fixture(fixture.source, fixture.path) {
             let Ok(Record {
@@ -671,6 +687,7 @@ fn promoted_commands_stay_out_of_the_legacy_rendering() {
                 let Event::Tool(tool) = &event else { continue };
                 for key in &tool.derived {
                     assert!(tool.fields.contains_key(key), "{}: {key}", fixture.path);
+                    *seen.entry(key.clone()).or_default() += 1;
                 }
                 // Exact, not substring: the rendering must equal the join over the
                 // non-derived fields, so a derived key leaking in (or a legacy field
@@ -694,6 +711,12 @@ fn promoted_commands_stay_out_of_the_legacy_rendering() {
                 }
             }
         }
+    }
+    for key in ["command", "skill", "skill_args"] {
+        assert!(
+            seen.get(key).copied().unwrap_or_default() > 0,
+            "no fixture promotes {key}, so this walk proves nothing about it"
+        );
     }
 }
 
@@ -1423,6 +1446,279 @@ fn codex_records_carry_no_compaction() {
     );
 }
 
+const CLAUDE_INVOCATION_FIXTURE: &str =
+    "claude-code-invocation/transcript/0c1a0de0-0000-4000-8000-000000077004.jsonl";
+const COPILOT_INVOCATION_FIXTURE: &str =
+    "copilot-invocation/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee/events.jsonl";
+
+/// Every tool event of a fixture, as `(tool name, invoked skill, skill args)` — the three
+/// together, because the whole point of `skill()` is that it is not `name()`.
+fn tool_skills(
+    source: Source,
+    relative: &str,
+) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+    content_events(source, relative)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Tool(tool) => Some((
+                tool.name().map(ToOwned::to_owned),
+                tool.skill().map(ToOwned::to_owned),
+                tool.skill_args().map(ToOwned::to_owned),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every record of a fixture as `(classification tag, slash command)`, so a test pins what a
+/// record promotes *and* that promoting it left the record in the census it was already in.
+fn record_slash_commands(source: Source, relative: &str) -> Vec<(String, Option<SlashCommand>)> {
+    stream_fixture(source, relative)
+        .iter()
+        .filter_map(|item| {
+            let record = item.as_ref().ok()?;
+            let tag = match &record.classification {
+                Classification::Content { .. } => "content".to_owned(),
+                Classification::Empty => "empty".to_owned(),
+                Classification::Ignored { kind } => format!("ignored:{kind}"),
+                Classification::Unknown { .. } => "unknown".to_owned(),
+            };
+            Some((tag, record.slash_command.as_deref().cloned()))
+        })
+        .collect()
+}
+
+fn slash(name: &str, args: Option<&str>) -> Option<SlashCommand> {
+    Some(SlashCommand {
+        name: name.to_owned(),
+        args: args.map(ToOwned::to_owned),
+    })
+}
+
+/// Issue #77: a Claude Code `Skill` tool use names the skill it invoked, and no other tool
+/// gains a skill from a key that happens to be spelled the same.
+#[test]
+fn claude_skill_tool_uses_name_the_skill_they_invoked() {
+    assert_eq!(
+        tool_skills(Source::ClaudeCode, CLAUDE_INVOCATION_FIXTURE),
+        [
+            // The two shapes the archive holds: with arguments and without.
+            (
+                Some("Skill".to_owned()),
+                Some("code-review".to_owned()),
+                Some("the working tree, effort high".to_owned()),
+            ),
+            (
+                Some("Skill".to_owned()),
+                Some("artifact-design".to_owned()),
+                None,
+            ),
+            // Two invocations in one record — which is why the skill is promoted per event
+            // and not, like `Record::slash_command`, per record. Blank args read as absent.
+            (Some("Skill".to_owned()), Some("simplify".to_owned()), None),
+            (
+                Some("Skill".to_owned()),
+                Some("security-review".to_owned()),
+                None,
+            ),
+            // A `Bash` call whose input carries a `skill` key: the tool name certifies the
+            // meaning of the blob, exactly as it does for `command`.
+            (Some("Bash".to_owned()), None, None),
+            // A skill name that is not a string is not a name, and `args` rides on the name:
+            // an invocation this crate cannot name is not one it attributes arguments to.
+            (Some("Skill".to_owned()), None, None),
+            // Blank name; non-string args; input that is not an object at all.
+            (Some("Skill".to_owned()), None, None),
+            (Some("Skill".to_owned()), Some("run".to_owned()), None),
+            (Some("Skill".to_owned()), None, None),
+            // `SlashCommand` is a real tool in that harness's vocabulary with zero uses in
+            // the archive, so this crate has never seen one of its payloads and reads none.
+            (Some("SlashCommand".to_owned()), None, None),
+        ]
+    );
+}
+
+/// The name a fold must read is the *skill*, not the tool: across harnesses `name()` answers
+/// two different questions and `skill()` answers one.
+#[test]
+fn the_skill_name_is_the_one_field_that_means_the_same_thing_in_both_harnesses() {
+    let claude = tool_skills(Source::ClaudeCode, CLAUDE_INVOCATION_FIXTURE);
+    let copilot = tool_skills(Source::Copilot, COPILOT_INVOCATION_FIXTURE);
+
+    // Copilot's `skill.invoked` *is* the skill, so its `name` and `skill` agree.
+    assert_eq!(
+        copilot,
+        [(
+            Some("notesmith-memory".to_owned()),
+            Some("notesmith-memory".to_owned()),
+            None,
+        )]
+    );
+    // Claude Code's do not, on every single invocation — which is the failure mode the key
+    // exists to prevent: a fold over `name()` scores five distinct skills as one called
+    // `Skill`, and a fold over `skill()` scores five.
+    let by_name: BTreeSet<_> = claude
+        .iter()
+        .filter(|(_, skill, _)| skill.is_some())
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    let by_skill: BTreeSet<_> = claude
+        .iter()
+        .filter_map(|(_, skill, _)| skill.clone())
+        .collect();
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_skill.len(), 5);
+}
+
+/// Issue #77: the two records Claude Code writes a slash command onto are both read, and
+/// reading them left each in the census it was already in.
+#[test]
+fn claude_slash_commands_are_read_from_both_carriers_without_moving_either() {
+    assert_eq!(
+        record_slash_commands(Source::ClaudeCode, CLAUDE_INVOCATION_FIXTURE),
+        [
+            ("content".to_owned(), None), // the opening user prompt
+            ("content".to_owned(), None), // the Skill tool uses
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            // The `user` carrier. It is content and stays content: the block is still, in
+            // full, this event's `legacy_content()`.
+            ("content".to_owned(), slash("/model", None)),
+            ("content".to_owned(), slash("/effort", Some("fable"))),
+            // `<command-message>` before `<command-name>`: a real archive ordering, and a
+            // block with no `<command-args>` at all reads the same as one with a blank.
+            ("content".to_owned(), slash("/claude-api", None)),
+            // The harness's caveat preamble and the command's own stdout are not the
+            // invocation, and neither promotes one.
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            // The `system`/`local_command` carrier. It is ignored bookkeeping and stays
+            // ignored — the promotion gives it no `legacy_content()` it never had.
+            ("ignored:system".to_owned(), slash("/context", None)),
+            // Another `system` subtype carrying an identical block, and a `system` record
+            // with no subtype at all: the subtype gate refuses both.
+            ("ignored:system".to_owned(), None),
+            ("ignored:system".to_owned(), None),
+            // Munshi's own summarizer prompt, quoting a transcript back with its tags
+            // intact — the trap the "whole content is the block" rule exists for, and one
+            // the mirror cache really holds three of.
+            ("content".to_owned(), None),
+            // A real block with a prose tail is not a block.
+            ("content".to_owned(), None),
+            // Bare `/compact` prose and the file path of the same shape: neither is read,
+            // because no rule separates them that is not a guess about prose.
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            // Two names state no single one; a blank name is not a name; an unclosed tag
+            // parses as nothing rather than as everything after it.
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            ("content".to_owned(), None),
+            // Only the string form of `message.content` is read: the block form is an
+            // under-claim this crate has never seen evidence of.
+            ("content".to_owned(), None),
+            ("content".to_owned(), None), // the closing assistant message
+        ]
+    );
+}
+
+/// Copilot records a slash command as prose and nothing else, so nothing is read — and the
+/// reason is in the fixture beside it, not merely in a doc comment.
+#[test]
+fn copilot_slash_commands_are_indistinguishable_from_prose_and_are_not_read() {
+    let rows = record_slash_commands(Source::Copilot, COPILOT_INVOCATION_FIXTURE);
+    assert!(
+        rows.iter().all(|(_, command)| command.is_none()),
+        "copilot promoted a slash command it cannot certify"
+    );
+    // Both records are user content, both open with `/`, and one of them is a sentence about
+    // a file. A consumer must read Copilot's slash-command rate as unknown, not as zero.
+    let texts: Vec<String> = content_events(Source::Copilot, COPILOT_INVOCATION_FIXTURE)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::User { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "/chronicle improve".to_owned(),
+            "/tmp/mode-mock.png does not exist".to_owned(),
+        ]
+    );
+
+    // Codex records neither, for the reason every Codex gap here has: zero archived sessions.
+    for fixture in FIXTURES {
+        if fixture.source != Source::Codex {
+            continue;
+        }
+        let rows = record_slash_commands(fixture.source, fixture.path);
+        assert!(!rows.is_empty(), "{}", fixture.path);
+        assert!(
+            rows.iter().all(|(_, command)| command.is_none()),
+            "{}",
+            fixture.path
+        );
+        assert!(
+            tool_skills(fixture.source, fixture.path)
+                .iter()
+                .all(|(_, skill, args)| skill.is_none() && args.is_none()),
+            "{}",
+            fixture.path
+        );
+    }
+}
+
+/// The byte-identity argument for the slash-command promotion, stated as a test over every
+/// fixture: a record that promotes one keeps the classification it had, and — where that
+/// classification is content — the exact text it always rendered.
+#[test]
+fn every_slash_command_stays_in_the_census_and_the_rendering_it_was_already_in() {
+    let mut carriers: BTreeMap<String, usize> = BTreeMap::new();
+    for fixture in FIXTURES {
+        for item in stream_fixture(fixture.source, fixture.path) {
+            let Ok(record) = item else { continue };
+            let Some(command) = record.slash_command.as_deref() else {
+                continue;
+            };
+            let tag = match &record.classification {
+                Classification::Content { events } => {
+                    // The `user` carrier is content, and the promotion is a *second reading*
+                    // of text the event already rendered in full: the name and the args must
+                    // both still be inside it, verbatim.
+                    let rendered: String = events
+                        .iter()
+                        .map(munshi_transcript::Event::legacy_content)
+                        .collect();
+                    assert!(
+                        rendered.contains(&command.name),
+                        "{}: {} left the rendering",
+                        fixture.path,
+                        command.name
+                    );
+                    if let Some(args) = &command.args {
+                        assert!(rendered.contains(args), "{}", fixture.path);
+                    }
+                    "content"
+                }
+                Classification::Ignored { .. } => "ignored",
+                other => panic!("{}: slash command in {other:?}", fixture.path),
+            };
+            *carriers.entry(tag.to_owned()).or_default() += 1;
+        }
+    }
+    // Both carriers must actually be walked, or the test proves half of what it claims.
+    assert_eq!(carriers.get("content"), Some(&3));
+    assert_eq!(carriers.get("ignored"), Some(&1));
+}
+
 /// The promotion is additive: what it reads may not change what an event renders as. Strip
 /// the promoted keys out of every record of every fixture and the whole stream — record
 /// accounting and the ordered `(kind, legacy content)` pairs alike — must come back
@@ -1434,6 +1730,7 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
     // and re-streamed rather than only read.
     let mut stripped_records = 0;
     let mut stripped_compactions = 0;
+    let mut stripped_invocations = 0;
     for fixture in FIXTURES {
         let bytes = fs::read(fixture_root().join(fixture.path)).unwrap();
         let mut stripped = String::new();
@@ -1467,6 +1764,21 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
             // the key that tells a `compact_boundary` from every other `system` record, yet
             // a `system` record classifies `Ignored { kind: "system" }` whatever its subtype
             // says, so its removal must not move a byte either.
+            //
+            // The slash-command promotion strips only its `system`/`local_command` carrier,
+            // and that limit is the promotion's own shape rather than a weaker guard. Its
+            // other carrier is a `user` record whose `message.content` *is* the command
+            // block, so stripping it would delete the very text the rendering is made of and
+            // prove nothing; the same is true of the skill promotion, which reads out of a
+            // `tool_use`'s rendered `input` blob. Those two are guarded instead by
+            // `promoted_commands_stay_out_of_the_legacy_rendering`, which pins `rendered()`
+            // against the join over the non-derived fields — a promoted key cannot enter that
+            // string without failing there — and by
+            // `every_slash_command_stays_in_the_census_and_the_rendering_it_was_already_in`,
+            // which asserts the promoted text is still inside the event's own rendering.
+            // Here the `system` carrier's whole `content` goes, alongside the `subtype`: both
+            // are keys a `system` record's `Ignored { kind: "system" }` classification never
+            // reads, and neither may move a byte.
             let stripped_keys = match value.get("type").and_then(serde_json::Value::as_str) {
                 Some("assistant") => Some(("message", ["id", "model", "usage"].as_slice())),
                 Some("assistant.message") => Some(("data", ["model", "outputTokens"].as_slice())),
@@ -1486,11 +1798,21 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
                 // — a `system` record of another subtype carrying a `compactMetadata`-shaped
                 // key — cannot keep the counter above zero while every real marker has
                 // quietly stopped being stripped.
-                let boundary = object.get("subtype").and_then(serde_json::Value::as_str)
-                    == Some("compact_boundary");
+                let subtype = object
+                    .get("subtype")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                let boundary = subtype.as_deref() == Some("compact_boundary");
+                // Same discipline for the slash-command carrier: counted only where the
+                // record really is one, so the `system` decoys carrying an identical block
+                // under another subtype cannot hold the counter up on their own.
+                let invocation = subtype.as_deref() == Some("local_command");
                 let (keys, marker): (&[&str], bool) =
                     match object.get("type").and_then(serde_json::Value::as_str) {
-                        Some("system") => (["compactMetadata", "subtype"].as_slice(), boundary),
+                        Some("system") => (
+                            ["compactMetadata", "subtype", "content"].as_slice(),
+                            boundary,
+                        ),
                         Some("session.compaction_start" | "session.compaction_complete") => {
                             (["data"].as_slice(), true)
                         }
@@ -1502,6 +1824,9 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
                 }
                 if marker && removed > 0 {
                     stripped_compactions += 1;
+                }
+                if invocation && removed > 0 {
+                    stripped_invocations += 1;
                 }
             }
             stripped.push_str(&value.to_string());
@@ -1525,6 +1850,10 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
     assert!(
         stripped_compactions > 0,
         "the walk must strip a compaction marker to prove anything about that promotion"
+    );
+    assert!(
+        stripped_invocations > 0,
+        "the walk must strip a slash-command carrier to prove anything about that promotion"
     );
 }
 
