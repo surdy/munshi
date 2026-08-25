@@ -723,6 +723,10 @@ enum ArchiveUploadCommand {
     Reconcile {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Reset uploaded rows whose recorded snapshot no longer exists so backfill can re-upload
+        /// them with a fresh capture identity.
+        #[arg(long)]
+        repair_missing: bool,
         /// Emit a stable machine-readable contract.
         #[arg(long)]
         json: bool,
@@ -2544,10 +2548,14 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
                 json,
             })
         }
-        ArchiveUploadCommand::Reconcile { state_dir, json } => {
+        ArchiveUploadCommand::Reconcile {
+            state_dir,
+            repair_missing,
+            json,
+        } => {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::ArchiveUploadReconcile {
-                report: Box::new(archive_upload_reconcile(&state_directory)?),
+                report: Box::new(archive_upload_reconcile(&state_directory, repair_missing)?),
                 json,
             })
         }

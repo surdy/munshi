@@ -324,6 +324,22 @@ impl ReadClient {
         )
     }
 
+    /// Reports whether one recorded snapshot still exists. A tombstoned snapshot is the expected
+    /// 404 case; every other non-success response remains an error rather than being mistaken for
+    /// absence.
+    pub(crate) fn snapshot_exists(&self, snapshot_id: &str) -> Result<bool, ReadError> {
+        let path = format!("{API_BASE}/snapshots/{}", http::encode_path(snapshot_id));
+        let response = self.get(&path, None).map_err(ReadError::Http)?;
+        match response.status {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(ReadError::Status {
+                status,
+                code: error_code(&response.body),
+            }),
+        }
+    }
+
     /// Reads the capture provenance — `source_agent`, `artifact_set_version`, and the optional
     /// `source_agent_version` — from a snapshot's canonical manifest.
     ///

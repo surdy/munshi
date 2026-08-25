@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -702,6 +703,86 @@ fn backfill_patwari_session_id_fills_only_a_missing_id_and_is_endpoint_scoped() 
     assert_eq!(row.patwari_session_id.as_deref(), Some("patwari-1"));
 }
 
+#[test]
+fn repair_missing_archive_upload_clears_server_identity_and_preserves_history() {
+    let directory = TempDir::new().unwrap();
+    let state_dir = directory.path().join("munshi-home");
+    let session = "45454545-4545-4545-8545-454545454545";
+    let endpoint = "http://127.0.0.1:1";
+    let mut store = StateStore::open(&state_dir).unwrap();
+    store
+        .ingest_agent_stop(
+            session,
+            10_000,
+            Path::new("/tmp/project"),
+            Path::new("/tmp/t.jsonl"),
+        )
+        .unwrap();
+    store
+        .prepare_archive_capture(session, endpoint, 7, "capture-old", "2026-07-25T00:00:00Z")
+        .unwrap();
+    store
+        .record_archive_upload_id(session, endpoint, "upload-old")
+        .unwrap();
+    store
+        .record_archive_upload_success(
+            session,
+            endpoint,
+            &munshi::ArchiveUploadSuccess {
+                uploaded_revision: 7,
+                uploaded_summary_hash: "summary-hash".to_owned(),
+                uploaded_markdown_hash: Some("markdown-hash".to_owned()),
+                snapshot_id: "snap-old".to_owned(),
+                patwari_session_id: "patwari-old".to_owned(),
+                uploaded_artifact_paths: vec![
+                    "summary.md".to_owned(),
+                    "transcript.jsonl".to_owned(),
+                ],
+                transfer_bytes: 11,
+                total_stored_bytes: 12,
+                total_original_bytes: 13,
+            },
+        )
+        .unwrap();
+    let failed = store
+        .record_archive_upload_failure(session, endpoint, "transport", 1, 20_000)
+        .unwrap();
+    assert_eq!(failed.upload_state, "dead-letter");
+    assert_eq!(failed.snapshot_id.as_deref(), Some("snap-old"));
+
+    assert!(
+        !store
+            .repair_missing_archive_upload(session, endpoint, "snap-other")
+            .unwrap()
+    );
+    assert!(
+        store
+            .repair_missing_archive_upload(session, endpoint, "snap-old")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .repair_missing_archive_upload(session, endpoint, "snap-old")
+            .unwrap(),
+        "the reset is idempotent"
+    );
+
+    let row = store
+        .get_archive_upload(session, endpoint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.upload_state, "pending");
+    assert!(row.capture_id.is_none());
+    assert!(row.capture_revision.is_none());
+    assert!(row.captured_at.is_none());
+    assert!(row.upload_id.is_none());
+    assert!(row.snapshot_id.is_none());
+    assert!(row.patwari_session_id.is_none());
+    assert_eq!(row.uploaded_revision, Some(7));
+    assert_eq!(row.uploaded_summary_hash.as_deref(), Some("summary-hash"));
+    assert_eq!(row.transfer_bytes_total, 11);
+}
+
 // ---------------------------------------------------------------------------
 // CLI backfill of sessions archived while upload was disabled (issue #32)
 // ---------------------------------------------------------------------------
@@ -783,6 +864,48 @@ fn backfill_uploads_archived_sessions_without_rows_and_is_idempotent() {
     assert_eq!(again["uploaded"], 0);
     assert_eq!(server.completed_count(), 1, "no second upload happened");
     assert_eq!(server.upload_count(), 1);
+}
+
+#[test]
+fn reconcile_repair_missing_resets_a_tombstoned_upload_for_backfill() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(BACKFILL_SESSION);
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+    let (first, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(first["uploaded"], 1);
+
+    let old_snapshot = harness.archive_upload_status()["items"][0]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    server.tombstone_snapshot(&old_snapshot);
+    let changed = harness
+        .database()
+        .execute(
+            "UPDATE archive_uploads
+             SET upload_state='dead-letter',attempts=5,last_error_category='transport'
+             WHERE snapshot_id=?1",
+            [&old_snapshot],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let report = harness.json(&["archive-upload", "reconcile", "--repair-missing", "--json"]);
+    assert_eq!(report["repaired_missing"], 1);
+    assert_eq!(report["repaired"][0]["missing_snapshot_id"], old_snapshot);
+    let status = harness.archive_upload_status();
+    assert_eq!(status["items"][0]["state"], "pending");
+    assert!(status["items"][0]["snapshot_id"].is_null());
+
+    let (second, success) = harness.backfill();
+    assert!(success);
+    assert_eq!(second["candidates"], 1);
+    assert_eq!(second["uploaded"], 1);
+    assert_eq!(server.upload_count(), 2, "a fresh capture was negotiated");
+    assert_eq!(server.completed_count(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1997,6 +2120,7 @@ struct FakeState {
     accept_budget: Option<u32>,
     /// A `(artifact_index, chunk_index)` that should always answer `chunk_conflict`.
     conflict_chunk: Option<(u32, u64)>,
+    tombstoned_snapshots: HashSet<String>,
 }
 
 struct FakePatwari {
@@ -2017,6 +2141,7 @@ impl FakePatwari {
             completed: 0,
             accept_budget: None,
             conflict_chunk: None,
+            tombstoned_snapshots: HashSet::new(),
         }));
         let thread_state = Arc::clone(&state);
         thread::spawn(move || {
@@ -2079,6 +2204,14 @@ impl FakePatwari {
     fn conflict_on_chunk(&self, artifact_index: u32, chunk_index: u64) {
         self.state.lock().unwrap().conflict_chunk = Some((artifact_index, chunk_index));
     }
+
+    fn tombstone_snapshot(&self, snapshot_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .tombstoned_snapshots
+            .insert(snapshot_id.to_owned());
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<FakeState>>) {
@@ -2099,7 +2232,39 @@ struct FakeRequest {
 }
 
 fn route(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
+    if request.method == "GET" && request.target.starts_with("/api/v1/snapshots?") {
+        let items: Vec<Value> = state
+            .uploads
+            .iter()
+            .filter(|upload| upload.completed)
+            .filter_map(|upload| {
+                let snapshot_id = format!("snap-{:016x}", upload.manifest_sig);
+                (!state.tombstoned_snapshots.contains(&snapshot_id)).then(|| {
+                    json!({
+                        "snapshot_id": snapshot_id,
+                        "session_id": upload.session_id,
+                        "completed_at": "2026-08-25T00:00:00Z",
+                    })
+                })
+            })
+            .collect();
+        return json_response(200, &json!({ "items": items, "next_cursor": null }));
+    }
     let segments: Vec<&str> = request.target.trim_start_matches('/').split('/').collect();
+    if request.method == "GET" && segments.len() == 4 && segments[2] == "snapshots" {
+        let snapshot_id = decode(segments[3]);
+        let present = state.uploads.iter().any(|upload| {
+            upload.completed && format!("snap-{:016x}", upload.manifest_sig) == snapshot_id
+        }) && !state.tombstoned_snapshots.contains(&snapshot_id);
+        return if present {
+            json_response(200, &json!({ "snapshot_id": snapshot_id }))
+        } else {
+            json_response(
+                404,
+                &json!({ "error": { "code": "not_found", "message": "missing" } }),
+            )
+        };
+    }
     // /api/v1/clients/{id}
     if request.method == "PUT" && segments.len() == 4 && segments[2] == "clients" {
         state.registered_client = Some(decode(segments[3]));
@@ -2322,6 +2487,7 @@ fn complete_upload(upload_id: &str, state: &mut FakeState) -> Vec<u8> {
     }
     let upload = &state.uploads[index];
     let snapshot_id = format!("snap-{:016x}", upload.manifest_sig);
+    state.tombstoned_snapshots.remove(&snapshot_id);
     // Report real byte totals like Patwari does (issue #65): the stored sum from the accepted
     // manifest, and the bytes this upload actually PUT (0 when every chunk was already held).
     let total_stored: u64 = upload

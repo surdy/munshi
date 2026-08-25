@@ -1894,6 +1894,35 @@ impl StateStore {
         Ok(updated > 0)
     }
 
+    /// Resets a row whose recorded snapshot has disappeared from Patwari. The row may since have
+    /// moved from `uploaded` to `failed` or `dead-letter`; its snapshot still needs replacement.
+    /// Stale server identities are cleared so the next backfill mints a fresh capture, while
+    /// successful-upload hashes and accounting remain as historical ledger data.
+    pub fn repair_missing_archive_upload(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        snapshot_id: &str,
+    ) -> Result<bool, StateError> {
+        let updated = self.connection.execute(
+            "UPDATE archive_uploads SET
+                capture_id=NULL,capture_revision=NULL,captured_at=NULL,upload_id=NULL,
+                snapshot_id=NULL,patwari_session_id=NULL,upload_state='pending',
+                attempts=0,next_attempt_at_ms=NULL,last_error_category=NULL,updated_at_ms=?5
+             WHERE session_id=(
+                    SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
+                 ) AND endpoint=?3 AND snapshot_id=?4",
+            params![
+                session_id,
+                self.source_kind,
+                endpoint,
+                snapshot_id,
+                now_ms()
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Records a failed archive-upload attempt. Increments the attempt count, then either schedules
     /// the next attempt (bounded backoff) while under `max_attempts` or parks the row as a
     /// `dead-letter` once attempts are exhausted. Never touches archival state.

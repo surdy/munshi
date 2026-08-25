@@ -1878,9 +1878,16 @@ pub struct ReconciledUpload {
     pub patwari_session_id: String,
 }
 
-/// The `archive-upload reconcile` contract (issue #76): a one-time backfill of the Patwari session
-/// id onto uploaded rows recorded before schema 10, read from the server's snapshot listing and
-/// matched by snapshot id.
+/// One uploaded row whose recorded snapshot was absent and was reset for a fresh backfill.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairedUpload {
+    pub source: String,
+    pub session_id: String,
+    pub missing_snapshot_id: String,
+}
+
+/// The `archive-upload reconcile` contract: backfill old Patwari session ids and, when requested,
+/// reset uploaded rows whose recorded snapshot no longer exists.
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveUploadReconcileReport {
     pub schema_version: u32,
@@ -1895,21 +1902,35 @@ pub struct ArchiveUploadReconcileReport {
     pub unmatched: usize,
     /// Rows that never recorded a snapshot id (no successful upload); nothing to reconcile.
     pub no_snapshot: usize,
+    /// Uploaded rows whose absent snapshot was reset for a fresh backfill.
+    pub repaired_missing: usize,
     /// The rows filled this run.
     pub reconciled: Vec<ReconciledUpload>,
+    /// The rows reset this run.
+    pub repaired: Vec<RepairedUpload>,
 }
 
 impl ArchiveUploadReconcileReport {
     pub fn print_human(&self) {
         print_settings(&self.settings);
         println!(
-            "archive reconcile filled={} already-present={} unmatched={} no-snapshot={}",
-            self.filled, self.already_present, self.unmatched, self.no_snapshot
+            "archive reconcile filled={} already-present={} unmatched={} no-snapshot={} repaired-missing={}",
+            self.filled,
+            self.already_present,
+            self.unmatched,
+            self.no_snapshot,
+            self.repaired_missing
         );
         for row in &self.reconciled {
             println!(
                 "{}  {} -> patwari={}",
                 row.session_id, row.snapshot_id, row.patwari_session_id
+            );
+        }
+        for row in &self.repaired {
+            println!(
+                "{}  missing {} -> pending",
+                row.session_id, row.missing_snapshot_id
             );
         }
     }
@@ -1928,15 +1949,18 @@ fn from_read(error: ReadError) -> PatwariError {
     }
 }
 
-/// Backfills the Patwari session id (issue #76) onto uploaded rows that predate schema 10, so the
-/// id `restore --session` filters on is discoverable from `sessions`/`archive-upload status`
-/// without a full-archive dry run. Lists the server's snapshots once, matches each local row's
-/// recorded `snapshot_id`, and fills the id where it is still missing. Idempotent: a row that
-/// already carries the id is left untouched, and a snapshot the listing does not hold is reported
-/// unmatched rather than guessed. Needs a configured, addressable endpoint but not an enabled one —
-/// reconciling historical rows is useful after upload has been disabled. Never contacts the server
-/// for anything but the listing, and never mutates archival lifecycle.
-pub fn reconcile(state_directory: &Path) -> Result<ArchiveUploadReconcileReport, PatwariError> {
+/// Backfills the Patwari session id (issue #76) onto uploaded rows that predate schema 10. With
+/// `repair_missing`, also verifies every row's recorded snapshot directly and resets a 404 to a
+/// fresh pending attempt. This includes rows that moved from `uploaded` to `failed` or
+/// `dead-letter` while retaining their last successful snapshot id. The direct check avoids
+/// treating an incomplete archive listing as proof of deletion. Idempotent: present snapshots and
+/// already-reset rows are left untouched.
+/// Needs a configured, addressable endpoint but not an enabled one; backfill still requires upload
+/// to be enabled. Never mutates archival lifecycle.
+pub fn reconcile(
+    state_directory: &Path,
+    repair_missing: bool,
+) -> Result<ArchiveUploadReconcileReport, PatwariError> {
     let config = load_stored_config(state_directory)?;
     let settings = ArchiveUploadSettings::from_config(&config);
     if !config.archive_upload.is_addressable() {
@@ -1956,6 +1980,7 @@ pub fn reconcile(state_directory: &Path) -> Result<ArchiveUploadReconcileReport,
     let mut unmatched = 0usize;
     let mut no_snapshot = 0usize;
     let mut reconciled = Vec::new();
+    let mut repaired = Vec::new();
 
     if StateStore::database_path(state_directory).exists() {
         let mut store = StateStore::open(state_directory)?;
@@ -1964,14 +1989,29 @@ pub fn reconcile(state_directory: &Path) -> Result<ArchiveUploadReconcileReport,
             if record.endpoint != endpoint {
                 continue;
             }
-            if record.patwari_session_id.is_some() {
-                already_present += 1;
-                continue;
-            }
             let Some(snapshot_id) = record.snapshot_id.as_deref() else {
                 no_snapshot += 1;
                 continue;
             };
+            if repair_missing && !client.snapshot_exists(snapshot_id).map_err(from_read)? {
+                let mut source_store = StateStore::open_for_source(state_directory, record.source)?;
+                if source_store.repair_missing_archive_upload(
+                    &record.session_id,
+                    &endpoint,
+                    snapshot_id,
+                )? {
+                    repaired.push(RepairedUpload {
+                        source: record.source.as_selector().to_owned(),
+                        session_id: record.session_id.clone(),
+                        missing_snapshot_id: snapshot_id.to_owned(),
+                    });
+                }
+                continue;
+            }
+            if record.patwari_session_id.is_some() {
+                already_present += 1;
+                continue;
+            }
             match mapping.get(snapshot_id) {
                 Some(patwari) => {
                     if store.backfill_patwari_session_id(&endpoint, snapshot_id, patwari)? {
@@ -1996,7 +2036,9 @@ pub fn reconcile(state_directory: &Path) -> Result<ArchiveUploadReconcileReport,
         filled: reconciled.len(),
         unmatched,
         no_snapshot,
+        repaired_missing: repaired.len(),
         reconciled,
+        repaired,
     })
 }
 
@@ -2243,12 +2285,11 @@ pub fn backfill(
         (Vec::new(), Vec::new())
     };
     // Sessions already holding a row for this endpoint belong to the worker and retry paths, with
-    // two exceptions this run reconciles: an `uploaded` row whose snapshot is not proven
+    // three exceptions this run reconciles: an `uploaded` row whose snapshot is not proven
     // self-contained (issue #47), and one whose recorded markdown hash no longer matches the
-    // session's current markdown (issue #73) — a cursor-only re-render the worker's idempotency
-    // check left behind, or any pre-migration row whose markdown hash was never recorded. A row
-    // recorded for a different endpoint (e.g. before reconfiguration) does not count here at all,
-    // matching `retry`'s endpoint scoping.
+    // session's current markdown (issue #73), or a formerly uploaded row whose missing snapshot
+    // `reconcile --repair-missing` reset to pending. A row recorded for a different endpoint (e.g.
+    // before reconfiguration) does not count here at all, matching `retry`'s endpoint scoping.
     let recorded: BTreeMap<(SourceKind, &str), &ArchiveUploadRecord> = uploads
         .iter()
         .filter(|record| record.endpoint == endpoint)
@@ -2267,9 +2308,12 @@ pub fn backfill(
                 // idempotency check is the backstop: a candidate that is in fact current still
                 // reports `already-uploaded` and never reaches the server.
                 Some(record) => {
-                    record.upload_state == "uploaded"
+                    (record.upload_state == "uploaded"
                         && (!records_full_snapshot(record)
-                            || record.uploaded_markdown_hash != session.markdown_hash)
+                            || record.uploaded_markdown_hash != session.markdown_hash))
+                        || (record.upload_state == "pending"
+                            && record.snapshot_id.is_none()
+                            && record.uploaded_revision.is_some())
                 }
             }
         })
