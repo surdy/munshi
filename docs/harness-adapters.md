@@ -228,8 +228,9 @@ plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `c
   whose `compactMetadata` states the trigger and the context size on either side of the boundary,
   followed by a `user` record flagged `isCompactSummary` carrying the summary it produced (a
   normal `user` event). Only the boundary is read for `Record.compaction`; the summary message is
-  not, so one compaction leaves exactly one marker. Rare in practice — 9 boundaries across 8 of
-  the mirror cache's 346 Claude Code sessions.
+  not, so one compaction leaves exactly one marker. Rare in practice — 9 boundary records across
+  8 of the mirror cache's 346 Claude Code transcripts, which deduplicate to 8 boundaries in 7
+  sessions (the cache holds two snapshots of one of them).
 - **Interrupted** — the transcript ends without a clean end and may contain a `system` interruption
   notice (ignored metadata). Munshi records the interrupted completion reason supplied by the
   recovery/caller path; the transcript shape itself is not used to infer interruption.

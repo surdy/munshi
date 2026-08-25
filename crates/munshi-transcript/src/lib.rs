@@ -431,7 +431,7 @@ pub struct Compaction {
     /// Which half of the compaction this record marks.
     pub phase: CompactionPhase,
     /// Why the harness compacted, verbatim: Claude Code's `compactMetadata.trigger`
-    /// (`manual` on all 9 of the cache's boundaries) and Copilot's `trigger` (`threshold`,
+    /// (`manual` on all 9 of the cache's boundary records) and Copilot's `trigger` (`threshold`,
     /// on 5 of its 367 pairs). **Nearly always absent for Copilot** — the key is a recent
     /// addition to that envelope — so a consumer that splits sessions by manual against
     /// automatic compaction can do it for Claude Code and must report the Copilot split as
@@ -479,7 +479,7 @@ pub struct Compaction {
     /// it is the share a session cannot shrink by talking less.
     pub tool_definition_tokens: Option<u64>,
     /// The context window the harness was compacting against, from Copilot's `tokenLimit`
-    /// on either half. **Absent on all 9 Claude Code boundaries and on all but 5 Copilot
+    /// on either half. **Absent on every Claude Code boundary and on all but 5 Copilot
     /// pairs**, so utilization as a *ratio* is not a thing this archive can be folded into.
     /// A consumer wanting one supplies the denominator itself, from the model, and must
     /// never read an absent limit as an unbounded context.

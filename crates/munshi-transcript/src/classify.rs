@@ -690,7 +690,7 @@ fn claude_assistant_meta(message: &Map<String, Value>) -> Option<AssistantMeta> 
 ///
 /// The subtype is required, not merely preferred: `system` is a general bookkeeping kind
 /// this crate has always ignored wholesale (7,895 records across the mirror cache), and only
-/// its `compact_boundary` subtype marks a compaction (9 records, in 8 of 346 sessions).
+/// its `compact_boundary` subtype marks a compaction (9 records, in 8 of 346 transcripts).
 /// Reading `compactMetadata` off any `system` record would be trusting a key name on a kind
 /// whose other subtypes are free to spell anything.
 const CLAUDE_COMPACT_BOUNDARY: &str = "compact_boundary";
@@ -699,11 +699,17 @@ const CLAUDE_COMPACT_BOUNDARY: &str = "compact_boundary";
 ///
 /// Claude Code writes one record per compaction, *after* the fact: it states `preTokens` and
 /// `postTokens` together, which only a finished compaction knows, so it reads as
-/// [`CompactionPhase::Complete`]. All 9 of the mirror cache's boundaries carry `trigger`,
-/// `preTokens` and `postTokens`, every one of them as an integer and every `trigger` reading
-/// `manual` — the envelope's automatic trigger exists but this archive has never recorded
-/// one, so the value passes through verbatim rather than being folded into a two-state flag
-/// this crate has only ever seen one side of.
+/// [`CompactionPhase::Complete`]. All 9 of the mirror cache's boundary records carry
+/// `trigger`, `preTokens` and `postTokens`, every one of them as an integer and every
+/// `trigger` reading `manual` — the envelope's automatic trigger exists but this archive has
+/// never recorded one, so the value passes through verbatim rather than being folded into a
+/// two-state flag this crate has only ever seen one side of.
+///
+/// Those 9 records are 8 distinct boundaries in 7 distinct sessions: the cache holds two
+/// snapshots of one session, so its boundary is counted twice at the blob level. Every
+/// figure above is a per-record count, which is the level this crate reads at; a consumer
+/// folding *sessions* deduplicates snapshots of one session first, as it must for every
+/// other per-record figure here.
 ///
 /// The record's own `content` (`"Conversation compacted"`) is a fixed English label, not a
 /// figure, and the summary the compaction produced is the *next* record — a `user` message
