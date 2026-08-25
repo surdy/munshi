@@ -210,6 +210,11 @@ pub struct Record {
     /// The slash command the operator ran, when the record is the one a harness writes to
     /// mark one (issue #77, for qanungo's Code Review lane).
     ///
+    /// **Claude Code only.** Copilot CLI records a slash command as `user.message` prose with
+    /// no marker of any kind, so this is always `None` for that source and a consumer must
+    /// read its slash-command rate as *unknown* rather than as zero — see [`SlashCommand`],
+    /// which states why nothing is read there.
+    ///
     /// A fourth independent read-pass, and the first one whose records are *not* all of one
     /// census: Claude Code writes the same command block onto a `user` record — already
     /// [`Classification::Content`], already rendered verbatim — in most versions, and onto a
@@ -553,6 +558,18 @@ pub struct Compaction {
 /// other 6 a *file path* — `/Users/...`, `/tmp/...` — in the identical shape. No rule
 /// separates them that is not a guess about prose, so all 20 stay unread, and a consumer sees
 /// an under-count it can reason about instead of invented commands it cannot.
+///
+/// # This is a Claude Code signal only, and absence elsewhere is not zero
+///
+/// **Copilot CLI has no slash-command signal at all**: that harness records one as
+/// `user.message` prose with no marker and no name key, and the mirror cache holds a
+/// `user.message` reading `"/tmp/mode-mock.png does not exist"` — a sentence about a file, in
+/// the shape a command would take — so nothing in the envelope separates the two and nothing
+/// is read. A consumer folding both harnesses must therefore report Copilot's slash-command
+/// rate as **unknown**, never as zero: every Copilot session scoring zero here is this crate
+/// declining to guess, not the operator declining to run commands. Codex records nothing for
+/// the reason every Codex gap here has — zero archived sessions. Copilot's *skills* are a
+/// different matter and are typed; see [`ToolEvent::skill`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommand {
     /// The command as the harness spells it, verbatim modulo edge whitespace — never

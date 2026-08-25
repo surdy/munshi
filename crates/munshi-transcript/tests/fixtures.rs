@@ -1609,7 +1609,12 @@ fn claude_slash_commands_are_read_from_both_carriers_without_moving_either() {
             // intact — the trap the "whole content is the block" rule exists for, and one
             // the mirror cache really holds three of.
             ("content".to_owned(), None),
-            // A real block with a prose tail is not a block.
+            // A real block with a prose tail is not a block — and, on the next record, a real
+            // block with a prose *head* and no tail at all. Both halves of the whole-content
+            // rule are pinned here on purpose: a parser that searched for the opening tag
+            // instead of requiring the content to start with it would still refuse the tail
+            // case, so the tail alone lets that mistake through the fixture gate.
+            ("content".to_owned(), None),
             ("content".to_owned(), None),
             // Bare `/compact` prose and the file path of the same shape: neither is read,
             // because no rule separates them that is not a guess about prose.
