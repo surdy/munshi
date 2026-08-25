@@ -123,6 +123,15 @@ once the chunked-marathon giants uploaded (issue #45), added eight more: `abort`
 `session.plan_changed`, `session.task_complete`, and `session.workspace_file_changed` — same
 treatment.
 
+`session.compaction_start` and `session.compaction_complete` stay ignored metadata *and*
+additionally promote `Record.compaction` (issue #77): the CLI writes both halves for every
+compaction — 367 of each across the mirror cache, strictly alternating in all 83 sessions that
+compacted — so a consumer counting compaction *records* doubles Copilot's figure. The start
+states the pre-compaction context as a `systemTokens` / `conversationTokens` /
+`toolDefinitionsTokens` breakdown; the completion states `preCompactionTokens` and `success`. The
+same three key names appear on a completion meaning the *post*-compaction context, which is why
+the promotion is keyed per phase.
+
 ### Sidecar artifacts (snapshot artifact set v2, issue #23)
 
 Beside `events.jsonl`, the session-state directory holds harness sidecar files, an allowlisted
@@ -205,15 +214,22 @@ plus bookkeeping keys such as `uuid`, `parentUuid`, `sessionId`, `timestamp`, `c
 | `type: "user"`, `message.content` `tool_result` blocks | `tool` event (`event=tool_result`) |
 | `type: "assistant"`, `text` blocks | `assistant` event |
 | `type: "assistant"`, `tool_use` blocks | `tool` event (`event=tool_use`) |
-| `type: "summary"` (compaction), `type: "system"`, queue bookkeeping | ignored metadata |
+| `type: "summary"`, `type: "system"`, queue bookkeeping | ignored metadata |
+| `type: "system"`, `subtype: "compact_boundary"` (context compaction) | ignored metadata, plus a promoted `Record.compaction` (issue #77) |
 | `type: "permission-mode"` / `"pr-link"` / `"file-history-delta"` / `"frame-link"` / `"agent-name"` (archive-observed session bookkeeping) | ignored metadata |
 
 **Lifecycles.**
 
 - **Normal** — user prompt, assistant replies, and paired `tool_use`/`tool_result` blocks.
-- **Resumed** — the transcript opens with a `summary` compaction record and continues appending to
+- **Resumed** — the transcript opens with a `summary` record and continues appending to
   the same session; Munshi reprocesses it as a delta into a new summary revision on the stable
   archive path.
+- **Compacted** — mid-session, the CLI writes a `system` record with `subtype: "compact_boundary"`
+  whose `compactMetadata` states the trigger and the context size on either side of the boundary,
+  followed by a `user` record flagged `isCompactSummary` carrying the summary it produced (a
+  normal `user` event). Only the boundary is read for `Record.compaction`; the summary message is
+  not, so one compaction leaves exactly one marker. Rare in practice — 9 boundaries across 8 of
+  the mirror cache's 346 Claude Code sessions.
 - **Interrupted** — the transcript ends without a clean end and may contain a `system` interruption
   notice (ignored metadata). Munshi records the interrupted completion reason supplied by the
   recovery/caller path; the transcript shape itself is not used to infer interruption.

@@ -12,8 +12,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use munshi_transcript::{
-    AssistantMeta, Classification, Event, NON_OBJECT_JSON_KIND, Record, RecordError,
-    SessionSummary, Source, TokenUsage, TranscriptStream,
+    AssistantMeta, Classification, Compaction, CompactionPhase, Event, NON_OBJECT_JSON_KIND,
+    Record, RecordError, SessionSummary, Source, TokenUsage, TranscriptStream,
 };
 
 fn fixture_root() -> PathBuf {
@@ -93,6 +93,12 @@ const FIXTURES: &[Fixture] = &[
         Source::ClaudeCode,
         "claude-code-assistant-usage/transcript/0c1a0de0-0000-4000-8000-000000077002.jsonl",
     ),
+    // Issue #77: the compaction markers each harness writes, the near-miss `system`
+    // subtypes that must not be read as one, and figures that must not be read at all.
+    well_formed(
+        Source::ClaudeCode,
+        "claude-code-compaction/transcript/0c1a0de0-0000-4000-8000-000000077003.jsonl",
+    ),
     well_formed(
         Source::Codex,
         "codex-rollout-0.x/normal/c0de0000-0000-4000-8000-000000000001.jsonl",
@@ -169,6 +175,10 @@ const FIXTURES: &[Fixture] = &[
     well_formed(
         Source::Copilot,
         "copilot-assistant-usage/cccccccc-cccc-4ccc-8ccc-cccccccccccc/events.jsonl",
+    ),
+    well_formed(
+        Source::Copilot,
+        "copilot-compaction/dddddddd-dddd-4ddd-8ddd-dddddddddddd/events.jsonl",
     ),
     well_formed(
         Source::Copilot,
@@ -1109,6 +1119,304 @@ fn codex_records_carry_no_meta() {
     }
 }
 
+const CLAUDE_COMPACTION_FIXTURE: &str =
+    "claude-code-compaction/transcript/0c1a0de0-0000-4000-8000-000000077003.jsonl";
+const COPILOT_COMPACTION_FIXTURE: &str =
+    "copilot-compaction/dddddddd-dddd-4ddd-8ddd-dddddddddddd/events.jsonl";
+
+/// Every record of a fixture as `(classification tag, compaction)`, so a test can pin what a
+/// record promotes *and* that promoting it left the record in the census it was already in.
+fn record_compactions(source: Source, relative: &str) -> Vec<(String, Option<Compaction>)> {
+    stream_fixture(source, relative)
+        .into_iter()
+        .map(|item| {
+            // A malformed line promotes nothing, and the deliberately-truncated fixtures
+            // carry one: an error item is a row like any other, never an abort.
+            let Ok(record) = item else {
+                return ("error".to_owned(), None);
+            };
+            let tag = match &record.classification {
+                Classification::Content { events } => format!("content:{}", events.len()),
+                Classification::Empty => "empty".to_owned(),
+                Classification::Ignored { kind } => format!("ignored:{kind}"),
+                Classification::Unknown { .. } => "unknown".to_owned(),
+            };
+            (tag, record.compaction.map(|compaction| *compaction))
+        })
+        .collect()
+}
+
+/// A compaction with nothing but a phase: what a marker whose figures are unreadable — or
+/// were never written — still states, because the record's existence is the claim.
+fn marker(phase: CompactionPhase) -> Compaction {
+    Compaction {
+        phase,
+        trigger: None,
+        succeeded: None,
+        pre_tokens: None,
+        post_tokens: None,
+        system_tokens: None,
+        conversation_tokens: None,
+        tool_definition_tokens: None,
+        token_limit: None,
+    }
+}
+
+#[test]
+fn claude_compact_boundaries_are_read_and_neighbouring_system_records_are_not() {
+    let rows = record_compactions(Source::ClaudeCode, CLAUDE_COMPACTION_FIXTURE);
+    let compactions: Vec<_> = rows
+        .iter()
+        .map(|(tag, compaction)| (tag.as_str(), compaction.clone()))
+        .collect();
+
+    assert_eq!(
+        compactions,
+        vec![
+            ("content:1", None),
+            ("content:1", None),
+            // A boundary states its trigger and both sizes. `cumulativeDroppedTokens`,
+            // `durationMs` and the preserved-message uuids beside them stay in the record.
+            (
+                "ignored:system",
+                Some(Compaction {
+                    trigger: Some("manual".to_owned()),
+                    pre_tokens: Some(214864),
+                    post_tokens: Some(8156),
+                    ..marker(CompactionPhase::Complete)
+                })
+            ),
+            // The post-compaction summary is a user event, exactly as it always was, and
+            // carries no compaction of its own: one compaction, one marker.
+            ("content:1", None),
+            ("content:1", None),
+            // The trigger passes through verbatim, so an `auto` boundary is not folded into
+            // the `manual` the archive happens to hold only examples of.
+            (
+                "ignored:system",
+                Some(Compaction {
+                    trigger: Some("auto".to_owned()),
+                    pre_tokens: Some(339462),
+                    post_tokens: Some(10705),
+                    ..marker(CompactionPhase::Complete)
+                })
+            ),
+            // A different `system` subtype carrying a `compactMetadata`-shaped key is not a
+            // compaction: the subtype certifies the meaning, never the key name.
+            ("ignored:system", None),
+            // A `system` record with no subtype at all.
+            ("ignored:system", None),
+            // A real boundary whose figures are a string, a negative and a float, and whose
+            // trigger is blank: each is left absent rather than guessed, and the boundary
+            // still reports that a compaction happened.
+            ("ignored:system", Some(marker(CompactionPhase::Complete))),
+            // `compactMetadata` that is not an object, and a boundary with none at all.
+            ("ignored:system", Some(marker(CompactionPhase::Complete))),
+            ("ignored:system", Some(marker(CompactionPhase::Complete))),
+            ("content:1", None),
+        ]
+    );
+}
+
+#[test]
+fn copilot_compaction_markers_are_read_per_phase() {
+    let rows = record_compactions(Source::Copilot, COPILOT_COMPACTION_FIXTURE);
+    let compactions: Vec<_> = rows
+        .iter()
+        .map(|(tag, compaction)| (tag.as_str(), compaction.clone()))
+        .collect();
+
+    assert_eq!(
+        compactions,
+        vec![
+            ("ignored:session.start", None),
+            ("content:1", None),
+            // The older start shape: the three-way breakdown and nothing else. Its total is
+            // absent rather than summed, because the sum is not a figure the source wrote.
+            (
+                "ignored:session.compaction_start",
+                Some(Compaction {
+                    system_tokens: Some(19138),
+                    conversation_tokens: Some(129018),
+                    tool_definition_tokens: Some(12783),
+                    ..marker(CompactionPhase::Start)
+                })
+            ),
+            // The completion states the total and the outcome. `summaryContent`,
+            // `compactionTokensUsed`, the checkpoint and the request ids all stay in the
+            // record.
+            (
+                "ignored:session.compaction_complete",
+                Some(Compaction {
+                    succeeded: Some(true),
+                    pre_tokens: Some(160939),
+                    ..marker(CompactionPhase::Complete)
+                })
+            ),
+            // The newer start shape names the total itself, plus the window and the trigger.
+            (
+                "ignored:session.compaction_start",
+                Some(Compaction {
+                    trigger: Some("threshold".to_owned()),
+                    pre_tokens: Some(218150),
+                    system_tokens: Some(11422),
+                    conversation_tokens: Some(188577),
+                    tool_definition_tokens: Some(18151),
+                    token_limit: Some(272000),
+                    ..marker(CompactionPhase::Start)
+                })
+            ),
+            (
+                "ignored:session.compaction_complete",
+                Some(Compaction {
+                    trigger: Some("threshold".to_owned()),
+                    succeeded: Some(true),
+                    pre_tokens: Some(218150),
+                    post_tokens: Some(34994),
+                    token_limit: Some(272000),
+                    ..marker(CompactionPhase::Complete)
+                })
+            ),
+            (
+                "ignored:session.compaction_start",
+                Some(Compaction {
+                    trigger: Some("threshold".to_owned()),
+                    pre_tokens: Some(160271),
+                    system_tokens: Some(9835),
+                    conversation_tokens: Some(132262),
+                    tool_definition_tokens: Some(18174),
+                    token_limit: Some(200000),
+                    ..marker(CompactionPhase::Start)
+                })
+            ),
+            // A failed compaction: the attempt happened and states its window, and no size
+            // figure is invented for a compaction that never ran.
+            (
+                "ignored:session.compaction_complete",
+                Some(Compaction {
+                    trigger: Some("threshold".to_owned()),
+                    succeeded: Some(false),
+                    token_limit: Some(200000),
+                    ..marker(CompactionPhase::Complete)
+                })
+            ),
+            (
+                "ignored:session.compaction_start",
+                Some(Compaction {
+                    system_tokens: Some(10271),
+                    conversation_tokens: Some(403967),
+                    tool_definition_tokens: Some(16516),
+                    ..marker(CompactionPhase::Start)
+                })
+            ),
+            // The trap this promotion is keyed per phase to avoid: a completion spelling
+            // `systemTokens` / `conversationTokens` / `toolDefinitionsTokens` for the context
+            // it was *left* with. Reading them here would file 11,189 post-compaction
+            // conversation tokens as the 403,971 that went in.
+            (
+                "ignored:session.compaction_complete",
+                Some(Compaction {
+                    succeeded: Some(true),
+                    pre_tokens: Some(403971),
+                    post_tokens: Some(11193),
+                    ..marker(CompactionPhase::Complete)
+                })
+            ),
+            // Figures that are not counts, and a blank trigger.
+            (
+                "ignored:session.compaction_start",
+                Some(marker(CompactionPhase::Start))
+            ),
+            // `data` that is not an object at all: the marker still marks a compaction.
+            (
+                "ignored:session.compaction_complete",
+                Some(marker(CompactionPhase::Complete))
+            ),
+            // A neighbouring bookkeeping kind that happens to carry compaction-shaped keys
+            // is not a compaction marker.
+            ("ignored:session.context_changed", None),
+            ("content:1", None),
+            ("ignored:session.shutdown", None),
+        ]
+    );
+}
+
+/// Copilot writes two records per compaction and Claude Code writes one, so the only fold
+/// that means the same thing in both harnesses counts completions. Over these two fixtures a
+/// record fold says 15 compactions and a completion fold says 10 — and the true figure is 10.
+#[test]
+fn counting_compaction_records_double_counts_copilot_and_counting_completions_does_not() {
+    let counts = |source, relative| {
+        let rows = record_compactions(source, relative);
+        let markers: Vec<_> = rows
+            .into_iter()
+            .filter_map(|(_, compaction)| compaction)
+            .collect();
+        let completions = markers
+            .iter()
+            .filter(|compaction| compaction.phase == CompactionPhase::Complete)
+            .count();
+        (markers.len(), completions)
+    };
+
+    // Claude Code: one record per compaction, so the two folds agree.
+    assert_eq!(
+        counts(Source::ClaudeCode, CLAUDE_COMPACTION_FIXTURE),
+        (5, 5)
+    );
+    // Copilot: strictly alternating starts and completions, so a record fold doubles.
+    assert_eq!(counts(Source::Copilot, COPILOT_COMPACTION_FIXTURE), (10, 5));
+}
+
+#[test]
+fn every_compaction_marker_stays_in_the_census_it_was_already_in() {
+    // The whole byte-identity argument for this promotion, stated as a test: nothing it
+    // reads is content, so no record it touches can gain, lose or change an event. A future
+    // change that typed a marker as an event would fail here before it reached the archive.
+    for (source, relative) in [
+        (Source::ClaudeCode, CLAUDE_COMPACTION_FIXTURE),
+        (Source::Copilot, COPILOT_COMPACTION_FIXTURE),
+    ] {
+        for (tag, compaction) in record_compactions(source, relative) {
+            if compaction.is_some() {
+                assert!(
+                    tag.starts_with("ignored:"),
+                    "{relative}: a compaction marker left its census as {tag}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_records_carry_no_compaction() {
+    // The rollout schema names a `compacted` metadata record, and the archive holds zero
+    // Codex sessions, so this crate has never seen one of its payloads. Nothing is read for
+    // it — including from the `compacted` record the resumed fixture carries, whose payload
+    // is a message and no figure at all.
+    let mut compacted_records = 0;
+    for fixture in FIXTURES {
+        if fixture.source != Source::Codex {
+            continue;
+        }
+        let rows = record_compactions(fixture.source, fixture.path);
+        assert!(!rows.is_empty(), "{}", fixture.path);
+        compacted_records += rows
+            .iter()
+            .filter(|(tag, _)| tag == "ignored:compacted")
+            .count();
+        assert!(
+            rows.iter().all(|(_, compaction)| compaction.is_none()),
+            "{}",
+            fixture.path
+        );
+    }
+    assert!(
+        compacted_records > 0,
+        "a fixture must carry a `compacted` record for this to prove anything"
+    );
+}
+
 /// The promotion is additive: what it reads may not change what an event renders as. Strip
 /// the promoted keys out of every record of every fixture and the whole stream — record
 /// accounting and the ordered `(kind, legacy content)` pairs alike — must come back
@@ -1119,6 +1427,7 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
     // `serde_json` is the crate's own dependency, so a fixture record can be edited here
     // and re-streamed rather than only read.
     let mut stripped_records = 0;
+    let mut stripped_compactions = 0;
     for fixture in FIXTURES {
         let bytes = fs::read(fixture_root().join(fixture.path)).unwrap();
         let mut stripped = String::new();
@@ -1143,6 +1452,13 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
             // `messageId` is what makes an `assistant.message` content at all. Stripping
             // either would change the rendering for reasons that have nothing to do with
             // the promotion, proving nothing.
+            //
+            // The compaction promotion (issue #77) strips alongside it. `compactMetadata`
+            // is nested, so deleting it takes every figure with it; the Copilot markers keep
+            // their whole `data` object, since the promotion reads keys straight off it and
+            // the classification reads nothing there at all. `subtype` is the one key held
+            // back on purpose: it is what tells a `compact_boundary` from the other `system`
+            // records, and removing it would test the fixture rather than the rendering.
             let stripped_keys = match value.get("type").and_then(serde_json::Value::as_str) {
                 Some("assistant") => Some(("message", ["id", "model", "usage"].as_slice())),
                 Some("assistant.message") => Some(("data", ["model", "outputTokens"].as_slice())),
@@ -1157,6 +1473,18 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
                     stripped_records += usize::from(object.remove(*key).is_some());
                 }
             }
+            if let Some(object) = value.as_object_mut() {
+                let compaction_key = match object.get("type").and_then(serde_json::Value::as_str) {
+                    Some("system") => Some("compactMetadata"),
+                    Some("session.compaction_start" | "session.compaction_complete") => {
+                        Some("data")
+                    }
+                    _ => None,
+                };
+                if let Some(key) = compaction_key {
+                    stripped_compactions += usize::from(object.remove(key).is_some());
+                }
+            }
             stripped.push_str(&value.to_string());
             stripped.push('\n');
         }
@@ -1169,9 +1497,15 @@ fn nothing_the_promotion_reads_reaches_the_legacy_rendering() {
         );
         assert_eq!(before, after, "{}", fixture.path);
     }
+    // Counted per promotion, so a walk that quietly stopped stripping one of them cannot
+    // keep passing on the strength of the other.
     assert!(
         stripped_records > 0,
         "the walk must strip something to prove anything"
+    );
+    assert!(
+        stripped_compactions > 0,
+        "the walk must strip a compaction marker to prove anything about that promotion"
     );
 }
 

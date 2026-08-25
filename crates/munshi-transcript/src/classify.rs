@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::{AssistantMeta, Event, TokenUsage, ToolEvent};
+use crate::{AssistantMeta, Compaction, CompactionPhase, Event, TokenUsage, ToolEvent};
 
 /// Classification outcome before the raw record is attached by the stream.
 pub(crate) enum Class {
@@ -64,6 +64,42 @@ pub(crate) fn assistant_meta(
             .then(|| object.get("message").and_then(Value::as_object))
             .flatten()
             .and_then(claude_assistant_meta),
+        crate::Source::Codex => None,
+    }
+}
+
+/// What a record says about a context compaction (issue #77): which half of one it marks,
+/// and the context-size figures the source states around it.
+///
+/// A third independent pass, for the same reason [`assistant_meta`] is a second one and one
+/// more besides. Every record read here is [`Class::Ignored`] bookkeeping and stays that
+/// way: a compaction is a fact about the session's context window, not conversation content,
+/// so typing it as an event would move records out of a census and into a legacy rendering
+/// they have never had.
+///
+/// Claude Code's post-compaction summary — the `user` record flagged `isCompactSummary` that
+/// follows a boundary — is deliberately *not* read, though it is the one compaction-adjacent
+/// record that already is content. It carries no figure the boundary beside it does not, and
+/// flagging it would put a second marker on one compaction for a consumer to count twice.
+///
+/// Codex records nothing. Its rollout schema does have a `compacted` metadata record — named
+/// in [`CODEX_METADATA`] — but the archive holds zero Codex sessions, so this crate has never
+/// seen one payload of it. Guessing at the shape would be inventing an interpretation, and
+/// an absent field is an under-claim a consumer can see.
+pub(crate) fn compaction(source: crate::Source, object: &Map<String, Value>) -> Option<Compaction> {
+    let record_type = object.get("type").and_then(Value::as_str)?;
+    match source {
+        crate::Source::Copilot => {
+            let phase = match record_type {
+                "session.compaction_start" => CompactionPhase::Start,
+                "session.compaction_complete" => CompactionPhase::Complete,
+                _ => return None,
+            };
+            Some(copilot_compaction(phase, event_data(object)))
+        }
+        crate::Source::ClaudeCode => (record_type == "system")
+            .then(|| claude_compaction(object))
+            .flatten(),
         crate::Source::Codex => None,
     }
 }
@@ -226,6 +262,74 @@ fn copilot_assistant_meta(data: &Map<String, Value>) -> Option<AssistantMeta> {
             .and_then(nonempty),
     }
     .recorded()
+}
+
+/// The context-size figures a Copilot compaction marker states (issue #77), read per phase
+/// because the same key names mean different things on the two halves.
+///
+/// `session.compaction_start` states the pre-compaction context as a three-way breakdown
+/// (`systemTokens` / `conversationTokens` / `toolDefinitionsTokens`, on all 367 of the mirror
+/// cache's starts) and, in the newer envelope only, that breakdown's total as
+/// `currentTokens` alongside a `tokenLimit` and a `trigger` (5 of 367). The total is read as
+/// `pre_tokens` where the source writes it, and never computed from the components where it
+/// does not — the archive holds a pair whose components sum to 400,754 against a recorded
+/// 403,971.
+///
+/// `session.compaction_complete` states `preCompactionTokens` and `success`, plus
+/// `postCompactionTokens` on 3 records. Its `systemTokens` / `conversationTokens` /
+/// `toolDefinitionsTokens` — spelled identically, present on 1 record — describe the context
+/// the compaction *left*, so they are deliberately not read: filing them as the pre-compaction
+/// breakdown would report a post-compaction figure as its own opposite.
+///
+/// Deliberately left in the raw record. `summaryContent`, the compaction summary itself:
+/// this promotion types the *fact and size* of a compaction, and hanging a multi-kilobyte
+/// body off a record-level analysis field to serve a lane that folds counts and tokens is
+/// not a size figure. `compactionTokensUsed`, the summarizer call's own bill: cost is
+/// [`crate::AssistantMeta`]'s surface, where it is per API message and deduplicated by
+/// message id, and a second differently-keyed cost object here would be a parallel truth
+/// that folds differently. `checkpointPath` (a filesystem path, hence a privacy surface),
+/// `checkpointNumber`, `requestId`, `serviceRequestId`: bookkeeping no metric names.
+/// `preCompactionMessagesLength`, `messagesRemoved`, `tokensRemoved`: message counts and a
+/// difference the promoted figures already state, promotable later under the same
+/// one-at-a-time rule if a consumer ever names them. `model`: it names the model the
+/// *summarizer* ran under, and the usage promotion already refused session-level model
+/// records for attributing no message's cost.
+fn copilot_compaction(phase: CompactionPhase, data: Option<&Map<String, Value>>) -> Compaction {
+    let mut compaction = Compaction {
+        phase,
+        trigger: None,
+        succeeded: None,
+        pre_tokens: None,
+        post_tokens: None,
+        system_tokens: None,
+        conversation_tokens: None,
+        tool_definition_tokens: None,
+        token_limit: None,
+    };
+    // A marker whose `data` is missing or malformed still marks a compaction: the record's
+    // existence is the claim, and only the figures are lost.
+    let Some(data) = data else {
+        return compaction;
+    };
+    compaction.trigger = data
+        .get("trigger")
+        .and_then(Value::as_str)
+        .and_then(nonempty);
+    compaction.token_limit = token_count(data.get("tokenLimit"));
+    match phase {
+        CompactionPhase::Start => {
+            compaction.pre_tokens = token_count(data.get("currentTokens"));
+            compaction.system_tokens = token_count(data.get("systemTokens"));
+            compaction.conversation_tokens = token_count(data.get("conversationTokens"));
+            compaction.tool_definition_tokens = token_count(data.get("toolDefinitionsTokens"));
+        }
+        CompactionPhase::Complete => {
+            compaction.succeeded = data.get("success").and_then(Value::as_bool);
+            compaction.pre_tokens = token_count(data.get("preCompactionTokens"));
+            compaction.post_tokens = token_count(data.get("postCompactionTokens"));
+        }
+    }
+    compaction
 }
 
 fn valid_tool_start(data: &Map<String, Value>) -> bool {
@@ -579,6 +683,65 @@ fn claude_assistant_meta(message: &Map<String, Value>) -> Option<AssistantMeta> 
         message_id: message.get("id").and_then(Value::as_str).and_then(nonempty),
     }
     .recorded()
+}
+
+/// The `system` record subtype Claude Code writes at a compaction boundary (issue #77), and
+/// the object it states the compaction's figures in.
+///
+/// The subtype is required, not merely preferred: `system` is a general bookkeeping kind
+/// this crate has always ignored wholesale (7,895 records across the mirror cache), and only
+/// its `compact_boundary` subtype marks a compaction (9 records, in 8 of 346 sessions).
+/// Reading `compactMetadata` off any `system` record would be trusting a key name on a kind
+/// whose other subtypes are free to spell anything.
+const CLAUDE_COMPACT_BOUNDARY: &str = "compact_boundary";
+
+/// The figures a Claude Code `compact_boundary` states (issue #77).
+///
+/// Claude Code writes one record per compaction, *after* the fact: it states `preTokens` and
+/// `postTokens` together, which only a finished compaction knows, so it reads as
+/// [`CompactionPhase::Complete`]. All 9 of the mirror cache's boundaries carry `trigger`,
+/// `preTokens` and `postTokens`, every one of them as an integer and every `trigger` reading
+/// `manual` — the envelope's automatic trigger exists but this archive has never recorded
+/// one, so the value passes through verbatim rather than being folded into a two-state flag
+/// this crate has only ever seen one side of.
+///
+/// The record's own `content` (`"Conversation compacted"`) is a fixed English label, not a
+/// figure, and the summary the compaction produced is the *next* record — a `user` message
+/// flagged `isCompactSummary`, which this crate already classifies as a user event and
+/// already renders. There is nothing to promote from it that the stream does not already
+/// carry, and flagging that record would put a second marker on the same compaction for a
+/// consumer to double-count.
+///
+/// Deliberately left in the raw record. `cumulativeDroppedTokens`, which is a *session*
+/// running total and not this compaction's reclaim — the cache proves the difference, one
+/// session's second boundary reading 1,317,965 against its own 328,757 of `preTokens` minus
+/// `postTokens` — so summing it across a session's compactions would multiply-count.
+/// `durationMs`, how long compacting took rather than how large the context was.
+/// `preservedSegment`, `preservedMessages` and `preCompactDiscoveredTools`, which are
+/// message uuids and tool names describing the compaction's internal mechanics.
+fn claude_compaction(object: &Map<String, Value>) -> Option<Compaction> {
+    if object.get("subtype").and_then(Value::as_str) != Some(CLAUDE_COMPACT_BOUNDARY) {
+        return None;
+    }
+    let metadata = object.get("compactMetadata").and_then(Value::as_object);
+    Some(Compaction {
+        phase: CompactionPhase::Complete,
+        trigger: metadata
+            .and_then(|metadata| metadata.get("trigger"))
+            .and_then(Value::as_str)
+            .and_then(nonempty),
+        // Claude Code writes a boundary only for a compaction that happened, and states no
+        // outcome of its own; `None` says exactly that, and is not a failure.
+        succeeded: None,
+        pre_tokens: metadata.and_then(|metadata| token_count(metadata.get("preTokens"))),
+        post_tokens: metadata.and_then(|metadata| token_count(metadata.get("postTokens"))),
+        // The envelope states no breakdown of the pre-compaction context and no window size
+        // to measure it against; absence here is the archive's, not a reading failure.
+        system_tokens: None,
+        conversation_tokens: None,
+        tool_definition_tokens: None,
+        token_limit: None,
+    })
 }
 
 /// The token figures of a Claude Code `message.usage`, taking exactly the keys whose
@@ -1603,6 +1766,248 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The compaction a record promotes, read the way the stream reads it.
+    fn compaction_of(source: Source, json: &str) -> Option<Compaction> {
+        let value: Value = serde_json::from_str(json).unwrap();
+        compaction(source, value.as_object().unwrap())
+    }
+
+    /// A marker with no readable figure: what a compaction record still states.
+    fn marker(phase: CompactionPhase) -> Compaction {
+        Compaction {
+            phase,
+            trigger: None,
+            succeeded: None,
+            pre_tokens: None,
+            post_tokens: None,
+            system_tokens: None,
+            conversation_tokens: None,
+            tool_definition_tokens: None,
+            token_limit: None,
+        }
+    }
+
+    /// The `system` record kind is bookkeeping wholesale — 7,895 records across the mirror
+    /// cache — and only its `compact_boundary` subtype marks a compaction. The subtype is
+    /// what certifies the meaning of `compactMetadata`, exactly as a tool's *name* and not
+    /// its keys certifies the meaning of `command`.
+    #[test]
+    fn only_the_compact_boundary_subtype_of_a_claude_system_record_is_a_compaction() {
+        assert_eq!(
+            compaction_of(
+                Source::ClaudeCode,
+                r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","compactMetadata":{"trigger":"manual","preTokens":214864,"postTokens":8156,"cumulativeDroppedTokens":206708,"durationMs":97954}}"#,
+            ),
+            Some(Compaction {
+                trigger: Some("manual".to_owned()),
+                pre_tokens: Some(214864),
+                post_tokens: Some(8156),
+                ..marker(CompactionPhase::Complete)
+            })
+        );
+
+        // Another subtype, no subtype, and a subtype that is not a string: none of them is a
+        // boundary, whatever key they carry.
+        for json in [
+            r#"{"type":"system","subtype":"local_command_stdout","compactMetadata":{"preTokens":9}}"#,
+            r#"{"type":"system","compactMetadata":{"preTokens":9}}"#,
+            r#"{"type":"system","subtype":7,"compactMetadata":{"preTokens":9}}"#,
+        ] {
+            assert_eq!(compaction_of(Source::ClaudeCode, json), None, "{json}");
+        }
+
+        // Neither is the post-compaction summary that follows a boundary: it is already a
+        // user event, and flagging it would put a second marker on one compaction.
+        assert_eq!(
+            compaction_of(
+                Source::ClaudeCode,
+                r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}"#,
+            ),
+            None
+        );
+    }
+
+    /// A boundary states that a compaction happened whether or not its figures are readable,
+    /// which is the difference between this type and [`AssistantMeta`]: there, a record with
+    /// nothing readable made no claim; here, the record *is* the claim.
+    #[test]
+    fn a_claude_boundary_with_unreadable_metadata_still_marks_a_compaction() {
+        for json in [
+            // A string count, a negative, a float, and a blank trigger.
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"   ","preTokens":"214864","postTokens":-1,"cumulativeDroppedTokens":1.5}}"#,
+            // `compactMetadata` that is not an object, and none at all.
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":7}"#,
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":null}"#,
+            r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}"#,
+        ] {
+            assert_eq!(
+                compaction_of(Source::ClaudeCode, json),
+                Some(marker(CompactionPhase::Complete)),
+                "{json}"
+            );
+        }
+
+        // One figure readable and the other not: each is dropped on its own.
+        assert_eq!(
+            compaction_of(
+                Source::ClaudeCode,
+                r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"preTokens":214864,"postTokens":"8156"}}"#,
+            ),
+            Some(Compaction {
+                pre_tokens: Some(214864),
+                ..marker(CompactionPhase::Complete)
+            })
+        );
+    }
+
+    /// Copilot spells `systemTokens` / `conversationTokens` / `toolDefinitionsTokens` on both
+    /// halves, meaning the pre-compaction context on a start and the post-compaction one on a
+    /// completion. Reading them by key alone would file a figure as its own opposite, so the
+    /// promotion is keyed per phase — and a transposition fails this test.
+    #[test]
+    fn copilot_context_components_are_read_on_a_start_and_never_on_a_completion() {
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_start","data":{"systemTokens":19138,"conversationTokens":129018,"toolDefinitionsTokens":12783}}"#,
+            ),
+            Some(Compaction {
+                system_tokens: Some(19138),
+                conversation_tokens: Some(129018),
+                tool_definition_tokens: Some(12783),
+                ..marker(CompactionPhase::Start)
+            })
+        );
+
+        // The archive's one completion carrying the same keys: 11,189 conversation tokens
+        // are what it was *left* with, against the 403,971 that went in.
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_complete","data":{"success":true,"preCompactionTokens":403971,"postCompactionTokens":11193,"systemTokens":10271,"conversationTokens":11189,"toolDefinitionsTokens":16516}}"#,
+            ),
+            Some(Compaction {
+                succeeded: Some(true),
+                pre_tokens: Some(403971),
+                post_tokens: Some(11193),
+                ..marker(CompactionPhase::Complete)
+            })
+        );
+
+        // Symmetrically, a start's `preCompactionTokens` is not a key that envelope writes,
+        // and is not read as the start's total either — only `currentTokens` is.
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_start","data":{"systemTokens":11422,"conversationTokens":188577,"toolDefinitionsTokens":18151,"currentTokens":218150,"tokenLimit":272000,"trigger":"threshold","model":"claude-synthetic","preCompactionTokens":999999}}"#,
+            ),
+            Some(Compaction {
+                trigger: Some("threshold".to_owned()),
+                pre_tokens: Some(218150),
+                system_tokens: Some(11422),
+                conversation_tokens: Some(188577),
+                tool_definition_tokens: Some(18151),
+                token_limit: Some(272000),
+                ..marker(CompactionPhase::Start)
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_copilot_compaction_is_marked_as_one_and_invents_no_figures() {
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_complete","data":{"success":false,"error":"background compaction summarizer did not settle within 60s","tokenLimit":200000,"trigger":"threshold"}}"#,
+            ),
+            Some(Compaction {
+                trigger: Some("threshold".to_owned()),
+                succeeded: Some(false),
+                token_limit: Some(200000),
+                ..marker(CompactionPhase::Complete)
+            })
+        );
+
+        // The oldest failure shape names nothing but the error.
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_complete","data":{"success":false,"error":"Error: fetch failed"}}"#,
+            ),
+            Some(Compaction {
+                succeeded: Some(false),
+                ..marker(CompactionPhase::Complete)
+            })
+        );
+
+        // A `success` that is not a boolean is not an outcome; `None` is neither failure nor
+        // success, and the attempt is still marked.
+        assert_eq!(
+            compaction_of(
+                Source::Copilot,
+                r#"{"type":"session.compaction_complete","data":{"success":"true"}}"#,
+            ),
+            Some(marker(CompactionPhase::Complete))
+        );
+        // As is a marker whose `data` is missing or unreadable.
+        for json in [
+            r#"{"type":"session.compaction_complete","data":"unreadable"}"#,
+            r#"{"type":"session.compaction_complete"}"#,
+        ] {
+            assert_eq!(
+                compaction_of(Source::Copilot, json),
+                Some(marker(CompactionPhase::Complete)),
+                "{json}"
+            );
+        }
+    }
+
+    /// Neighbouring kinds carrying compaction-shaped keys are not compaction markers, and
+    /// every marker stays the ignored bookkeeping it has always been.
+    #[test]
+    fn compaction_markers_are_read_without_leaving_their_census() {
+        for json in [
+            r#"{"type":"session.compaction_start","data":{"systemTokens":1}}"#,
+            r#"{"type":"session.compaction_complete","data":{"success":true,"preCompactionTokens":1}}"#,
+        ] {
+            assert!(
+                matches!(classify_json(Source::Copilot, json), Class::Ignored(_)),
+                "{json}"
+            );
+            assert!(compaction_of(Source::Copilot, json).is_some(), "{json}");
+        }
+        assert!(matches!(
+            classify_json(
+                Source::ClaudeCode,
+                r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"preTokens":1}}"#
+            ),
+            Class::Ignored(kind) if kind == "system"
+        ));
+
+        // Kinds that describe the context without marking a compaction.
+        for json in [
+            r#"{"type":"session.context_changed","data":{"reason":"compaction","preCompactionTokens":9,"tokenLimit":272000}}"#,
+            r#"{"type":"session.usage_checkpoint","data":{"tokensUsed":123}}"#,
+            r#"{"type":"session.truncation","data":{"tokensRemoved":9}}"#,
+        ] {
+            assert_eq!(compaction_of(Source::Copilot, json), None, "{json}");
+        }
+    }
+
+    #[test]
+    fn codex_records_promote_no_compaction() {
+        // The rollout schema names a `compacted` metadata record and the archive holds zero
+        // Codex sessions, so this crate has never seen one of its payloads. Nothing is
+        // guessed at: an absent field is an under-claim a consumer can see, an invented one
+        // is a wrong number it cannot.
+        for json in [
+            r#"{"type":"compacted","payload":{"message":"Prior context compacted."}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"/work","model":"gpt-synthetic"}}"#,
+        ] {
+            assert_eq!(compaction_of(Source::Codex, json), None, "{json}");
+        }
     }
 
     #[test]

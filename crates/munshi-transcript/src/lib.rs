@@ -36,6 +36,9 @@
 //! [`AssistantMeta`], which carries per-message model and token usage, hangs off
 //! [`Record`] rather than off any event, because it describes the record — what one API
 //! message was billed — and not the text or tool calls that record splits into.
+//! [`Compaction`] hangs off [`Record`] for a stronger version of the same reason: the
+//! records marking a compaction are bookkeeping this crate has always set aside, and typing
+//! them as [`Event`]s would move them out of their census into a rendering they never had.
 //!
 //! [`envelope_matches`], [`claude_origin_cwd`], [`claude_git_branch`], and
 //! [`claude_agent_version`] expose the pure, privacy-safe envelope predicates behind `munshi`'s
@@ -187,6 +190,19 @@ pub struct Record {
     /// otherwise 136, most records are not assistant records, and
     /// [`TranscriptStream::collect_records`] buffers every record of a transcript at once.
     pub assistant_meta: Option<Box<AssistantMeta>>,
+    /// What the record says about a context compaction, when it is one of the records a
+    /// harness writes to mark one (issue #77, for qanungo's Context Management lane).
+    ///
+    /// Like [`Self::assistant_meta`] this is read in a pass of its own, independent of
+    /// [`Self::classification`], and for a sharper reason: every record it reads is
+    /// [`Classification::Ignored`] bookkeeping, and none of them may move. A compaction is a
+    /// fact about the *session's* context window, not conversation content — see
+    /// [`Compaction`].
+    ///
+    /// Boxed for the same reason as the meta beside it: eight `Option`s and a discriminant
+    /// come to 128 bytes, which unboxed would take [`Record`] from 152 to 272, and 743
+    /// records of the mirror cache's 689,160 carry one.
+    pub compaction: Option<Box<Compaction>>,
 }
 
 /// The read-time meaning of one transcript record.
@@ -359,6 +375,115 @@ impl TokenUsage {
     pub(crate) fn recorded(self) -> Option<Self> {
         (self != Self::default()).then_some(self)
     }
+}
+
+/// Which half of a compaction a record marks (issue #77).
+///
+/// Claude Code writes one record per compaction and writes it afterwards, so its
+/// `compact_boundary` reads as [`Self::Complete`]: the record states how large the context
+/// was before and how large it was left, which only a finished compaction knows. Copilot
+/// writes both halves as separate records. Reading them onto one discriminant is what lets a
+/// consumer state one counting rule for both harnesses — see [`Compaction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompactionPhase {
+    /// The harness announced that it was about to compact (Copilot
+    /// `session.compaction_start`). Nothing has been dropped yet, and the compaction may
+    /// still fail.
+    Start,
+    /// The compaction is over, successfully or not (Copilot `session.compaction_complete`,
+    /// Claude Code's `compact_boundary`).
+    Complete,
+}
+
+/// What a record says about a context compaction: that one happened, which half of it this
+/// record marks, and whatever the source states about the size of the context around it
+/// (issue #77, for qanungo's Context Management lane).
+///
+/// The *position* of a compaction is [`Record::record`] and [`Record::timestamp`], which
+/// every record already carries: a consumer folding pre-compaction utilization from the
+/// assistant usage of the messages before a boundary reads it from the stream it is already
+/// walking, and this type does not restate it.
+///
+/// # Counting compactions means counting one phase, not counting records
+///
+/// Copilot writes a `session.compaction_start` and a `session.compaction_complete` for every
+/// compaction — 367 of each across the mirror cache, strictly alternating in all 83 sessions
+/// that compacted at all — so a fold over records counts every Copilot compaction twice and
+/// every Claude Code one once. Counting [`CompactionPhase::Complete`] gives a figure that
+/// means the same thing in both harnesses, which is why Claude Code's single record is read
+/// as that phase and not as a third one.
+///
+/// Two things that rule under-claims, and does so knowingly. A compaction whose session ended
+/// between the two records leaves a `Start` a `Complete`-fold does not see; the archive holds
+/// no such session, but a transcript captured mid-compaction could. And a `Complete` may have
+/// failed — [`Self::succeeded`] is `Some(false)` on 3 of the cache's 367 — so a fold counting
+/// *effective* compactions must filter on it, while a fold counting how often the operator
+/// hit the context wall should not.
+///
+/// # Absence is not "no compaction"
+///
+/// Unlike [`AssistantMeta`], this type has no "recorded" gate: a marker record with no
+/// readable figure at all still reports that a compaction happened, because the record's
+/// existence *is* the claim. What stays absent is every figure the source did not state, and
+/// the sources state very different amounts — see the fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compaction {
+    /// Which half of the compaction this record marks.
+    pub phase: CompactionPhase,
+    /// Why the harness compacted, verbatim: Claude Code's `compactMetadata.trigger`
+    /// (`manual` on all 9 of the cache's boundaries) and Copilot's `trigger` (`threshold`,
+    /// on 5 of its 367 pairs). **Nearly always absent for Copilot** — the key is a recent
+    /// addition to that envelope — so a consumer that splits sessions by manual against
+    /// automatic compaction can do it for Claude Code and must report the Copilot split as
+    /// unknown rather than defaulting it either way.
+    pub trigger: Option<String>,
+    /// Copilot's `success`. `None` where the source states nothing, which is every
+    /// [`CompactionPhase::Start`] (the outcome is not known yet) and every Claude Code
+    /// record (a `compact_boundary` is written only for a compaction that happened).
+    /// `None` is therefore not a failure, and not a success either.
+    pub succeeded: Option<bool>,
+    /// How large the context was before the compaction, as the source states it in one
+    /// figure: Claude Code's `compactMetadata.preTokens`, Copilot's `preCompactionTokens`
+    /// on a `Complete` and `currentTokens` on a `Start`.
+    ///
+    /// Present on every Claude Code boundary and on the 364 Copilot completions that
+    /// succeeded, but on only 5 Copilot starts. A start that lacks it still states the
+    /// three components below, whose sum the archive shows equal to the paired completion's
+    /// `preCompactionTokens` in 363 of the 364 pairs both figures exist for — and *unequal*
+    /// in the remaining one (400,754 against 403,971). So a consumer may add the components
+    /// up knowing what it is doing; this crate will not do the addition for it, because a
+    /// derived figure that disagrees with a recorded one in one case out of 364 is a figure
+    /// no source ever wrote.
+    pub pre_tokens: Option<u64>,
+    /// How large the context was left, from Claude Code's `compactMetadata.postTokens` and
+    /// Copilot's `postCompactionTokens`. Copilot records it on only 3 of 367 completions,
+    /// so *reclaim* (`pre_tokens - post_tokens`) is a Claude Code figure in practice.
+    pub post_tokens: Option<u64>,
+    /// The system prompt's share of the pre-compaction context, from Copilot's
+    /// `systemTokens` on a [`CompactionPhase::Start`] — recorded on all 367 of them, which
+    /// makes this breakdown the one pre-compaction size figure Copilot always states.
+    ///
+    /// This and the two fields below are read on `Start` records **only**, and that is a
+    /// safety rule rather than a scope choice: Copilot spells the same three keys on a
+    /// completion, where they describe the context it was *left* with, not the one it
+    /// started from. The cache holds one such completion, whose `conversationTokens` reads
+    /// 11,189 beside a `postCompactionTokens` of 11,193 and a `preCompactionTokens` of
+    /// 403,971. Reading them by key alone would silently file a post-compaction figure as a
+    /// pre-compaction one.
+    pub system_tokens: Option<u64>,
+    /// The conversation's share of the pre-compaction context, from Copilot's
+    /// `conversationTokens` on a [`CompactionPhase::Start`]. See [`Self::system_tokens`].
+    pub conversation_tokens: Option<u64>,
+    /// The tool definitions' share of the pre-compaction context, from Copilot's
+    /// `toolDefinitionsTokens` on a [`CompactionPhase::Start`]. See [`Self::system_tokens`];
+    /// it is the share a session cannot shrink by talking less.
+    pub tool_definition_tokens: Option<u64>,
+    /// The context window the harness was compacting against, from Copilot's `tokenLimit`
+    /// on either half. **Absent on all 9 Claude Code boundaries and on all but 5 Copilot
+    /// pairs**, so utilization as a *ratio* is not a thing this archive can be folded into.
+    /// A consumer wanting one supplies the denominator itself, from the model, and must
+    /// never read an absent limit as an unbounded context.
+    pub token_limit: Option<u64>,
 }
 
 /// Structured fields of a tool event, keyed exactly as the legacy renderer keys them
@@ -557,6 +682,7 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
                         kind: NON_OBJECT_JSON_KIND.to_owned(),
                     },
                     assistant_meta: None,
+                    compaction: None,
                 }));
             };
             let raw_timestamp = object.get("timestamp").cloned();
@@ -573,6 +699,10 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
             // Read independently of the classification: a record's usage is what it was
             // billed, whether its content classified as events, as empty, or as ignored.
             let assistant_meta = classify::assistant_meta(self.source, object).map(Box::new);
+            // Read independently for the same reason and one more: the records that mark a
+            // compaction are bookkeeping this crate deliberately does not archive, so the
+            // only way to type them without moving them out of their census is beside it.
+            let compaction = classify::compaction(self.source, object).map(Box::new);
             return Some(Ok(Record {
                 line,
                 record,
@@ -580,6 +710,7 @@ impl<R: BufRead> Iterator for TranscriptStream<R> {
                 timestamp,
                 classification,
                 assistant_meta,
+                compaction,
             }));
         }
     }
