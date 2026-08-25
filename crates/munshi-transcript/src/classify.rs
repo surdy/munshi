@@ -823,10 +823,19 @@ fn claude_compaction(object: &Map<String, Value>) -> Option<Compaction> {
 /// whose `content` is a command block's own output rather than an invocation.
 const CLAUDE_LOCAL_COMMAND: &str = "local_command";
 
-/// The three tags a Claude Code slash-command block is built from. A record's content must
-/// consist of these and nothing else for it to be read as an invocation — see
-/// [`claude_command_block`].
-const CLAUDE_COMMAND_TAGS: [&str; 3] = ["command-name", "command-message", "command-args"];
+/// The three tags a Claude Code slash-command block is built from, as `(open, close)` pairs.
+/// A record's content must consist of these and nothing else for it to be read as an
+/// invocation — see [`claude_command_block`].
+///
+/// Spelled out rather than built from the tag names because the parser runs against the
+/// `message.content` of *every* Claude Code `user` record — 43,973 of them across the mirror
+/// cache, almost none of which is a command — and a matcher that formatted its own delimiters
+/// would allocate six strings per record to discover that.
+const CLAUDE_COMMAND_TAGS: [(&str, &str); 3] = [
+    ("<command-name>", "</command-name>"),
+    ("<command-message>", "</command-message>"),
+    ("<command-args>", "</command-args>"),
+];
 
 /// The slash command a Claude Code record records, from the two carriers the archive holds
 /// (issue #77).
@@ -891,10 +900,9 @@ fn claude_command_block(content: &str) -> Option<[Option<&str>; 3]> {
             CLAUDE_COMMAND_TAGS
                 .iter()
                 .enumerate()
-                .find_map(|(index, tag)| {
-                    let after = rest.strip_prefix(&format!("<{tag}>"))?;
-                    let close = format!("</{tag}>");
-                    let end = after.find(&close)?;
+                .find_map(|(index, (open, close))| {
+                    let after = rest.strip_prefix(open)?;
+                    let end = after.find(close)?;
                     Some((index, &after[..end], &after[end + close.len()..]))
                 })?;
         if found[index].is_some() {

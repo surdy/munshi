@@ -191,7 +191,7 @@ pub struct Record {
     /// deduplicated output tokens — 39% — unreachable at any price.
     ///
     /// Boxed because it is ten `Option`s wide (232 bytes) against a record that is
-    /// otherwise 136, most records are not assistant records, and
+    /// otherwise 152, most records are not assistant records, and
     /// [`TranscriptStream::collect_records`] buffers every record of a transcript at once.
     pub assistant_meta: Option<Box<AssistantMeta>>,
     /// What the record says about a context compaction, when it is one of the records a
@@ -204,7 +204,7 @@ pub struct Record {
     /// [`Compaction`].
     ///
     /// Boxed for the same reason as the meta beside it: eight `Option`s and a discriminant
-    /// come to 128 bytes, which unboxed would take [`Record`] from 152 to 272, and 743
+    /// come to 128 bytes, which unboxed would take [`Record`] from 160 to 280, and 743
     /// records of the mirror cache's 689,160 carry one.
     pub compaction: Option<Box<Compaction>>,
     /// The slash command the operator ran, when the record is the one a harness writes to
@@ -220,8 +220,8 @@ pub struct Record {
     /// the two carriers apart reads [`Self::classification`], which already says which it is.
     ///
     /// Boxed like the two promotions beside it: a `String` and an `Option<String>` come to 48
-    /// bytes against a [`Record`] that is otherwise 160, and 175 records of the mirror
-    /// cache's 693,030 carry one.
+    /// bytes, which unboxed would take [`Record`] from 160 to 200, and 175 records of the
+    /// mirror cache's 693,030 carry one.
     pub slash_command: Option<Box<SlashCommand>>,
 }
 
