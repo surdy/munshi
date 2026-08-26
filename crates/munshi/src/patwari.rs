@@ -887,10 +887,15 @@ fn now_rfc3339() -> String {
 /// present one spelling of itself across the whole system, so qanungo can scope by device and have
 /// it line up with everything else munshi labels. `None` when the OS declines to answer or the
 /// hostname sanitizes away to nothing — better an absent key than an empty one.
-fn capture_hostname() -> Option<String> {
-    let sanitized =
-        crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string());
-    (!sanitized.is_empty()).then_some(sanitized)
+fn capture_hostname(machine_label: Option<&str>) -> Option<String> {
+    let configured = machine_label
+        .map(str::to_owned)
+        .filter(|label| !label.is_empty());
+    configured.or_else(|| {
+        let sanitized =
+            crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string());
+        (!sanitized.is_empty()).then_some(sanitized)
+    })
 }
 
 /// The capture machine's UTC offset at `captured_at`, as RFC3339 spells it (`+05:30`, `-08:00`,
@@ -1330,6 +1335,7 @@ pub(crate) fn upload_after_archive(
         &config.archive_upload,
         &client_id,
         &endpoint,
+        config.memory_sync.machine_label.as_deref(),
         &output_directory,
         &record,
         &config.harnesses.source_homes(),
@@ -1379,6 +1385,7 @@ pub(crate) fn retry_pending_uploads(
             &config.archive_upload,
             &client_id,
             &endpoint,
+            config.memory_sync.machine_label.as_deref(),
             &output_directory,
             &session,
             &config.harnesses.source_homes(),
@@ -1396,6 +1403,7 @@ pub(crate) fn upload_one(
     settings: &crate::registration::StoredArchiveUpload,
     client_id: &str,
     endpoint: &str,
+    machine_label: Option<&str>,
     output_directory: &Path,
     record: &SessionRecord,
     homes: &SourceHomes,
@@ -1491,7 +1499,14 @@ pub(crate) fn upload_one(
         });
     }
 
-    match run_upload(state, client_id, endpoint, record, &artifacts) {
+    match run_upload(
+        state,
+        client_id,
+        endpoint,
+        machine_label,
+        record,
+        &artifacts,
+    ) {
         Ok(receipt) => {
             state.record_archive_upload_success(
                 &record.session_id,
@@ -1568,7 +1583,11 @@ fn record_upload_failure(
 /// observation* that has no typed home in the manifest. Every key is lowercase snake, every value a
 /// short sanitized string, and every one of them is optional — the map is opaque to Patwari, which
 /// returns it verbatim, so a reader that does not recognize a key ignores it.
-fn capture_source_metadata(record: &SessionRecord, captured_at: &str) -> BTreeMap<String, String> {
+fn capture_source_metadata(
+    record: &SessionRecord,
+    captured_at: &str,
+    machine_label: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     // A recorded-evidence identity (issue #40) is flagged in the capture metadata so a consumer can
     // distinguish it from a live-resolved one; live identities add nothing.
@@ -1583,7 +1602,7 @@ fn capture_source_metadata(record: &SessionRecord, captured_at: &str) -> BTreeMa
     if let Some(offset) = capture_utc_offset(captured_at) {
         metadata.insert("utc_offset".to_owned(), offset);
     }
-    if let Some(hostname) = capture_hostname() {
+    if let Some(hostname) = capture_hostname(machine_label) {
         metadata.insert("hostname".to_owned(), hostname);
     }
     metadata
@@ -1595,6 +1614,7 @@ fn run_upload(
     state: &mut StateStore,
     client_id: &str,
     endpoint: &str,
+    machine_label: Option<&str>,
     record: &SessionRecord,
     artifacts: &[PreparedArtifact],
 ) -> Result<UploadReceipt, PatwariError> {
@@ -1616,7 +1636,7 @@ fn run_upload(
         captured_at: prep.captured_at.clone(),
         source_cursor: Some(record.current_revision.to_string()),
         source_state_hash: record.current_summary_hash.clone(),
-        source_metadata: capture_source_metadata(record, &prep.captured_at),
+        source_metadata: capture_source_metadata(record, &prep.captured_at, machine_label),
         project: record
             .project
             .as_ref()
@@ -2193,6 +2213,7 @@ fn rearchive_manifest(
     record: &SessionRecord,
     prep: &crate::state::CapturePrep,
     artifacts: &[PreparedArtifact],
+    machine_label: Option<&str>,
 ) -> Result<Value, PatwariError> {
     let mut manifest = snapshot.get("manifest").cloned().ok_or_else(|| {
         PatwariError::Protocol("saved snapshot response omitted manifest".to_owned())
@@ -2219,7 +2240,7 @@ fn rearchive_manifest(
         .ok_or_else(|| {
             PatwariError::Protocol("saved source_metadata is not an object".to_owned())
         })?;
-    for (key, value) in capture_source_metadata(record, &prep.captured_at) {
+    for (key, value) in capture_source_metadata(record, &prep.captured_at, machine_label) {
         metadata.insert(key, Value::String(value));
     }
     capture.insert(
@@ -2327,7 +2348,14 @@ pub fn rearchive(
         captured_at: now_rfc3339(),
         resume_upload_id: None,
     };
-    let _ = rearchive_manifest(&snapshot, &record, &validation_prep, &artifacts)?;
+    let machine_label = config.memory_sync.machine_label.as_deref();
+    let _ = rearchive_manifest(
+        &snapshot,
+        &record,
+        &validation_prep,
+        &artifacts,
+        machine_label,
+    )?;
     let expected_fingerprint = snapshot
         .get("snapshot_fingerprint")
         .and_then(Value::as_str)
@@ -2397,7 +2425,7 @@ pub fn rearchive(
         &new_uuid(),
         &now_rfc3339(),
     )?;
-    let manifest = rearchive_manifest(&snapshot, &record, &prep, &artifacts)?;
+    let manifest = rearchive_manifest(&snapshot, &record, &prep, &artifacts, machine_label)?;
     let endpoint_owned = endpoint.clone();
     let receipt = client.upload_snapshot(
         &prep.capture_id,
@@ -2697,6 +2725,7 @@ pub fn retry(
             &config.archive_upload,
             &client_id,
             &endpoint,
+            config.memory_sync.machine_label.as_deref(),
             &output_directory,
             record.source,
             &record.session_id,
@@ -2816,6 +2845,7 @@ pub fn backfill(
             &config.archive_upload,
             &client_id,
             &endpoint,
+            config.memory_sync.machine_label.as_deref(),
             &output_directory,
             session.source,
             &session.session_id,
@@ -2840,6 +2870,7 @@ fn locked_upload_one(
     settings: &crate::registration::StoredArchiveUpload,
     client_id: &str,
     endpoint: &str,
+    machine_label: Option<&str>,
     output_directory: &Path,
     source: SourceKind,
     session_id: &str,
@@ -2866,6 +2897,7 @@ fn locked_upload_one(
         settings,
         client_id,
         endpoint,
+        machine_label,
         output_directory,
         &session,
         homes,
@@ -3029,9 +3061,9 @@ mod tests {
         let expected =
             crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string());
         if expected.is_empty() {
-            assert_eq!(capture_hostname(), None);
+            assert_eq!(capture_hostname(None), None);
         } else {
-            assert_eq!(capture_hostname().as_deref(), Some(expected.as_str()));
+            assert_eq!(capture_hostname(None).as_deref(), Some(expected.as_str()));
             // Sanitized means routing-safe: no whitespace, no uppercase, no shell-hostile bytes.
             assert!(
                 expected.chars().all(|c| c.is_ascii_lowercase()
@@ -3054,7 +3086,11 @@ mod tests {
         let record = archived_record("11111111-1111-1111-8111-111111111111", &transcript_path);
 
         let captured_at = "2026-07-25T00:00:00Z";
-        let metadata = capture_source_metadata(&record, captured_at);
+        let metadata = capture_source_metadata(&record, captured_at, Some("canonical-mac"));
+        assert_eq!(
+            metadata.get("hostname").map(String::as_str),
+            Some("canonical-mac")
+        );
         let artifacts = prepare_artifacts(vec![ArtifactSource {
             logical_path: "summary.md".to_owned(),
             media_type: Some("text/markdown".to_owned()),
@@ -3088,10 +3124,11 @@ mod tests {
         let hostname = source_metadata["hostname"]
             .as_str()
             .expect("capture carries a hostname");
-        assert!(!hostname.is_empty());
+        assert_eq!(hostname, "canonical-mac");
         assert_eq!(
-            hostname,
-            crate::memory_sync::sanitize_machine_label(&crate::memory_sync::hostname_string())
+            capture_hostname(Some("mac.local")).as_deref(),
+            Some("mac.local"),
+            "the persisted canonical label must not be sanitized a second time"
         );
         // This record has a live-resolved identity, so `origin` stays absent — the machine keys do
         // not drag an unrelated marker in with them.
@@ -3116,7 +3153,7 @@ mod tests {
             origin: ProjectOrigin::Recorded,
         });
 
-        let metadata = capture_source_metadata(&record, "2026-07-25T00:00:00Z");
+        let metadata = capture_source_metadata(&record, "2026-07-25T00:00:00Z", None);
         assert_eq!(metadata.get("origin").map(String::as_str), Some("recorded"));
         assert!(metadata.contains_key("utc_offset"));
         assert!(metadata.contains_key("hostname"));
@@ -3512,6 +3549,7 @@ mod tests {
                 &settings,
                 "client",
                 endpoint,
+                None,
                 &output_dir,
                 &record,
                 &SourceHomes::default(),
@@ -3597,6 +3635,7 @@ mod tests {
                 &settings,
                 "client",
                 endpoint,
+                None,
                 &output_dir,
                 record,
                 &SourceHomes::default(),
@@ -3722,6 +3761,7 @@ mod tests {
             &settings,
             "client",
             endpoint,
+            None,
             &output_dir,
             &record,
             &SourceHomes::default(),
