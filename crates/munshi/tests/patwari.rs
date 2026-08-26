@@ -783,6 +783,214 @@ fn repair_missing_archive_upload_clears_server_identity_and_preserves_history() 
     assert_eq!(row.transfer_bytes_total, 11);
 }
 
+#[test]
+fn rearchive_states_resume_but_never_enter_the_generic_retry_sweep() {
+    let directory = TempDir::new().unwrap();
+    let state_dir = directory.path().join("munshi-home");
+    let session = "46464646-4646-4646-8646-464646464646";
+    let endpoint = "http://127.0.0.1:1";
+    let mut store = StateStore::open(&state_dir).unwrap();
+    store
+        .ingest_agent_stop(
+            session,
+            10_000,
+            Path::new("/tmp/project"),
+            Path::new("/tmp/t.jsonl"),
+        )
+        .unwrap();
+    store
+        .prepare_archive_capture(session, endpoint, 7, "capture-old", "2026-07-25T00:00:00Z")
+        .unwrap();
+    store
+        .record_archive_upload_success(
+            session,
+            endpoint,
+            &munshi::ArchiveUploadSuccess {
+                uploaded_revision: 7,
+                uploaded_summary_hash: "summary-hash".to_owned(),
+                uploaded_markdown_hash: Some("markdown-hash".to_owned()),
+                snapshot_id: "snap-old".to_owned(),
+                patwari_session_id: "patwari-old".to_owned(),
+                uploaded_artifact_paths: vec![
+                    "summary.md".to_owned(),
+                    "transcript.jsonl".to_owned(),
+                ],
+                transfer_bytes: 11,
+                total_stored_bytes: 12,
+                total_original_bytes: 13,
+            },
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .repair_missing_archive_upload_for_rearchive(session, endpoint, "snap-old")
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_archive_upload(session, endpoint)
+            .unwrap()
+            .unwrap()
+            .upload_state,
+        "rearchive-pending"
+    );
+    assert!(
+        store
+            .eligible_archive_uploads(i64::MAX, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let first = store
+        .prepare_archive_capture(
+            session,
+            endpoint,
+            7,
+            "capture-rearchive",
+            "2026-07-26T00:00:00Z",
+        )
+        .unwrap();
+    store
+        .record_archive_upload_id(session, endpoint, "upload-rearchive")
+        .unwrap();
+    let failed = store
+        .record_archive_rearchive_failure(session, endpoint, "upload-transport")
+        .unwrap();
+    assert_eq!(failed.upload_state, "rearchive-failed");
+    assert!(
+        store
+            .eligible_archive_uploads(i64::MAX, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .reset_archive_upload_for_retry(session, endpoint, true)
+            .unwrap()
+            .unwrap()
+            .upload_state,
+        "rearchive-failed",
+        "generic retry cannot unpark a rearchive"
+    );
+    assert!(
+        store
+            .record_archive_upload_failure(session, endpoint, "upload-transport", 5, i64::MAX,)
+            .is_err(),
+        "generic failure bookkeeping cannot demote a parked rearchive"
+    );
+    assert_eq!(
+        store
+            .get_archive_upload(session, endpoint)
+            .unwrap()
+            .unwrap()
+            .upload_state,
+        "rearchive-failed"
+    );
+
+    let resumed = store
+        .prepare_archive_capture(
+            session,
+            endpoint,
+            7,
+            "capture-unused",
+            "2026-07-27T00:00:00Z",
+        )
+        .unwrap();
+    assert_eq!(resumed.capture_id, first.capture_id);
+    assert_eq!(
+        resumed.resume_upload_id.as_deref(),
+        Some("upload-rearchive")
+    );
+    let parked = store
+        .ensure_archive_rearchive_target(session, endpoint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.upload_state, "rearchive-pending");
+    assert_eq!(
+        parked.upload_id.as_deref(),
+        Some("upload-rearchive"),
+        "parking a resumed rearchive retains its server upload identity"
+    );
+    assert!(
+        store
+            .eligible_archive_uploads(i64::MAX, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mismatch = store
+        .record_archive_rearchive_fingerprint_mismatch(session, endpoint)
+        .unwrap();
+    assert_eq!(mismatch.upload_state, "rearchive-failed");
+    assert!(mismatch.capture_id.is_none() && mismatch.upload_id.is_none());
+    assert_eq!(
+        mismatch.last_error_category.as_deref(),
+        Some("snapshot-fingerprint-mismatch")
+    );
+    let fresh = store
+        .prepare_archive_capture(
+            session,
+            endpoint,
+            7,
+            "capture-after-mismatch",
+            "2026-07-27T12:00:00Z",
+        )
+        .unwrap();
+    assert_eq!(fresh.capture_id, "capture-after-mismatch");
+    assert!(fresh.resume_upload_id.is_none());
+    store
+        .record_archive_rearchive_failure(session, endpoint, "upload-transport")
+        .unwrap();
+    assert!(store.abandon_archive_rearchive(session, endpoint).unwrap());
+    let abandoned = store
+        .get_archive_upload(session, endpoint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(abandoned.upload_state, "pending");
+    assert!(abandoned.capture_id.is_none() && abandoned.upload_id.is_none());
+    assert_eq!(
+        abandoned.last_error_category.as_deref(),
+        Some("rearchive-abandoned")
+    );
+    assert_eq!(
+        store.eligible_archive_uploads(i64::MAX, 10).unwrap().len(),
+        1,
+        "explicit abandon returns the row to ordinary uploads"
+    );
+
+    let ordinary_session = "47474747-4747-4747-8747-474747474747";
+    store
+        .ingest_agent_stop(
+            ordinary_session,
+            10_000,
+            Path::new("/tmp/project"),
+            Path::new("/tmp/ordinary.jsonl"),
+        )
+        .unwrap();
+    store
+        .prepare_archive_capture(
+            ordinary_session,
+            endpoint,
+            7,
+            "ordinary-capture",
+            "2026-07-28T00:00:00Z",
+        )
+        .unwrap();
+    store
+        .record_archive_upload_id(ordinary_session, endpoint, "ordinary-upload")
+        .unwrap();
+    let adopted = store
+        .ensure_archive_rearchive_target(ordinary_session, endpoint)
+        .unwrap()
+        .unwrap();
+    assert_eq!(adopted.upload_state, "rearchive-pending");
+    assert!(
+        adopted.capture_id.is_none() && adopted.upload_id.is_none(),
+        "an ordinary upload identity must never be resumed as a rearchive"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CLI backfill of sessions archived while upload was disabled (issue #32)
 // ---------------------------------------------------------------------------

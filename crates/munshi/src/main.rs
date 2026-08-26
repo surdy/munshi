@@ -16,17 +16,17 @@ use munshi::{
     ProjectStatus, RegisterConfig, RestoreConfig, RestoreError, RestoreReport, ResumeConfig,
     RetrieveError, RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceHomes,
     SourceKind, StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport,
-    WorkerContext, accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
-    archive_upload_reconcile, archive_upload_retry, archive_upload_status,
-    configure_archive_upload, configure_delivery, configure_memory_sync, conflicting_source_home,
-    default_copilot_home, delivery_backfill, delivery_retry, delivery_status,
-    delivery_verify_history, handle_hook, lift_stale_source_limit_parks, memory_sync_run,
-    memory_sync_status, parse_archive_markdown, parse_summarizer_env, project_label,
-    project_status, prune_summarizer_exhaust, reactivate_regrown_lost_transcripts,
-    read_last_failure, register, restore, retrieve, run_archive_worker_for_source, run_recovery,
-    set_archive_upload_enabled, set_delivery_enabled, set_memory_sync_enabled, set_project_enabled,
-    summarizer_exhaust_bytes, tick_recovery_sweep, unregister, verify_archive_parse,
-    wait_for_hook_result_for_source,
+    WorkerContext, abandon_archive_upload_rearchive, accept_disclosure_from_terminal,
+    archive_session, archive_upload_backfill, archive_upload_rearchive, archive_upload_reconcile,
+    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
+    configure_memory_sync, conflicting_source_home, default_copilot_home, delivery_backfill,
+    delivery_retry, delivery_status, delivery_verify_history, handle_hook,
+    lift_stale_source_limit_parks, memory_sync_run, memory_sync_status, parse_archive_markdown,
+    parse_summarizer_env, project_label, project_status, prune_summarizer_exhaust,
+    reactivate_regrown_lost_transcripts, read_last_failure, register, restore, retrieve,
+    run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
+    set_memory_sync_enabled, set_project_enabled, summarizer_exhaust_bytes, tick_recovery_sweep,
+    unregister, verify_archive_parse, wait_for_hook_result_for_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -727,6 +727,24 @@ enum ArchiveUploadCommand {
         /// them with a fresh capture identity.
         #[arg(long)]
         repair_missing: bool,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-archive one repaired row from a saved pre-tombstone snapshot document, preserving every
+    /// fingerprint-bearing manifest field and artifact byte.
+    Rearchive {
+        session_id: String,
+        #[arg(long)]
+        source: String,
+        /// JSON returned by GET /api/v1/snapshots/{snapshot_id} before it was tombstoned.
+        #[arg(long, required_unless_present = "abandon", conflicts_with = "abandon")]
+        snapshot_file: Option<PathBuf>,
+        /// Give up fingerprint preservation and return this parked row to ordinary uploads.
+        #[arg(long)]
+        abandon: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
         /// Emit a stable machine-readable contract.
         #[arg(long)]
         json: bool,
@@ -2556,6 +2574,32 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::ArchiveUploadReconcile {
                 report: Box::new(archive_upload_reconcile(&state_directory, repair_missing)?),
+                json,
+            })
+        }
+        ArchiveUploadCommand::Rearchive {
+            session_id,
+            source,
+            snapshot_file,
+            abandon,
+            state_dir,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            let source = parse_source_selector(&source)?;
+            Ok(Outcome::ArchiveUploadRun {
+                report: Box::new(if abandon {
+                    abandon_archive_upload_rearchive(&state_directory, source, &session_id)?
+                } else {
+                    archive_upload_rearchive(
+                        &state_directory,
+                        source,
+                        &session_id,
+                        snapshot_file
+                            .as_deref()
+                            .ok_or("--snapshot-file is required unless --abandon is passed")?,
+                    )?
+                }),
                 json,
             })
         }

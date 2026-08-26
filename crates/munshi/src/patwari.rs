@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -62,6 +62,7 @@ pub const INITIAL_ARTIFACT_SET_VERSION: u16 = 1;
 pub const CURRENT_ARTIFACT_SET_VERSION: u16 = 2;
 /// The logical-path prefix of staged sidecar artifacts (artifact set v2, issue #23).
 pub(crate) const SIDECAR_LOGICAL_PREFIX: &str = "sidecar/";
+const OUTPUTS_LOGICAL_PREFIX: &str = "outputs/";
 /// Custom chunk headers Patwari requires on each artifact chunk PUT.
 const CHUNK_SHA256_HEADER: &str = "x-patwari-chunk-sha256";
 const CHUNK_LENGTH_HEADER: &str = "x-patwari-chunk-length";
@@ -71,6 +72,9 @@ const BASE_BACKOFF_MS: i64 = 60_000;
 const MAX_BACKOFF_MS: i64 = 3_600_000;
 /// Network timeout for a single upload request. Larger than delivery's: chunk bodies are bigger.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Completion verifies and decompresses the entire snapshot server-side. Large transcripts can
+/// legitimately take much longer than an individual chunk or status request.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Error)]
 pub enum PatwariError {
@@ -264,20 +268,7 @@ pub fn build_manifest(
     capture: &CaptureContext,
     artifacts: &[PreparedArtifact],
 ) -> Value {
-    let artifacts_json: Vec<Value> = artifacts
-        .iter()
-        .map(|artifact| {
-            json!({
-                "logical_path": artifact.logical_path,
-                "media_type": artifact.media_type,
-                "original_size_bytes": artifact.original_size_bytes,
-                "original_sha256": prefixed_digest(&artifact.original_sha256),
-                "stored_size_bytes": artifact.stored_size_bytes,
-                "stored_sha256": prefixed_digest(&artifact.stored_sha256),
-                "compression": artifact.compression,
-            })
-        })
-        .collect();
+    let artifacts_json = prepared_artifacts_json(artifacts);
     json!({
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "session": {
@@ -298,6 +289,23 @@ pub fn build_manifest(
         },
         "artifacts": artifacts_json,
     })
+}
+
+fn prepared_artifacts_json(artifacts: &[PreparedArtifact]) -> Vec<Value> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "logical_path": artifact.logical_path,
+                "media_type": artifact.media_type,
+                "original_size_bytes": artifact.original_size_bytes,
+                "original_sha256": prefixed_digest(&artifact.original_sha256),
+                "stored_size_bytes": artifact.stored_size_bytes,
+                "stored_sha256": prefixed_digest(&artifact.stored_sha256),
+                "compression": artifact.compression,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -580,7 +588,7 @@ impl PatwariClient {
             "{API_BASE}/uploads/{}/complete",
             http::encode_path(upload_id)
         );
-        let response = self.send_json("POST", &path, None)?;
+        let response = self.send_json_with_timeout("POST", &path, None, COMPLETION_TIMEOUT)?;
         match response.status {
             200 | 201 => parse_completion(&response.body, upload_id, capture_id),
             409 => Err(self.conflict_error(&response.body)),
@@ -595,6 +603,16 @@ impl PatwariClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<http::HttpResponse, PatwariError> {
+        self.send_json_with_timeout(method, path, body, self.timeout)
+    }
+
+    fn send_json_with_timeout(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<http::HttpResponse, PatwariError> {
         let mut headers = vec![Header {
             name: "Accept",
             value: "application/json",
@@ -607,7 +625,7 @@ impl PatwariClient {
         }
         http::send(
             &self.endpoint,
-            self.timeout,
+            timeout,
             &http::HttpRequest {
                 method,
                 path,
@@ -1396,6 +1414,14 @@ pub(crate) fn upload_one(
             });
         }
     };
+    if matches!(
+        existing.upload_state.as_str(),
+        "rearchive-pending" | "rearchive-failed"
+    ) {
+        return Ok(UploadOutcome::Skipped {
+            reason: "rearchive-parked".to_owned(),
+        });
+    }
     if existing.upload_state == "dead-letter" {
         return Ok(UploadOutcome::Skipped {
             reason: "dead-letter".to_owned(),
@@ -2043,6 +2069,451 @@ pub fn reconcile(
 }
 
 // ---------------------------------------------------------------------------
+// Fingerprint-preserving rearchive
+// ---------------------------------------------------------------------------
+
+fn rearchive_artifact_path(
+    output_directory: &Path,
+    markdown_relative: &Path,
+    logical_path: &str,
+) -> Result<PathBuf, PatwariError> {
+    let relative = if logical_path == SUMMARY_LOGICAL_PATH {
+        return Ok(output_directory.join(markdown_relative));
+    } else if logical_path == TRANSCRIPT_LOGICAL_PATH {
+        crate::render::restored_relative_directory(markdown_relative).join(TRANSCRIPT_LOGICAL_PATH)
+    } else if let Some(digest) = logical_path.strip_prefix(OUTPUTS_LOGICAL_PREFIX) {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PatwariError::Protocol(format!(
+                "saved snapshot contains invalid output path {logical_path}"
+            )));
+        }
+        crate::render::restored_relative_directory(markdown_relative)
+            .join(OUTPUTS_LOGICAL_PREFIX.trim_end_matches('/'))
+            .join(digest)
+    } else if let Some(relative) = logical_path.strip_prefix(SIDECAR_LOGICAL_PREFIX) {
+        let relative = Path::new(relative);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(PatwariError::Protocol(format!(
+                "saved snapshot contains invalid sidecar path {logical_path}"
+            )));
+        }
+        crate::render::sidecar_relative_directory(markdown_relative).join(relative)
+    } else {
+        return Err(PatwariError::Protocol(format!(
+            "saved snapshot contains unsupported artifact {logical_path}"
+        )));
+    };
+    Ok(output_directory.join(relative))
+}
+
+fn rearchive_sources(
+    snapshot: &Value,
+    output_directory: &Path,
+    record: &SessionRecord,
+) -> Result<Vec<ArtifactSource>, PatwariError> {
+    let markdown_relative = record
+        .markdown_relative_path
+        .as_deref()
+        .ok_or(PatwariError::SnapshotIncomplete(SUMMARY_LOGICAL_PATH))?;
+    let artifacts = snapshot
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            PatwariError::Protocol("saved snapshot response omitted artifacts".to_owned())
+        })?;
+    let mut seen = BTreeSet::new();
+    let mut sources = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let logical_path = artifact
+            .get("logical_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PatwariError::Protocol("saved snapshot artifact omitted logical_path".to_owned())
+            })?;
+        if !seen.insert(logical_path.to_owned()) {
+            return Err(PatwariError::Protocol(format!(
+                "saved snapshot repeated artifact {logical_path}"
+            )));
+        }
+        let expected_size = artifact
+            .get("original_size_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                PatwariError::Protocol(format!(
+                    "saved snapshot artifact {logical_path} omitted original_size_bytes"
+                ))
+            })?;
+        let expected_sha = artifact
+            .get("original_sha256")
+            .and_then(Value::as_str)
+            .map(|value| value.strip_prefix("sha256:").unwrap_or(value))
+            .ok_or_else(|| {
+                PatwariError::Protocol(format!(
+                    "saved snapshot artifact {logical_path} omitted original_sha256"
+                ))
+            })?;
+        let path = rearchive_artifact_path(output_directory, markdown_relative, logical_path)?;
+        let bytes = std::fs::read(&path).map_err(PatwariError::Io)?;
+        if bytes.len() as u64 != expected_size || sha256_hex(&bytes) != expected_sha {
+            return Err(PatwariError::Protocol(format!(
+                "restored artifact {logical_path} does not match the saved snapshot"
+            )));
+        }
+        sources.push(ArtifactSource {
+            logical_path: logical_path.to_owned(),
+            media_type: artifact
+                .get("media_type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            bytes,
+        });
+    }
+    if !REQUIRED_LOGICAL_PATHS
+        .iter()
+        .all(|required| seen.contains(*required))
+    {
+        return Err(PatwariError::Protocol(
+            "saved snapshot is not self-contained".to_owned(),
+        ));
+    }
+    sources.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    Ok(sources)
+}
+
+fn rearchive_manifest(
+    snapshot: &Value,
+    record: &SessionRecord,
+    prep: &crate::state::CapturePrep,
+    artifacts: &[PreparedArtifact],
+) -> Result<Value, PatwariError> {
+    let mut manifest = snapshot.get("manifest").cloned().ok_or_else(|| {
+        PatwariError::Protocol("saved snapshot response omitted manifest".to_owned())
+    })?;
+    let session = manifest
+        .get("session")
+        .and_then(Value::as_object)
+        .ok_or_else(|| PatwariError::Protocol("saved manifest omitted session".to_owned()))?;
+    if session.get("source_session_id").and_then(Value::as_str) != Some(record.session_id.as_str())
+        || session.get("source_agent").and_then(Value::as_str) != Some(record.source.agent_label())
+    {
+        return Err(PatwariError::Protocol(
+            "saved manifest session does not match the requested Munshi session".to_owned(),
+        ));
+    }
+    let capture = manifest
+        .get_mut("capture")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| PatwariError::Protocol("saved manifest omitted capture".to_owned()))?;
+    let metadata = capture
+        .entry("source_metadata")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            PatwariError::Protocol("saved source_metadata is not an object".to_owned())
+        })?;
+    for (key, value) in capture_source_metadata(record, &prep.captured_at) {
+        metadata.insert(key, Value::String(value));
+    }
+    capture.insert(
+        "captured_at".to_owned(),
+        Value::String(prep.captured_at.clone()),
+    );
+    capture.insert(
+        "source_cursor".to_owned(),
+        Value::String(record.current_revision.to_string()),
+    );
+    capture.insert(
+        "source_state_hash".to_owned(),
+        record
+            .current_summary_hash
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    capture.insert(
+        "munshi_version".to_owned(),
+        Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+    );
+    manifest
+        .as_object_mut()
+        .ok_or_else(|| PatwariError::Protocol("saved manifest is not an object".to_owned()))?
+        .insert(
+            "artifacts".to_owned(),
+            Value::Array(prepared_artifacts_json(artifacts)),
+        );
+    Ok(manifest)
+}
+
+/// Re-archives one tombstoned snapshot from its saved inspection document and restore output.
+/// Unlike the normal retry path, this preserves every fingerprint-bearing manifest field and uses
+/// exactly the artifact logical paths and original bytes the old snapshot recorded. Only
+/// fingerprint-excluded capture observation fields are refreshed.
+pub fn rearchive(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+    snapshot_file: &Path,
+) -> Result<ArchiveUploadRunReport, PatwariError> {
+    let config = load_stored_config(state_directory)?;
+    let settings = ArchiveUploadSettings::from_config(&config);
+    if !config.archive_upload.enabled {
+        return Err(PatwariError::NotEnabled);
+    }
+    if !config.archive_upload.is_addressable() {
+        return Err(PatwariError::NotConfigured);
+    }
+    let endpoint = config.archive_upload.endpoint.clone().unwrap();
+    let client_id = ensure_client_id(Path::new(&config.state_directory))?;
+    let output_directory = PathBuf::from(&config.output_directory);
+    let snapshot: Value =
+        serde_json::from_slice(&std::fs::read(snapshot_file).map_err(PatwariError::Io)?).map_err(
+            |error| PatwariError::Protocol(format!("saved snapshot is not valid JSON: {error}")),
+        )?;
+
+    let mut report = ArchiveUploadRunReport {
+        schema_version: 1,
+        command: "archive-upload-rearchive",
+        settings,
+        candidates: 1,
+        uploaded: 0,
+        already_uploaded: 0,
+        skipped: 0,
+        failed: 0,
+        note: None,
+        items: Vec::new(),
+    };
+    let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
+        report.record(
+            source,
+            session_id,
+            UploadOutcome::Skipped {
+                reason: "worker-busy".to_owned(),
+            },
+        );
+        return Ok(report);
+    };
+    let mut state = StateStore::open_for_source(state_directory, source)?;
+    let Some(record) = state.get_session(session_id)? else {
+        report.record(
+            source,
+            session_id,
+            UploadOutcome::Skipped {
+                reason: "session-unknown".to_owned(),
+            },
+        );
+        return Ok(report);
+    };
+    let old_snapshot_id = snapshot
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PatwariError::Protocol("saved snapshot response omitted snapshot_id".to_owned())
+        })?;
+    // Validate every local byte and every saved-manifest structural precondition before clearing
+    // the stale snapshot linkage. A malformed template must leave the ledger naming the tombstone,
+    // not turn the row into a generic pending candidate that normal backfill could pick up.
+    let sources = rearchive_sources(&snapshot, &output_directory, &record)?;
+    let artifacts = prepare_artifacts(sources);
+    let validation_prep = crate::state::CapturePrep {
+        capture_id: "validation-only".to_owned(),
+        captured_at: now_rfc3339(),
+        resume_upload_id: None,
+    };
+    let _ = rearchive_manifest(&snapshot, &record, &validation_prep, &artifacts)?;
+    let expected_fingerprint = snapshot
+        .get("snapshot_fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PatwariError::Protocol(
+                "saved snapshot response omitted snapshot_fingerprint".to_owned(),
+            )
+        })?;
+    let client = PatwariClient::connect(&endpoint, &client_id)?;
+    let mut client_metadata = BTreeMap::new();
+    client_metadata.insert(
+        "munshi_version".to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+    );
+    client.register_client(hostname().as_deref(), None, &client_metadata)?;
+
+    // A restored operational database can legitimately lack the old upload ledger row even when
+    // the immutable snapshot and all local artifacts prove the session identity. Create the row
+    // only after those checks and client registration have succeeded.
+    let existing = match state.get_archive_upload(session_id, &endpoint)? {
+        Some(existing) => existing,
+        None => state
+            .ensure_archive_rearchive_target(session_id, &endpoint)?
+            .ok_or_else(|| {
+                PatwariError::Protocol(
+                    "requested session disappeared before ledger repair".to_owned(),
+                )
+            })?,
+    };
+    if let Some(recorded_snapshot_id) = existing.snapshot_id.as_deref() {
+        if recorded_snapshot_id != old_snapshot_id {
+            return Err(PatwariError::Protocol(format!(
+                "session records snapshot {recorded_snapshot_id}, not saved snapshot {old_snapshot_id}"
+            )));
+        }
+        let read = ReadClient::connect(&endpoint).map_err(from_http)?;
+        if read.snapshot_exists(old_snapshot_id).map_err(from_read)? {
+            return Err(PatwariError::Protocol(
+                "saved snapshot is still live; tombstone it before rearchiving".to_owned(),
+            ));
+        }
+        if !state.repair_missing_archive_upload_for_rearchive(
+            session_id,
+            &endpoint,
+            old_snapshot_id,
+        )? {
+            return Err(PatwariError::Protocol(
+                "missing snapshot ledger row could not be repaired".to_owned(),
+            ));
+        }
+        state
+            .get_archive_upload(session_id, &endpoint)?
+            .ok_or_else(|| {
+                PatwariError::Protocol("repaired archive-upload row disappeared".to_owned())
+            })?;
+    } else {
+        state
+            .ensure_archive_rearchive_target(session_id, &endpoint)?
+            .ok_or_else(|| {
+                PatwariError::Protocol("archive-upload rearchive row disappeared".to_owned())
+            })?;
+    }
+    let prep = state.prepare_archive_capture(
+        session_id,
+        &endpoint,
+        record.current_revision,
+        &new_uuid(),
+        &now_rfc3339(),
+    )?;
+    let manifest = rearchive_manifest(&snapshot, &record, &prep, &artifacts)?;
+    let endpoint_owned = endpoint.clone();
+    let receipt = client.upload_snapshot(
+        &prep.capture_id,
+        &manifest,
+        &artifacts,
+        prep.resume_upload_id.as_deref(),
+        |upload_id| {
+            let _ = state.record_archive_upload_id(session_id, &endpoint_owned, upload_id);
+        },
+    );
+    match receipt {
+        Ok(receipt) if receipt.snapshot_fingerprint != expected_fingerprint => {
+            state.record_archive_rearchive_fingerprint_mismatch(session_id, &endpoint)?;
+            return Err(PatwariError::Protocol(format!(
+                "rearchive created snapshot {} with fingerprint {}, expected \
+                 {expected_fingerprint}; tombstone that snapshot before retrying",
+                receipt.snapshot_id, receipt.snapshot_fingerprint
+            )));
+        }
+        Ok(receipt) => {
+            state.record_archive_upload_success(
+                session_id,
+                &endpoint,
+                &ArchiveUploadSuccess {
+                    uploaded_revision: record.current_revision,
+                    uploaded_summary_hash: record.current_summary_hash.clone().unwrap_or_default(),
+                    uploaded_markdown_hash: record.markdown_hash.clone(),
+                    snapshot_id: receipt.snapshot_id.clone(),
+                    patwari_session_id: receipt.session_id,
+                    uploaded_artifact_paths: artifacts
+                        .iter()
+                        .map(|artifact| artifact.logical_path.clone())
+                        .collect(),
+                    transfer_bytes: receipt.upload_transfer_bytes,
+                    total_stored_bytes: receipt.total_stored_bytes,
+                    total_original_bytes: receipt.total_original_bytes,
+                },
+            )?;
+            report.record(
+                source,
+                session_id,
+                UploadOutcome::Uploaded {
+                    snapshot_id: receipt.snapshot_id,
+                    revision: record.current_revision,
+                },
+            );
+        }
+        Err(error) => {
+            let category = error.category().to_owned();
+            state.record_archive_rearchive_failure(session_id, &endpoint, &category)?;
+            report.record(
+                source,
+                session_id,
+                UploadOutcome::Failed {
+                    category,
+                    dead_letter: false,
+                },
+            );
+        }
+    }
+    Ok(report)
+}
+
+/// Explicitly abandons a parked fingerprint-preserving rearchive so future revisions can use the
+/// ordinary current-version upload path.
+pub fn abandon_rearchive(
+    state_directory: &Path,
+    source: SourceKind,
+    session_id: &str,
+) -> Result<ArchiveUploadRunReport, PatwariError> {
+    let config = load_stored_config(state_directory)?;
+    let settings = ArchiveUploadSettings::from_config(&config);
+    let endpoint = config
+        .archive_upload
+        .endpoint
+        .clone()
+        .ok_or(PatwariError::NotConfigured)?;
+    let mut report = ArchiveUploadRunReport {
+        schema_version: 1,
+        command: "archive-upload-rearchive-abandon",
+        settings,
+        candidates: 1,
+        uploaded: 0,
+        already_uploaded: 0,
+        skipped: 0,
+        failed: 0,
+        note: None,
+        items: Vec::new(),
+    };
+    let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
+        report.record(
+            source,
+            session_id,
+            UploadOutcome::Skipped {
+                reason: "worker-busy".to_owned(),
+            },
+        );
+        return Ok(report);
+    };
+    let mut state = StateStore::open_for_source(state_directory, source)?;
+    if !state.abandon_archive_rearchive(session_id, &endpoint)? {
+        return Err(PatwariError::Protocol(
+            "session has no parked rearchive to abandon".to_owned(),
+        ));
+    }
+    report.record(
+        source,
+        session_id,
+        UploadOutcome::Skipped {
+            reason: "rearchive-abandoned".to_owned(),
+        },
+    );
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
 // Retry run contract
 // ---------------------------------------------------------------------------
 
@@ -2076,6 +2547,7 @@ impl ArchiveUploadRunReport {
         print_settings(&self.settings);
         let label = match self.command {
             "archive-upload-backfill" => "archive-upload backfill",
+            "archive-upload-rearchive-abandon" => "archive-upload rearchive --abandon",
             _ => "archive-upload retry",
         };
         println!(
@@ -2189,9 +2661,15 @@ pub fn retry(
         .into_iter()
         .filter(|record| record.endpoint == endpoint)
         .filter(|record| match &session_id {
-            // One session: retry it whatever its state, optionally narrowed by source.
+            // One session: retry any ordinary state, optionally narrowed by source. A parked
+            // fingerprint-preserving rearchive is resumed only by `archive-upload rearchive`.
             Some(id) => {
-                record.session_id == *id && source.is_none_or(|wanted| record.source == wanted)
+                record.session_id == *id
+                    && source.is_none_or(|wanted| record.source == wanted)
+                    && !matches!(
+                        record.upload_state.as_str(),
+                        "rearchive-pending" | "rearchive-failed"
+                    )
             }
             // --all: every failed upload, plus dead-letter rows only when forced.
             None => {

@@ -23,7 +23,7 @@ use crate::source::{PreviousSource, SourceHomes, SourceKind, derive_transcript_p
 use crate::summary::StructuredSummary;
 
 const DATABASE_FILE: &str = "munshi.db";
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const WORKER_RESERVATION_STALE_MS: i64 = 5_000;
 
 /// The `transcript_source` recorded for a path re-derived from a session's ID through its source's
@@ -928,6 +928,68 @@ impl StateStore {
             transaction.pragma_update(None, "user_version", 10)?;
             transaction.commit()?;
         }
+        if current < 11 {
+            // Fingerprint-preserving rearchive attempts must never enter the generic retry sweep.
+            // SQLite cannot alter the upload-state CHECK constraint in place, so preserve every
+            // ledger column while admitting the two migration-only states.
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE archive_uploads_new (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL,
+                    capture_id TEXT,
+                    capture_revision INTEGER,
+                    captured_at TEXT,
+                    upload_id TEXT,
+                    uploaded_revision INTEGER,
+                    uploaded_summary_hash TEXT,
+                    snapshot_id TEXT,
+                    upload_state TEXT NOT NULL CHECK (upload_state IN (
+                        'pending','uploaded','failed','dead-letter',
+                        'rearchive-pending','rearchive-failed'
+                    )),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_ms INTEGER,
+                    last_error_category TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    uploaded_artifact_paths TEXT,
+                    transfer_bytes_total INTEGER NOT NULL DEFAULT 0,
+                    last_stored_bytes INTEGER,
+                    last_original_bytes INTEGER,
+                    uploaded_markdown_hash TEXT,
+                    patwari_session_id TEXT,
+                    UNIQUE(session_id, endpoint)
+                 );
+                 INSERT INTO archive_uploads_new (
+                    id,session_id,endpoint,capture_id,capture_revision,captured_at,upload_id,
+                    uploaded_revision,uploaded_summary_hash,snapshot_id,upload_state,attempts,
+                    next_attempt_at_ms,last_error_category,created_at_ms,updated_at_ms,
+                    uploaded_artifact_paths,transfer_bytes_total,last_stored_bytes,
+                    last_original_bytes,uploaded_markdown_hash,patwari_session_id
+                 )
+                 SELECT
+                    id,session_id,endpoint,capture_id,capture_revision,captured_at,upload_id,
+                    uploaded_revision,uploaded_summary_hash,snapshot_id,upload_state,attempts,
+                    next_attempt_at_ms,last_error_category,created_at_ms,updated_at_ms,
+                    uploaded_artifact_paths,transfer_bytes_total,last_stored_bytes,
+                    last_original_bytes,uploaded_markdown_hash,patwari_session_id
+                 FROM archive_uploads;
+                 DROP TABLE archive_uploads;
+                 ALTER TABLE archive_uploads_new RENAME TO archive_uploads;
+                 CREATE INDEX archive_uploads_state_idx
+                    ON archive_uploads(upload_state, next_attempt_at_ms);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+                params![11, now_ms()],
+            )?;
+            transaction.pragma_update(None, "user_version", 11)?;
+            transaction.commit()?;
+        }
         let user_version: i64 =
             self.connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -1781,7 +1843,10 @@ impl StateStore {
                 upload_id,
                 upload_state,
             } if capture_revision == revision_i64
-                && (upload_state == "pending" || upload_state == "failed") =>
+                && matches!(
+                    upload_state.as_str(),
+                    "pending" | "failed" | "rearchive-pending" | "rearchive-failed"
+                ) =>
             {
                 Some(CapturePrep {
                     capture_id,
@@ -1797,7 +1862,12 @@ impl StateStore {
             transaction.execute(
                 "UPDATE archive_uploads SET
                     capture_id=?3,capture_revision=?4,captured_at=?5,upload_id=NULL,
-                    upload_state='pending',updated_at_ms=?6
+                    upload_state=CASE
+                        WHEN upload_state IN ('rearchive-pending','rearchive-failed')
+                            THEN 'rearchive-pending'
+                        ELSE 'pending'
+                    END,
+                    updated_at_ms=?6
                  WHERE session_id=?1 AND endpoint=?2",
                 params![
                     database_id,
@@ -1904,11 +1974,38 @@ impl StateStore {
         endpoint: &str,
         snapshot_id: &str,
     ) -> Result<bool, StateError> {
+        self.repair_missing_archive_upload_with_state(session_id, endpoint, snapshot_id, "pending")
+    }
+
+    /// Repairs a tombstoned snapshot for the fingerprint-preserving rearchive path. The dedicated
+    /// state is intentionally excluded from generic retry sweeps, so a crash cannot replace an old
+    /// artifact-set manifest with a normal current-version upload.
+    pub fn repair_missing_archive_upload_for_rearchive(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        snapshot_id: &str,
+    ) -> Result<bool, StateError> {
+        self.repair_missing_archive_upload_with_state(
+            session_id,
+            endpoint,
+            snapshot_id,
+            "rearchive-pending",
+        )
+    }
+
+    fn repair_missing_archive_upload_with_state(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        snapshot_id: &str,
+        upload_state: &str,
+    ) -> Result<bool, StateError> {
         let updated = self.connection.execute(
             "UPDATE archive_uploads SET
                 capture_id=NULL,capture_revision=NULL,captured_at=NULL,upload_id=NULL,
-                snapshot_id=NULL,patwari_session_id=NULL,upload_state='pending',
-                attempts=0,next_attempt_at_ms=NULL,last_error_category=NULL,updated_at_ms=?5
+                snapshot_id=NULL,patwari_session_id=NULL,upload_state=?5,
+                attempts=0,next_attempt_at_ms=NULL,last_error_category=NULL,updated_at_ms=?6
              WHERE session_id=(
                     SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
                  ) AND endpoint=?3 AND snapshot_id=?4",
@@ -1917,10 +2014,59 @@ impl StateStore {
                 self.source_kind,
                 endpoint,
                 snapshot_id,
+                upload_state,
                 now_ms()
             ],
         )?;
         Ok(updated > 0)
+    }
+
+    /// Creates or parks an unbound row for fingerprint-preserving rearchive. Existing capture and
+    /// upload identities are retained so a manually resumed migration can finish accepted chunks.
+    pub fn ensure_archive_rearchive_target(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<Option<ArchiveUploadRecord>, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        self.connection.execute(
+            "INSERT INTO archive_uploads(
+                session_id,endpoint,upload_state,attempts,created_at_ms,updated_at_ms
+             ) VALUES (?1,?2,'rearchive-pending',0,?3,?3)
+             ON CONFLICT(session_id,endpoint) DO UPDATE SET
+                capture_id=CASE
+                    WHEN archive_uploads.upload_state IN (
+                        'rearchive-pending','rearchive-failed'
+                    ) THEN archive_uploads.capture_id
+                    ELSE NULL
+                END,
+                capture_revision=CASE
+                    WHEN archive_uploads.upload_state IN (
+                        'rearchive-pending','rearchive-failed'
+                    ) THEN archive_uploads.capture_revision
+                    ELSE NULL
+                END,
+                captured_at=CASE
+                    WHEN archive_uploads.upload_state IN (
+                        'rearchive-pending','rearchive-failed'
+                    ) THEN archive_uploads.captured_at
+                    ELSE NULL
+                END,
+                upload_id=CASE
+                    WHEN archive_uploads.upload_state IN (
+                        'rearchive-pending','rearchive-failed'
+                    ) THEN archive_uploads.upload_id
+                    ELSE NULL
+                END,
+                upload_state='rearchive-pending',attempts=0,next_attempt_at_ms=NULL,
+                last_error_category=NULL,updated_at_ms=?3
+             WHERE archive_uploads.snapshot_id IS NULL",
+            params![database_id, endpoint, now],
+        )?;
+        self.get_archive_upload(session_id, endpoint)
     }
 
     /// Records a failed archive-upload attempt. Increments the attempt count, then either schedules
@@ -1960,13 +2106,14 @@ impl StateStore {
         } else {
             ("failed", Some(next_attempt_at_ms))
         };
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE archive_uploads SET
                 upload_state=?4,attempts=?5,next_attempt_at_ms=?6,
                 last_error_category=?7,updated_at_ms=?8
              WHERE session_id=(
                     SELECT id FROM sessions WHERE source_kind=?2 AND source_session_id=?1
-                 ) AND endpoint=?3",
+                 ) AND endpoint=?3
+               AND upload_state NOT IN ('rearchive-pending','rearchive-failed')",
             params![
                 session_id,
                 self.source_kind,
@@ -1978,13 +2125,94 @@ impl StateStore {
                 now,
             ],
         )?;
+        if updated != 1 {
+            return Err(StateError::InvalidState);
+        }
         transaction.commit()?;
         self.get_archive_upload(session_id, endpoint)?
             .ok_or(StateError::InvalidState)
     }
 
-    /// Resets an archive-upload row to `pending` so a subsequent attempt is eligible, clearing
-    /// backoff. With `force`, a `dead-letter` row is revived and its attempt count reset.
+    /// Records a rearchive failure without making it eligible for the normal current-version retry
+    /// path. The persisted capture/upload identity remains available to an explicit rearchive
+    /// resume.
+    pub fn record_archive_rearchive_failure(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+        category: &str,
+    ) -> Result<ArchiveUploadRecord, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        let updated = self.connection.execute(
+            "UPDATE archive_uploads SET
+                upload_state='rearchive-failed',attempts=attempts+1,
+                next_attempt_at_ms=NULL,last_error_category=?3,updated_at_ms=?4
+             WHERE session_id=?1 AND endpoint=?2
+               AND upload_state IN ('rearchive-pending','rearchive-failed')",
+            params![database_id, endpoint, category, now_ms()],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidState);
+        }
+        self.get_archive_upload(session_id, endpoint)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Records a completed rearchive whose returned fingerprint did not match the saved snapshot.
+    /// The server's upload identity cannot be resumed safely: it will only return the same completed
+    /// receipt. Clear it so an explicit rearchive rerun negotiates a fresh capture.
+    pub fn record_archive_rearchive_fingerprint_mismatch(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<ArchiveUploadRecord, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Err(StateError::InvalidState);
+        };
+        let updated = self.connection.execute(
+            "UPDATE archive_uploads SET
+                capture_id=NULL,capture_revision=NULL,captured_at=NULL,upload_id=NULL,
+                upload_state='rearchive-failed',attempts=attempts+1,
+                next_attempt_at_ms=NULL,last_error_category='snapshot-fingerprint-mismatch',
+                updated_at_ms=?3
+             WHERE session_id=?1 AND endpoint=?2
+               AND upload_state IN ('rearchive-pending','rearchive-failed')",
+            params![database_id, endpoint, now_ms()],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidState);
+        }
+        self.get_archive_upload(session_id, endpoint)?
+            .ok_or(StateError::InvalidState)
+    }
+
+    /// Explicitly abandons a parked fingerprint-preserving rearchive and returns the row to the
+    /// ordinary current-version upload path. This is intentionally separate from generic retry.
+    pub fn abandon_archive_rearchive(
+        &mut self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<bool, StateError> {
+        let Some(database_id) = self.session_database_id(session_id)? else {
+            return Ok(false);
+        };
+        let updated = self.connection.execute(
+            "UPDATE archive_uploads SET
+                capture_id=NULL,capture_revision=NULL,captured_at=NULL,upload_id=NULL,
+                snapshot_id=NULL,patwari_session_id=NULL,upload_state='pending',attempts=0,
+                next_attempt_at_ms=NULL,last_error_category='rearchive-abandoned',updated_at_ms=?3
+             WHERE session_id=?1 AND endpoint=?2
+               AND upload_state IN ('rearchive-pending','rearchive-failed')",
+            params![database_id, endpoint, now_ms()],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Resets an ordinary archive-upload row to `pending` so a subsequent attempt is eligible,
+    /// clearing backoff. Fingerprint-preserving rearchive rows remain parked. With `force`, a
+    /// `dead-letter` row is revived and its attempt count reset.
     pub fn reset_archive_upload_for_retry(
         &mut self,
         session_id: &str,
@@ -1994,6 +2222,12 @@ impl StateStore {
         let Some(current) = self.get_archive_upload(session_id, endpoint)? else {
             return Ok(None);
         };
+        if matches!(
+            current.upload_state.as_str(),
+            "rearchive-pending" | "rearchive-failed"
+        ) {
+            return Ok(Some(current));
+        }
         if current.upload_state == "dead-letter" && !force {
             return Ok(Some(current));
         }
