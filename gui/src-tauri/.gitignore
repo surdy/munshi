@@ -1,0 +1,4 @@
+/target/
+/gen/
+# The CLI is copied in at package time by contrib/build-gui.sh, never committed.
+/resources/bin/munshi

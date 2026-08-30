@@ -6,9 +6,32 @@ structured summary, then writes a durable local Markdown archive of what happene
 no server, no cloud storage. This guide walks you from a fresh clone to automatic archiving of
 your everyday sessions.
 
-## 1. Build Munshi
+## 1. Install Munshi
 
-Munshi ships as a Rust workspace with no packaged releases yet, so you build it yourself:
+Munshi ships as a Rust workspace with no packaged releases yet, so you build it yourself. There
+are two ways to do that, and they end in the same place: a `munshi` binary on your `PATH` at
+`~/.local/bin`. Pick either — the rest of this guide is identical afterwards.
+
+The command line is the primary way to run Munshi. The desktop app is an optional addon that
+happens to be the easiest way to *install* the command line, because it ships it inside its own
+bundle and handles the codesigning wrinkle below for you.
+
+### Option A — the desktop app (also installs the command line)
+
+Builds the CLI, signs it, and wraps both in an app bundle:
+
+```bash
+./contrib/build-gui.sh
+```
+
+Open the result from `gui/src-tauri/target/release/bundle/` (a `.app` or `.dmg` on macOS, an
+AppImage or `.deb` on Linux), and click **Install** on the banner it shows on first run. That
+copies the bundled `munshi` to `~/.local/bin/munshi`.
+
+Needs Node 20+ and npm on top of Munshi's own requirements, plus `webkit2gtk-4.1` and `libgtk-3`
+on Linux. Full details in [the desktop addon guide](gui.md).
+
+### Option B — the command line only
 
 ```bash
 cd /absolute/path/to/munshi
@@ -28,13 +51,19 @@ mkdir -p ~/.local/bin && cp target/release/munshi ~/.local/bin/munshi
 If you ever move or rebuild the binary at a new path, re-run `munshi register` afterward so the
 hooks point at the right place.
 
-On macOS there's one more wrinkle worth knowing before you schedule anything in the background:
+### One macOS wrinkle, either way
+
+On macOS there's one more thing worth knowing before you schedule anything in the background:
 TCC attributes folder-access grants (Documents, Desktop, …) for a background `munshi` to the
 binary itself, keyed to its codesigning identity — and an ad-hoc-signed binary's identity changes
 on every rebuild, so the grant is orphaned and macOS re-prompts each time. Sign the installed
 binary with a **stable** self-signed identity instead; the header of
 [`contrib/dev-deploy.sh`](../contrib/dev-deploy.sh) documents the one-time certificate setup and
 the script then builds, signs, and installs to `~/.local/bin` in one step.
+
+Both options above already do this: `contrib/build-gui.sh` signs the copy it bundles (so the copy
+the app installs carries a stable identity), and `contrib/dev-deploy.sh` is the command-line
+equivalent. Only a hand-rolled `cp` skips it.
 
 ## 2. Choose a summarizer
 
@@ -209,6 +238,12 @@ Copilot sessions land flat under the project component:
 ```text
 <output-dir>/<project-component>/<session-id>.md
 ```
+
+If you installed the desktop app in step 1, everything above has a visual equivalent: open it and
+the same session appears in the list, with its summary, its state, and buttons to re-summarize or
+retry. It reads the very same commands — nothing is displayed there that `munshi status`,
+`munshi sessions` and `munshi show` will not tell you. Use whichever you prefer; the app is a
+window onto the CLI, not a second implementation.
 
 ## Archiving one session manually (no registration needed)
 

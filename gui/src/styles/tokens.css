@@ -1,0 +1,71 @@
+/*
+ * The design tokens from `crates/munshi-dashboard/assets/index.html`, carried over unchanged so
+ * the desktop addon and the backlog dashboard read as one product.
+ *
+ * Both themes are defined here in full: bare `:root` is light, the media query covers a viewer on
+ * the system default, and the explicit `[data-theme]` selectors let the in-app toggle win in both
+ * directions.
+ */
+
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+  --series-1: #2a78d6; /* archived  (blue)   */
+  --series-2: #eb6834; /* queued    (orange) */
+  --series-3: #1baf7a; /* recovered (aqua)   */
+  --series-4: #898781; /* superseded (grey)  */
+  --seq: #2a78d6;
+  --seq-track: #cde2fb;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  --selection: rgba(42, 120, 214, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #6f6e69;
+    --seq: #3987e5;
+    --seq-track: #184f95;
+    --selection: rgba(57, 135, 229, 0.18);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --page: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --baseline: #383835;
+  --border: rgba(255, 255, 255, 0.1);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #6f6e69;
+  --seq: #3987e5;
+  --seq-track: #184f95;
+  --selection: rgba(57, 135, 229, 0.18);
+}

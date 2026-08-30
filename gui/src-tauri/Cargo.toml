@@ -1,0 +1,35 @@
+# A nested workspace: `exclude`d from the repo root's (see the note there) so Munshi's own
+# `cargo build/test --workspace` never pulls in Tauri or needs webkit2gtk present.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "munshi-gui"
+version = "0.1.0"
+description = "Munshi desktop addon — a native window over Munshi's archiving backlog"
+authors = ["surdy"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+# The `_lib` suffix keeps the library name distinct from the binary name, which a Windows linker
+# requires (rust-lang/cargo#8519).
+name = "munshi_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

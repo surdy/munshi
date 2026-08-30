@@ -6,6 +6,12 @@ members = [
     "crates/munshi-runner",
     "crates/munshi-transcript",
 ]
+# The desktop GUI (docs/gui.md, ADR 0014) is a nested Cargo workspace under `gui/src-tauri`,
+# deliberately excluded from this one. It is an optional addon whose Tauri/WebKit dependency
+# tree must not land in `cargo build --workspace`, `cargo test --workspace`, or the system
+# requirements for building the CLI: a core contributor on a bare Linux box needs no
+# webkit2gtk to build and test Munshi itself.
+exclude = ["gui/src-tauri"]
 resolver = "3"
 
 [workspace.package]
