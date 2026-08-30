@@ -407,3 +407,34 @@ session content.
   state internals.
 - [`docs/phase-0-claude-code-findings.md`](phase-0-claude-code-findings.md) — the evidence
   behind Claude Code's hook behavior, including the completion-reason ambiguity.
+
+## Sessions that can never archive (identity mismatch)
+
+A session whose recorded ID does not belong to the transcript it points at can never archive: the
+read fails on the identity check before any content is read, on every attempt. `munshi doctor`
+reports these under `id-mismatch-parked`, and `munshi sessions` shows them `failed` with
+`source-id-mismatch`.
+
+The known cause is Copilot CLI firing its `agentStop` hook once per **subagent**, passing the
+subagent's tool-call ID (`call_…`) alongside the parent session's transcript path (issue #82).
+Munshi refuses those at ingest now, so this only affects rows recorded before that fix. The
+subagent's work is not lost — it is part of the parent session's transcript, and the parent
+archives normally.
+
+List the affected rows:
+
+```bash
+munshi purge-mismatched
+```
+
+That is a dry run; it prints each session, the transcript it claims, and the session that
+transcript actually belongs to. To remove them:
+
+```bash
+munshi purge-mismatched --confirm
+```
+
+Only sessions that are parked and never produced an archive are ever eligible — a session with a
+Markdown record behind it is refused even if its ID looks wrong. Removing a session also removes
+its observations and processing attempts; its diagnostics are kept, detached, so the record of what
+happened survives the cleanup.

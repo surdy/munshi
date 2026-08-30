@@ -365,7 +365,7 @@ pub fn resolve_session_reference(
 /// It deliberately **fails open**: a path whose id cannot be derived returns `true`, leaving the
 /// verdict to the read-time check that already exists. Refusing a payload discards evidence, so
 /// this only ever refuses when it can positively derive an id and that id disagrees.
-pub(crate) fn session_id_matches_transcript_path(
+pub fn session_id_matches_transcript_path(
     source: SourceKind,
     session_id: &str,
     transcript_path: &Path,

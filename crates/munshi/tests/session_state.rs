@@ -10,7 +10,7 @@ use munshi::{
     ArchiveMetadata, CompletionReason, SessionReference, SourceKind, StateStore, StructuredSummary,
     atomic_replace, content_hash, inspect_project, load_session, parse_archive_markdown,
     recorded_project_identity, render_markdown, render_revision_markdown,
-    resolve_session_reference,
+    resolve_session_reference, session_id_matches_transcript_path,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -1490,6 +1490,89 @@ fn unhydratable_sessions_stay_queued_until_an_origin_appears() {
 /// concurrent hook claimed or archived in the meantime must not be labelled
 /// `origin-unresolved` on the way past. Parking re-checks the recovery-held shape inside its
 /// own transaction, exactly as hydration does, and leaves a row that has moved on alone.
+/// Issue #82: the purge must select on re-derived identity, not on a stored label, and must never
+/// touch a session that produced an archive. The archived row here is the one that matters: it is
+/// mismatched in exactly the same way, and is still excluded.
+#[test]
+fn purge_selects_only_unarchived_identity_mismatches() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("purge-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    let transcript = harness.write_transcript(SESSION_A, "PURGE_REQUEST", "answer");
+    let path = transcript.to_str().unwrap();
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    // (id, revision, category) — only the first is eligible.
+    let rows = [
+        // Mismatched and never archived: the subagent case.
+        ("call_ToolCallIdNotASession", 0, "source-id-mismatch"),
+        // Mismatched, never archived, but still carrying the pre-fix label: must still be found.
+        (SESSION_B, 0, "source-failed"),
+        // Mismatched but it archived once, so a Markdown record refers back to it.
+        ("cccccccc-cccc-4ccc-8ccc-cccccccccccc", 3, "source-id-mismatch"),
+    ];
+    for (session, revision, category) in rows {
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                    source_kind,source_session_id,transcript_path,transcript_source,
+                    completion_reason,source_end_reason,lifecycle_state,active,
+                    last_error_category,next_retry_at_ms,current_summary_revision,
+                    state_generation,created_at_ms,updated_at_ms
+                 ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                           'failed',0,?3,-1,?4,1,1,1)",
+                params![session, path, category, revision],
+            )
+            .unwrap();
+    }
+    // The session the transcript actually belongs to, parked but correctly identified.
+    connection
+        .execute(
+            "INSERT INTO sessions(
+                source_kind,source_session_id,transcript_path,transcript_source,
+                completion_reason,source_end_reason,lifecycle_state,active,
+                last_error_category,next_retry_at_ms,current_summary_revision,
+                state_generation,created_at_ms,updated_at_ms
+             ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                       'failed',0,'source-failed',-1,0,1,1,1)",
+            params![SESSION_A, path],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = StateStore::open(&harness.state).unwrap();
+    let candidates = store.parked_unarchived_sessions().unwrap();
+    let mismatched: Vec<&str> = candidates
+        .iter()
+        .filter(|(source, session_id, path)| {
+            !session_id_matches_transcript_path(*source, session_id, path)
+        })
+        .map(|(_, session_id, _)| session_id.as_str())
+        .collect();
+    assert_eq!(
+        mismatched,
+        vec!["call_ToolCallIdNotASession", SESSION_B],
+        "both mismatches are found regardless of label; the archived one and the correctly \
+         identified one are not"
+    );
+
+    let mut store = StateStore::open_for_source(&harness.state, SourceKind::Copilot).unwrap();
+    assert!(store.purge_parked_session("call_ToolCallIdNotASession").unwrap());
+    // The archived row is refused even when named directly.
+    assert!(
+        !store
+            .purge_parked_session("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+            .unwrap(),
+        "a session that archived is never purgeable"
+    );
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let remaining: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 3, "exactly one row was removed");
+}
+
 /// Issue #83: the issue-#44 stale-park reactivation is a *size-cap* mechanism. It re-measures the
 /// transcript and lifts the park if it now fits. `source-failed` was matched alongside
 /// `source-oversized` from when the two were one lumped code — but since #57 `source-failed` is

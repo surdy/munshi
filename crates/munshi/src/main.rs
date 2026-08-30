@@ -27,6 +27,7 @@ use munshi::{
     run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
     set_memory_sync_enabled, set_project_enabled, summarizer_exhaust_bytes, tick_recovery_sweep,
     unregister, verify_archive_parse, wait_for_hook_result_for_source,
+    session_id_matches_transcript_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -412,6 +413,21 @@ enum Command {
         /// Bound the upload and delivery retries per tick.
         #[arg(long, default_value_t = 32)]
         limit: usize,
+    },
+    /// Purge parked failures whose session ID does not belong to the transcript they point at
+    /// (issue #82). Copilot fires `agentStop` once per subagent with the subagent's tool-call ID,
+    /// which created sessions that can never archive. Ingest now refuses those, so this clears
+    /// the rows recorded before that fix. Dry-run unless `--confirm` is given; only sessions that
+    /// never produced an archive are ever eligible.
+    PurgeMismatched {
+        /// Actually delete. Without it, the eligible sessions are only listed.
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit a stable machine-readable contract.
+        #[arg(long)]
+        json: bool,
     },
     /// Settle sessions whose transcripts were destroyed as transcript-lost (issue #58).
     /// Declaring data lost is an explicit operator action: eligible sessions are permanently
@@ -898,6 +914,10 @@ enum Outcome {
         report: Box<DiagnosticsReport>,
         json: bool,
     },
+    PurgeMismatched {
+        report: Box<PurgeMismatchedReport>,
+        json: bool,
+    },
     Show {
         report: Box<ShowReport>,
         json: bool,
@@ -1250,6 +1270,86 @@ struct RetryReport {
     state_before: Option<String>,
     state_after: Option<String>,
     archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// The `munshi purge-mismatched` contract (issue #82). `eligible` counts sessions whose recorded
+/// ID does not belong to their recorded transcript; `purged` is 0 on a dry run.
+struct PurgeMismatchedReport {
+    schema_version: u32,
+    command: &'static str,
+    confirmed: bool,
+    eligible: usize,
+    purged: usize,
+    items: Vec<PurgeMismatchedItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PurgeMismatchedItem {
+    source: String,
+    session_id: String,
+    transcript_path: String,
+    /// The ID the transcript's own layout implies, which is what the recorded ID should have been.
+    expected_session_id: Option<String>,
+}
+
+/// Lists — and with `confirm`, removes — parked failures whose ID does not belong to the
+/// transcript they point at.
+///
+/// The mismatch is re-derived here rather than read from `last_error_category`: rows parked before
+/// `source-id-mismatch` existed still carry the older `source-failed` label, and deciding what to
+/// delete from a stale label would both miss those and risk deleting rows that merely share it.
+fn build_purge_mismatched_report(
+    state_directory: &Path,
+    confirm: bool,
+) -> Result<PurgeMismatchedReport, Box<dyn std::error::Error>> {
+    let candidates = {
+        let state = StateStore::open(state_directory)?;
+        state.parked_unarchived_sessions()?
+    };
+
+    let mismatched: Vec<_> = candidates
+        .into_iter()
+        .filter(|(source, session_id, path)| {
+            !session_id_matches_transcript_path(*source, session_id, path)
+        })
+        .collect();
+
+    let mut items = Vec::with_capacity(mismatched.len());
+    let mut purged = 0usize;
+    for (source, session_id, path) in &mismatched {
+        if confirm {
+            let mut state = StateStore::open_for_source(state_directory, *source)?;
+            if state.purge_parked_session(session_id)? {
+                purged += 1;
+            }
+        }
+        items.push(PurgeMismatchedItem {
+            source: source.id_prefix().to_string(),
+            session_id: session_id.clone(),
+            transcript_path: path.display().to_string(),
+            expected_session_id: expected_session_id_for(*source, path),
+        });
+    }
+
+    Ok(PurgeMismatchedReport {
+        schema_version: 1,
+        command: "purge-mismatched",
+        confirmed: confirm,
+        eligible: mismatched.len(),
+        purged,
+        items,
+    })
+}
+
+/// The session ID a transcript's own layout implies, for the report. `None` when the path shape is
+/// one the layout rules cannot name an ID from.
+fn expected_session_id_for(source: SourceKind, path: &Path) -> Option<String> {
+    let candidate = match source {
+        SourceKind::Copilot => path.parent()?.file_name()?,
+        SourceKind::ClaudeCode | SourceKind::Codex => path.file_stem()?,
+    };
+    candidate.to_str().map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1674,6 +1774,30 @@ fn main() -> ExitCode {
                 emit_json(&report);
             } else {
                 print_attempts_human(&report);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::PurgeMismatched { report, json }) => {
+            if json {
+                emit_json(&report);
+            } else if report.eligible == 0 {
+                println!("no identity-mismatched sessions to purge");
+            } else if report.confirmed {
+                println!("purged {} identity-mismatched session(s)", report.purged);
+            } else {
+                for item in &report.items {
+                    println!(
+                        "{}:{}\n  points at {}\n  which belongs to {}",
+                        item.source,
+                        item.session_id,
+                        item.transcript_path,
+                        item.expected_session_id.as_deref().unwrap_or("an unnameable path"),
+                    );
+                }
+                println!(
+                    "{} session(s) eligible; re-run with --confirm to purge",
+                    report.eligible
+                );
             }
             ExitCode::SUCCESS
         }
@@ -2219,6 +2343,17 @@ fn run() -> Result<Outcome, Box<dyn Error>> {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::Tick {
                 report: Box::new(build_tick_report(&state_directory, limit)?),
+                json,
+            })
+        }
+        Command::PurgeMismatched {
+            confirm,
+            state_dir,
+            json,
+        } => {
+            let state_directory = resolve_state_directory(state_dir)?;
+            Ok(Outcome::PurgeMismatched {
+                report: Box::new(build_purge_mismatched_report(&state_directory, confirm)?),
                 json,
             })
         }
