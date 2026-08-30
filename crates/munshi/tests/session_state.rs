@@ -1490,6 +1490,76 @@ fn unhydratable_sessions_stay_queued_until_an_origin_appears() {
 /// concurrent hook claimed or archived in the meantime must not be labelled
 /// `origin-unresolved` on the way past. Parking re-checks the recovery-held shape inside its
 /// own transaction, exactly as hydration does, and leaves a row that has moved on alone.
+/// Issue #83: the issue-#44 stale-park reactivation is a *size-cap* mechanism. It re-measures the
+/// transcript and lifts the park if it now fits. `source-failed` was matched alongside
+/// `source-oversized` from when the two were one lumped code — but since #57 `source-failed` is
+/// the residual I/O category, unrelated to size, so the measurement passed on every sweep for any
+/// small file. The park was lifted moments after being written, `failure_streak` reset to 0, and
+/// deterministic failures retried forever without ever reaching RETRY_PARK_THRESHOLD.
+#[test]
+fn a_source_failed_park_survives_the_size_cap_reactivation() {
+    let harness = Harness::new();
+    let summarizer = harness.revision_summarizer("park-lift-count");
+    assert_success(&harness.register(&summarizer, 10_000));
+    // Both transcripts are small, so the size re-check passes for either row.
+    let a = harness.write_transcript(SESSION_A, "OVERSIZED_REQUEST", "answer");
+    let b = harness.write_transcript(SESSION_B, "RESIDUAL_REQUEST", "answer");
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    for (session, transcript, category) in [
+        (SESSION_A, &a, "source-oversized"),
+        (SESSION_B, &b, "source-failed"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                    source_kind,source_session_id,transcript_path,transcript_source,
+                    completion_reason,source_end_reason,lifecycle_state,active,
+                    last_error_category,next_retry_at_ms,failure_streak,
+                    state_generation,created_at_ms,updated_at_ms
+                 ) VALUES ('copilot-cli',?1,?2,'version-pinned-recovery','unknown','unknown',
+                           'failed',0,?3,-1,1,1,1,1)",
+                params![session, transcript.to_str().unwrap(), category],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let store = StateStore::open_for_source(&harness.state, SourceKind::Copilot).unwrap();
+    let candidates: Vec<String> = store
+        .parked_source_limit_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|(_, session_id, _)| session_id)
+        .collect();
+    assert_eq!(
+        candidates,
+        vec![SESSION_A.to_string()],
+        "only the size-cap park is a reactivation candidate"
+    );
+
+    let mut store = store;
+    assert!(
+        store.lift_source_limit_park(SESSION_A).unwrap(),
+        "an oversized park is still lifted once the transcript fits"
+    );
+    assert!(
+        !store.lift_source_limit_park(SESSION_B).unwrap(),
+        "a residual source-failed park must stay parked"
+    );
+
+    let connection = Connection::open(harness.state.join("munshi.db")).unwrap();
+    let (next_retry, streak): (Option<i64>, i64) = connection
+        .query_row(
+            "SELECT next_retry_at_ms,failure_streak FROM sessions WHERE source_session_id=?1",
+            [SESSION_B],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(next_retry, Some(-1), "the park marker is untouched");
+    assert_eq!(streak, 1, "and the streak is not reset, so it can reach the threshold");
+}
+
 #[test]
 fn parking_skips_a_session_that_was_archived_concurrently() {
     let harness = Harness::new();

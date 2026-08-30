@@ -1734,7 +1734,7 @@ fn policy_gate(
     Ok(None)
 }
 
-/// A permanent `source-oversized` park (or a pre-#57 `source-failed` one) freezes a verdict
+/// A permanent `source-oversized` park freezes a verdict
 /// reached under the source limit configured at failure time. The currently configured limit
 /// always wins on retry (issue #44): when the parked transcript now fits within
 /// `stored.limits.max_source_bytes`, the park is lifted so the normal claim gates re-evaluate
@@ -1752,7 +1752,7 @@ fn lift_stale_source_limit_park(
     if session.lifecycle_state != "failed"
         || !matches!(
             session.last_error_category.as_deref(),
-            Some("source-oversized" | "source-failed")
+            Some("source-oversized")
         )
     {
         return Ok(());

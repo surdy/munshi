@@ -2942,11 +2942,18 @@ impl StateStore {
     }
 
     /// Failed sessions parked permanently (`next_retry_at_ms < 0`) under the `source-oversized`
-    /// verdict — or the pre-#57 lumped `source-failed` code older rows still carry — across
-    /// every source scope. That verdict is config-dependent — it records that the transcript
-    /// exceeded the source limit configured at failure time — so callers re-check the listed
-    /// transcripts against the currently configured limit and lift stale parks (issue #44).
+    /// verdict, across every source scope. That verdict is config-dependent — it records that the
+    /// transcript exceeded the source limit configured at failure time — so callers re-check the
+    /// listed transcripts against the currently configured limit and lift stale parks (issue #44).
     /// Sessions without a recorded transcript path are omitted: there is nothing to re-measure.
+    ///
+    /// `source-failed` was matched here too, from when it was the lumped size-cap code. Issue #57
+    /// made it the *residual I/O* category, which has no relationship to `max_source_bytes` — so
+    /// the size test below passed on every sweep for any small file, lifting a park that had just
+    /// been written and zeroing its `failure_streak`. Deterministic failures then retried forever,
+    /// never reaching `RETRY_PARK_THRESHOLD`, and head-of-line-blocked genuine retries because a
+    /// lifted `NULL` sorts first. Issue #83. Pre-#57 rows still carrying the legacy code are no
+    /// longer auto-lifted after a cap raise; `munshi retry --force` revives those.
     pub fn parked_source_limit_sessions(
         &self,
     ) -> Result<Vec<(SourceKind, String, PathBuf)>, StateError> {
@@ -2955,7 +2962,7 @@ impl StateStore {
              FROM sessions
              WHERE lifecycle_state='failed'
                AND next_retry_at_ms<0
-               AND last_error_category IN ('source-oversized','source-failed')
+               AND last_error_category='source-oversized'
                AND transcript_path IS NOT NULL
              ORDER BY updated_at_ms,id",
         )?;
@@ -2978,7 +2985,7 @@ impl StateStore {
             .collect())
     }
 
-    /// Lifts a permanent `source-oversized` park (or a pre-#57 `source-failed` one) so the
+    /// Lifts a permanent `source-oversized` park so the
     /// normal claim gates re-evaluate the session. The caller must first verify the transcript
     /// fits the currently configured source limit; this only clears the frozen verdict
     /// (`next_retry_at_ms < 0`) recorded under a superseded configuration (issue #44) and never
@@ -2993,7 +3000,7 @@ impl StateStore {
              WHERE source_kind=?2 AND source_session_id=?1
                AND lifecycle_state='failed'
                AND next_retry_at_ms<0
-               AND last_error_category IN ('source-oversized','source-failed')",
+               AND last_error_category='source-oversized'",
             params![session_id, self.source_kind, now_ms()],
         )?;
         Ok(changed == 1)
