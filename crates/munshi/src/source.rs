@@ -352,6 +352,30 @@ pub fn resolve_session_reference(
 
 /// Derive a stable session ID from an explicit transcript path for the given source.
 ///
+/// Whether `session_id` is consistent with the layout of `transcript_path` for `source`.
+///
+/// This is the same identity rule [`resolve_session_reference`] enforces at read time, hoisted so
+/// a hook payload can be refused before it creates a session row (issue #82: Copilot fires
+/// `agentStop` once per subagent, passing the subagent's tool-call id as `sessionId` alongside the
+/// *parent* session's `transcriptPath`; each one became a session that could never archive).
+///
+/// It works lexically on the path as given — no `canonicalize`, no `stat` — because it runs inside
+/// a hook with a 2-second budget, and because the caller has not yet decided the path is usable.
+///
+/// It deliberately **fails open**: a path whose id cannot be derived returns `true`, leaving the
+/// verdict to the read-time check that already exists. Refusing a payload discards evidence, so
+/// this only ever refuses when it can positively derive an id and that id disagrees.
+pub fn session_id_matches_transcript_path(
+    source: SourceKind,
+    session_id: &str,
+    transcript_path: &Path,
+) -> bool {
+    match derive_session_id_from_path(source, transcript_path) {
+        Ok(derived) => derived == session_id,
+        Err(_) => true,
+    }
+}
+
 /// Copilot keeps its version-pinned `session-state/<id>/events.jsonl` layout where the
 /// parent directory is the session ID. Claude Code and Codex name the transcript file
 /// itself after the session, so the sanitized file stem is used.
@@ -1300,6 +1324,65 @@ pub(crate) fn validate_session_id(value: &str) -> Result<&str, SourceError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #82: Copilot fires `agentStop` once per subagent, passing the subagent's tool-call
+    /// id as `sessionId` alongside the *parent* session's transcript path. This is the exact
+    /// payload shape observed in the field, and it must be refused before it becomes a session.
+    #[test]
+    fn a_copilot_subagent_tool_call_id_does_not_match_the_parent_transcript() {
+        let parent = Path::new(
+            "/home/u/.copilot/session-state/cd4a2547-2739-4125-907f-5dfa03a679b3/events.jsonl",
+        );
+        assert!(!session_id_matches_transcript_path(
+            SourceKind::Copilot,
+            "call_RTDYl8D6VfcBoav2PS2id192",
+            parent,
+        ));
+        // The parent session's own stop, with the same path, is accepted.
+        assert!(session_id_matches_transcript_path(
+            SourceKind::Copilot,
+            "cd4a2547-2739-4125-907f-5dfa03a679b3",
+            parent,
+        ));
+    }
+
+    /// The guard must fail open: refusing a payload discards evidence, so anything whose id
+    /// cannot be derived is left to the read-time check rather than rejected here.
+    #[test]
+    fn an_underivable_path_is_not_treated_as_a_mismatch() {
+        // Note both callers run `validate_absolute_string` on the path first, so a relative
+        // path never reaches here; only shapes that can actually arrive are covered.
+        for path in [
+            "/home/u/.copilot/session-state/abc/transcript.txt", // not events.jsonl
+            "/events.jsonl",                                     // no parent directory to name
+        ] {
+            assert!(
+                session_id_matches_transcript_path(
+                    SourceKind::Copilot,
+                    "any-id",
+                    Path::new(path)
+                ),
+                "{path} should fail open"
+            );
+        }
+    }
+
+    /// Claude Code and Codex name the transcript file itself after the session, so the same
+    /// rule applies through a different derivation.
+    #[test]
+    fn file_named_sources_match_on_the_stem() {
+        let path = Path::new("/home/u/.claude/projects/p/e0820fcc-1111-2222-3333-444444444444.jsonl");
+        assert!(session_id_matches_transcript_path(
+            SourceKind::ClaudeCode,
+            "e0820fcc-1111-2222-3333-444444444444",
+            path,
+        ));
+        assert!(!session_id_matches_transcript_path(
+            SourceKind::ClaudeCode,
+            "call_SomeToolCallId",
+            path,
+        ));
+    }
     use super::*;
 
     fn copilot_tool_complete(call_id: &str, output: &str) -> String {

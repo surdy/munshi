@@ -577,6 +577,62 @@ fn copilot_1_0_76_agent_stop_with_stop_hook_active_records_evidence() {
     assert_eq!(invalid, 0);
 }
 
+/// Issue #82: Copilot fires `agentStop` once per subagent, passing the subagent's tool-call id
+/// as `sessionId` alongside the *parent* session's `transcriptPath`. Ingesting those created a
+/// session per subagent that could never archive — the read-time identity check rejected it on
+/// every attempt, forever. The stop must be refused at ingest and leave no session behind.
+#[test]
+fn copilot_subagent_agent_stop_creates_no_session() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+    let project = git_project(directory.path());
+
+    // The parent session's own stop is ingested normally.
+    let parent = agent_stop_payload(&project, &fixture_events());
+    assert_success(&hook_command(
+        &paths,
+        "agent-stop",
+        parent.to_string().as_bytes(),
+    ));
+
+    // The subagent's stop carries a tool-call id and the same, parent transcript path.
+    let mut subagent = agent_stop_payload(&project, &fixture_events());
+    subagent["sessionId"] = Value::String("call_RTDYl8D6VfcBoav2PS2id192".to_string());
+    let output = hook_command(&paths, "agent-stop", subagent.to_string().as_bytes());
+
+    let connection = Connection::open(paths.state.join("munshi.db")).unwrap();
+    let phantom: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source_session_id LIKE 'call!_%' ESCAPE '!'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phantom, 0, "a subagent stop must not become a session");
+
+    // The parent is untouched, and the refusal is visible rather than silent.
+    let parent_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source_session_id=?1",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_rows, 1);
+    let recorded: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostics WHERE category='session-id-mismatch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the declined stop must leave one diagnostic");
+    // The hook still exits zero: declining a payload is Munshi's business, and a non-zero exit
+    // would surface inside the user's Copilot session as a failing hook.
+    assert_success(&output);
+}
+
 /// Issue #49: a payload the pinned struct cannot parse at all (here: the timestamp field
 /// gone) must still record agent-stop evidence — with the timestamp taken from receipt
 /// time — instead of degrading into an evidence-less husk only the sweep can reconstruct.

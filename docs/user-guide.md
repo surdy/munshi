@@ -266,6 +266,13 @@ sessions line, and the session stays parked because a real summary is still owed
 `munshi retry <session-id>` re-attempts a real summary; when it succeeds, the real summary
 replaces the placeholder as the next revision and is re-uploaded and re-delivered automatically.
 
+### `munshi purge-mismatched`
+
+Removes parked failures whose session ID does not belong to the transcript they point at — rows
+that can never archive however often they are retried. Dry-run by default; `--confirm` deletes.
+Sessions that ever produced an archive are never eligible. See
+[troubleshooting](troubleshooting.md#sessions-that-can-never-archive-identity-mismatch).
+
 ## Marathon sessions and chunked summaries
 
 Very long "marathon" sessions rarely need the placeholder above: they are summarized in chunks

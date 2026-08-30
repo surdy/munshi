@@ -2941,12 +2941,82 @@ impl StateStore {
         Ok(reserved_database_id.is_some())
     }
 
+    /// Parked failures that never produced an archive, with the transcript path they claim.
+    ///
+    /// Candidates for the identity-mismatch purge (issue #82). This deliberately does **not**
+    /// filter on `last_error_category`: rows parked before `source-id-mismatch` existed still
+    /// carry the old `source-failed` label, and a label is a record of what happened once, not
+    /// ground truth now. The caller re-derives the mismatch from the id and path themselves, so
+    /// the purge verifies rather than trusts.
+    ///
+    /// `current_summary_revision = 0` is the safety rail: a session that ever archived has a Markdown
+    /// record referring back to it, and is never purgeable here whatever its id looks like.
+    pub fn parked_unarchived_sessions(
+        &self,
+    ) -> Result<Vec<(SourceKind, String, PathBuf)>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_kind,source_session_id,transcript_path
+             FROM sessions
+             WHERE lifecycle_state='failed'
+               AND next_retry_at_ms<0
+               AND current_summary_revision=0
+               AND transcript_path IS NOT NULL
+             ORDER BY updated_at_ms,id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(source_kind, session_id, path)| {
+                SourceKind::from_agent_label(&source_kind)
+                    .map(|source| (source, session_id, PathBuf::from(path)))
+            })
+            .collect())
+    }
+
+    /// Permanently removes one session row and everything that hangs off it.
+    ///
+    /// Observations, processing attempts, deliveries, archive uploads and memory-sync rows are
+    /// removed by `ON DELETE CASCADE`. Diagnostics are `ON DELETE SET NULL` and deliberately
+    /// survive: they are the content-free record of what happened, and a purge should not be able
+    /// to erase the evidence that explains why it was needed.
+    ///
+    /// Guarded to the same shape [`parked_unarchived_sessions`] selects, so a session that has
+    /// been retried into a different state since it was listed is skipped rather than deleted out
+    /// from under a running worker. Returns whether a row was actually removed.
+    pub fn purge_parked_session(&mut self, session_id: &str) -> Result<bool, StateError> {
+        validate_session_id(session_id)?;
+        let removed = self.connection.execute(
+            "DELETE FROM sessions
+             WHERE source_kind=?2 AND source_session_id=?1
+               AND lifecycle_state='failed'
+               AND next_retry_at_ms<0
+               AND current_summary_revision=0",
+            params![session_id, self.source_kind],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Failed sessions parked permanently (`next_retry_at_ms < 0`) under the `source-oversized`
-    /// verdict — or the pre-#57 lumped `source-failed` code older rows still carry — across
-    /// every source scope. That verdict is config-dependent — it records that the transcript
-    /// exceeded the source limit configured at failure time — so callers re-check the listed
-    /// transcripts against the currently configured limit and lift stale parks (issue #44).
+    /// verdict, across every source scope. That verdict is config-dependent — it records that the
+    /// transcript exceeded the source limit configured at failure time — so callers re-check the
+    /// listed transcripts against the currently configured limit and lift stale parks (issue #44).
     /// Sessions without a recorded transcript path are omitted: there is nothing to re-measure.
+    ///
+    /// `source-failed` was matched here too, from when it was the lumped size-cap code. Issue #57
+    /// made it the *residual I/O* category, which has no relationship to `max_source_bytes` — so
+    /// the size test below passed on every sweep for any small file, lifting a park that had just
+    /// been written and zeroing its `failure_streak`. Deterministic failures then retried forever,
+    /// never reaching `RETRY_PARK_THRESHOLD`, and head-of-line-blocked genuine retries because a
+    /// lifted `NULL` sorts first. Issue #83. Pre-#57 rows still carrying the legacy code are no
+    /// longer auto-lifted after a cap raise; `munshi retry --force` revives those.
     pub fn parked_source_limit_sessions(
         &self,
     ) -> Result<Vec<(SourceKind, String, PathBuf)>, StateError> {
@@ -2955,7 +3025,7 @@ impl StateStore {
              FROM sessions
              WHERE lifecycle_state='failed'
                AND next_retry_at_ms<0
-               AND last_error_category IN ('source-oversized','source-failed')
+               AND last_error_category='source-oversized'
                AND transcript_path IS NOT NULL
              ORDER BY updated_at_ms,id",
         )?;
@@ -2978,7 +3048,7 @@ impl StateStore {
             .collect())
     }
 
-    /// Lifts a permanent `source-oversized` park (or a pre-#57 `source-failed` one) so the
+    /// Lifts a permanent `source-oversized` park so the
     /// normal claim gates re-evaluate the session. The caller must first verify the transcript
     /// fits the currently configured source limit; this only clears the frozen verdict
     /// (`next_retry_at_ms < 0`) recorded under a superseded configuration (issue #44) and never
@@ -2993,7 +3063,7 @@ impl StateStore {
              WHERE source_kind=?2 AND source_session_id=?1
                AND lifecycle_state='failed'
                AND next_retry_at_ms<0
-               AND last_error_category IN ('source-oversized','source-failed')",
+               AND last_error_category='source-oversized'",
             params![session_id, self.source_kind, now_ms()],
         )?;
         Ok(changed == 1)
