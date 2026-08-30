@@ -4198,11 +4198,13 @@ fn push_parked_session_checks(checks: &mut Vec<CheckResult>, records: &[SessionR
     let mut oversized = 0usize;
     let mut missing = 0usize;
     let mut input_limited = 0usize;
+    let mut id_mismatched = 0usize;
     for record in records.iter().filter(parked) {
         match record.last_error_category.as_deref() {
             Some("source-oversized") => oversized += 1,
             Some("source-missing") => missing += 1,
             Some("summary-input-limit") => input_limited += 1,
+            Some("source-id-mismatch") => id_mismatched += 1,
             Some("source-failed") => {
                 let exists = record
                     .transcript_path
@@ -4238,6 +4240,21 @@ fn push_parked_session_checks(checks: &mut Vec<CheckResult>, records: &[SessionR
                 "{} session(s) parked on a size cap: {}; re-register with a larger limit, then `munshi retry-all --force`",
                 oversized + input_limited,
                 parts.join(", ")
+            ),
+        );
+    }
+    // Identity mismatches are not an I/O or size condition and no retry can fix them: the row's
+    // session id does not belong to the transcript it points at. Historically these were Copilot
+    // subagent stops recorded as sessions (issue #82); ingest now refuses them, so a non-zero
+    // count here is residue from before that fix rather than something still accumulating.
+    if id_mismatched > 0 {
+        push_check(
+            checks,
+            "id-mismatch-parked",
+            CheckStatus::Warning,
+            format!(
+                "{id_mismatched} parked record(s) carry a session id that does not match their recorded transcript \
+                 (issue #82: Copilot fires agentStop per subagent). No retry can archive these; they are safe to purge"
             ),
         );
     }

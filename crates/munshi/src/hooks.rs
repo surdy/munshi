@@ -24,9 +24,18 @@ use crate::render::{
     parse_archive_markdown, render_revision_markdown,
 };
 use crate::source::{
-    PreviousSource, SessionReference, SourceError, SourceKind, TranscriptLoadMode,
-    claude_transcript_origin, claude_transcript_recorded_origin, copilot_workspace_origin,
-    for_each_claude_project_transcript, load_session_update, resolve_session_reference,
+    claude_transcript_origin,
+    claude_transcript_recorded_origin,
+    copilot_workspace_origin,
+    for_each_claude_project_transcript,
+    load_session_update,
+    PreviousSource,
+    resolve_session_reference,
+    session_id_matches_transcript_path,
+    SessionReference,
+    SourceError,
+    SourceKind,
+    TranscriptLoadMode,
     validate_transcript_envelope,
 };
 use crate::state::{
@@ -735,6 +744,23 @@ fn handle_agent_stop(state_directory: &Path, input: impl Read) -> Result<(), Hoo
         return Err(failure(
             "agent-stop",
             "unsupported-stop-reason",
+            Some(payload.session_id),
+        ));
+    }
+    // Copilot fires `agentStop` once per *subagent*, passing the subagent's tool-call id as
+    // `sessionId` next to the parent session's `transcriptPath` (issue #82). Ingesting those
+    // creates sessions that can never archive: the read-time identity check rejects them on every
+    // attempt, forever. Refuse here instead, so the stop is recorded as one diagnostic rather than
+    // becoming a permanently-failing row. The subagent's work is already inside the parent
+    // transcript, and the parent session archives normally.
+    if !session_id_matches_transcript_path(
+        SourceKind::Copilot,
+        &payload.session_id,
+        Path::new(&payload.transcript_path),
+    ) {
+        return Err(failure(
+            "agent-stop",
+            "session-id-mismatch",
             Some(payload.session_id),
         ));
     }
@@ -2074,6 +2100,11 @@ fn ingest_lenient_agent_stop(
     validate_absolute_string(cwd).map_err(|code| failure("agent-stop", code, session()))?;
     validate_absolute_string(transcript_path)
         .map_err(|code| failure("agent-stop", code, session()))?;
+    // The same subagent guard the pinned path applies (issue #82). A drifted payload must not be
+    // the way a phantom session gets in.
+    if !session_id_matches_transcript_path(source, session_id, Path::new(transcript_path)) {
+        return Err(failure("agent-stop", "session-id-mismatch", session()));
+    }
     // The event gates stay in force when the gating field is present; a drifted payload that
     // dropped the field entirely still records evidence rather than a husk.
     match source {
@@ -2196,6 +2227,13 @@ fn worker_error_code(error: &HookWorkerError) -> &'static str {
         // remains the residual I/O category — and the legacy code on rows recorded before the
         // split, which readers must keep accepting.
         HookWorkerError::Source(SourceError::SourceLimit { .. }) => "source-oversized",
+        // A stored session id that does not match the parent directory of its stored transcript
+        // path (issue #82: Copilot fires `agentStop` per subagent, with the subagent's tool-call
+        // id and the *parent* session's transcript). It is its own category rather than residual
+        // `source-failed` for two reasons: it is an identity error, detected before a byte is
+        // read, so no I/O advice applies; and `source-failed` is still matched by the size-cap
+        // park lift (issue #83), which would un-park these forever.
+        HookWorkerError::Source(SourceError::SessionIdMismatch) => "source-id-mismatch",
         HookWorkerError::Source(SourceError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -2258,6 +2296,12 @@ mod worker_error_code_tests {
             std::io::ErrorKind::PermissionDenied,
         )));
         assert_eq!(worker_error_code(&residual), "source-failed");
+        // An identity mismatch is a fourth, distinct cause: the id does not belong to the
+        // transcript, detected before a byte is read (issue #82). It must not fall into
+        // `source-failed`, whose park the size-cap lift keeps reopening (issue #83).
+        let mismatched = HookWorkerError::Source(SourceError::SessionIdMismatch);
+        assert_eq!(worker_error_code(&mismatched), "source-id-mismatch");
+        assert!(!worker_error_retryable(&mismatched));
         // Neither new code disturbs the park semantics: both remain non-retryable.
         assert!(!worker_error_retryable(&missing));
         assert!(!worker_error_retryable(&oversized));
