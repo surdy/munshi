@@ -22,6 +22,19 @@ be rebuilt from that Markdown.
 
 ## Checking on things
 
+Everything in this section is a command. If you would rather look at it than type it, two optional
+addons render the same picture from the same `--json` contracts, and neither can show you anything
+the commands below will not:
+
+- the [desktop app](gui.md) — a native window with a searchable session list, per-session
+  summaries, and buttons for the retry and re-summarize actions described under
+  [Retrying work](#retrying-work);
+- the [backlog dashboard](dashboard.md) — a local web page, useful on a headless or remote
+  machine where a desktop app is not an option.
+
+Both are read-through views of the CLI, not a second implementation, and Munshi works exactly the
+same with both absent.
+
 ### `munshi status`
 
 The fastest overall health check: registration state, whether hooks are installed, and rollups of
@@ -31,9 +44,6 @@ pending/failed/archived work.
 munshi status
 munshi status --json   # stable machine-readable contract
 ```
-
-If you prefer watching this in a browser, an optional local web dashboard addon renders the same
-operational picture over the CLI's `--json` contracts; see [`dashboard.md`](dashboard.md).
 
 ### `munshi sessions`
 
@@ -730,6 +740,7 @@ over.
   pipeline.
 - [`harness-adapters.md`](harness-adapters.md) — per-harness capture details and sidecar
   artifacts.
+- [`gui.md`](gui.md) — the optional desktop app, and installing the command line it ships with.
 - [`dashboard.md`](dashboard.md) — the optional local web dashboard addon.
 - [`troubleshooting.md`](troubleshooting.md) — diagnosing failures beyond what `doctor` and
   `configuration-check` cover.

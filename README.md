@@ -55,6 +55,19 @@ my-project-6c79ec1dbed7/claude-code/e0820fcc-….md   # title, goal, work comple
                                                      # decisions, files changed, open items
 ```
 
+Prefer a window to a terminal? Build the optional desktop app instead — it bundles this same
+`munshi` binary and installs it for you:
+
+```bash
+./contrib/build-gui.sh    # then open gui/src-tauri/target/release/bundle/…
+```
+
+Registration still happens once in a terminal (it discloses what Munshi will process, and you have
+to accept that), but from then on the app shows the backlog, every session and its summary, and
+the retry actions. It reads Munshi's published JSON contracts and nothing else, so the two views
+never disagree — and Munshi works exactly the same with the app absent. See
+[the desktop addon guide](docs/gui.md).
+
 The full walkthrough — including the disclosure you're accepting and how to pick a summarizer —
 is in [getting started](docs/getting-started.md).
 
@@ -71,6 +84,10 @@ Munshi is the local scribe in a small family of tools:
 - **Madari** — a session-discovery GUI that reads Munshi's JSON status contracts to show archive
   state next to each discovered session.
 
+Munshi's own optional surfaces — the [desktop app](docs/gui.md) and the
+[backlog dashboard](docs/dashboard.md) — sit on the same versioned JSON contracts these
+integrations use. Both are addons; the command line stays the primary way to run Munshi.
+
 Remote flow happens through exactly three opt-in sinks, each disabled by default and enabled
 separately: `munshi summary-delivery` (summaries to Notesmith), `munshi archive-upload`
 (full snapshots to Patwari), and `munshi memory-sync` (harness auto-memory mirrored into
@@ -85,6 +102,7 @@ Notesmith, issue #59). Each integration is optional; Munshi is fully useful as a
 | [Using Munshi day to day](docs/user-guide.md) | Status, sessions, retries, budgets, project policy, delivery |
 | [Configuration reference](docs/configuration.md) | Every `config.json` setting in one place |
 | [Manual archival](docs/manual-archive.md) | Archiving a single transcript standalone, no hooks required |
+| [Desktop addon](docs/gui.md) | The optional native app, and installing the CLI it ships with |
 | [Backlog dashboard addon](docs/dashboard.md) | Visualizing the operational JSON contracts (issue #56) |
 | [Troubleshooting](docs/troubleshooting.md) | Why a session didn't archive, and how to find out |
 

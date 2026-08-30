@@ -1,10 +1,14 @@
 # Backlog dashboard addon
 
 `munshi-dashboard` is an optional local web dashboard over Munshi's archiving backlog,
-adopted as a supported addon in issue #56. It replaced the Python spike that was rescued
-into `contrib/dashboard` (previously served on `127.0.0.1:8877`), keeping the spike's page
-and its `/api/data` payload shape unchanged. It is a separate binary in this workspace;
-the `munshi` CLI itself grows no UI code path.
+adopted as a supported addon in issue #56. It replaced a Python spike, keeping that spike's page
+and its `/api/data` payload shape unchanged. It is a separate binary in this workspace; the
+`munshi` CLI itself grows no UI code path.
+
+> Looking for a desktop app instead? The [desktop addon](gui.md) covers the same ground in a
+> native window, adds per-session actions, and ships the `munshi` command line inside its bundle.
+> This dashboard remains the right choice when a desktop app is not an option — a headless box, a
+> remote machine you reach over `ssh -L`, or anywhere you would rather not build a Tauri app.
 
 ## Running it
 
