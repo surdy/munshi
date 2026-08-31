@@ -206,6 +206,23 @@ pub enum WorkerContext {
     Background,
 }
 
+/// Projects a worker's context onto the narrower permission the archive-upload path needs (issue
+/// #61): may this attempt read the session's origin directory to record instruction-file
+/// provenance? The rule is the same one the project-inspection branch above applies — a
+/// scheduler-descended worker touches nothing under the origin, not even to check that it exists —
+/// so the two must never disagree, which is why they read from one enum.
+///
+/// Public so `munshi tick`'s own upload retry derives its answer here rather than hand-typing a
+/// constant beside the call. A scheduler pass that declares itself `Background` for the recovery
+/// sweep and then spells `Allowed` for the upload two lines later is exactly the divergence that
+/// re-opened this gate once already.
+pub fn origin_access(context: WorkerContext) -> crate::patwari::OriginAccess {
+    match context {
+        WorkerContext::Interactive => crate::patwari::OriginAccess::Allowed,
+        WorkerContext::Background => crate::patwari::OriginAccess::Withheld,
+    }
+}
+
 pub fn run_archive_worker(
     state_directory: &Path,
     session_id: &str,
@@ -636,8 +653,11 @@ pub fn run_recovery(
     // a transient Patwari outage recovers here rather than waiting for the session to change. This
     // is best-effort like delivery — a failure is recorded as a safe diagnostic and never affects
     // the recovery of local archival above.
-    if let Err(error) = crate::patwari::retry_pending_uploads(state_directory, RECOVERY_SCAN_LIMIT)
-    {
+    if let Err(error) = crate::patwari::retry_pending_uploads(
+        state_directory,
+        RECOVERY_SCAN_LIMIT,
+        origin_access(context),
+    ) {
         let _ = error;
         let _ = state.record_diagnostic("archive-upload", "archive-upload-retry-error", None, None);
     }
@@ -1407,9 +1427,12 @@ fn process_claim(
     // Archive upload runs strictly downstream of the successful local archive too, in parallel with
     // and independent of Notesmith delivery above (ADR 0009): a Patwari outage is recorded as a
     // bounded retry or a safe diagnostic and never changes the archived result the worker returns.
-    if let Err(error) =
-        crate::patwari::upload_after_archive(state, stored, &claim.session.session_id)
-    {
+    if let Err(error) = crate::patwari::upload_after_archive(
+        state,
+        stored,
+        &claim.session.session_id,
+        origin_access(context),
+    ) {
         let _ = error;
         let _ = state.record_diagnostic(
             "archive-upload",
@@ -2280,6 +2303,23 @@ fn worker_error_retryable(error: &HookWorkerError) -> bool {
 #[cfg(test)]
 mod worker_error_code_tests {
     use super::*;
+
+    /// Every scheduler-descended path must withhold origin access (issue #61). This mapping is the
+    /// single place that decision is made: the archive worker and the recovery sweep call it, and
+    /// `munshi tick`'s upload retry derives from it too rather than naming a constant of its own.
+    /// Flipping either arm here is the whole regression, so it is pinned rather than assumed.
+    #[test]
+    fn a_background_worker_withholds_origin_access() {
+        assert_eq!(
+            origin_access(WorkerContext::Background),
+            crate::patwari::OriginAccess::Withheld,
+            "a scheduler-descended pass must not touch a session's origin directory"
+        );
+        assert_eq!(
+            origin_access(WorkerContext::Interactive),
+            crate::patwari::OriginAccess::Allowed
+        );
+    }
 
     /// The issue #57 split: a vanished transcript, an oversized one, and residual I/O are
     /// three different problems with three different resolutions, and the code must say

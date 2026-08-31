@@ -19,18 +19,33 @@ pub enum ProjectIdentityError {
     InvalidDirectory,
 }
 
-pub fn inspect_project(directory: &Path) -> Result<ProjectIdentity, ProjectIdentityError> {
-    let canonical = directory
-        .canonicalize()
-        .map_err(|_| ProjectIdentityError::InvalidDirectory)?;
+/// The directory a session's project identity is derived from: the canonicalized git worktree
+/// root containing `directory`, or the canonicalized directory itself when it is not inside a
+/// worktree. `None` when `directory` does not resolve to a readable directory at all.
+///
+/// Factored out of [`inspect_project`] rather than forked (issue #77) so the second caller that
+/// needs a project root — capture-time instruction-file provenance — asks this exact question and
+/// gets this exact answer. Two spellings of "the project root" is precisely the defect that would
+/// let a capture report on a `CLAUDE.md` belonging to a directory other than the one the session
+/// is filed under.
+///
+/// This touches the origin directory (a `canonicalize`, then a `git` invocation inside it), so a
+/// caller forbidden from touching it — issue #61's background worker — must not call it.
+pub(crate) fn project_root(directory: &Path) -> Option<PathBuf> {
+    let canonical = directory.canonicalize().ok()?;
     if !canonical.is_dir() {
-        return Err(ProjectIdentityError::InvalidDirectory);
+        return None;
     }
+    Some(
+        git_output(&canonical, &["rev-parse", "--show-toplevel"])
+            .map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or(canonical),
+    )
+}
 
-    let root = git_output(&canonical, &["rev-parse", "--show-toplevel"])
-        .map(PathBuf::from)
-        .and_then(|path| path.canonicalize().ok())
-        .unwrap_or(canonical);
+pub fn inspect_project(directory: &Path) -> Result<ProjectIdentity, ProjectIdentityError> {
+    let root = project_root(directory).ok_or(ProjectIdentityError::InvalidDirectory)?;
     let remote = find_remote(&root);
     let project = remote
         .as_deref()
@@ -263,6 +278,51 @@ mod tests {
         let after_delete = recorded_project_identity(&root, None);
         assert_eq!(after_delete.identity, recorded.identity);
         assert_eq!(after_delete.component, recorded.component);
+    }
+
+    /// `project_root` and `inspect_project` must answer the same question the same way: a
+    /// subdirectory of a git worktree resolves to the worktree toplevel, and the identity
+    /// `inspect_project` derives is the one built from exactly that root. Anything else would let
+    /// a capture report instruction-file provenance for a directory other than the one the session
+    /// is filed under (issue #77).
+    #[test]
+    fn project_root_and_inspect_project_agree_on_a_worktree_subdirectory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("worktree");
+        let nested = root.join("crates").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "--quiet"])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "git init must succeed for this test to mean anything"
+        );
+        let root = root.canonicalize().unwrap();
+
+        // The subdirectory and the toplevel resolve to one root.
+        assert_eq!(project_root(&nested), Some(root.clone()));
+        assert_eq!(project_root(&root), Some(root.clone()));
+
+        // And that root is the one the identity is derived from: this repository has no remote, so
+        // the identity is the remote-less hash of the root path, not of the subdirectory.
+        let from_subdirectory = inspect_project(&nested).unwrap();
+        let from_root = inspect_project(&root).unwrap();
+        assert_eq!(from_subdirectory.identity, from_root.identity);
+        assert_eq!(from_subdirectory.component, from_root.component);
+        assert_eq!(
+            from_subdirectory.identity,
+            format!("local:sha256:{:x}", Sha256::digest(path_bytes(&root))),
+            "the identity must hash the root `project_root` returns"
+        );
+
+        // A path that is not a readable directory has no root at all.
+        assert_eq!(project_root(&root.join("missing")), None);
+        let file = root.join("CLAUDE.md");
+        std::fs::write(&file, b"# instructions\n").unwrap();
+        assert_eq!(project_root(&file), None);
     }
 
     /// The display label falls through name, then component, then origin basename, and the

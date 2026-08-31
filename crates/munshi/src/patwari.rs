@@ -251,6 +251,25 @@ pub struct CaptureContext {
     /// heatmap and per-device scope). Every key is individually optional and readers ignore ones
     /// they do not know, so this map extends without a schema change and older captures that lack
     /// a key stay readable. See `capture_source_metadata`.
+    ///
+    /// Instruction-file provenance (issue #77) adds `claude_md` and `agents_md`, which qanungo's
+    /// instructions-doctor anchors "an instruction edit landed" on by watching the value change
+    /// between captures:
+    ///
+    /// - A value of 64 lowercase hex is the sha256 of `<project root>/CLAUDE.md` or
+    ///   `<project root>/AGENTS.md`. The root is the directory the session's project identity is
+    ///   itself derived from, so the digest and the identity always name the same project. Only
+    ///   that one file is considered — no ancestor walk, no `~/.claude/CLAUDE.md`. The hash is all
+    ///   that travels; the file's content is never uploaded.
+    /// - The value `absent` means the root was readable and the file provably was not there
+    ///   (`ErrorKind::NotFound`). That is a positive observation: a capture that says `absent`
+    ///   followed by one that says a digest is an instruction file being *created*.
+    /// - The key is *omitted* whenever munshi could not look: origin access was withheld from this
+    ///   attempt (issue #61's background worker), the session records no `origin_cwd` (codex
+    ///   sessions record none, so they never carry these keys), the root did not resolve,
+    ///   permission was denied, the path is a symlink, a directory, or a device, or the file is
+    ///   larger than `MAX_INSTRUCTION_BYTES`. Omitted and `absent` are deliberately different
+    ///   answers: "we did not look" must never read as "it is not there".
     pub source_metadata: BTreeMap<String, String>,
     pub project: Option<String>,
     pub repository: Option<String>,
@@ -955,6 +974,166 @@ fn format_utc_offset(gmtoff_seconds: i64) -> Option<String> {
     Some(format!("{sign}{hours:02}:{minutes:02}"))
 }
 
+// ---------------------------------------------------------------------------
+// Instruction-file provenance (issue #77)
+// ---------------------------------------------------------------------------
+//
+// Two more keys ride the same opaque map: `claude_md` and `agents_md`, the sha256 of the project
+// root's `CLAUDE.md` / `AGENTS.md`. Only the digest travels — the file's content is never uploaded,
+// which is what makes recording it on every capture acceptable at all. Downstream, qanungo's
+// instructions-doctor anchors "an instruction edit landed" on the value changing between two
+// captures, which is a question nothing in the archive can answer today.
+//
+// Like the machine keys, these accrue value only from ship time: a capture taken before this shipped
+// carries no record of what the instructions said at that moment, and nothing can reconstruct it.
+//
+// Snapshot-fingerprint consequence, checked rather than assumed: none, on both sides. Patwari's
+// `snapshot_fingerprint` projects the capture through a `StableCapture` naming five fields —
+// project, repository, branch, source_agent_version, artifact_set_version — so `source_metadata` is
+// structurally unreachable from it, and a server test mutates the map and pins the fingerprint
+// unchanged. On this side the map feeds `build_manifest` and nothing else: no munshi-transcript file
+// is touched, so no rendered content and no content address moves. A re-capture whose only change is
+// an instruction digest therefore adds a capture row and coalesces, rather than minting a snapshot.
+
+/// Whether this upload attempt may touch the session's origin directory (issue #61).
+///
+/// The upload path runs both from user-attributed processes and from a scheduler-descended worker,
+/// and the latter "must not touch the origin directory — not even to check that it exists": a stat
+/// of a TCC-protected root (`~/Documents` and friends, which real sessions live under) raises the
+/// permission prompt the background context exists to avoid. Callers therefore state which they
+/// are, rather than the capture code guessing from ambient state.
+///
+/// This is the same distinction [`crate::hooks::WorkerContext`] draws for project inspection, kept
+/// as a separate type because it travels a different path and answers a narrower question: not
+/// "may I resolve an identity" but "may I read a byte off the origin disk at all".
+///
+/// Every public upload entry point takes one, with no default. That is deliberate and was arrived
+/// at the hard way: `retry` and `backfill` read like operator commands, and the first cut let them
+/// hardcode `Allowed` on that reading — but `munshi tick` calls `retry` on every scheduler pass to
+/// drain failed rows, so a Patwari outage (the tick's *designed* steady state) would have walked
+/// the scheduler straight into a TCC-protected origin. A caller-set invariant nothing enforces is
+/// not an invariant, so the type demands the answer instead of assuming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginAccess {
+    /// Descended from a user-attributed process: the origin directory may be read.
+    Allowed,
+    /// Descended from a platform scheduler: no filesystem contact with the origin directory, not
+    /// even an existence check. Instruction-file provenance is omitted entirely.
+    Withheld,
+}
+
+/// The instruction files whose digests a capture records, paired with the `source_metadata` key
+/// each is reported under. Filenames are exact and case-sensitive, matching what the harnesses
+/// themselves read.
+const INSTRUCTION_FILES: [(&str, &str); 2] =
+    [("CLAUDE.md", "claude_md"), ("AGENTS.md", "agents_md")];
+
+/// The value recording that the root was readable and the instruction file provably was not there.
+/// Distinct from an omitted key, which records only that munshi did not look.
+const INSTRUCTION_ABSENT: &str = "absent";
+
+/// The largest instruction file munshi will read to hash. An instruction file is prose a human
+/// maintains; a megabyte of it is not one, and reading an arbitrarily large file on every capture
+/// is a cost the provenance does not justify. Over the cap the key is *omitted*, never `absent` —
+/// the file exists, we declined to look.
+const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
+
+/// Instruction-file provenance for this capture: `claude_md` / `agents_md` for the project root the
+/// session's identity is derived from, each either a digest, `absent`, or missing entirely.
+///
+/// Re-hashed on every attempt, deliberately. This matches `capture_hostname` — ambient machine state
+/// read at the moment of the attempt — rather than `capture_utc_offset`, which is a pure function of
+/// the persisted `captured_at` and so is fixed for the life of a capture id. There is no
+/// `captured_at`-equivalent to resolve an instruction file against: the file has exactly one state,
+/// the one it has now, and munshi keeps no history of it. So the honest bound is the one `a31b218`
+/// states for the hostname: determinism is in `(record, captured_at)` plus the ambient environment,
+/// not in `(record, captured_at)` alone. An instruction edit landing between two attempts of one
+/// capture id alters the manifest, and that window is narrow by construction — the normal retry path
+/// resumes the persisted upload id and never re-sends the manifest, so surfacing it as a
+/// `capture_id_conflict` also takes a lost or expired upload. Freezing the first attempt's digest
+/// instead would need persisted state and would buy nothing the consumer wants: the digest is
+/// evidence about the working tree, and the freshest reading is the truest one.
+///
+/// Returns an empty map, touching no filesystem at all, when origin access is withheld.
+fn capture_instruction_provenance(
+    record: &SessionRecord,
+    origin_access: OriginAccess,
+) -> BTreeMap<String, String> {
+    let mut provenance = BTreeMap::new();
+    // Issue #61: a scheduler-descended worker gets no further than this line — not a stat, not an
+    // existence check. Every key is simply absent from the capture.
+    if origin_access == OriginAccess::Withheld {
+        return provenance;
+    }
+    // `origin_cwd` is the session's recorded working directory, often a subdirectory of the
+    // project; `project.identity` is not a path and can never stand in for one. A session that
+    // recorded no origin (codex records none) yields no keys, per the contract.
+    let Some(origin_cwd) = record.origin_cwd.as_deref() else {
+        return provenance;
+    };
+    let Some(root) = crate::project::project_root(origin_cwd) else {
+        return provenance;
+    };
+    for (filename, key) in INSTRUCTION_FILES {
+        if let Some(state) = instruction_file_state(&root.join(filename)) {
+            provenance.insert(key.to_owned(), state);
+        }
+    }
+    provenance
+}
+
+/// What the capture should report for one instruction file: `Some(<64 lowercase hex>)` for a
+/// readable regular file within the cap, `Some("absent")` when it provably is not there, and `None`
+/// — omit the key — for every other outcome.
+///
+/// Symlinks are omitted rather than followed on purpose. A digest of a file living outside the
+/// project is worse than no provenance at all: the consumer would read it as a statement about this
+/// project's instructions and be wrong, with nothing in the record to reveal it. Directories and
+/// devices are refused for the same reason. Only `NotFound` earns `absent`; a permission error means
+/// munshi could not look, which is exactly what an omitted key says.
+fn instruction_file_state(path: &Path) -> Option<String> {
+    // `symlink_metadata`, not `metadata`: the question is what is *at* this path, not what it
+    // eventually points to.
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(INSTRUCTION_ABSENT.to_owned());
+        }
+        Err(_) => return None,
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_INSTRUCTION_BYTES {
+        return None;
+    }
+    hash_bounded_file(path)
+}
+
+/// Streams a file into a sha256, refusing anything over [`MAX_INSTRUCTION_BYTES`]. `None` on any
+/// read failure — instruction provenance never errors an upload, it just goes unreported.
+///
+/// The reader is capped at one byte past the limit so the size is re-checked against what was
+/// actually read, not only against the `stat` that preceded it: a file that grew past the cap
+/// between the two is refused rather than hashed in part. Bytes are consumed in a fixed buffer, so
+/// no file size can make this allocate.
+fn hash_bounded_file(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file).take(MAX_INSTRUCTION_BYTES + 1);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    let mut read_bytes: u64 = 0;
+    loop {
+        let filled = reader.read(&mut buffer).ok()?;
+        if filled == 0 {
+            break;
+        }
+        read_bytes += filled as u64;
+        if read_bytes > MAX_INSTRUCTION_BYTES {
+            return None;
+        }
+        hasher.update(&buffer[..filled]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Generates a version-4 UUID string from operating-system randomness, used for the persistent
 /// client identity and per-attempt capture ids (both must parse as UUIDs server-side).
 fn new_uuid() -> String {
@@ -1316,10 +1495,14 @@ fn collect_staged_paths(root: &Path, directory: &Path, depth: usize, out: &mut V
 /// This never mutates the session's archival lifecycle. It returns `Ok(None)` when archive upload
 /// is disabled or unconfigured, records network/server failures as a bounded retry, and reuses the
 /// persisted capture id (resuming an interrupted upload) or mints a fresh one for a new revision.
+///
+/// `origin_access` is the worker's own context (issue #61) carried through to capture provenance: a
+/// scheduler-descended worker withholds it and the capture records no instruction-file digests.
 pub(crate) fn upload_after_archive(
     state: &mut StateStore,
     config: &StoredConfig,
     session_id: &str,
+    origin_access: OriginAccess,
 ) -> Result<Option<UploadOutcome>, PatwariError> {
     if !config.archive_upload.enabled || !config.archive_upload.is_addressable() {
         return Ok(None);
@@ -1340,6 +1523,7 @@ pub(crate) fn upload_after_archive(
         &record,
         &config.harnesses.source_homes(),
         config.limits.max_event_text_bytes,
+        origin_access,
     )?;
     Ok(Some(outcome))
 }
@@ -1353,9 +1537,13 @@ pub(crate) fn upload_after_archive(
 /// never races a worker uploading the same session; a locked session is skipped this pass and
 /// re-scanned next time. A per-session failure is recorded as a bounded retry and never affects
 /// local archival; a store or lock error aborts the sweep so the caller can record a diagnostic.
+///
+/// `origin_access` is the recovery sweep's own context (issue #61) carried through to capture
+/// provenance: a scheduler-descended sweep withholds it and records no instruction-file digests.
 pub(crate) fn retry_pending_uploads(
     state_directory: &Path,
     limit: usize,
+    origin_access: OriginAccess,
 ) -> Result<(), PatwariError> {
     let config = load_stored_config(state_directory)?;
     if !config.archive_upload.enabled || !config.archive_upload.is_addressable() {
@@ -1390,6 +1578,7 @@ pub(crate) fn retry_pending_uploads(
             &session,
             &config.harnesses.source_homes(),
             config.limits.max_event_text_bytes,
+            origin_access,
         )?;
     }
     Ok(())
@@ -1397,6 +1586,10 @@ pub(crate) fn retry_pending_uploads(
 
 /// Uploads one session's current snapshot to the configured server, recording the result in
 /// operational state. Never mutates the session's archival lifecycle.
+///
+/// `origin_access` states whether this attempt may read the session's origin directory (issue #61);
+/// it reaches only the capture's instruction-file provenance, which is omitted when it is
+/// [`OriginAccess::Withheld`]. No other part of the upload touches the origin.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upload_one(
     state: &mut StateStore,
@@ -1408,6 +1601,7 @@ pub(crate) fn upload_one(
     record: &SessionRecord,
     homes: &SourceHomes,
     max_event_text_bytes: usize,
+    origin_access: OriginAccess,
 ) -> Result<UploadOutcome, PatwariError> {
     if record.current_revision == 0 {
         return Ok(UploadOutcome::Skipped {
@@ -1506,6 +1700,7 @@ pub(crate) fn upload_one(
         machine_label,
         record,
         &artifacts,
+        origin_access,
     ) {
         Ok(receipt) => {
             state.record_archive_upload_success(
@@ -1587,6 +1782,7 @@ fn capture_source_metadata(
     record: &SessionRecord,
     captured_at: &str,
     machine_label: Option<&str>,
+    origin_access: OriginAccess,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     // A recorded-evidence identity (issue #40) is flagged in the capture metadata so a consumer can
@@ -1605,6 +1801,9 @@ fn capture_source_metadata(
     if let Some(hostname) = capture_hostname(machine_label) {
         metadata.insert("hostname".to_owned(), hostname);
     }
+    // Instruction-file provenance (issue #77), omitted wholesale when this attempt may not touch the
+    // origin directory (issue #61) and per-file whenever munshi could not look.
+    metadata.extend(capture_instruction_provenance(record, origin_access));
     metadata
 }
 
@@ -1617,6 +1816,7 @@ fn run_upload(
     machine_label: Option<&str>,
     record: &SessionRecord,
     artifacts: &[PreparedArtifact],
+    origin_access: OriginAccess,
 ) -> Result<UploadReceipt, PatwariError> {
     // Mint a fresh capture id + captured_at for this revision, or reuse the persisted pair (and any
     // resumable upload id) when this is a retry of the same attempt.
@@ -1636,7 +1836,12 @@ fn run_upload(
         captured_at: prep.captured_at.clone(),
         source_cursor: Some(record.current_revision.to_string()),
         source_state_hash: record.current_summary_hash.clone(),
-        source_metadata: capture_source_metadata(record, &prep.captured_at, machine_label),
+        source_metadata: capture_source_metadata(
+            record,
+            &prep.captured_at,
+            machine_label,
+            origin_access,
+        ),
         project: record
             .project
             .as_ref()
@@ -2214,6 +2419,7 @@ fn rearchive_manifest(
     prep: &crate::state::CapturePrep,
     artifacts: &[PreparedArtifact],
     machine_label: Option<&str>,
+    origin_access: OriginAccess,
 ) -> Result<Value, PatwariError> {
     let mut manifest = snapshot.get("manifest").cloned().ok_or_else(|| {
         PatwariError::Protocol("saved snapshot response omitted manifest".to_owned())
@@ -2240,7 +2446,13 @@ fn rearchive_manifest(
         .ok_or_else(|| {
             PatwariError::Protocol("saved source_metadata is not an object".to_owned())
         })?;
-    for (key, value) in capture_source_metadata(record, &prep.captured_at, machine_label) {
+    // Freshly observed provenance is merged *over* the saved snapshot's map rather than replacing
+    // it, so a key this capture omits leaves the prior value standing — already true of
+    // `utc_offset` and `hostname`, and now of `claude_md` / `agents_md`: a rearchive that could not
+    // read the project root reports the digests the tombstoned snapshot recorded, not `absent`.
+    for (key, value) in
+        capture_source_metadata(record, &prep.captured_at, machine_label, origin_access)
+    {
         metadata.insert(key, Value::String(value));
     }
     capture.insert(
@@ -2349,12 +2561,16 @@ pub fn rearchive(
         resume_upload_id: None,
     };
     let machine_label = config.memory_sync.machine_label.as_deref();
+    // `munshi archive-upload rearchive` is an operator-invoked CLI command, never scheduler-driven,
+    // so reading the project root here cannot raise a background permission prompt (issue #61).
+    let origin_access = OriginAccess::Allowed;
     let _ = rearchive_manifest(
         &snapshot,
         &record,
         &validation_prep,
         &artifacts,
         machine_label,
+        origin_access,
     )?;
     let expected_fingerprint = snapshot
         .get("snapshot_fingerprint")
@@ -2425,7 +2641,14 @@ pub fn rearchive(
         &new_uuid(),
         &now_rfc3339(),
     )?;
-    let manifest = rearchive_manifest(&snapshot, &record, &prep, &artifacts, machine_label)?;
+    let manifest = rearchive_manifest(
+        &snapshot,
+        &record,
+        &prep,
+        &artifacts,
+        machine_label,
+        origin_access,
+    )?;
     let endpoint_owned = endpoint.clone();
     let receipt = client.upload_snapshot(
         &prep.capture_id,
@@ -2656,6 +2879,14 @@ fn stale_endpoint_note(
 /// (`force` additionally revives a dead-letter row and resets its bounded attempt count), then the
 /// upload runs under the session's advisory lock. A locked session is reported skipped this run.
 /// Never mutates the session's archival lifecycle.
+///
+/// `origin_access` is not incidental here. This reads like an operator command, but `munshi tick`
+/// calls it on every scheduler pass to drain failed rows, which is exactly the state a Patwari
+/// outage leaves the ledger in. A scheduler-driven caller must pass [`OriginAccess::Withheld`] so
+/// the retry records no instruction-file provenance rather than reaching into a possibly
+/// TCC-protected origin directory (issue #61); the `munshi archive-upload retry` CLI passes
+/// [`OriginAccess::Allowed`].
+#[allow(clippy::too_many_arguments)]
 pub fn retry(
     state_directory: &Path,
     source: Option<SourceKind>,
@@ -2663,6 +2894,7 @@ pub fn retry(
     all: bool,
     force: bool,
     limit: usize,
+    origin_access: OriginAccess,
 ) -> Result<ArchiveUploadRunReport, PatwariError> {
     let _ = all;
     let config = load_stored_config(state_directory)?;
@@ -2732,6 +2964,7 @@ pub fn retry(
             &config.harnesses.source_homes(),
             config.limits.max_event_text_bytes,
             Some(force),
+            origin_access,
         )?;
         report.record(record.source, &record.session_id, outcome);
     }
@@ -2769,9 +3002,14 @@ pub fn retry(
 /// Requires archive upload to be enabled and addressable; candidates are bounded by `limit`; a
 /// session whose advisory lock is held (an archive worker is on it) is reported skipped this run.
 /// Never mutates the session's archival lifecycle.
+///
+/// `origin_access` states whether this run may read session origin directories for instruction-file
+/// provenance (issue #61). Nothing scheduler-driven calls backfill today, but it takes the answer
+/// explicitly rather than assuming one, for the reason [`OriginAccess`] records.
 pub fn backfill(
     state_directory: &Path,
     limit: usize,
+    origin_access: OriginAccess,
 ) -> Result<ArchiveUploadRunReport, PatwariError> {
     let config = load_stored_config(state_directory)?;
     let settings = ArchiveUploadSettings::from_config(&config);
@@ -2852,6 +3090,7 @@ pub fn backfill(
             &config.harnesses.source_homes(),
             config.limits.max_event_text_bytes,
             None,
+            origin_access,
         )?;
         report.record(session.source, &session.session_id, outcome);
     }
@@ -2864,6 +3103,11 @@ pub fn backfill(
 /// count) — this is the one caller of `reset_archive_upload_for_retry`; `None` (backfill) leaves
 /// any row as found. A locked session (an archive worker is uploading it) is reported skipped
 /// rather than contended.
+///
+/// `origin_access` is passed through from the public entry point rather than assumed here. An
+/// earlier cut hardcoded [`OriginAccess::Allowed`] on the belief that this path was CLI-only; it is
+/// not — `munshi tick` drives [`retry`] on every scheduler pass — and the belief was written down
+/// as a comment where nothing could enforce it. Only the caller knows what it descended from.
 #[allow(clippy::too_many_arguments)]
 fn locked_upload_one(
     state_directory: &Path,
@@ -2877,6 +3121,7 @@ fn locked_upload_one(
     homes: &SourceHomes,
     max_event_text_bytes: usize,
     reset_for_retry: Option<bool>,
+    origin_access: OriginAccess,
 ) -> Result<UploadOutcome, PatwariError> {
     let Some(_lock) = try_acquire_session_lock(state_directory, session_id)? else {
         return Ok(UploadOutcome::Skipped {
@@ -2902,6 +3147,7 @@ fn locked_upload_one(
         &session,
         homes,
         max_event_text_bytes,
+        origin_access,
     )
 }
 
@@ -3086,7 +3332,12 @@ mod tests {
         let record = archived_record("11111111-1111-1111-8111-111111111111", &transcript_path);
 
         let captured_at = "2026-07-25T00:00:00Z";
-        let metadata = capture_source_metadata(&record, captured_at, Some("canonical-mac"));
+        let metadata = capture_source_metadata(
+            &record,
+            captured_at,
+            Some("canonical-mac"),
+            OriginAccess::Allowed,
+        );
         assert_eq!(
             metadata.get("hostname").map(String::as_str),
             Some("canonical-mac")
@@ -3153,7 +3404,8 @@ mod tests {
             origin: ProjectOrigin::Recorded,
         });
 
-        let metadata = capture_source_metadata(&record, "2026-07-25T00:00:00Z", None);
+        let metadata =
+            capture_source_metadata(&record, "2026-07-25T00:00:00Z", None, OriginAccess::Allowed);
         assert_eq!(metadata.get("origin").map(String::as_str), Some("recorded"));
         assert!(metadata.contains_key("utc_offset"));
         assert!(metadata.contains_key("hostname"));
@@ -3165,6 +3417,411 @@ mod tests {
             );
             assert!(value.len() <= 64, "metadata value {value:?} is too long");
         }
+    }
+
+    /// The bytes and digest of the two instruction files these tests write, fixed here so a change
+    /// to what munshi hashes (the whole file, verbatim, no normalization) fails loudly.
+    const CLAUDE_MD_BYTES: &[u8] = b"# Project instructions\n\nAlways run the tests.\n";
+    const CLAUDE_MD_SHA256: &str =
+        "8640be1f2a16b1498de046498a617406d2f0569951e9437177098f0953a84d03";
+    const AGENTS_MD_BYTES: &[u8] = b"agents\n";
+    const AGENTS_MD_SHA256: &str =
+        "38700dfad5711976e2f7aeab31013f04aed8c83118a1ef892f6d23bdfe944602";
+
+    /// An archived record whose session ran inside `origin_cwd`, which the instruction-provenance
+    /// path resolves to a project root. `archived_record` hardcodes `/tmp/project`, so tests that
+    /// care about the origin directory point it at their own `TempDir` instead of relying on — or
+    /// disturbing — that shared fixture.
+    fn record_rooted_at(
+        session_id: &str,
+        transcript_path: &Path,
+        origin_cwd: &Path,
+    ) -> SessionRecord {
+        let mut record = archived_record(session_id, transcript_path);
+        record.origin_cwd = Some(origin_cwd.to_path_buf());
+        record
+    }
+
+    #[test]
+    fn instruction_provenance_hashes_the_file_at_the_project_root() {
+        use tempfile::TempDir;
+
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("CLAUDE.md"), CLAUDE_MD_BYTES).unwrap();
+        std::fs::write(root.join("AGENTS.md"), AGENTS_MD_BYTES).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "33333333-3333-3333-8333-333333333333",
+            &transcript_path,
+            root,
+        );
+
+        let provenance = capture_instruction_provenance(&record, OriginAccess::Allowed);
+        assert_eq!(
+            provenance.get("claude_md").map(String::as_str),
+            Some(CLAUDE_MD_SHA256),
+            "the digest must be sha256 of the file's exact bytes"
+        );
+        assert_eq!(
+            provenance.get("agents_md").map(String::as_str),
+            Some(AGENTS_MD_SHA256)
+        );
+        // The shape a consumer may rely on: 64 lowercase hex, which also clears the map's own
+        // value-length bound.
+        for value in provenance.values() {
+            assert_eq!(value.len(), 64, "digest {value:?} is not 64 characters");
+            assert!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+                "digest {value:?} is not lowercase hex"
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_provenance_reports_absent_when_the_root_is_readable_and_the_file_is_not_there() {
+        use tempfile::TempDir;
+
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("CLAUDE.md"), CLAUDE_MD_BYTES).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "44444444-4444-4444-8444-444444444444",
+            &transcript_path,
+            root,
+        );
+
+        // `absent` is a positive observation — the root was read and the file provably was not
+        // there — and must never be confused with the key simply being missing.
+        let provenance = capture_instruction_provenance(&record, OriginAccess::Allowed);
+        assert_eq!(
+            provenance.get("agents_md").map(String::as_str),
+            Some(INSTRUCTION_ABSENT)
+        );
+        assert_eq!(
+            provenance.get("claude_md").map(String::as_str),
+            Some(CLAUDE_MD_SHA256),
+            "one file being absent says nothing about the other"
+        );
+    }
+
+    #[test]
+    fn instruction_provenance_is_omitted_when_munshi_cannot_look() {
+        use tempfile::TempDir;
+
+        let directory = TempDir::new().unwrap();
+        let transcript_path = directory.path().join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+
+        // No `origin_cwd` at all: codex sessions record none, so they carry no instruction keys.
+        let mut record = archived_record("55555555-5555-5555-8555-555555555555", &transcript_path);
+        record.origin_cwd = None;
+        assert!(
+            capture_instruction_provenance(&record, OriginAccess::Allowed).is_empty(),
+            "a session with no recorded origin must report nothing, not `absent`"
+        );
+
+        // An origin that no longer resolves to a directory: the root is unknown, so which
+        // `CLAUDE.md` to speak about is unknown too.
+        let vanished = directory.path().join("gone");
+        record.origin_cwd = Some(vanished);
+        assert!(
+            capture_instruction_provenance(&record, OriginAccess::Allowed).is_empty(),
+            "an unresolvable root must report nothing, not `absent`"
+        );
+    }
+
+    #[test]
+    fn withheld_origin_access_records_no_instruction_provenance() {
+        use tempfile::TempDir;
+
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("CLAUDE.md"), CLAUDE_MD_BYTES).unwrap();
+        std::fs::write(root.join("AGENTS.md"), AGENTS_MD_BYTES).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "66666666-6666-6666-8666-666666666666",
+            &transcript_path,
+            root,
+        );
+
+        // Issue #61: a scheduler-descended worker must not touch the origin directory, so both keys
+        // vanish even though both files are sitting right there and readable.
+        //
+        // What this pins is the *output* — an empty map — not the absence of filesystem side
+        // effects, which no assertion here can observe. The no-touch property rests on the
+        // `Withheld` guard being the first statement of `capture_instruction_provenance`, ahead of
+        // every path that could stat, canonicalize, or shell out to git. Read that guard, not this
+        // test, to check the property.
+        assert!(
+            capture_instruction_provenance(&record, OriginAccess::Withheld).is_empty(),
+            "withheld origin access must yield no instruction keys at all"
+        );
+
+        // And nothing else in the capture is collateral damage: the machine keys are ambient state,
+        // not origin state, so they are unaffected by the withholding.
+        let withheld = capture_source_metadata(
+            &record,
+            "2026-07-25T00:00:00Z",
+            Some("mac"),
+            OriginAccess::Withheld,
+        );
+        assert_eq!(withheld.get("hostname").map(String::as_str), Some("mac"));
+        assert!(withheld.contains_key("utc_offset"));
+        assert!(!withheld.contains_key("claude_md"));
+        assert!(!withheld.contains_key("agents_md"));
+
+        let allowed = capture_source_metadata(
+            &record,
+            "2026-07-25T00:00:00Z",
+            Some("mac"),
+            OriginAccess::Allowed,
+        );
+        assert_eq!(
+            allowed.get("claude_md").map(String::as_str),
+            Some(CLAUDE_MD_SHA256),
+            "the same record under allowed access does report the digests"
+        );
+        assert_eq!(allowed.get("hostname"), withheld.get("hostname"));
+        assert_eq!(allowed.get("utc_offset"), withheld.get("utc_offset"));
+    }
+
+    #[test]
+    fn instruction_provenance_refuses_a_symlinked_instruction_file() {
+        use tempfile::TempDir;
+
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("shared-CLAUDE.md");
+        std::fs::write(&target, CLAUDE_MD_BYTES).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("CLAUDE.md")).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "77777777-7777-7777-8777-777777777777",
+            &transcript_path,
+            root,
+        );
+
+        // Deliberate: a digest of a file living outside the project would be read as a statement
+        // about this project's instructions, with nothing in the record to reveal otherwise. Worse
+        // than no provenance, so the key is omitted — and it is *not* `absent`, because the path
+        // does exist.
+        let provenance = capture_instruction_provenance(&record, OriginAccess::Allowed);
+        assert!(
+            !provenance.contains_key("claude_md"),
+            "a symlinked instruction file must be omitted, got {provenance:?}"
+        );
+
+        // A directory at the same path is refused the same way, and for the same reason.
+        std::fs::create_dir(root.join("AGENTS.md")).unwrap();
+        let provenance = capture_instruction_provenance(&record, OriginAccess::Allowed);
+        assert!(
+            !provenance.contains_key("agents_md"),
+            "a directory named AGENTS.md must be omitted, got {provenance:?}"
+        );
+    }
+
+    #[test]
+    fn instruction_provenance_omits_an_oversize_instruction_file() {
+        use tempfile::TempDir;
+
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            vec![b'x'; (MAX_INSTRUCTION_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "88888888-8888-8888-8888-888888888888",
+            &transcript_path,
+            root,
+        );
+
+        // Over the cap the key is omitted, never `absent`: the file exists, munshi declined to read
+        // it. Reporting `absent` here would tell the doctor an instruction file was deleted.
+        let provenance = capture_instruction_provenance(&record, OriginAccess::Allowed);
+        assert!(
+            !provenance.contains_key("claude_md"),
+            "an oversize instruction file must be omitted, got {provenance:?}"
+        );
+
+        // Exactly at the cap is still read: the bound is inclusive.
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            vec![b'x'; MAX_INSTRUCTION_BYTES as usize],
+        )
+        .unwrap();
+        let provenance = capture_instruction_provenance(&record, OriginAccess::Allowed);
+        assert_eq!(
+            provenance.get("claude_md").map(String::len),
+            Some(64),
+            "a file exactly at the cap is hashed"
+        );
+    }
+
+    #[test]
+    fn hash_bounded_file_re_checks_the_size_it_actually_read() {
+        use tempfile::TempDir;
+
+        // The test above goes through `instruction_file_state`, so the oversize file is refused by
+        // the `stat` gate and the read-side re-check never runs. In production that branch is
+        // reachable only by a file growing past the cap between the `stat` and the read, so it is
+        // pinned here directly — otherwise the one line standing between a racing file and an
+        // unbounded hash would have no coverage at all.
+        let directory = TempDir::new().unwrap();
+        let oversize = directory.path().join("oversize.md");
+        std::fs::write(&oversize, vec![b'x'; (MAX_INSTRUCTION_BYTES + 1) as usize]).unwrap();
+        assert_eq!(
+            hash_bounded_file(&oversize),
+            None,
+            "a file over the cap must be refused by the read-side check, not hashed in part"
+        );
+
+        // The boundary itself is inclusive, and the digest is the real one.
+        let at_cap = directory.path().join("at-cap.md");
+        std::fs::write(&at_cap, vec![b'x'; MAX_INSTRUCTION_BYTES as usize]).unwrap();
+        assert_eq!(
+            hash_bounded_file(&at_cap),
+            Some(sha256_hex(&vec![b'x'; MAX_INSTRUCTION_BYTES as usize]))
+        );
+
+        // And an ordinary file hashes to the digest the constants pin, so the streaming loop is not
+        // quietly dropping or duplicating a chunk.
+        let small = directory.path().join("CLAUDE.md");
+        std::fs::write(&small, CLAUDE_MD_BYTES).unwrap();
+        assert_eq!(hash_bounded_file(&small).as_deref(), Some(CLAUDE_MD_SHA256));
+
+        // An unreadable path is `None`, never an error: provenance must not fail an upload.
+        assert_eq!(
+            hash_bounded_file(&directory.path().join("missing.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn instruction_provenance_is_rehashed_on_every_attempt() {
+        use tempfile::TempDir;
+
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("CLAUDE.md"), CLAUDE_MD_BYTES).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "99999999-9999-9999-8999-999999999999",
+            &transcript_path,
+            root,
+        );
+
+        // Same record, same `captured_at` — the pair `capture_utc_offset` is deterministic in.
+        let captured_at = "2026-07-25T00:00:00Z";
+        let first =
+            capture_source_metadata(&record, captured_at, Some("mac"), OriginAccess::Allowed);
+        assert_eq!(
+            first.get("claude_md").map(String::as_str),
+            Some(CLAUDE_MD_SHA256)
+        );
+
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            b"# Project instructions\n\nEdited.\n",
+        )
+        .unwrap();
+        let second =
+            capture_source_metadata(&record, captured_at, Some("mac"), OriginAccess::Allowed);
+
+        // The chosen semantics, pinned: instruction provenance is ambient state read at attempt
+        // time (like `hostname`), not a pure function of `captured_at` (like `utc_offset`). An edit
+        // between two attempts of one capture id changes the value, and that is the honest answer —
+        // the digest is evidence about the working tree, and the freshest reading is the truest.
+        assert_ne!(
+            first.get("claude_md"),
+            second.get("claude_md"),
+            "an instruction edit between attempts must be reflected"
+        );
+        assert_eq!(
+            first.get("utc_offset"),
+            second.get("utc_offset"),
+            "the offset stays fixed by `captured_at`, unlike the instruction digests"
+        );
+    }
+
+    #[test]
+    fn built_manifest_carries_instruction_provenance() {
+        use tempfile::TempDir;
+
+        // The full construction path again — a `SessionRecord` through `capture_source_metadata`
+        // into `build_manifest` — so the round trip fails if the wiring is ever dropped.
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("CLAUDE.md"), CLAUDE_MD_BYTES).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, b"{\"type\":\"user\"}\n").unwrap();
+        let record = record_rooted_at(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            &transcript_path,
+            root,
+        );
+
+        let captured_at = "2026-07-25T00:00:00Z";
+        let artifacts = prepare_artifacts(vec![ArtifactSource {
+            logical_path: "summary.md".to_owned(),
+            media_type: Some("text/markdown".to_owned()),
+            bytes: b"# Title\n".to_vec(),
+        }]);
+        let manifest = build_manifest(
+            &SessionContext {
+                source_agent: "claude-code".to_owned(),
+                source_session_id: record.session_id.clone(),
+            },
+            &CaptureContext {
+                captured_at: captured_at.to_owned(),
+                source_cursor: Some("1".to_owned()),
+                source_state_hash: None,
+                source_metadata: capture_source_metadata(
+                    &record,
+                    captured_at,
+                    Some("canonical-mac"),
+                    OriginAccess::Allowed,
+                ),
+                project: None,
+                repository: None,
+                branch: None,
+                source_agent_version: None,
+                artifact_set_version: CURRENT_ARTIFACT_SET_VERSION,
+                munshi_version: Some("0.1.0".to_owned()),
+            },
+            &artifacts,
+        );
+
+        let source_metadata = &manifest["capture"]["source_metadata"];
+        assert_eq!(
+            source_metadata["claude_md"].as_str(),
+            Some(CLAUDE_MD_SHA256),
+            "the digest survives manifest assembly verbatim"
+        );
+        assert_eq!(
+            source_metadata["agents_md"].as_str(),
+            Some(INSTRUCTION_ABSENT)
+        );
+        // Nothing but the hash travels: the manifest carries no instruction-file content anywhere.
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !serialized.contains("Always run the tests"),
+            "instruction file content must never reach the manifest"
+        );
     }
 
     #[test]
@@ -3554,6 +4211,7 @@ mod tests {
                 &record,
                 &SourceHomes::default(),
                 DEFAULT_MAX_EVENT_TEXT_BYTES,
+                OriginAccess::Allowed,
             )
             .unwrap();
             assert!(
@@ -3640,6 +4298,7 @@ mod tests {
                 record,
                 &SourceHomes::default(),
                 DEFAULT_MAX_EVENT_TEXT_BYTES,
+                OriginAccess::Allowed,
             )
             .unwrap()
         };
@@ -3766,6 +4425,7 @@ mod tests {
             &record,
             &SourceHomes::default(),
             DEFAULT_MAX_EVENT_TEXT_BYTES,
+            OriginAccess::Allowed,
         )
         .unwrap();
         assert!(matches!(

@@ -38,9 +38,10 @@ pub use exhaust::{
 };
 pub use hooks::{
     HookEvent, HookFailure, HookResult, HookWorkerError, SUMMARIZER_EXHAUST_DIAGNOSTIC,
-    WorkerContext, handle_hook, lift_stale_source_limit_parks, reactivate_regrown_lost_transcripts,
-    read_last_failure, run_archive_worker, run_archive_worker_for_source, run_recovery,
-    tick_recovery_sweep, wait_for_hook_result, wait_for_hook_result_for_source,
+    WorkerContext, handle_hook, lift_stale_source_limit_parks, origin_access,
+    reactivate_regrown_lost_transcripts, read_last_failure, run_archive_worker,
+    run_archive_worker_for_source, run_recovery, tick_recovery_sweep, wait_for_hook_result,
+    wait_for_hook_result_for_source,
 };
 pub use memory_sync::{
     MemorySinkConfig, MemorySyncError, MemorySyncItem, MemorySyncRunItem, MemorySyncRunReport,
@@ -50,13 +51,14 @@ pub use memory_sync::{
 pub use patwari::{
     ArchiveUploadItem, ArchiveUploadReconcileReport, ArchiveUploadRunItem, ArchiveUploadRunReport,
     ArchiveUploadSettings, ArchiveUploadStatusReport, ArtifactSource, CURRENT_ARTIFACT_SET_VERSION,
-    CaptureContext, INITIAL_ARTIFACT_SET_VERSION, PatwariClient, PatwariError, PreparedArtifact,
-    ReconciledUpload, RepairedUpload, SessionContext, UploadOutcome, UploadReceipt,
-    abandon_rearchive as abandon_archive_upload_rearchive, assemble_artifact_sources,
-    backfill as archive_upload_backfill, build_manifest, configure as configure_archive_upload,
-    prepare_artifact, prepare_artifacts, rearchive as archive_upload_rearchive,
-    reconcile as archive_upload_reconcile, retry as archive_upload_retry,
-    set_enabled as set_archive_upload_enabled, status as archive_upload_status,
+    CaptureContext, INITIAL_ARTIFACT_SET_VERSION, OriginAccess, PatwariClient, PatwariError,
+    PreparedArtifact, ReconciledUpload, RepairedUpload, SessionContext, UploadOutcome,
+    UploadReceipt, abandon_rearchive as abandon_archive_upload_rearchive,
+    assemble_artifact_sources, backfill as archive_upload_backfill, build_manifest,
+    configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
+    rearchive as archive_upload_rearchive, reconcile as archive_upload_reconcile,
+    retry as archive_upload_retry, set_enabled as set_archive_upload_enabled,
+    status as archive_upload_status,
 };
 pub use policy::{DisabledReason, GlobalPolicy, PolicyError, ResolvedPolicy, resolve_policy};
 pub use project::{

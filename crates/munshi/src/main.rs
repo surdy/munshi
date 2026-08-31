@@ -12,16 +12,17 @@ use munshi::{
     ArchiveUploadSettings, ArchiveUploadStatusReport, ArtifactMatch, AttemptRecord,
     DeliveryCredentialSource, DeliveryError, DeliveryRunReport, DeliverySinkConfig,
     DeliveryStatusReport, Diagnostic, EXHAUST_SIZE_WARN_BYTES, ExhaustStatus, HistoryReport,
-    HookEvent, HookFailure, HookResult, MemorySinkConfig, MemorySyncError, PatwariError,
-    ProjectStatus, RegisterConfig, RestoreConfig, RestoreError, RestoreReport, ResumeConfig,
-    RetrieveError, RetrieveResult, SearchResults, SessionRecord, SessionReference, SourceHomes,
-    SourceKind, StateStore, StructuredSummary, VerifyArchiveError, VerifyArchiveReport,
-    WorkerContext, abandon_archive_upload_rearchive, accept_disclosure_from_terminal,
-    archive_session, archive_upload_backfill, archive_upload_rearchive, archive_upload_reconcile,
-    archive_upload_retry, archive_upload_status, configure_archive_upload, configure_delivery,
-    configure_memory_sync, conflicting_source_home, default_copilot_home, delivery_backfill,
-    delivery_retry, delivery_status, delivery_verify_history, handle_hook,
-    lift_stale_source_limit_parks, memory_sync_run, memory_sync_status, parse_archive_markdown,
+    HookEvent, HookFailure, HookResult, MemorySinkConfig, MemorySyncError, OriginAccess,
+    PatwariError, ProjectStatus, RegisterConfig, RestoreConfig, RestoreError, RestoreReport,
+    ResumeConfig, RetrieveError, RetrieveResult, SearchResults, SessionRecord, SessionReference,
+    SourceHomes, SourceKind, StateStore, StructuredSummary, VerifyArchiveError,
+    VerifyArchiveReport, WorkerContext, abandon_archive_upload_rearchive,
+    accept_disclosure_from_terminal, archive_session, archive_upload_backfill,
+    archive_upload_rearchive, archive_upload_reconcile, archive_upload_retry,
+    archive_upload_status, configure_archive_upload, configure_delivery, configure_memory_sync,
+    conflicting_source_home, default_copilot_home, delivery_backfill, delivery_retry,
+    delivery_status, delivery_verify_history, handle_hook, lift_stale_source_limit_parks,
+    memory_sync_run, memory_sync_status, origin_access, parse_archive_markdown,
     parse_summarizer_env, project_label, project_status, prune_summarizer_exhaust,
     reactivate_regrown_lost_transcripts, read_last_failure, register, restore, retrieve,
     run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
@@ -2697,7 +2698,13 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
         } => {
             let state_directory = resolve_state_directory(state_dir)?;
             Ok(Outcome::ArchiveUploadRun {
-                report: Box::new(archive_upload_backfill(&state_directory, limit)?),
+                report: Box::new(archive_upload_backfill(
+                    &state_directory,
+                    limit,
+                    // Operator-invoked in their own terminal, so reading project roots here cannot
+                    // raise a background permission prompt (issue #61).
+                    OriginAccess::Allowed,
+                )?),
                 json,
             })
         }
@@ -2760,6 +2767,9 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
                     all,
                     force,
                     limit,
+                    // Operator-invoked in their own terminal, unlike the same function's
+                    // scheduler-driven caller in `build_tick_report` (issue #61).
+                    OriginAccess::Allowed,
                 )?),
                 json,
             })
@@ -3246,7 +3256,22 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
     } else {
         "busy"
     };
-    match archive_upload_retry(state_directory, None, None, true, false, limit) {
+    // `munshi tick` is the scheduler-launched pass — the same `WorkerContext::Background` the
+    // recovery sweep above runs under — so this retry must not touch any session's origin
+    // directory, not even to stat it (issue #61). Draining failed upload rows is the tick's
+    // designed job during a Patwari outage, which is precisely when this runs most often, so the
+    // captures it re-sends carry no instruction-file provenance rather than risk a background
+    // permission prompt on a TCC-protected project root. Derived from the context rather than
+    // written as a constant, so the sweep and the upload cannot drift apart.
+    match archive_upload_retry(
+        state_directory,
+        None,
+        None,
+        true,
+        false,
+        limit,
+        origin_access(WorkerContext::Background),
+    ) {
         Ok(upload) => {
             report.upload_candidates = upload.candidates;
             report.upload_failed = upload.failed;
