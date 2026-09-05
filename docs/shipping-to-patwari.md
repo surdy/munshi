@@ -159,8 +159,9 @@ registered hook database. Its `--state-dir` flag only supplies the extraction th
 registration — it does not write upload state. So the obvious demo path ("archive some transcripts
 by hand, then upload them") silently does nothing until you bridge the two.
 
-This is the exact sequence that works ([#85](https://github.com/surdy/munshi/issues/85) tracks
-making it discoverable — `munshi hook` is currently hidden from `munshi --help`):
+This is the exact sequence that works. `munshi hook` is listed in `munshi --help` and
+`munshi archive --help` points here, so the bridge is reachable without knowing it exists
+(issue #85):
 
 ```bash
 # 1. Archive each session standalone (writes Markdown, no upload state)

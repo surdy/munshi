@@ -249,6 +249,50 @@ fn delivery_alias_still_drives_summary_delivery_commands() {
     );
 }
 
+/// Issue #85: `hook recover --rebuild-state` is the only bridge from a manually archived session
+/// into upload state, so it must be reachable from `--help` rather than only from prose. The hook
+/// ingestion points stay hidden — a person never types them.
+#[test]
+fn help_lists_hook_and_hook_help_lists_recover_while_hiding_the_ingestion_points() {
+    let top = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_success(&top);
+    let text = String::from_utf8_lossy(&top.stdout).into_owned();
+    assert!(
+        text.lines().any(|line| line.trim_start().starts_with("hook ")),
+        "top-level help must list `hook`: {text}"
+    );
+
+    let hook = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["hook", "--help"])
+        .output()
+        .unwrap();
+    assert_success(&hook);
+    let text = String::from_utf8_lossy(&hook.stdout).into_owned();
+    assert!(
+        text.contains("recover"),
+        "`hook --help` must list `recover`: {text}"
+    );
+    assert!(
+        !text.contains("agent-stop") && !text.contains("session-end"),
+        "`hook --help` must keep the hook ingestion points hidden: {text}"
+    );
+
+    // The bridge is documented in one place, and `archive --help` points at it (issue #85).
+    let archive = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["archive", "--help"])
+        .output()
+        .unwrap();
+    assert_success(&archive);
+    let text = String::from_utf8_lossy(&archive.stdout).into_owned();
+    assert!(
+        text.contains("shipping-to-patwari.md") && text.contains("hook recover"),
+        "`archive --help` must point at the manual-archive bridge: {text}"
+    );
+}
+
 #[test]
 fn registration_is_idempotent_preserves_files_and_guards_the_1_0_70_hook_schema() {
     let directory = test_directory();

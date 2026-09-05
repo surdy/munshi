@@ -42,7 +42,18 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Manually summarize and archive one coding-agent session.
-    #[command(visible_alias = "summarize")]
+    ///
+    /// This writes a standalone Munshi-owned Markdown record. It creates no archive-upload
+    /// state and ships nothing to Patwari; `--state-dir` only supplies a registration's
+    /// claim-ticket extraction threshold. Getting a manually archived session into Patwari
+    /// takes the bridge documented in docs/shipping-to-patwari.md, section 5 "The
+    /// manual-archive bridge":
+    ///
+    ///   1. put each transcript where the registered harness home expects it
+    ///   2. munshi hook recover --state-dir <state> --rebuild-state
+    ///   3. munshi archive-upload backfill --state-dir <state>
+    ///   4. munshi archive-upload status --state-dir <state>
+    #[command(visible_alias = "summarize", verbatim_doc_comment)]
     Archive {
         /// The source harness's stable session ID.
         session_id: Option<String>,
@@ -465,7 +476,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    #[command(hide = true, subcommand)]
+    /// Recovery and hook-ingestion commands. `hook recover` is the operator-facing one.
+    #[command(subcommand)]
     Hook(HookCommand),
     #[command(hide = true)]
     HookWorker {
@@ -791,6 +803,8 @@ enum ArchiveUploadCommand {
 
 #[derive(Debug, Subcommand)]
 enum HookCommand {
+    /// Hook ingestion point, invoked by the installed harness hook. Not for interactive use.
+    #[command(hide = true)]
     AgentStop {
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -798,6 +812,8 @@ enum HookCommand {
         #[arg(long, default_value = "copilot")]
         source: String,
     },
+    /// Hook ingestion point, invoked by the installed harness hook. Not for interactive use.
+    #[command(hide = true)]
     SessionEnd {
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -805,6 +821,8 @@ enum HookCommand {
         #[arg(long, default_value = "copilot")]
         source: String,
     },
+    /// Block until one session's archive worker settles. Used by the hook wrappers.
+    #[command(hide = true)]
     Wait {
         #[arg(long)]
         state_dir: PathBuf,
@@ -816,6 +834,10 @@ enum HookCommand {
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
     },
+    /// Run the recovery sweep by hand: rescue stalled sessions, retry eligible summaries, and
+    /// drain `pending`/`failed` archive uploads. `--rebuild-state` additionally re-imports your
+    /// Munshi-owned Markdown into operational state — the bridge that puts a manually archived
+    /// session (`munshi archive`) into upload state. See `docs/shipping-to-patwari.md`.
     Recover {
         #[arg(long)]
         state_dir: PathBuf,
@@ -823,6 +845,9 @@ enum HookCommand {
         stale_after_ms: u64,
         #[arg(long)]
         force_retry: bool,
+        /// Back up the operational database and rebuild it from the Munshi-owned Markdown under
+        /// the registered output directory. Existing Markdown is never deleted; upload rows are
+        /// reset, so `archive-upload backfill` reconsiders every archived session.
         #[arg(long)]
         rebuild_state: bool,
     },

@@ -518,7 +518,7 @@ receipts, which blob dedup makes far smaller than the artifact sizes — and
 are the numbers that decide whether delta-upload optimization (issue #24) is ever worth building;
 rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts failed uploads (`--force` revives
 dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
-also retried automatically by the recovery sweep (`munshi hook recover` — hidden from `--help`; a
+also retried automatically by the recovery sweep (`munshi hook recover` — a
 recovery command, run by the hooks and by `munshi tick`, and available to you for explicit
 repair), so a transient outage
 recovers without a new revision. `backfill` uploads archived sessions the configured server holds
