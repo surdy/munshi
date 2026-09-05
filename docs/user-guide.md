@@ -476,6 +476,10 @@ with `--configure` enables it remotely instead of only verifying. Full design an
 
 ## Archive upload (Patwari) in brief
 
+**Full guide: [`shipping-to-patwari.md`](shipping-to-patwari.md)** — the whole capture side of the
+seam: what a snapshot contains, the trust posture, the manual-archive bridge, device identity, and
+a second-machine checklist.
+
 Archive upload publishes each summary revision's full snapshot — the rendered summary, the verbatim
 transcript, any extracted outputs, and (for Copilot sessions) a bounded allowlist of harness
 sidecar files (`sidecar/…` artifacts: workspace, plan, and checkpoint state, staged beside the

@@ -124,6 +124,7 @@ Notesmith, issue #59). Each integration is optional; Munshi is fully useful as a
 | [Summarizers](docs/summarizers.md) | The summarizer contract, Copilot and Claude Code examples, writing your own |
 | [Using Munshi day to day](docs/user-guide.md) | Status, sessions, retries, budgets, project policy, delivery, archive upload, restore |
 | [Configuration reference](docs/configuration.md) | Every `config.json` setting in one place |
+| [Shipping to Patwari](docs/shipping-to-patwari.md) | The capture side of the archive seam: what a snapshot carries, configure/enable, how uploads drain, device identity, second-machine checklist |
 | [Manual archival](docs/manual-archive.md) | Archiving a single transcript standalone, no hooks required |
 | [Desktop addon](docs/gui.md) | The optional native app, and installing the CLI it ships with |
 | [Backlog dashboard addon](docs/dashboard.md) | Visualizing the operational JSON contracts (issue #56) |

@@ -284,6 +284,9 @@ default) yourself if you also want the operational state gone.
   auto-memory mirrored into Notesmith, issue #59). The
   [user guide](user-guide.md) covers the first two in brief;
   [`docs/configuration.md`](configuration.md) documents all three sinks' settings.
+- [`docs/shipping-to-patwari.md`](shipping-to-patwari.md) — the archive-upload seam in full: what a
+  snapshot carries, the no-credential trust posture, how uploads actually drain, getting a manually
+  archived session into upload state, device identity, and a second-machine checklist.
 - [`docs/summarizers.md`](summarizers.md) — the summarizer contract, if you want to write your own.
 - [`docs/user-guide.md`](user-guide.md) — day-to-day operation: disabling projects, retries, budgets.
 - [`docs/configuration.md`](configuration.md) — every `config.json` setting in one place.
