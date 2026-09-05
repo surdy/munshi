@@ -149,7 +149,7 @@ tick reports it one line per subsystem:
 
 ```
 tick: recovery sweep already running elsewhere
-tick: archive-upload retried candidates=<n> failed=<n>
+tick: archive-upload candidates=<n> uploaded=<n> failed=<n>
 tick: summary-delivery retried candidates=<n> failed=<n>
 tick: memory-sync synced=<n> failed=<n> blocked=<n>
 tick: summarizer-exhaust retention refused: <reason>
@@ -157,7 +157,9 @@ tick: summarizer-exhaust pruned dirs=<n> bytes=<n>
 ```
 
 The first line means another process already holds the recovery sweep — a quiet non-event, not
-an error. The retention-refused line is the one deliberate exception to "silence unless
+an error. The archive-upload line counts both drains one tick runs — the recovery sweep's
+`pending`/`failed` pass and the bounded retry after it — so a tick that emptied a `pending` pile
+says so instead of moving a hundred snapshots in silence (issue #87). The retention-refused line is the one deliberate exception to "silence unless
 something happened": a summarizer-exhaust home that conflicts with a registered harness home is
 a standing misconfiguration that disables retention forever, so it is said on every tick (see
 below).
@@ -524,15 +526,29 @@ a lifetime `transfer_bytes_total` — the bytes actually moved on the wire per P
 receipts, which blob dedup makes far smaller than the artifact sizes — and
 `stored_bytes_latest_total`, the compressed footprint of every session's latest snapshot. These
 are the numbers that decide whether delta-upload optimization (issue #24) is ever worth building;
-rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts failed uploads (`--force` revives
-dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
-also retried automatically by the recovery sweep (`munshi hook recover` — hidden from `--help`; a
+rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts stalled uploads: a named session in any ordinary state, or, with `--all`,
+every `pending` or `failed` row for the configured endpoint — the same rows the recovery sweep
+drains (`--force` additionally revives dead-letter sessions and resets their bounded attempt
+count). Uploads whose backoff has elapsed are
+also retried automatically by the recovery sweep (`munshi hook recover` — a
 recovery command, run by the hooks and by `munshi tick`, and available to you for explicit
 repair), so a transient outage
-recovers without a new revision. `backfill` uploads archived sessions the configured server holds
-no self-contained snapshot for — sessions archived while upload was disabled or unconfigured, and
-sessions whose recorded snapshot is not known to carry both `summary.md` and `transcript.jsonl` —
-running each through the normal upload path (`--limit` bounds one run, default 200). `reconcile`
+recovers without a new revision. `backfill` consults this machine's **local** upload ledger, not the server: it uploads archived
+sessions whose local rows say the configured endpoint holds no self-contained snapshot — sessions
+archived while upload was disabled or unconfigured, sessions whose recorded snapshot is not known
+to carry both `summary.md` and `transcript.jsonl`, and sessions whose recorded Markdown hash has
+drifted — running each through the normal upload path (`--limit` bounds one run, default 200). It
+never asks the server what it holds, so a row that says `uploaded` is not reconsidered even if the
+snapshot is gone from the archive; `backfill` leaves `pending` and `failed` rows to `retry`, and
+ends with a `note:` naming how many it left and what drains them (issue #87). Two recovery paths
+follow from that (issue #89). If the archive lost some snapshots, `reconcile --repair-missing`
+lists the server's snapshots and resets the rows whose snapshot no longer exists, after which
+`backfill` re-uploads them. If the archive was **emptied** — a wiped Patwari data directory, a
+replacement server — the blunt path is
+`munshi hook recover --state-dir <state> --rebuild-state`, which rebuilds operational state from
+your Munshi-owned Markdown and resets the upload rows with it, followed by
+`munshi archive-upload backfill` and then `munshi tick` (or
+`munshi archive-upload retry --all`) for anything left `pending`. `reconcile`
 (issue #76) is a one-time metadata backfill, not an upload: it lists the server's snapshots once and
 fills the `patwari_session_id` onto uploaded rows recorded before that id was stored, matching by
 snapshot id. It is idempotent (a row that already carries the id is left untouched), endpoint-scoped,

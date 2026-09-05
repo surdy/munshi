@@ -42,7 +42,18 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Manually summarize and archive one coding-agent session.
-    #[command(visible_alias = "summarize")]
+    ///
+    /// This writes a standalone Munshi-owned Markdown record. It creates no archive-upload
+    /// state and ships nothing to Patwari; `--state-dir` only supplies a registration's
+    /// claim-ticket extraction threshold. Getting a manually archived session into Patwari
+    /// takes the bridge documented in docs/shipping-to-patwari.md, section 5 "The
+    /// manual-archive bridge":
+    ///
+    ///   1. put each transcript where the registered harness home expects it
+    ///   2. munshi hook recover --state-dir <state> --rebuild-state
+    ///   3. munshi archive-upload backfill --state-dir <state>
+    ///   4. munshi archive-upload status --state-dir <state>
+    #[command(visible_alias = "summarize", verbatim_doc_comment)]
     Archive {
         /// The source harness's stable session ID.
         session_id: Option<String>,
@@ -465,7 +476,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    #[command(hide = true, subcommand)]
+    /// Recovery and hook-ingestion commands. `hook recover` is the operator-facing one.
+    #[command(subcommand)]
     Hook(HookCommand),
     #[command(hide = true)]
     HookWorker {
@@ -771,14 +783,15 @@ enum ArchiveUploadCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Retry failed uploads, or one session's upload.
+    /// Retry stalled uploads, or one session's upload.
     Retry {
-        /// A single session ID to retry; omit with `--all` to retry every failed upload.
+        /// A single session ID to retry; omit with `--all` to retry every stalled upload.
         session_id: Option<String>,
         /// Disambiguate when the same session ID exists under multiple sources.
         #[arg(long)]
         source: Option<String>,
-        /// Retry every failed upload.
+        /// Retry every pending or failed upload — the same rows the `munshi tick` recovery
+        /// sweep drains.
         #[arg(long)]
         all: bool,
         /// Revive dead-letter uploads and reset their bounded attempt count.
@@ -796,6 +809,8 @@ enum ArchiveUploadCommand {
 
 #[derive(Debug, Subcommand)]
 enum HookCommand {
+    /// Hook ingestion point, invoked by the installed harness hook. Not for interactive use.
+    #[command(hide = true)]
     AgentStop {
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -803,6 +818,8 @@ enum HookCommand {
         #[arg(long, default_value = "copilot")]
         source: String,
     },
+    /// Hook ingestion point, invoked by the installed harness hook. Not for interactive use.
+    #[command(hide = true)]
     SessionEnd {
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -810,6 +827,8 @@ enum HookCommand {
         #[arg(long, default_value = "copilot")]
         source: String,
     },
+    /// Block until one session's archive worker settles. Used by the hook wrappers.
+    #[command(hide = true)]
     Wait {
         #[arg(long)]
         state_dir: PathBuf,
@@ -821,6 +840,10 @@ enum HookCommand {
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
     },
+    /// Run the recovery sweep by hand: rescue stalled sessions, retry eligible summaries, and
+    /// drain `pending`/`failed` archive uploads. `--rebuild-state` additionally re-imports your
+    /// Munshi-owned Markdown into operational state — the bridge that puts a manually archived
+    /// session (`munshi archive`) into upload state. See `docs/shipping-to-patwari.md`.
     Recover {
         #[arg(long)]
         state_dir: PathBuf,
@@ -828,6 +851,9 @@ enum HookCommand {
         stale_after_ms: u64,
         #[arg(long)]
         force_retry: bool,
+        /// Back up the operational database and rebuild it from the Munshi-owned Markdown under
+        /// the registered output directory. Existing Markdown is never deleted; upload rows are
+        /// reset, so `archive-upload backfill` reconsiders every archived session.
         #[arg(long)]
         rebuild_state: bool,
     },
@@ -1389,7 +1415,12 @@ struct TickReport {
     /// recovery lock (the pipeline is active; nothing for a tick to add), `"skipped"` when
     /// unregistered.
     recovery: &'static str,
+    /// Archive-upload rows this tick attempted, summed over both drains it runs: the recovery
+    /// sweep's `pending`/`failed` pass and the bounded retry that follows it (issue #87). Before
+    /// the sweep's counts were surfaced, a tick that uploaded a hundred snapshots reported zero.
     upload_candidates: usize,
+    /// Attempts that put a new snapshot in the archive.
+    upload_uploaded: usize,
     upload_failed: usize,
     delivery_candidates: usize,
     delivery_failed: usize,
@@ -3237,6 +3268,7 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
         registered: state_database_exists(state_directory),
         recovery: "skipped",
         upload_candidates: 0,
+        upload_uploaded: 0,
         upload_failed: 0,
         delivery_candidates: 0,
         delivery_failed: 0,
@@ -3262,10 +3294,17 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
     report.exhaust_store_removed = exhaust.store_removed;
     lift_stale_source_limit_parks(state_directory)?;
     reactivate_regrown_lost_transcripts(state_directory)?;
-    report.recovery = if tick_recovery_sweep(state_directory)? {
-        "swept"
-    } else {
-        "busy"
+    // The sweep's own upload drain is what empties a `pending` pile, so its counts are the tick's
+    // to report (issue #87): they are added to the bounded retry's below rather than replaced by
+    // them, because the two drains take disjoint rows within one tick.
+    report.recovery = match tick_recovery_sweep(state_directory)? {
+        Some(uploads) => {
+            report.upload_candidates += uploads.attempted;
+            report.upload_uploaded += uploads.uploaded;
+            report.upload_failed += uploads.failed;
+            "swept"
+        }
+        None => "busy",
     };
     // `munshi tick` is the scheduler-launched pass — the same `WorkerContext::Background` the
     // recovery sweep above runs under — so this retry must not touch any session's origin
@@ -3284,8 +3323,9 @@ fn build_tick_report(state_directory: &Path, limit: usize) -> Result<TickReport,
         origin_access(WorkerContext::Background),
     ) {
         Ok(upload) => {
-            report.upload_candidates = upload.candidates;
-            report.upload_failed = upload.failed;
+            report.upload_candidates += upload.candidates;
+            report.upload_uploaded += upload.uploaded;
+            report.upload_failed += upload.failed;
         }
         Err(PatwariError::NotEnabled | PatwariError::NotConfigured) => {}
         Err(error) => return Err(error.into()),
@@ -3319,10 +3359,14 @@ fn print_tick_human(report: &TickReport) {
     if report.recovery == "busy" {
         println!("tick: recovery sweep already running elsewhere");
     }
-    if report.upload_candidates > 0 {
+    // Issue #87: the drain that actually empties a `pending` pile is the recovery sweep's, and
+    // this line used to count only the bounded retry after it — so a tick that moved a hundred
+    // snapshots said nothing at all, and `archive-upload status` was the only way to learn it
+    // had. It now covers both drains, and stays quiet when neither had work.
+    if report.upload_candidates > 0 || report.upload_uploaded > 0 || report.upload_failed > 0 {
         println!(
-            "tick: archive-upload retried candidates={} failed={}",
-            report.upload_candidates, report.upload_failed
+            "tick: archive-upload candidates={} uploaded={} failed={}",
+            report.upload_candidates, report.upload_uploaded, report.upload_failed
         );
     }
     if report.delivery_candidates > 0 {

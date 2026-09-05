@@ -45,6 +45,18 @@ used. The manual path writes a standalone record and never uploads to Patwari, s
 a manually produced summary are only redeemable once the same session is archived and uploaded
 through the hook pipeline.
 
+## Getting a manually archived session into Patwari
+
+`munshi archive` creates **no** archive-upload state: it does not open the registered hook
+database, and `--state-dir` only supplies the extraction threshold above. So `archive-upload
+backfill` finds nothing to do after a manual archive until the record is imported into operational
+state by `munshi hook recover --state-dir <state> --rebuild-state`.
+
+That bridge — where each harness expects its transcript to live, in what order to run the four
+commands, and how to confirm the snapshot landed — is documented once, in
+[the manual-archive bridge section of `shipping-to-patwari.md`](shipping-to-patwari.md#5-the-manual-archive-bridge).
+`munshi archive --help` points at the same place. Nothing here duplicates it.
+
 For Copilot sessions, the manual path also stages the allowlisted sidecar set (issue #23) into the
 sibling `<session-id>.sidecar/` directory beside the Markdown — the same
 `workspace.yaml`/`plan.md`/checkpoints narrative state the hook pipeline captures, with the same

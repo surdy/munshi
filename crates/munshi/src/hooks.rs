@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::archive_git::{ArchiveGitError, commit_archive_revision};
+use crate::patwari::UploadSweepCounts;
 use crate::policy::resolve_policy;
 use crate::project::{
     ProjectIdentity, ProjectIdentityError, inspect_project, recorded_project_identity,
@@ -358,10 +359,13 @@ fn run_archive_worker_inner(
 }
 
 /// Runs the standard recovery sweep for `munshi tick` (issue #55): exactly the sweep a hook
-/// event triggers, minus the hook. Returns `Ok(false)` without error when another process
+/// event triggers, minus the hook. Returns `Ok(None)` without error when another process
 /// already holds the recovery lock — a busy pipeline means the machine is not idle, and the
-/// tick has nothing to add.
-pub fn tick_recovery_sweep(state_directory: &Path) -> Result<bool, HookWorkerError> {
+/// tick has nothing to add. Otherwise it carries what the sweep's upload drain moved, which is
+/// the only part of the sweep a person watching `munshi tick` needs told about (issue #87).
+pub fn tick_recovery_sweep(
+    state_directory: &Path,
+) -> Result<Option<UploadSweepCounts>, HookWorkerError> {
     match run_recovery(
         state_directory,
         Duration::from_millis(DEFAULT_RECOVERY_STALE_MS),
@@ -369,19 +373,21 @@ pub fn tick_recovery_sweep(state_directory: &Path) -> Result<bool, HookWorkerErr
         false,
         WorkerContext::Background,
     ) {
-        Ok(()) => Ok(true),
-        Err(HookWorkerError::State(StateError::LockBusy)) => Ok(false),
+        Ok(uploads) => Ok(Some(uploads)),
+        Err(HookWorkerError::State(StateError::LockBusy)) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
+/// Returns what the sweep's archive-upload drain moved this pass; every other part of the sweep
+/// reports itself through operational state and diagnostics.
 pub fn run_recovery(
     state_directory: &Path,
     stale_after: Duration,
     force_retry: bool,
     rebuild: bool,
     context: WorkerContext,
-) -> Result<(), HookWorkerError> {
+) -> Result<UploadSweepCounts, HookWorkerError> {
     let recovery_deadline = Instant::now() + Duration::from_secs(1);
     let _recovery_lock = loop {
         if let Some(lock) = try_acquire_session_lock(state_directory, "_recovery")? {
@@ -653,15 +659,20 @@ pub fn run_recovery(
     // a transient Patwari outage recovers here rather than waiting for the session to change. This
     // is best-effort like delivery — a failure is recorded as a safe diagnostic and never affects
     // the recovery of local archival above.
-    if let Err(error) = crate::patwari::retry_pending_uploads(
+    let uploads = match crate::patwari::retry_pending_uploads(
         state_directory,
         RECOVERY_SCAN_LIMIT,
         origin_access(context),
     ) {
-        let _ = error;
-        let _ = state.record_diagnostic("archive-upload", "archive-upload-retry-error", None, None);
-    }
-    Ok(())
+        Ok(counts) => counts,
+        Err(error) => {
+            let _ = error;
+            let _ =
+                state.record_diagnostic("archive-upload", "archive-upload-retry-error", None, None);
+            UploadSweepCounts::default()
+        }
+    };
+    Ok(uploads)
 }
 
 /// Return a mutable state store scoped to `source`. Copilot reuses the recovery-owned

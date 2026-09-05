@@ -1226,6 +1226,30 @@ impl UploadOutcome {
             Self::Failed { .. } => "failed",
         }
     }
+
+    /// The per-session line's outcome text. Issue #86: the kind alone collapses every skip to a
+    /// bare `skipped`, sending the reader to `--json` for a reason the human printer already
+    /// holds. The token is the same one the machine contract serializes.
+    fn as_human(&self) -> String {
+        match self {
+            Self::Skipped { reason } => format!("skipped: {reason}"),
+            other => other.as_kind().to_owned(),
+        }
+    }
+}
+
+/// What one recovery-sweep upload drain moved (issue #87). The sweep runs inside `munshi tick`,
+/// `munshi hook recover` and ordinary hook events; only `tick` reports it, and only when it is
+/// non-zero, so silence stays the tick's healthy voice.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UploadSweepCounts {
+    /// Eligible rows this pass actually attempted an upload for. Rows whose session was locked by
+    /// a worker, or whose row belongs to another endpoint, are not attempted and not counted.
+    pub attempted: usize,
+    /// Attempts that put a new snapshot in the archive.
+    pub uploaded: usize,
+    /// Attempts that recorded a bounded retry or parked the row as dead-letter.
+    pub failed: usize,
 }
 
 /// Ensures the persistent client UUID exists in durable configuration, generating and storing one
@@ -1552,10 +1576,11 @@ pub(crate) fn retry_pending_uploads(
     state_directory: &Path,
     limit: usize,
     origin_access: OriginAccess,
-) -> Result<(), PatwariError> {
+) -> Result<UploadSweepCounts, PatwariError> {
+    let mut counts = UploadSweepCounts::default();
     let config = load_stored_config(state_directory)?;
     if !config.archive_upload.enabled || !config.archive_upload.is_addressable() {
-        return Ok(());
+        return Ok(counts);
     }
     let endpoint = config.archive_upload.endpoint.clone().unwrap();
     let client_id = ensure_client_id(Path::new(&config.state_directory))?;
@@ -1576,7 +1601,7 @@ pub(crate) fn retry_pending_uploads(
         };
         // `upload_one` re-honors the backoff against the freshly read row and records its own
         // failure, so a row that just became due proceeds while one that is not is skipped quietly.
-        upload_one(
+        let outcome = upload_one(
             &mut state,
             &config.archive_upload,
             &client_id,
@@ -1588,8 +1613,14 @@ pub(crate) fn retry_pending_uploads(
             config.limits.max_event_text_bytes,
             origin_access,
         )?;
+        counts.attempted += 1;
+        match outcome {
+            UploadOutcome::Uploaded { .. } => counts.uploaded += 1,
+            UploadOutcome::Failed { .. } => counts.failed += 1,
+            UploadOutcome::AlreadyUploaded { .. } | UploadOutcome::Skipped { .. } => {}
+        }
     }
-    Ok(())
+    Ok(counts)
 }
 
 /// Uploads one session's current snapshot to the configured server, recording the result in
@@ -2853,7 +2884,7 @@ impl ArchiveUploadRunReport {
             println!("note: {note}");
         }
         for item in &self.items {
-            println!("{} -> {}", item.session_id, item.outcome.as_kind());
+            println!("{} -> {}", item.session_id, item.outcome.as_human());
         }
     }
 
@@ -2922,7 +2953,9 @@ fn stale_endpoint_note(
     })
 }
 
-/// Retries failed uploads, or one session's upload, against the configured server. Requires archive
+/// Retries stalled uploads, or one session's upload, against the configured server. `--all`
+/// covers exactly what the recovery sweep would drain — every `pending` or `failed` row for the
+/// configured endpoint (issue #87) — plus dead-letter rows under `force`. Requires archive
 /// upload to be enabled and addressable. Each candidate's backoff is cleared before the attempt
 /// (`force` additionally revives a dead-letter row and resets its bounded attempt count), then the
 /// upload runs under the session's advisory lock. A locked session is reported skipped this run.
@@ -2979,9 +3012,16 @@ pub fn retry(
                         "rearchive-pending" | "rearchive-failed"
                     )
             }
-            // --all: every failed upload, plus dead-letter rows only when forced.
+            // --all: every row the recovery sweep would drain — `pending` as well as `failed`
+            // (issue #87) — plus dead-letter rows only when forced. `pending` is the state a row
+            // sits in after an upload it never got to attempt (a rebuilt row whose transcript was
+            // missing, a `reconcile --repair-missing` reset), and the sweep's own eligibility
+            // (`eligible_archive_uploads`, `upload_state IN ('pending','failed')`) has always
+            // included it. `retry --all` skipping it left the two commands whose names say "do
+            // the upload again" refusing to, with only a silent `tick` able to move them.
             None => {
-                record.upload_state == "failed" || (force && record.upload_state == "dead-letter")
+                matches!(record.upload_state.as_str(), "pending" | "failed")
+                    || (force && record.upload_state == "dead-letter")
             }
         })
         .collect();
@@ -3113,6 +3153,28 @@ pub fn backfill(
         .collect();
     candidates.truncate(limit);
 
+    // Issue #87: `pending` and `failed` rows are the retry path's business, and staying silent
+    // about them made backfill's second run — the one right after you fixed the cause of a
+    // skip — report a bare `candidates=0` that reads as "nothing left to do" when the opposite
+    // is true. Name the count and the command that moves them.
+    let taken: BTreeSet<(SourceKind, &str)> = candidates
+        .iter()
+        .map(|session| (session.source, session.session_id.as_str()))
+        .collect();
+    let deferred = recorded
+        .iter()
+        .filter(|(key, record)| {
+            matches!(record.upload_state.as_str(), "pending" | "failed") && !taken.contains(key)
+        })
+        .count();
+    let note = (deferred > 0).then(|| {
+        format!(
+            "{deferred} upload row(s) are pending or failed and belong to the retry path; \
+             run `munshi archive-upload retry --all` (the `munshi tick` recovery sweep drains \
+             them too)"
+        )
+    });
+
     let mut report = ArchiveUploadRunReport {
         schema_version: 1,
         command: "archive-upload-backfill",
@@ -3122,7 +3184,7 @@ pub fn backfill(
         already_uploaded: 0,
         skipped: 0,
         failed: 0,
-        note: None,
+        note,
         items: Vec::new(),
     };
     for session in candidates {
@@ -3203,6 +3265,50 @@ fn locked_upload_one(
 mod tests {
     use super::*;
     use crate::source::PreviousSource;
+
+    /// Issue #86: the human per-session line carries the skip reason the machine contract already
+    /// serialized; every other outcome keeps its bare kind token.
+    #[test]
+    fn human_outcome_text_carries_the_skip_reason() {
+        assert_eq!(
+            UploadOutcome::Skipped {
+                reason: "missing-transcript.jsonl".to_owned(),
+            }
+            .as_human(),
+            "skipped: missing-transcript.jsonl"
+        );
+        assert_eq!(
+            UploadOutcome::Skipped {
+                reason: "worker-busy".to_owned(),
+            }
+            .as_human(),
+            "skipped: worker-busy"
+        );
+        assert_eq!(
+            UploadOutcome::Uploaded {
+                snapshot_id: "snap".to_owned(),
+                revision: 1,
+            }
+            .as_human(),
+            "uploaded"
+        );
+        assert_eq!(
+            UploadOutcome::AlreadyUploaded {
+                snapshot_id: None,
+                revision: 1,
+            }
+            .as_human(),
+            "already-uploaded"
+        );
+        assert_eq!(
+            UploadOutcome::Failed {
+                category: "network".to_owned(),
+                dead_letter: false,
+            }
+            .as_human(),
+            "failed"
+        );
+    }
 
     #[test]
     fn prepare_artifact_records_both_representations() {

@@ -124,33 +124,39 @@ The normal path is automatic and needs none of the commands above after setup:
 **`tick` is the drain.** Its recovery sweep retries every upload row in state `pending` *or*
 `failed` whose backoff has elapsed, independent of any new revision, up to 32 rows a pass. That is
 how a transient Patwari outage recovers without the session having to change. The same sweep runs
-inside `munshi hook recover` and on ordinary hook events.
+inside `munshi hook recover` and on ordinary hook events. A tick that moved something says so on
+one line, counting both drains it runs — the sweep's and the bounded retry after it:
+
+```text
+tick: archive-upload candidates=23 uploaded=23 failed=0
+```
+
+A tick with nothing to do still prints nothing, so a timer can fire it forever in silence.
 
 The operator commands, and what each honestly does:
 
 | Command | Picks up | Does **not** |
 | --- | --- | --- |
-| `backfill` | Archived sessions with **no** upload row for the configured endpoint; `uploaded` rows whose snapshot is not proven to carry both required artifacts; `uploaded` rows whose Markdown hash has drifted; rows `reconcile --repair-missing` reset | Touch `pending`, `failed`, or `dead-letter` rows — those belong to the retry paths |
+| `backfill` | Archived sessions with **no** upload row for the configured endpoint; `uploaded` rows whose snapshot is not proven to carry both required artifacts; `uploaded` rows whose Markdown hash has drifted; rows `reconcile --repair-missing` reset | Touch `pending`, `failed`, or `dead-letter` rows — those belong to the retry paths, and its `note:` line says how many it left there and what takes them |
 | `retry <session-id>` | That one session in any ordinary state, `pending` included | Resume a parked fingerprint-preserving rearchive |
-| `retry --all` | Every `failed` row (plus `dead-letter` rows with `--force`) | Touch `pending` rows |
+| `retry --all` | Every `pending` *or* `failed` row for the configured endpoint — the same rows the sweep drains (plus `dead-letter` rows with `--force`) | Consider a session that has no upload row yet; that is `backfill`'s half |
 | `reconcile` | Fills `patwari_session_id` onto uploaded rows recorded before that id was stored, from one server listing. Idempotent, endpoint-scoped, never overwrites | Upload anything |
 | `reconcile --repair-missing` | Additionally resets uploaded rows whose recorded snapshot no longer exists, so `backfill` re-uploads them with a fresh capture identity | Upload anything itself |
 | `rearchive <id> --source <s> --snapshot-file <f>` | Re-archives one repaired row from the JSON `GET /api/v1/snapshots/{snapshot_id}` returned *before* the snapshot was tombstoned, preserving every fingerprint-bearing field and byte (`--abandon` gives that up and returns the row to ordinary uploads) | Apply to anything but a parked rearchive row |
 
 Three sharp edges, found by running this end to end, each tracked in munshi issues:
 
-- **`backfill` and `retry --all` ignore `pending` rows** — only the `tick`/`hook recover` sweep
-  drains them, and `tick` deliberately prints nothing when it has quiet sections, so you cannot
-  tell from its output that it just moved a hundred snapshots. Run `archive-upload status`
-  afterwards. ([#87](https://github.com/surdy/munshi/issues/87))
+- **`backfill` still leaves `pending` rows alone** — by design; it is the "no row yet" half of
+  the pair. It now ends with a `note:` naming how many rows it left and pointing at
+  `retry --all`, which takes exactly what the sweep would take. ([#87](https://github.com/surdy/munshi/issues/87))
 - **`backfill` trusts local bookkeeping, not the server.** It compares against this machine's
   upload rows, so if the archive is wiped while the rows still say `uploaded`, `backfill` reports
   `candidates=0`. Use `reconcile --repair-missing` (which checks the server's listing and resets
   rows whose snapshot is gone) and then `backfill`. ([#89](https://github.com/surdy/munshi/issues/89))
-- **A `skipped` line carries no reason in human output** — just `<session-id> -> skipped`. The
-  reason *is* in the machine contract: run the same command with `--json` and read each item's
-  `reason` (`missing-transcript.jsonl`, `no-artifacts`, `not-archived`, `dead-letter`,
-  `retry-not-due`, `worker-busy`, …). ([#86](https://github.com/surdy/munshi/issues/86))
+- **A `skipped` line names its reason** — `<session-id> -> skipped: missing-transcript.jsonl`.
+  The same token is each item's `reason` under `--json` (`missing-transcript.jsonl`,
+  `no-artifacts`, `not-archived`, `dead-letter`, `retry-not-due`, `worker-busy`, …).
+  ([#86](https://github.com/surdy/munshi/issues/86))
 
 ## 5. The manual-archive bridge
 
@@ -159,8 +165,9 @@ registered hook database. Its `--state-dir` flag only supplies the extraction th
 registration — it does not write upload state. So the obvious demo path ("archive some transcripts
 by hand, then upload them") silently does nothing until you bridge the two.
 
-This is the exact sequence that works ([#85](https://github.com/surdy/munshi/issues/85) tracks
-making it discoverable — `munshi hook` is currently hidden from `munshi --help`):
+This is the exact sequence that works. `munshi hook` is listed in `munshi --help` and
+`munshi archive --help` points here, so the bridge is reachable without knowing it exists
+(issue #85):
 
 ```bash
 # 1. Archive each session standalone (writes Markdown, no upload state)
@@ -180,12 +187,17 @@ munshi archive-upload configure --endpoint http://127.0.0.1:8080
 munshi archive-upload enable
 munshi archive-upload backfill
 
-# 5. Drain the pending rows — this is the step that actually uploads
-munshi tick --state-dir ~/.munshi
+# 5. Drain anything step 4 left in `pending` — a session whose transcript was not yet in
+#    place when backfill ran. `munshi tick` does the same thing on the timer's schedule.
+munshi archive-upload retry --all --state-dir ~/.munshi
 
 # 6. Confirm
 munshi archive-upload status
 ```
+
+With step 3 done before step 4, backfill uploads everything in one pass and step 5 is a no-op
+(`candidates=0`). Out of order, backfill reports `skipped: missing-transcript.jsonl` per session
+and leaves each row `pending`; its `note:` line then points at step 5.
 
 **Step 3 is the one that traps people.** A row rebuilt by `--rebuild-state` was reconstructed from
 its Markdown alone, and Markdown records no transcript path. Before skipping such a session, Munshi
@@ -364,7 +376,8 @@ are not retroactively summarized or uploaded unless you archive them by hand and
   unreachable, `munshi retrieve <sha256> --local --session <id>` redeems the same claim ticket
   straight from the on-disk transcript, no network involved.
 - **A `pending` pile that never moves** — see [§4](#4-how-uploads-actually-happen): run
-  `munshi tick`, then `archive-upload status`. `backfill` and `retry --all` will not help.
+  `munshi archive-upload retry --all` (or `munshi tick`), then `archive-upload status`.
+  `backfill` alone will not move a row that already exists; its `note:` line says so.
 - **`archive-upload status` failing with "malformed or was not created by this version"** on a
   state directory reached through a **symlink**: use the real path. `munshi status` works either
   way, which makes this look like file corruption when it is path identity.
