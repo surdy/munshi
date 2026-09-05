@@ -90,6 +90,13 @@ pub enum PatwariError {
     Io(#[source] std::io::Error),
     #[error("archive upload endpoint {0} is not a supported http URL")]
     UnsupportedEndpoint(String),
+    /// `--machine-label` was given a value with nothing routing-safe in it. Named distinctly from
+    /// `NotConfigured` so the message points at the label the operator typed rather than at the
+    /// endpoint, which is configured perfectly well (issue #88's class of misleading error).
+    #[error(
+        "the machine label {given:?} sanitizes to nothing; it needs at least one of [a-z0-9._-]"
+    )]
+    InvalidMachineLabel { given: String },
     #[error("archive upload transport failed: {0}")]
     Transport(String),
     #[error("archive upload protocol error: {0}")]
@@ -127,6 +134,7 @@ impl PatwariError {
             Self::NotConfigured => "upload-not-configured",
             Self::Io(_) => "upload-io",
             Self::UnsupportedEndpoint(_) => "upload-endpoint",
+            Self::InvalidMachineLabel { .. } => "invalid-machine-label",
             Self::Transport(_) => "upload-transport",
             Self::Protocol(_) => "upload-protocol",
             Self::Server { .. } => "upload-server",
@@ -1984,7 +1992,9 @@ pub struct ArchiveUploadStatusReport {
 /// the *same* stored field `memory-sync configure --machine` writes, so the label is settable from
 /// the command that owns the capture/upload relationship without configuring an unrelated Notesmith
 /// mirror, and neither command is a prerequisite for the other. Omitting it leaves any recorded
-/// label untouched; a label that sanitizes away to nothing is refused rather than silently ignored.
+/// label untouched; a label that sanitizes away to nothing is refused as
+/// [`PatwariError::InvalidMachineLabel`] — naming the label the operator typed, not the endpoint —
+/// rather than silently ignored.
 pub fn configure(
     state_directory: &Path,
     endpoint: &str,
@@ -1992,7 +2002,11 @@ pub fn configure(
 ) -> Result<ArchiveUploadSettings, PatwariError> {
     http::parse_http_endpoint(endpoint).map_err(from_http)?;
     let label = match machine_label.map(crate::memory_sync::sanitize_machine_label) {
-        Some(label) if label.is_empty() => return Err(PatwariError::NotConfigured),
+        Some(label) if label.is_empty() => {
+            return Err(PatwariError::InvalidMachineLabel {
+                given: machine_label.unwrap_or_default().to_owned(),
+            });
+        }
         other => other,
     };
     let (config, ()) = update_stored_config(state_directory, |config| {
@@ -3363,10 +3377,20 @@ mod tests {
         // falls through to the hostname, which would silently defeat the very override the
         // operator ran the command for. Refused before any state is touched.
         let directory = TempDir::new().unwrap();
-        assert!(matches!(
-            configure(directory.path(), "http://127.0.0.1:8080", Some("   ")),
-            Err(PatwariError::NotConfigured)
-        ));
+        let error = configure(directory.path(), "http://127.0.0.1:8080", Some("   "))
+            .expect_err("an empty label is refused");
+        assert!(
+            matches!(&error, PatwariError::InvalidMachineLabel { given } if given == "   "),
+            "expected an invalid-label error naming what was typed, got {error:?}"
+        );
+        // The message must point at the label, not at the endpoint, which is configured fine.
+        assert_eq!(error.category(), "invalid-machine-label");
+        let message = error.to_string();
+        assert!(message.contains("machine label"), "{message}");
+        assert!(
+            !message.contains("not configured"),
+            "the endpoint is not the problem: {message}"
+        );
 
         // What configure stores is what capture stamps and what client registration sends: one
         // sanitizer, one spelling. (The stored-field sharing itself is pinned end to end in
