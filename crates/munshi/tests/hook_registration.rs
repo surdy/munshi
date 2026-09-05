@@ -261,7 +261,8 @@ fn help_lists_hook_and_hook_help_lists_recover_while_hiding_the_ingestion_points
     assert_success(&top);
     let text = String::from_utf8_lossy(&top.stdout).into_owned();
     assert!(
-        text.lines().any(|line| line.trim_start().starts_with("hook ")),
+        text.lines()
+            .any(|line| line.trim_start().starts_with("hook ")),
         "top-level help must list `hook`: {text}"
     );
 
