@@ -114,10 +114,11 @@ contract; the common causes are:
   invoked. (`--max-input-bytes` sits at or above the threshold and is only a never-exceed
   backstop; see [`configuration.md`](configuration.md#the-size-knob-relation).)
 
-Test the summarizer standalone before blaming Munshi:
+Test the summarizer standalone before blaming Munshi, using the sample request committed at
+`fixtures/summarizer/sample-request.json` (from a checkout of this repository):
 
 ```bash
-cat sample-request.json | /absolute/path/to/your-summarizer | python3 -m json.tool; echo "exit=$?"
+cat fixtures/summarizer/sample-request.json | /absolute/path/to/your-summarizer | python3 -m json.tool; echo "exit=$?"
 ```
 
 If that doesn't cleanly print all eight fields, fix the summarizer (or its wrapper — see

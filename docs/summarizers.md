@@ -50,9 +50,9 @@ Munshi writes one JSON object like this to your summarizer's stdin:
     "tags": "array of strings"
   },
   "session": {
-    "id": "claude-code:a1b2c3d4-...",
+    "id": "claude-code:a1b2c3d4-0000-4000-8000-000000000001",
     "source_agent": "claude-code",
-    "session_id": "a1b2c3d4-...",
+    "session_id": "a1b2c3d4-0000-4000-8000-000000000001",
     "project_identity": "github.com/you/your-repo",
     "repository": "you/your-repo"
   },
@@ -64,6 +64,12 @@ Munshi writes one JSON object like this to your summarizer's stdin:
   "ignored_unknown_event_count": 0
 }
 ```
+
+That object is committed verbatim as
+[`fixtures/summarizer/sample-request.json`](../fixtures/summarizer/sample-request.json) — pipe
+that file into your own summarizer rather than retyping this block
+([section 7](#7-writing-your-own)). A test asserts the three copies stay identical: the file, this
+block, and the envelope Munshi actually serializes.
 
 Field reference:
 
@@ -371,16 +377,31 @@ just the new `events` — this keeps titles/goals stable across a session's resu
 still works, but revisions may drift each time.
 
 Test a summarizer standalone before registering it, by handing it a sample request the same way
-Munshi would — save a request like the one in [section 2](#2-the-input-request) to
-`sample-request.json`, then:
+Munshi would. A ready one — the [section 2](#2-the-input-request) envelope — is committed at
+[`fixtures/summarizer/sample-request.json`](../fixtures/summarizer/sample-request.json); from a
+checkout of this repository:
 
 ```bash
-cat sample-request.json | /absolute/path/to/your-summarizer | python3 -m json.tool; echo "exit=$?"
+cat fixtures/summarizer/sample-request.json | /absolute/path/to/your-summarizer | python3 -m json.tool; echo "exit=$?"
 ```
 
 If `python3 -m json.tool` prints a clean, re-formatted object with all eight fields and no
 error, your summarizer is producing valid output. Also try a session with genuinely little to
 report, to confirm your placeholder-backfill logic covers empty lists.
+
+Starting points you can copy, rather than beginning from a blank file:
+
+- [`fixtures/summarizer/no-op.sh`](../fixtures/summarizer/no-op.sh) — the smallest program that
+  satisfies this contract. It calls no backend: it drains stdin and prints one valid summary, so
+  it is both a skeleton to fill in and a control when you are debugging — if Munshi rejects even
+  this, the problem is the wiring, not your model's output.
+- [`contrib/claude-summarizer.sh`](../contrib/claude-summarizer.sh) and
+  [`contrib/copilot-summarizer.sh`](../contrib/copilot-summarizer.sh) — the two real wrappers of
+  sections 5 and 6, including the fence-stripping and empty-list backfill above.
+- `fixtures/manual/fake-summarizer/*.sh` — the deterministic stubs Munshi's own tests run against.
+  They are test doubles, not templates: each one asserts on the request it was handed or fails
+  deliberately, so read them for the shapes Munshi accepts and rejects (`phase-aware.sh` is a full
+  validator of the v2 envelope) rather than copying one as a base.
 
 You can also exercise a registered summarizer against one real session without registering
 automatic capture, using [`munshi archive`](manual-archive.md).

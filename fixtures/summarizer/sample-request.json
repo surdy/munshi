@@ -1,0 +1,28 @@
+{
+  "contract_version": 2,
+  "phase": "complete",
+  "instruction": "Summarize this coding session as exactly one JSON object matching required_schema. Return every required field. Capture goals, meaningful completed work, decisions, files changed, commands and validation, and open items. Do not quote prompts, raw tool output, secrets, or substantial code. Use concise strings and arrays of strings. Return JSON only, with no Markdown fence or commentary.",
+  "required_schema": {
+    "title": "non-empty string",
+    "goal": "non-empty string",
+    "work_completed": "array of strings",
+    "decisions": "array of strings",
+    "files_changed": "array of strings",
+    "commands_and_validation": "array of strings",
+    "open_items": "array of strings",
+    "tags": "array of strings"
+  },
+  "session": {
+    "id": "claude-code:a1b2c3d4-0000-4000-8000-000000000001",
+    "source_agent": "claude-code",
+    "session_id": "a1b2c3d4-0000-4000-8000-000000000001",
+    "project_identity": "github.com/you/your-repo",
+    "repository": "you/your-repo"
+  },
+  "events": [
+    { "kind": "user", "content": "Add a retry command for failed deliveries." },
+    { "kind": "assistant", "content": "I'll add a `munshi delivery retry` subcommand..." },
+    { "kind": "tool", "content": "cargo test -p munshi delivery::retry ... ok" }
+  ],
+  "ignored_unknown_event_count": 0
+}
