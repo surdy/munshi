@@ -53,7 +53,7 @@ pub use patwari::{
     ArchiveUploadSettings, ArchiveUploadStatusReport, ArtifactSource, CURRENT_ARTIFACT_SET_VERSION,
     CaptureContext, INITIAL_ARTIFACT_SET_VERSION, OriginAccess, PatwariClient, PatwariError,
     PreparedArtifact, ReconciledUpload, RepairedUpload, SessionContext, UploadOutcome,
-    UploadReceipt, abandon_rearchive as abandon_archive_upload_rearchive,
+    UploadReceipt, UploadSweepCounts, abandon_rearchive as abandon_archive_upload_rearchive,
     assemble_artifact_sources, backfill as archive_upload_backfill, build_manifest,
     configure as configure_archive_upload, prepare_artifact, prepare_artifacts,
     rearchive as archive_upload_rearchive, reconcile as archive_upload_reconcile,

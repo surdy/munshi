@@ -1185,6 +1185,120 @@ fn a_session_without_a_readable_transcript_never_uploads_a_summary_only_snapshot
 }
 
 // ---------------------------------------------------------------------------
+// Draining `pending` rows (issue #87)
+// ---------------------------------------------------------------------------
+
+const PENDING_RETRY_SESSION: &str = "87878787-8787-4787-8787-878787878701";
+const PENDING_TICK_SESSION: &str = "87878787-8787-4787-8787-878787878702";
+
+/// The dead end issue #87 records, walked end to end. Two rows are archived, their transcripts
+/// removed, and a first `backfill` skips both — leaving them `pending`, which is the state
+/// `backfill` deliberately never revisits. Before this fix, the two commands whose names say "do
+/// the upload again" both reported `candidates=0` and only a silent `munshi tick` moved them.
+///
+/// Now: `backfill` still leaves them alone but names them and the command that takes them,
+/// `retry --all` drains them, and the `tick` that drains one says so on one line — while an
+/// idle tick stays silent.
+#[test]
+fn pending_rows_are_named_by_backfill_drained_by_retry_all_and_reported_by_tick() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(PENDING_RETRY_SESSION);
+    harness.archive_session(PENDING_TICK_SESSION);
+    let retry_transcript = PathBuf::from(harness.forget_transcript_path(PENDING_RETRY_SESSION));
+    let tick_transcript = PathBuf::from(harness.forget_transcript_path(PENDING_TICK_SESSION));
+    let retry_bytes = std::fs::read(&retry_transcript).unwrap();
+    let tick_bytes = std::fs::read(&tick_transcript).unwrap();
+    std::fs::remove_file(&retry_transcript).unwrap();
+    std::fs::remove_file(&tick_transcript).unwrap();
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+
+    // First backfill: both sessions are candidates, both skip, and the human output says why
+    // per session (issue #86) rather than printing two bare `-> skipped` lines. Both rows land
+    // in `pending`.
+    let human = harness.munshi(&["archive-upload", "backfill"]);
+    assert_cli_success(&human);
+    let text = String::from_utf8_lossy(&human.stdout).into_owned();
+    assert!(
+        text.contains("candidates=2 uploaded=0 already-uploaded=0 skipped=2 failed=0"),
+        "backfill summary: {text}"
+    );
+    assert_eq!(
+        text.matches("-> skipped: missing-transcript.jsonl").count(),
+        2,
+        "each skipped session names its reason: {text}"
+    );
+
+    // Put the transcripts back where the registered harness home expects them — the step a
+    // rebuilt row needs — and watch the second backfill decline the work while naming who takes
+    // it. That bare `candidates=0` with no note was the second dead end.
+    std::fs::write(&retry_transcript, &retry_bytes).unwrap();
+    std::fs::write(&tick_transcript, &tick_bytes).unwrap();
+    let (report, success) = harness.backfill();
+    assert!(success, "report: {report}");
+    assert_eq!(report["candidates"], 0, "report: {report}");
+    let note = report["note"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        note.contains("pending") && note.contains("retry --all"),
+        "backfill must name the pending rows and the command that drains them: {report}"
+    );
+
+    // `retry --all` takes `pending` rows now, exactly as the recovery sweep always has.
+    let retried = harness.json(&["archive-upload", "retry", "--all", "--json"]);
+    assert_eq!(retried["candidates"], 2, "report: {retried}");
+    assert_eq!(retried["uploaded"], 2, "report: {retried}");
+    assert_eq!(retried["failed"], 0, "report: {retried}");
+    let status = harness.archive_upload_status();
+    assert_eq!(status["uploaded"], 2, "status: {status}");
+    assert_eq!(status["pending"], 0, "status: {status}");
+    assert_eq!(server.completed_count(), 2);
+}
+
+/// The other half of issue #87: `munshi tick` drains `pending` rows through its recovery sweep,
+/// and used to print nothing at all while doing it — the sweep's uploads were counted by nobody,
+/// so the only evidence was `archive-upload status` afterwards. One line when it moved something;
+/// silence when it did not.
+#[test]
+fn tick_reports_the_uploads_its_recovery_sweep_drained_and_stays_silent_when_idle() {
+    let harness = CliHarness::new();
+    harness.register();
+    harness.archive_session(PENDING_TICK_SESSION);
+    let transcript = PathBuf::from(harness.forget_transcript_path(PENDING_TICK_SESSION));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+    let (report, success) = harness.backfill();
+    assert!(success, "report: {report}");
+    assert_eq!(report["skipped"], 1, "report: {report}");
+    std::fs::write(&transcript, &bytes).unwrap();
+
+    let output = harness.munshi(&["tick"]);
+    assert_cli_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        text.contains("tick: archive-upload candidates=1 uploaded=1 failed=0"),
+        "a tick that uploaded must say so: {text}"
+    );
+    let json = harness.json(&["tick", "--json"]);
+    assert_eq!(json["upload_candidates"], 0, "tick: {json}");
+    assert_eq!(json["upload_uploaded"], 0, "tick: {json}");
+    assert_eq!(server.completed_count(), 1);
+
+    // Nothing left to move: the tick returns to silence.
+    let output = harness.munshi(&["tick"]);
+    assert_cli_success(&output);
+    assert!(
+        output.stdout.is_empty(),
+        "an idle tick must print nothing: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Transcript-path re-derivation at upload time (issue #53)
 // ---------------------------------------------------------------------------
 

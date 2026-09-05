@@ -149,7 +149,7 @@ tick reports it one line per subsystem:
 
 ```
 tick: recovery sweep already running elsewhere
-tick: archive-upload retried candidates=<n> failed=<n>
+tick: archive-upload candidates=<n> uploaded=<n> failed=<n>
 tick: summary-delivery retried candidates=<n> failed=<n>
 tick: memory-sync synced=<n> failed=<n> blocked=<n>
 tick: summarizer-exhaust retention refused: <reason>
@@ -157,7 +157,9 @@ tick: summarizer-exhaust pruned dirs=<n> bytes=<n>
 ```
 
 The first line means another process already holds the recovery sweep — a quiet non-event, not
-an error. The retention-refused line is the one deliberate exception to "silence unless
+an error. The archive-upload line counts both drains one tick runs — the recovery sweep's
+`pending`/`failed` pass and the bounded retry after it — so a tick that emptied a `pending` pile
+says so instead of moving a hundred snapshots in silence (issue #87). The retention-refused line is the one deliberate exception to "silence unless
 something happened": a summarizer-exhaust home that conflicts with a registered harness home is
 a standing misconfiguration that disables retention forever, so it is said on every tick (see
 below).
@@ -516,8 +518,10 @@ a lifetime `transfer_bytes_total` — the bytes actually moved on the wire per P
 receipts, which blob dedup makes far smaller than the artifact sizes — and
 `stored_bytes_latest_total`, the compressed footprint of every session's latest snapshot. These
 are the numbers that decide whether delta-upload optimization (issue #24) is ever worth building;
-rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts failed uploads (`--force` revives
-dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
+rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts stalled uploads: a named session in any ordinary state, or, with `--all`,
+every `pending` or `failed` row for the configured endpoint — the same rows the recovery sweep
+drains (`--force` additionally revives dead-letter sessions and resets their bounded attempt
+count). Uploads whose backoff has elapsed are
 also retried automatically by the recovery sweep (`munshi hook recover` — a
 recovery command, run by the hooks and by `munshi tick`, and available to you for explicit
 repair), so a transient outage
