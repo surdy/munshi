@@ -491,6 +491,7 @@ local Markdown write, and it runs in parallel with, and independently of, Notesm
 ```bash
 munshi archive-upload configure --endpoint http://127.0.0.1:8080
 munshi archive-upload configure --endpoint https://patwari.example.net   # published endpoints
+munshi archive-upload configure --endpoint http://127.0.0.1:8080 --machine-label studio
 munshi archive-upload enable
 munshi archive-upload status
 munshi archive-upload retry --all
@@ -498,6 +499,13 @@ munshi archive-upload retry <session-id> --force
 munshi archive-upload backfill
 munshi archive-upload reconcile
 ```
+
+**Your machine label leaves this machine.** The capture machine label — the sanitized hostname
+unless you set one — is recorded on every uploaded snapshot and on this machine's client record in
+the archive, where everyone who can read that archive can see it. Override it with
+`munshi archive-upload configure --machine-label <label>` (or `munshi memory-sync configure
+--machine <label>`, which writes the same stored label); `munshi archive-upload status` reports the
+one in effect. Full rule: [`shipping-to-patwari.md`](shipping-to-patwari.md#6-device-identity).
 
 Endpoints may be `https://` (issue #35): Munshi speaks TLS through rustls, verifying against the
 operating system's trust store, and deliberately grows no TLS policy surface — there is no
@@ -579,7 +587,7 @@ the content. Munshi records:
 | Key | Value |
 | --- | --- |
 | `utc_offset` | The machine's UTC offset at capture time, derived from `captured_at` — a pure function of the timestamp, so it is stable across retries of one attempt |
-| `hostname` | A sanitized machine label (the same sanitizer `memory-sync` uses), read fresh on every attempt because it is ambient machine state |
+| `hostname` | The machine label (the same sanitizer `memory-sync` uses), read fresh on every attempt because it is ambient machine state |
 | `claude_md` | sha256 of the project root's `CLAUDE.md` at capture time, or `absent` if the root was readable and the file provably was not there (issue #77) |
 | `agents_md` | sha256 of the project root's `AGENTS.md`, same rules |
 

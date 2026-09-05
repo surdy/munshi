@@ -47,7 +47,11 @@ already trusted. So point `munshi archive-upload configure --endpoint` only at a
 private network you control (localhost, a LAN address, a tailnet name, or an `https://` name
 published behind a TLS-terminating reverse proxy that only resolves inside it) — never at anything
 reachable from the open internet, and add your own authenticating proxy in front of it if you need
-one. Notesmith summary delivery is different: `munshi summary-delivery configure` can be given a
+one. Know what identity travels with an upload, too: the capture machine label — the sanitized
+hostname unless you set one — is recorded on every uploaded snapshot and on this machine's client
+record in the archive, visible to everyone who can read it; override it with `munshi archive-upload
+configure --machine-label <label>` (or `munshi memory-sync configure --machine <label>`, the same
+stored label). Notesmith summary delivery is different: `munshi summary-delivery configure` can be given a
 credential *source* — an environment variable or an OS keychain entry — and Munshi reads the token
 from it at delivery time and sends `Authorization: Bearer …`, never storing the secret itself
 (the credential is optional, for an unauthenticated local daemon). None of this is a judgement

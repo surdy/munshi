@@ -1625,6 +1625,149 @@ fn backfill_is_a_guarded_no_op_when_upload_is_disabled() {
     assert_eq!(harness.archive_upload_status()["total"], 0);
 }
 
+// ---------------------------------------------------------------------------
+// Client registration hostname (issue #90)
+// ---------------------------------------------------------------------------
+
+const CLIENT_HOSTNAME_SESSION: &str = "59595959-5959-4959-8959-595959595941";
+const RELABELLED_SESSION: &str = "59595959-5959-4959-8959-595959595942";
+
+/// Issue #90: the archive's fleet panel showed `hostname: null` for exactly the machines that were
+/// uploading, because `PUT /clients/{id}` read the hostname from the `HOSTNAME` environment
+/// variable — which hooks and launchd/systemd timers do not set. The registration now derives the
+/// hostname the way the per-capture device label does, so the two agree by construction and no
+/// environment variable can steer either one.
+///
+/// The second half pins the refresh: registration is idempotent and rides *every* upload, so a
+/// client row already stored with a null or stale hostname is corrected by the next upload with no
+/// "last sent" bookkeeping.
+#[test]
+fn client_registration_carries_the_capture_machine_label_not_the_environment() {
+    let mut harness = CliHarness::new();
+    // A hook's environment, only worse: `HOSTNAME` present but unrelated to this machine. The old
+    // code would have registered exactly this string.
+    harness.set_env("HOSTNAME", "hostname-env-var-must-not-win");
+    harness.register();
+    harness.archive_session(CLIENT_HOSTNAME_SESSION);
+
+    let server = FakePatwari::start();
+    harness.configure_and_enable(&server.endpoint());
+    let (report, success) = harness.backfill();
+    assert!(success, "backfill exits zero when nothing fails");
+    assert_eq!(report["uploaded"], 1);
+
+    let registered = server
+        .registered_hostname()
+        .expect("the client PUT carried a hostname rather than JSON null");
+    assert_ne!(
+        registered, "hostname-env-var-must-not-win",
+        "client registration must not read the environment"
+    );
+    let capture_label = server.manifest(0)["capture"]["source_metadata"]["hostname"]
+        .as_str()
+        .expect("the capture carried a device label")
+        .to_owned();
+    assert_eq!(
+        registered, capture_label,
+        "the fleet panel's client label and the per-capture device label must be one string"
+    );
+
+    // The label is settable from the command that owns the upload relationship, and the next
+    // upload re-registers under it — the refresh path for a row already stored with the old value.
+    assert_cli_success(&harness.munshi(&[
+        "archive-upload",
+        "configure",
+        "--endpoint",
+        &server.endpoint(),
+        "--machine-label",
+        "Studio Mac.local",
+    ]));
+    harness.archive_session(RELABELLED_SESSION);
+    let (_report, success) = harness.backfill();
+    assert!(success);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.registered_hostname().as_deref() != Some("studio-mac") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the next upload never re-registered under the new label: {:?}",
+            server.registered_hostnames()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let latest = server.manifest(server.upload_count() - 1);
+    assert_eq!(
+        latest["capture"]["source_metadata"]["hostname"].as_str(),
+        Some("studio-mac"),
+        "the sanitized override is the capture's device label too"
+    );
+    let seen = server.registered_hostnames();
+    assert!(
+        seen.len() >= 2,
+        "registration rides every upload, not just the first: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(Option::is_some),
+        "no upload may register a null hostname: {seen:?}"
+    );
+}
+
+/// Issue #90 proposal 1: `archive-upload configure --machine-label` and
+/// `memory-sync configure --machine` write one stored label, so either command can set it and
+/// neither is a prerequisite for the other. A later memory-sync configure run for its own reasons
+/// must not rename the machine behind the operator's back.
+#[test]
+fn the_machine_label_is_one_value_shared_by_both_configure_commands() {
+    let harness = CliHarness::new();
+    harness.register();
+
+    assert_cli_success(&harness.munshi(&[
+        "archive-upload",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:18080",
+        "--machine-label",
+        "Studio Mac.local",
+    ]));
+    assert_eq!(
+        harness.archive_upload_status()["settings"]["machine_label"],
+        "studio-mac",
+        "the label is sanitized once and reported by the command that owns the upload"
+    );
+
+    // Configuring the unrelated Notesmith mirror keeps the label the operator chose.
+    assert_cli_success(&harness.munshi(&[
+        "memory-sync",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:27183",
+        "--vault",
+        "memvault",
+    ]));
+    let memory_status: Value = harness.json(&["memory-sync", "status", "--json"]);
+    assert_eq!(memory_status["settings"]["machine_label"], "studio-mac");
+    assert_eq!(
+        harness.archive_upload_status()["settings"]["machine_label"],
+        "studio-mac"
+    );
+
+    // And `memory-sync configure --machine` still sets it, for the same one field.
+    assert_cli_success(&harness.munshi(&[
+        "memory-sync",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:27183",
+        "--vault",
+        "memvault",
+        "--machine",
+        "Rack Box",
+    ]));
+    assert_eq!(
+        harness.archive_upload_status()["settings"]["machine_label"],
+        "rack-box"
+    );
+}
+
 /// Drives the real munshi binary: registration, one hook-driven archive lifecycle, and the
 /// `archive-upload` CLI. Mirrors the delivery-test harness, narrowed to what backfill needs.
 struct CliHarness {
@@ -1635,6 +1778,9 @@ struct CliHarness {
     state: PathBuf,
     output: PathBuf,
     project: PathBuf,
+    /// Extra environment for every child invocation, so a test can put munshi under the
+    /// environment a hook or a launchd/systemd timer really gives it (issue #90).
+    extra_env: Vec<(String, String)>,
 }
 
 impl CliHarness {
@@ -1655,7 +1801,13 @@ impl CliHarness {
             output: directory.path().join("archives"),
             project,
             directory,
+            extra_env: Vec::new(),
         }
+    }
+
+    /// Sets an environment variable for every subsequent child invocation.
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.extra_env.push((key.to_owned(), value.to_owned()));
     }
 
     /// Runs the binary with `args` plus `--state-dir`.
@@ -1664,6 +1816,7 @@ impl CliHarness {
             .args(args)
             .arg("--state-dir")
             .arg(&self.state)
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -1708,6 +1861,7 @@ impl CliHarness {
 
     fn register_with_summarizer(&self, summarizer: &Path, extra_args: &[&str]) {
         let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .arg("register")
             .arg("--accept-transcript-processing")
             .arg("--copilot-home")
@@ -2063,6 +2217,7 @@ impl CliHarness {
         let mut child = Command::new(env!("CARGO_BIN_EXE_munshi"))
             .arg("hook")
             .arg(event)
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .env("MUNSHI_HOME", &self.state)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2319,6 +2474,12 @@ struct AcceptedArtifact {
 
 struct FakeState {
     registered_client: Option<String>,
+    /// The hostname of the most recent `PUT /clients/{id}` body — `None` when the client sent
+    /// JSON null, which is exactly the archive-side symptom issue #90 reports.
+    registered_hostname: Option<String>,
+    /// Every hostname value the client has registered, in order, so a test can prove the PUT is a
+    /// refresh path and not a once-at-configure-time write.
+    registered_hostnames: Vec<Option<String>>,
     uploads: Vec<Upload>,
     capture_to_upload: HashMap<String, usize>,
     create_status_codes: Vec<u16>,
@@ -2342,6 +2503,8 @@ impl FakePatwari {
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(FakeState {
             registered_client: None,
+            registered_hostname: None,
+            registered_hostnames: Vec::new(),
             uploads: Vec::new(),
             capture_to_upload: HashMap::new(),
             create_status_codes: Vec::new(),
@@ -2367,6 +2530,14 @@ impl FakePatwari {
 
     fn registered_client(&self) -> Option<String> {
         self.state.lock().unwrap().registered_client.clone()
+    }
+
+    fn registered_hostname(&self) -> Option<String> {
+        self.state.lock().unwrap().registered_hostname.clone()
+    }
+
+    fn registered_hostnames(&self) -> Vec<Option<String>> {
+        self.state.lock().unwrap().registered_hostnames.clone()
     }
 
     fn upload_count(&self) -> usize {
@@ -2476,6 +2647,10 @@ fn route(request: &FakeRequest, state: &mut FakeState) -> Vec<u8> {
     // /api/v1/clients/{id}
     if request.method == "PUT" && segments.len() == 4 && segments[2] == "clients" {
         state.registered_client = Some(decode(segments[3]));
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let hostname = body["hostname"].as_str().map(ToOwned::to_owned);
+        state.registered_hostname = hostname.clone();
+        state.registered_hostnames.push(hostname);
         return json_response(200, &json!({ "client_id": decode(segments[3]) }));
     }
     // /api/v1/uploads ...

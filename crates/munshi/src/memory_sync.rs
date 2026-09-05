@@ -154,10 +154,10 @@ pub fn configure_sink(
     sink: MemorySinkConfig,
 ) -> Result<MemorySyncSettings, MemorySyncError> {
     parse_http_endpoint(&sink.endpoint).map_err(DeliveryError::from)?;
-    let label = match sink.machine_label.as_deref().map(sanitize_machine_label) {
-        Some(label) if !label.is_empty() => label,
+    let explicit = match sink.machine_label.as_deref().map(sanitize_machine_label) {
+        Some(label) if !label.is_empty() => Some(label),
         Some(_) => return Err(MemorySyncError::NotConfigured),
-        None => default_machine_label(),
+        None => None,
     };
     let (config, ()) = update_stored_config(state_directory, |config| {
         config.memory_sync.endpoint = Some(sink.endpoint.clone());
@@ -171,7 +171,22 @@ pub fn configure_sink(
             .max_attempts
             .filter(|value| *value >= 1)
             .unwrap_or(DEFAULT_MAX_DELIVERY_ATTEMPTS);
-        config.memory_sync.machine_label = Some(label.clone());
+        // Chosen once and kept: an explicit `--machine` wins, else a label already recorded here
+        // (possibly by `archive-upload configure --machine-label`, which writes this same field)
+        // stands, and only a machine that has never named itself falls back to the hostname. A
+        // re-run of configure for an unrelated reason must not silently rename the machine
+        // (issue #90) — that is the one-machine-mirrored-as-two defect in slow motion.
+        let existing = config
+            .memory_sync
+            .machine_label
+            .clone()
+            .filter(|label| !label.is_empty());
+        config.memory_sync.machine_label = Some(
+            explicit
+                .clone()
+                .or(existing)
+                .unwrap_or_else(default_machine_label),
+        );
         // Captured once, at configure time, so the mirror and the Patwari archive of this
         // machine correlate; absent when archive upload has never been configured.
         config.memory_sync.machine_id = config
