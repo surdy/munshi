@@ -704,6 +704,11 @@ enum ArchiveUploadCommand {
         /// Base URL of the Patwari archive server, for example `http://127.0.0.1:8080`.
         #[arg(long)]
         endpoint: String,
+        /// The machine label recorded on every uploaded snapshot and on this client's archive
+        /// record, visible to everyone who can read the archive. Defaults to the sanitized
+        /// hostname; writes the same stored label as `memory-sync configure --machine`.
+        #[arg(long)]
+        machine_label: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -1709,8 +1714,12 @@ fn main() -> ExitCode {
         }
         Ok(Outcome::ArchiveUploadConfigured { settings }) => {
             println!(
-                "configured Patwari archive server endpoint={}",
-                settings.endpoint.as_deref().unwrap_or("<unset>")
+                "configured Patwari archive server endpoint={} machine-label={}",
+                settings.endpoint.as_deref().unwrap_or("<unset>"),
+                settings
+                    .machine_label
+                    .as_deref()
+                    .unwrap_or("<sanitized hostname>")
             );
             ExitCode::SUCCESS
         }
@@ -2662,10 +2671,12 @@ fn run_archive_upload(command: ArchiveUploadCommand) -> Result<Outcome, Box<dyn 
     match command {
         ArchiveUploadCommand::Configure {
             endpoint,
+            machine_label,
             state_dir,
         } => {
             let state_directory = resolve_state_directory(state_dir)?;
-            let settings = configure_archive_upload(&state_directory, &endpoint)?;
+            let settings =
+                configure_archive_upload(&state_directory, &endpoint, machine_label.as_deref())?;
             Ok(Outcome::ArchiveUploadConfigured {
                 settings: Box::new(settings),
             })

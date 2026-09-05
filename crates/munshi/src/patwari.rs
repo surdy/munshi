@@ -90,6 +90,13 @@ pub enum PatwariError {
     Io(#[source] std::io::Error),
     #[error("archive upload endpoint {0} is not a supported http URL")]
     UnsupportedEndpoint(String),
+    /// `--machine-label` was given a value with nothing routing-safe in it. Named distinctly from
+    /// `NotConfigured` so the message points at the label the operator typed rather than at the
+    /// endpoint, which is configured perfectly well (issue #88's class of misleading error).
+    #[error(
+        "the machine label {given:?} sanitizes to nothing; it needs at least one of [a-z0-9._-]"
+    )]
+    InvalidMachineLabel { given: String },
     #[error("archive upload transport failed: {0}")]
     Transport(String),
     #[error("archive upload protocol error: {0}")]
@@ -127,6 +134,7 @@ impl PatwariError {
             Self::NotConfigured => "upload-not-configured",
             Self::Io(_) => "upload-io",
             Self::UnsupportedEndpoint(_) => "upload-endpoint",
+            Self::InvalidMachineLabel { .. } => "invalid-machine-label",
             Self::Transport(_) => "upload-transport",
             Self::Protocol(_) => "upload-protocol",
             Self::Server { .. } => "upload-server",
@@ -906,6 +914,13 @@ fn now_rfc3339() -> String {
 /// present one spelling of itself across the whole system, so qanungo can scope by device and have
 /// it line up with everything else munshi labels. `None` when the OS declines to answer or the
 /// hostname sanitizes away to nothing — better an absent key than an empty one.
+///
+/// The one derivation for both places a machine names itself to Patwari: this capture's
+/// `source_metadata.hostname` and the `PUT /clients/{id}` registration that rides every upload
+/// (issue #90). Client registration used to read the `HOSTNAME` environment variable, which hooks
+/// and launchd/systemd timers do not set, so the fleet panel showed `hostname: null` for exactly
+/// the machines that were uploading. Two spellings would also let the fleet's client label and the
+/// per-capture device label disagree, which is the defect this function exists to prevent.
 fn capture_hostname(machine_label: Option<&str>) -> Option<String> {
     let configured = machine_label
         .map(str::to_owned)
@@ -1233,13 +1248,6 @@ pub(crate) fn ensure_client_id(state_directory: &Path) -> Result<String, Patwari
             .unwrap_or(client_id.clone()))
     })?;
     Ok(stored)
-}
-
-/// The default machine hostname recorded at client registration, when resolvable.
-fn hostname() -> Option<String> {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|value| !value.is_empty())
 }
 
 /// Reads an archived session's snapshot artifacts from disk and assembles the artifact-set-v1
@@ -1866,7 +1874,10 @@ fn run_upload(
         "munshi_version".to_owned(),
         env!("CARGO_PKG_VERSION").to_owned(),
     );
-    client.register_client(hostname().as_deref(), None, &metadata)?;
+    // Registration is idempotent and rides every upload attempt, so it is also the refresh path: a
+    // client row already stored with a null or stale hostname is corrected by the next upload, with
+    // no "last sent" bookkeeping to keep in step with it (issue #90).
+    client.register_client(capture_hostname(machine_label).as_deref(), None, &metadata)?;
 
     let session_id = record.session_id.clone();
     let endpoint_owned = endpoint.to_owned();
@@ -1896,6 +1907,12 @@ pub struct ArchiveUploadSettings {
     pub endpoint: Option<String>,
     pub client_id: Option<String>,
     pub max_attempts: u32,
+    /// The canonical machine label this machine names itself by — the capture's device label and
+    /// the registered client's hostname alike (issue #90). Reported from the one stored field
+    /// (`memory_sync.machine_label`) that both this command and `memory-sync configure` write, so
+    /// there is nothing here to diverge from. `None` means no explicit label is recorded and the
+    /// sanitized OS hostname is used.
+    pub machine_label: Option<String>,
 }
 
 impl ArchiveUploadSettings {
@@ -1906,6 +1923,7 @@ impl ArchiveUploadSettings {
             endpoint: config.archive_upload.endpoint.clone(),
             client_id: config.archive_upload.client_id.clone(),
             max_attempts: config.archive_upload.max_attempts,
+            machine_label: config.memory_sync.machine_label.clone(),
         }
     }
 
@@ -1916,6 +1934,7 @@ impl ArchiveUploadSettings {
             endpoint: None,
             client_id: None,
             max_attempts: DEFAULT_MAX_ARCHIVE_UPLOAD_ATTEMPTS,
+            machine_label: None,
         }
     }
 }
@@ -1967,15 +1986,36 @@ pub struct ArchiveUploadStatusReport {
 
 /// Configures the Patwari server endpoint without enabling upload, generating and persisting the
 /// durable client UUID if one does not exist yet.
+///
+/// `machine_label`, when given, records the canonical label this machine names itself by — the
+/// capture's `source_metadata.hostname` and the registered client's hostname (issue #90). It writes
+/// the *same* stored field `memory-sync configure --machine` writes, so the label is settable from
+/// the command that owns the capture/upload relationship without configuring an unrelated Notesmith
+/// mirror, and neither command is a prerequisite for the other. Omitting it leaves any recorded
+/// label untouched; a label that sanitizes away to nothing is refused as
+/// [`PatwariError::InvalidMachineLabel`] — naming the label the operator typed, not the endpoint —
+/// rather than silently ignored.
 pub fn configure(
     state_directory: &Path,
     endpoint: &str,
+    machine_label: Option<&str>,
 ) -> Result<ArchiveUploadSettings, PatwariError> {
     http::parse_http_endpoint(endpoint).map_err(from_http)?;
+    let label = match machine_label.map(crate::memory_sync::sanitize_machine_label) {
+        Some(label) if label.is_empty() => {
+            return Err(PatwariError::InvalidMachineLabel {
+                given: machine_label.unwrap_or_default().to_owned(),
+            });
+        }
+        other => other,
+    };
     let (config, ()) = update_stored_config(state_directory, |config| {
         config.archive_upload.endpoint = Some(endpoint.to_owned());
         if config.archive_upload.client_id.is_none() {
             config.archive_upload.client_id = Some(new_uuid());
+        }
+        if let Some(label) = label.clone() {
+            config.memory_sync.machine_label = Some(label);
         }
         Ok(())
     })?;
@@ -2586,7 +2626,11 @@ pub fn rearchive(
         "munshi_version".to_owned(),
         env!("CARGO_PKG_VERSION").to_owned(),
     );
-    client.register_client(hostname().as_deref(), None, &client_metadata)?;
+    client.register_client(
+        capture_hostname(machine_label).as_deref(),
+        None,
+        &client_metadata,
+    )?;
 
     // A restored operational database can legitimately lack the old upload ledger row even when
     // the immutable snapshot and all local artifacts prove the session identity. Create the row
@@ -2831,7 +2875,7 @@ impl ArchiveUploadRunReport {
 
 fn print_settings(settings: &ArchiveUploadSettings) {
     println!(
-        "archive upload {} (endpoint {}, client {}, max-attempts {})",
+        "archive upload {} (endpoint {}, client {}, machine-label {}, max-attempts {})",
         if settings.enabled {
             "enabled"
         } else {
@@ -2839,6 +2883,10 @@ fn print_settings(settings: &ArchiveUploadSettings) {
         },
         settings.endpoint.as_deref().unwrap_or("<unset>"),
         settings.client_id.as_deref().unwrap_or("<unset>"),
+        settings
+            .machine_label
+            .as_deref()
+            .unwrap_or("<sanitized hostname>"),
         settings.max_attempts,
     );
 }
@@ -3318,6 +3366,43 @@ mod tests {
                 "sanitized hostname {expected:?} leaked an unsafe character"
             );
         }
+    }
+
+    #[test]
+    fn archive_upload_configure_refuses_a_label_that_sanitizes_away() {
+        use tempfile::TempDir;
+
+        // Issue #90 lets `archive-upload configure --machine-label` set the machine's one label.
+        // A label that reduces to nothing is refused rather than stored empty: an empty label
+        // falls through to the hostname, which would silently defeat the very override the
+        // operator ran the command for. Refused before any state is touched.
+        let directory = TempDir::new().unwrap();
+        let error = configure(directory.path(), "http://127.0.0.1:8080", Some("   "))
+            .expect_err("an empty label is refused");
+        assert!(
+            matches!(&error, PatwariError::InvalidMachineLabel { given } if given == "   "),
+            "expected an invalid-label error naming what was typed, got {error:?}"
+        );
+        // The message must point at the label, not at the endpoint, which is configured fine.
+        assert_eq!(error.category(), "invalid-machine-label");
+        let message = error.to_string();
+        assert!(message.contains("machine label"), "{message}");
+        assert!(
+            !message.contains("not configured"),
+            "the endpoint is not the problem: {message}"
+        );
+
+        // What configure stores is what capture stamps and what client registration sends: one
+        // sanitizer, one spelling. (The stored-field sharing itself is pinned end to end in
+        // `tests/patwari.rs`.)
+        assert_eq!(
+            crate::memory_sync::sanitize_machine_label("Studio Mac.local"),
+            "studio-mac"
+        );
+        assert_eq!(
+            capture_hostname(Some("studio-mac")).as_deref(),
+            Some("studio-mac")
+        );
     }
 
     #[test]

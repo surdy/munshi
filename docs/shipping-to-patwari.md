@@ -209,6 +209,11 @@ effect it resets upload rows, which is what makes it the recovery path when an a
 
 ## 6. Device identity
 
+**Your machine label leaves this machine.** It is recorded on every uploaded snapshot
+(`source_metadata.hostname`) and on this machine's client record in the archive, and it is visible
+to everyone who can read that archive. It defaults to your machine's own hostname, sanitized — so
+on a shared or multi-operator Patwari, set a label you are happy for the other readers to see.
+
 `source_metadata.hostname` is how the read side tells your machines apart, so two machines must
 never resolve to the same label. The rule, in order:
 
@@ -219,30 +224,46 @@ never resolve to the same label. The rule, in order:
 3. If the OS declines to answer or the result sanitizes away to nothing, the key is **omitted**
    rather than sent empty.
 
-Check what your machine will stamp before you rely on it — run `hostname` and apply the rule. If
-that is already a clean, distinct slug, you are done. If it is generic, ugly, or could collide with
-another machine, set an explicit label:
+The same rule produces the hostname on this machine's `PUT /clients/{id}` registration, which rides
+every upload — so the fleet's client label and the per-capture device label are one string by
+construction, and a client row already stored with a stale one is refreshed by the next upload
+(issue #90). Registration reads no environment variable: under a hook or a launchd/systemd timer
+there is no `HOSTNAME` to read, which is what used to leave the archive's client records null.
+
+Check what your machine will stamp before you rely on it — `munshi archive-upload status` reports
+the label in effect (`<sanitized hostname>` when none is recorded). If it is generic, ugly, could
+collide with another machine, or simply says more about you than you want a shared archive to know,
+set an explicit one:
+
+```bash
+munshi archive-upload configure \
+  --endpoint http://127.0.0.1:8080 \
+  --machine-label studio       # the label capture and client registration will use
+```
+
+`memory-sync configure --machine` writes the same stored label, so either command can set it and
+neither is a prerequisite for the other:
 
 ```bash
 munshi memory-sync configure \
   --endpoint http://127.0.0.1:27183 \
   --vault some-vault \
-  --machine studio          # the label capture will use
+  --machine studio          # the same one label, recorded from the mirror side
 ```
 
-Two things are surprising here and worth knowing
-([#90](https://github.com/surdy/munshi/issues/90) tracks both):
+Both commands leave an already-recorded label alone when their flag is omitted, so re-running
+either one for an unrelated reason never renames the machine. Two things about the memory-sync
+route are still worth knowing:
 
-- **The label lives in the `memory-sync` section**, which is the Notesmith auto-memory mirror — an
-  unrelated feature. `--endpoint` and `--vault` are required by that command even when the label is
-  all you want.
+- **`--endpoint` and `--vault` are required by that command** even when the label is all you want,
+  which is why `archive-upload configure --machine-label` exists.
 - **`configure` records; it does not enable.** Capture reads `machine_label` regardless of whether
   memory-sync is enabled, so do **not** run `munshi memory-sync enable` unless you actually want
   memory mirroring.
 
-The sanitizer and the hostname lookup are shared between capture provenance and memory-sync
-deliberately: one physical machine must present one spelling of itself everywhere, or it appears in
-the archive as two devices.
+The sanitizer and the hostname lookup are shared between capture provenance, client registration,
+and memory-sync deliberately: one physical machine must present one spelling of itself everywhere,
+or it appears in the archive as two devices.
 
 ## 7. Verifying it landed
 

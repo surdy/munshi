@@ -156,7 +156,7 @@ semantics live in [`user-guide.md`](user-guide.md).
 | `folder` | Optional vault-relative folder the per-machine memory trees are filed under; routes are `[folder/]<machine>/<slug>/<file>`. |
 | `credential` | Where the bearer credential is read from at sync time; same shape as `summary_delivery.credential`. Never the secret itself. |
 | `max_attempts` | Bounded sync attempts before a memory directory is parked as a dead letter (`5`). Revive with `memory-sync run --force`. |
-| `machine_label` | The one canonical machine label mirrored paths are routed under. Chosen at configure time (`--machine`, else the sanitized hostname) and persisted — never re-derived per run, so one physical machine can never appear as two. |
+| `machine_label` | The one canonical machine label this machine names itself by, everywhere: mirrored memory routes, every uploaded snapshot's `source_metadata.hostname`, and the archive's client record for this machine (issue #90). Chosen at configure time by `memory-sync configure --machine` or `archive-upload configure --machine-label` (either writes this field; both leave it alone when the flag is omitted), else the sanitized hostname, and persisted — never re-derived per run, so one physical machine can never appear as two. |
 | `machine_id` | The `archive_upload.client_id` captured at configure time when that section is configured, carried in the manifest so the memory mirror and the Patwari archive correlate without name matching. |
 | `provision_history` | `true` lets Munshi explicitly configure the vault's revision-history capability when absent instead of only verifying it (`false` by default). |
 
