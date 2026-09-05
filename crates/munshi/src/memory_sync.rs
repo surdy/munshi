@@ -922,8 +922,8 @@ mod tests {
     #[test]
     fn machine_labels_sanitize_to_routing_safe_slugs() {
         assert_eq!(
-            sanitize_machine_label("Surdys-MacBook-Pro.local"),
-            "surdys-macbook-pro"
+            sanitize_machine_label("Alices-MacBook-Pro.local"),
+            "alices-macbook-pro"
         );
         assert_eq!(
             sanitize_machine_label("test's MacBook Pro"),

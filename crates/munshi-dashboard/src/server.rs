@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn routable_addresses_are_refused() {
-        for address in ["0.0.0.0:8877", "192.168.16.169:8877", "[::]:8877"] {
+        for address in ["0.0.0.0:8877", "192.0.2.10:8877", "[::]:8877"] {
             let parsed: SocketAddr = address.parse().expect("a socket address");
             let error = loopback_bind(parsed).expect_err("a routable address is refused");
             assert!(

@@ -375,10 +375,10 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_http_endpoint("https://192.168.16.169:8443").unwrap(),
+            parse_http_endpoint("https://192.0.2.10:8443").unwrap(),
             HttpEndpoint {
                 tls: true,
-                host: "192.168.16.169".to_owned(),
+                host: "192.0.2.10".to_owned(),
                 port: 8443
             }
         );
@@ -407,7 +407,7 @@ mod tests {
             ServerName::DnsName(_)
         ));
         assert!(matches!(
-            ServerName::try_from("192.168.16.169".to_owned()).unwrap(),
+            ServerName::try_from("192.0.2.10".to_owned()).unwrap(),
             ServerName::IpAddress(_)
         ));
         assert!(ServerName::try_from("not a hostname".to_owned()).is_err());

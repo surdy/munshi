@@ -3291,8 +3291,8 @@ mod tests {
         // rules memory-sync's own label test pins; asserting them here would be circular if the
         // function were forked, which is exactly why it is not.
         assert_eq!(
-            crate::memory_sync::sanitize_machine_label("Surdys-MacBook-Pro.local"),
-            "surdys-macbook-pro"
+            crate::memory_sync::sanitize_machine_label("Alices-MacBook-Pro.local"),
+            "alices-macbook-pro"
         );
         assert_eq!(
             crate::memory_sync::sanitize_machine_label("test's MacBook Pro"),
