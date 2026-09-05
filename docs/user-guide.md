@@ -514,7 +514,9 @@ receipts, which blob dedup makes far smaller than the artifact sizes — and
 are the numbers that decide whether delta-upload optimization (issue #24) is ever worth building;
 rows recorded before this accounting contribute 0, so the totals are floors. `retry` re-attempts failed uploads (`--force` revives
 dead-letter sessions and resets their bounded attempt count). Uploads whose backoff has elapsed are
-also retried automatically by the recovery sweep (`munshi hook recover`), so a transient outage
+also retried automatically by the recovery sweep (`munshi hook recover` — hidden from `--help`; a
+recovery command, run by the hooks and by `munshi tick`, and available to you for explicit
+repair), so a transient outage
 recovers without a new revision. `backfill` uploads archived sessions the configured server holds
 no self-contained snapshot for — sessions archived while upload was disabled or unconfigured, and
 sessions whose recorded snapshot is not known to carry both `summary.md` and `transcript.jsonl` —
@@ -524,7 +526,13 @@ fills the `patwari_session_id` onto uploaded rows recorded before that id was st
 snapshot id. It is idempotent (a row that already carries the id is left untouched), endpoint-scoped,
 never overwrites a recorded id, and needs only a configured, addressable endpoint — not an enabled
 one — so historical rows reconcile even after upload has been disabled. A snapshot the listing no
-longer holds is reported `unmatched` rather than guessed.
+longer holds is reported `unmatched` rather than guessed. `reconcile --repair-missing` goes one
+step further and resets uploaded rows whose recorded snapshot no longer exists, so `backfill`
+re-uploads them with a fresh capture identity. `rearchive <session-id> --source <source>
+--snapshot-file <file>` re-archives one repaired row from the JSON that
+`GET /api/v1/snapshots/{snapshot_id}` returned *before* the snapshot was tombstoned, preserving
+every fingerprint-bearing manifest field and artifact byte; `--abandon` gives up that preservation
+and returns the parked row to ordinary uploads instead.
 
 Every snapshot is self-contained by contract, so a session whose transcript munshi cannot read is
 reported `skipped` rather than uploaded as a summary-only snapshot. Before skipping, munshi tries to
@@ -558,6 +566,34 @@ bare source session ID or the prefixed identity summarizer input carries (`copil
 `--source` disambiguates a bare ID shared across harnesses. Full design and rationale:
 [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md) and
 [ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md).
+
+### Capture provenance (`source_metadata`)
+
+Each upload's manifest carries a small opaque `source_metadata` map describing the *capture*, never
+the content. Munshi records:
+
+| Key | Value |
+| --- | --- |
+| `utc_offset` | The machine's UTC offset at capture time, derived from `captured_at` — a pure function of the timestamp, so it is stable across retries of one attempt |
+| `hostname` | A sanitized machine label (the same sanitizer `memory-sync` uses), read fresh on every attempt because it is ambient machine state |
+| `claude_md` | sha256 of the project root's `CLAUDE.md` at capture time, or `absent` if the root was readable and the file provably was not there (issue #77) |
+| `agents_md` | sha256 of the project root's `AGENTS.md`, same rules |
+
+Only the digest of an instruction file ever travels — the file's content is never uploaded, which
+is what makes hashing it on every capture acceptable at all. An omitted key means munshi did not
+look (a scheduler-descended upload takes no filesystem contact with the origin directory, and an
+instruction file over 1 MiB is skipped rather than read); that is deliberately distinct from
+`absent`, which means it looked and the file was not there. Freshly observed values are merged
+*over* the saved map rather than replacing it, so a rearchive that could not read the project root
+reports the digests the tombstoned snapshot recorded. The map is structurally unreachable from
+Patwari's snapshot fingerprint, so a re-capture whose only change is an instruction digest adds a
+capture row and coalesces rather than minting a snapshot.
+
+These fields exist for the read side: [qanungo](https://github.com/surdy/qanungo) scopes reports
+per device off `hostname`, and its instructions doctor anchors "an instruction edit landed" on a
+`claude_md` / `agents_md` digest changing between two captures — a question nothing else in the
+archive can answer. They accrue value only from ship time: a capture taken before they shipped
+carries no record of what the instructions said at that moment, and nothing can reconstruct it.
 
 ### `munshi verify-archive-parse`
 
@@ -626,7 +662,10 @@ A machine with no registration yet is the case this command exists for, so it ru
 `--endpoint` and `--output-dir` and the files are restored. Importing them into operational state is
 the part that genuinely needs a registration — the harness homes the importer re-derives from live
 in the stored configuration — so on an unregistered machine it is reported as skipped, and the
-sequence is `munshi restore` → `munshi register` → `munshi hook recover --rebuild-state`. Restored
+sequence is `munshi restore` → `munshi register` → `munshi hook recover --rebuild-state`. On a
+registered machine `--no-rebuild-state` opts out of the import deliberately, leaving the restored
+Markdown on disk for you to inspect and running that same `hook recover --rebuild-state`
+separately when you are ready. Restored
 rows land `archived` with no pending observation, so they are never re-summarized and never park as
 transcript-missing. `--json` emits the stable report; exit codes follow the same shape as the other
 archive commands (0 clean, 1 local, 2 invalid input, 3 unconfigured, 4 findings such as a refused

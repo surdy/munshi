@@ -71,8 +71,9 @@ Work through these in order:
    stale sessions with no end event (and, for Claude Code, also scans
    `~/.claude/projects/*/` for orphaned `<session-id>.jsonl` transcripts) and archives them with
    an `interrupted` completion reason. Give it a few minutes; if you don't want to wait, run
-   `munshi retry <id>` or `munshi retry-all` directly, or force the sweep now (use your actual
-   state directory — `~/.munshi` unless you set `$MUNSHI_HOME`):
+   `munshi retry <id>` or `munshi retry-all` directly, or force the sweep now with
+   `munshi hook recover` (hidden from `--help`; a recovery command — use your actual state
+   directory, `~/.munshi` unless you set `$MUNSHI_HOME`):
    ```bash
    munshi hook recover --state-dir ~/.munshi --stale-after-ms 1800000
    ```

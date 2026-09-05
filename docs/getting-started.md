@@ -123,7 +123,9 @@ picked in step 2.)
 By default `register` targets every harness whose home directory it finds on disk. To be
 explicit, pass `--harness copilot` and/or `--harness claude-code` (repeatable), or point directly
 at a harness home with `--copilot-home`/`--claude-home`. Pass `--dry-run` first if you just want
-to see the managed paths Munshi would write without touching anything.
+to see the managed paths Munshi would write without touching anything (it still asks you to accept
+the disclosure first — the prompt runs before the dry-run report, so `--dry-run` without
+`--accept-transcript-processing` stops at the prompt).
 
 Optionally, pass `--archive-git-history` to have Munshi commit each successful summary revision
 into a dedicated Git repository inside your output directory.

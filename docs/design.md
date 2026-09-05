@@ -22,6 +22,24 @@ above; see [ADR 0007](adr/0007-madari-status-and-actions-over-cli-json-only.md).
 [`docs/automatic-archive.md`](automatic-archive.md) and
 [ADR 0006](adr/0006-deliver-to-notesmith-downstream-of-local-archival.md).
 
+**Since then (2026-09-04).** The paragraph above stops at Notesmith delivery; everything in this
+list shipped after it and is implemented and tested. Full-snapshot archive upload to Patwari
+(`munshi archive-upload`, [ADR 0009](adr/0009-archive-full-snapshots-to-patwari.md)) with elision
+and claim tickets redeemed by `munshi retrieve`
+([ADR 0010](adr/0010-elide-with-claim-tickets-retrieve-on-demand.md)); local-record recovery from
+the archive via `munshi restore` (issue #70) and harness-home session resumption with
+`munshi restore --resume` (issue #71); the `munshi verify-archive-parse` acceptance walk over the
+shared read-time interpreter ([ADR 0011](adr/0011-interpret-transcripts-at-read-time-through-a-shared-streaming-crate.md));
+an idempotent maintenance sweep for platform timers (`munshi tick`, issue #55); harness auto-memory
+mirrored into Notesmith (`munshi memory-sync`, issue #59); the optional desktop app
+([ADR 0014](adr/0014-ship-the-desktop-addon-over-the-same-cli-json-boundary.md)) and the backlog
+dashboard addon (issue #56); chunked marathon summarization (issue #48); and the remote
+revision-history capability called "a later slice" above, now shipped as
+`munshi summary-delivery history`. Capture provenance travels with each upload in the manifest's
+`source_metadata` map — `utc_offset`, `hostname`, and the `claude_md` / `agents_md` instruction
+digests of issue #77 — which is what lets a read-side consumer scope by device and notice an
+instruction edit; see [`user-guide.md`](user-guide.md#capture-provenance-source_metadata).
+
 
 ## Goals
 
@@ -159,24 +177,25 @@ session should not require Copilot to remain the summarizer forever.
 
 ### Workspace layout
 
+The boundaries below exist as Rust modules inside `crates/munshi` rather than as separate crates:
+the original design sketched a crate per boundary, and the rule it stated — "crates should be
+split only where they provide a real dependency or reuse boundary" — is what kept them together.
+The workspace members are the five in [`Cargo.toml`](../Cargo.toml), which is authoritative:
+
 ```text
 munshi/
 ├── Cargo.toml
 ├── crates/
-│   ├── munshi-cli/
-│   ├── munshi-core/
-│   ├── munshi-source-copilot/
-│   ├── munshi-summarizer-copilot/
-│   ├── munshi-render-markdown/
-│   ├── munshi-sink-filesystem/
-│   ├── munshi-sink-notesmith/
-│   └── munshi-state/
+│   ├── munshi/              # the CLI, hooks, worker, sinks — where the boundaries below live
+│   ├── munshi-dashboard/    # the backlog dashboard addon (issue #56)
+│   ├── munshi-probe/        # the phase-0 harness probe
+│   ├── munshi-runner/       # the hook-invoked launcher
+│   └── munshi-transcript/   # the shared read-time transcript interpreter (ADR 0011)
 └── docs/
 ```
 
-The initial implementation does not need every crate on day one. The boundaries should exist as
-Rust traits or modules first; crates should be split only where they provide a real dependency or
-reuse boundary.
+The desktop GUI is a nested workspace under `gui/src-tauri`, deliberately excluded from this one
+so the CLI builds without a WebKit toolchain (ADR 0014, [`gui.md`](gui.md)).
 
 ### Core interfaces
 

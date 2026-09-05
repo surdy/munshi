@@ -103,9 +103,9 @@ Adapter-specific records that carry no archive-worthy conversation content (Clau
 `system` bookkeeping, Codex `session_meta`/`turn_context`/`compacted`/`reasoning`) are treated as
 ignored metadata. Model reasoning is deliberately dropped and never normalized into events.
 
-## Copilot CLI (version-pinned to 1.0.70)
+## Copilot CLI (version-pinned to 1.0.70, 1.0.76 also exercised)
 
-Unchanged from the original adapter. Transcript envelope: `{id, timestamp, parentId, type, data}`
+Unchanged from the original adapter. 1.0.70 is the probed pin; 1.0.76 is exercised too, against `fixtures/copilot-1.0.76/` — it added `stop_hook_active` to the `agentStop` payload, which the previous closed-schema parse rejected, and the current shape is pinned by `crates/munshi/tests/hook_registration.rs` (issue #49). Transcript envelope: `{id, timestamp, parentId, type, data}`
 JSONL under `$COPILOT_HOME/session-state/<sessionId>/events.jsonl`. Event types
 `user.message`, `assistant.message`, `tool.execution_start`, `tool.execution_complete`. See
 [phase-0 findings](phase-0-findings.md). The session-state path remains a private,
@@ -382,12 +382,25 @@ scope until someone needs it.
 
 ## Fixtures and conformance
 
-Synthetic/sanitized conformance fixtures live under `fixtures/claude-code-2.1.44/` and
-`fixtures/codex-rollout-0.x/`. They are hand-authored from the public schemas above — **no private
-transcript content is copied** — and cover missing fields, truncated (incomplete trailing record)
-transcripts, concurrent sessions, and source-specific metadata. The archive-observed bookkeeping
-kinds (issues #30/#34 and the full-archive census #45/#46) are exercised by hand-authored sessions
-under `fixtures/claude-code-2.1.2xx-bookkeeping/` and `fixtures/copilot-1.0.5x-bookkeeping/`. `crates/munshi/tests/harness_adapters.rs`
+Synthetic/sanitized conformance fixtures live under `fixtures/`. They are hand-authored from the
+public schemas above — **no private transcript content is copied** — and cover missing fields,
+truncated (incomplete trailing record) transcripts, concurrent sessions, and source-specific
+metadata. The seventeen fixture directories are:
+
+```text
+claude-code-2.1.205            copilot-1.0.5x-bookkeeping
+claude-code-2.1.2xx-bookkeeping  copilot-1.0.70
+claude-code-2.1.44             copilot-1.0.76
+claude-code-assistant-usage    copilot-assistant-usage
+claude-code-compaction         copilot-compaction
+claude-code-invocation         copilot-invocation
+claude-code-shell-command      copilot-shell-command
+codex-rollout-0.x              copilot-tool-activity
+                               manual
+```
+
+The archive-observed bookkeeping kinds (issues #30/#34 and the full-archive census #45/#46) are
+exercised by the two `*-bookkeeping/` directories. `crates/munshi/tests/harness_adapters.rs`
 exercises normalization, foreign-envelope rejection, the one-shot archive pipeline, and the shared
 archive/state worker pipeline (resumed revisions, interrupted completion reason, source isolation).
 

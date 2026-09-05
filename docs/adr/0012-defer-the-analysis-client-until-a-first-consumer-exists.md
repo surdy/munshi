@@ -1,5 +1,7 @@
 # Defer the analysis client until a first consumer exists
 
+**Status: superseded in part — the consumer exists as [surdy/qanungo](https://github.com/surdy/qanungo) (2026-08).** The title records the decision as it was taken; the closing paragraph records what happened next.
+
 A fourth suite component was designed and deliberately not built: a read-side analysis client
 (working name Qanungo, the officer who audited patwaris' records) with an incremental sync mirror
 of the archive, a content-addressed local cache, a rebuildable SQLite store of normalized events,
