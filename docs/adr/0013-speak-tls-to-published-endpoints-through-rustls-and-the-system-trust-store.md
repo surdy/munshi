@@ -1,10 +1,10 @@
 # Speak TLS to published endpoints through rustls and the system trust store
 
 The shared blocking HTTP/1.1 client was deliberately plain-HTTP over `std::net` (ADR 0006):
-both peers were trusted localhost/LAN daemons. Patwari is now also published at
-`https://patwari.clusterfault.com` through quadhost's Caddy — TLS terminated at the proxy,
-certificates issued by Let's Encrypt over DNS-01, the name resolving only to LAN/tailnet
-addresses — and that is the natural endpoint for any machine outside the trusted subnet.
+both peers were trusted localhost/LAN daemons. Patwari can now also be published at an
+`https://` name behind a TLS-terminating reverse proxy on a private network — TLS terminated at
+the proxy, a publicly trusted certificate, the name resolving only to LAN/tailnet addresses — and
+that is the natural endpoint for any machine outside the trusted subnet.
 Until now such machines needed an SSH tunnel, a manual dependency that quietly queues uploads
 when it is down (munshi issue #35).
 

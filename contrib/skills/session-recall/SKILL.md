@@ -10,21 +10,24 @@ a summary note in Notesmith, and the full verbatim transcript in the Patwari arc
 skill is a funnel — **always start with summaries (cheap), escalate to transcripts (heavy)
 only when the summary can't answer.**
 
-Both services are LAN/tailnet-local: requests cost nothing and content never leaves the
-user's network. All access below is read-only.
+**Configure first:** set `NOTESMITH_URL` and `PATWARI_URL` to your own endpoints — e.g.
+`export NOTESMITH_URL=http://127.0.0.1:27183 PATWARI_URL=http://127.0.0.1:8080`.
+
+Both services are meant to be LAN/tailnet-local: requests cost nothing and content never leaves
+the user's network. All access below is read-only.
 
 ## Stage 1 — search the summaries (always start here)
 
 Scored full-text search over all session summaries:
 
 ```sh
-curl -s "https://notesmith.clusterfault.com/api/v/sessions/search?q=<terms>" | python3 -m json.tool
+curl -s "$NOTESMITH_URL/api/v/sessions/search?q=<terms>" | python3 -m json.tool
 ```
 
 Each hit has `path`, `title`, `score`, and a `snippet`. Read a full note:
 
 ```sh
-curl -s "https://notesmith.clusterfault.com/api/v/sessions/notes/<path>"
+curl -s "$NOTESMITH_URL/api/v/sessions/notes/<path>"
 ```
 
 The JSON carries `frontmatter` (`munshi_session` = session ID, `munshi_source` =
@@ -53,9 +56,9 @@ Hash-addressed lookup, then download and decompress:
 
 ```sh
 HASH=<64-hex, strip any "sha256:" prefix>
-curl -s "https://patwari.clusterfault.com/api/v1/artifacts?original_sha256=$HASH" \
+curl -s "$PATWARI_URL/api/v1/artifacts?original_sha256=$HASH" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['items'][0]['content_url'])"
-curl -s "https://patwari.clusterfault.com<content_url>" -o /tmp/artifact.bin
+curl -s "$PATWARI_URL<content_url>" -o /tmp/artifact.bin
 zstd -d -q -f /tmp/artifact.bin -o /tmp/artifact.out 2>/dev/null || mv /tmp/artifact.bin /tmp/artifact.out
 ```
 
@@ -77,7 +80,7 @@ grep -n '"type":"user"' /tmp/artifact.out | head   # Claude Code user records
 
 Skip stage 1: `munshi show <session-id>` prints the summary and the archive path (use
 `--source claude-code|copilot` if ambiguous), then continue from stage 2. Browse the
-archive's own metadata at `https://patwari.clusterfault.com/api/v1/sessions` (cursor-paginated).
+archive's own metadata at `$PATWARI_URL/api/v1/sessions` (cursor-paginated).
 
 ## Caveats
 

@@ -25,7 +25,7 @@ clap = { version = "4.5.41", features = ["derive"] }
 chrono = { version = "0.4.41", default-features = false, features = ["std"] }
 libc = "0.2.174"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
-# TLS for the Caddy-published endpoints (ADR 0013): rustls on the `ring` provider — identical
+# TLS for published endpoints behind a reverse proxy (ADR 0013): rustls on the `ring` provider — identical
 # behavior on macOS and Linux, no cmake/asm build surprises — verifying against the system
 # trust store via rustls-native-certs, which is also the private-CA extension point.
 rustls = { version = "0.23.29", default-features = false, features = ["ring", "std", "logging", "tls12"] }

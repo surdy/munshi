@@ -554,8 +554,8 @@ fn installed_claude_version() -> Option<String> {
 /// The `projects/` subdirectory name Claude Code gives a working directory.
 ///
 /// **The rule:** every character of the absolute path that is not an ASCII letter or digit becomes
-/// `-`, one `-` per UTF-16 code unit. So `/Users/surdy/repos/munshi` becomes
-/// `-Users-surdy-repos-munshi`; a space, `.`, `_` and `+` each become one `-`; `ü` (one UTF-16 unit)
+/// `-`, one `-` per UTF-16 code unit. So `/Users/alice/repos/munshi` becomes
+/// `-Users-alice-repos-munshi`; a space, `.`, `_` and `+` each become one `-`; `ü` (one UTF-16 unit)
 /// becomes one `-` and an emoji (a surrogate pair) becomes two. The code-unit detail is not
 /// pedantry — it is what the harness's own JavaScript `String.prototype.replace` does, and getting
 /// it wrong puts the transcript in a directory the harness never reads.
@@ -608,25 +608,25 @@ mod tests {
     #[test]
     fn the_project_slug_matches_observed_claude_code_directories() {
         assert_eq!(
-            claude_project_slug("/Users/surdy/repos/munshi"),
-            "-Users-surdy-repos-munshi"
+            claude_project_slug("/Users/alice/repos/munshi"),
+            "-Users-alice-repos-munshi"
         );
         assert_eq!(claude_project_slug("/"), "-");
         assert_eq!(
-            claude_project_slug("/Users/surdy/repos/research/apy"),
-            "-Users-surdy-repos-research-apy"
+            claude_project_slug("/Users/alice/repos/research/apy"),
+            "-Users-alice-repos-research-apy"
         );
         // A space is encoded like any other non-alphanumeric, which the narrower
         // separators-only rule would have got wrong.
         assert_eq!(
-            claude_project_slug("/Users/surdy/repos/AI Coding for Real Engineers"),
-            "-Users-surdy-repos-AI-Coding-for-Real-Engineers"
+            claude_project_slug("/Users/alice/repos/AI Coding for Real Engineers"),
+            "-Users-alice-repos-AI-Coding-for-Real-Engineers"
         );
         // A path that already contains the encoding of another path doubles its leading dash,
         // exactly as the harness does for scratchpad directories.
         assert_eq!(
-            claude_project_slug("/private/tmp/claude-503/-Users-surdy-repos-munshi/x"),
-            "-private-tmp-claude-503--Users-surdy-repos-munshi-x"
+            claude_project_slug("/private/tmp/claude-503/-Users-alice-repos-munshi/x"),
+            "-private-tmp-claude-503--Users-alice-repos-munshi-x"
         );
         // `.`, `_` and `+` are each one dash; `ü` is one UTF-16 code unit and so one dash.
         assert_eq!(claude_project_slug("/a.d/ünï_x+y"), "-a-d--n--x-y");
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn every_derived_slug_is_a_safe_path_component() {
         for cwd in [
-            "/Users/surdy/repos/munshi",
+            "/Users/alice/repos/munshi",
             "/../../etc",
             "/a/../b",
             "/tmp/x\\y",

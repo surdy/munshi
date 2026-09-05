@@ -2,7 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- munshi tick (issue #55): fires the idempotent maintenance sweep every 15 minutes so an
      idle machine still drains retries, rescues, and park re-evaluations without a daemon.
-     Paths are absolute for this machine (launchd expands no ~); adjust user paths, then:
+     Paths must be absolute (launchd expands no ~): replace every YOUR_USERNAME placeholder
+     below with your own account name, then:
        cp contrib/launchd/com.munshi.tick.plist ~/Library/LaunchAgents/
        launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.munshi.tick.plist
      Remove with `launchctl bootout gui/$UID/com.munshi.tick`. The tick prints only when it
@@ -13,7 +14,7 @@
     <string>com.munshi.tick</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/surdy/.local/bin/munshi</string>
+        <string>/Users/YOUR_USERNAME/.local/bin/munshi</string>
         <string>tick</string>
     </array>
     <key>StartInterval</key>
@@ -23,8 +24,8 @@
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
-    <string>/Users/surdy/.munshi/tick.log</string>
+    <string>/Users/YOUR_USERNAME/.munshi/tick.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/surdy/.munshi/tick.log</string>
+    <string>/Users/YOUR_USERNAME/.munshi/tick.log</string>
 </dict>
 </plist>

@@ -29,7 +29,7 @@
     "active": true,
     "targets": ["app", "dmg", "appimage", "deb"],
     "resources": ["resources/bin/munshi"],
-    "copyright": "Copyright 2026 surdy",
+    "copyright": "Copyright (c) 2026 Harpreet Singh Gulati",
     "license": "MIT OR Apache-2.0",
     "publisher": "surdy",
     "category": "DeveloperTool",

@@ -573,7 +573,7 @@ Known preferences:
 Questions for the planning session:
 
 - Is the first Khata deployment single-user only?
-- Should it run beside Notesmith on quadhost?
+- Should it run beside Notesmith on the same host?
 - Is local filesystem storage sufficient initially?
 - Should artifact blobs live on local disk or NFS?
 - Is off-site replication required?
@@ -626,8 +626,8 @@ It should be private initially.
 Plan Khata, the central session-history and backup server paired with Munshi.
 
 Start by reading:
-- /Users/surdy/repos/munshi/README.md
-- /Users/surdy/repos/munshi/docs/khata-handoff.md
+- <munshi-checkout>/README.md
+- <munshi-checkout>/docs/khata-handoff.md
 
 Khata should receive versioned coding-agent session metadata, Markdown summary revisions, and
 eventually compressed full-session artifacts from Munshi. It must support idempotent and resumable

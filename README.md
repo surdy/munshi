@@ -39,6 +39,22 @@ The companion project is named in the same spirit: [Patwari](https://github.com/
 Supported today: **GitHub Copilot CLI** and **Claude Code** capture automatically; OpenAI Codex
 CLI sessions can be archived manually. macOS and Linux.
 
+## Trust and authentication
+
+Be aware before you point Munshi at a server: the full-snapshot upload to Patwari carries **no
+credential at all**, because Patwari has no authentication — this suite was built as one person's
+private tooling for their own LAN and tailnet, where every client that can reach the archive is
+already trusted. So point `munshi archive-upload configure --endpoint` only at a Patwari on a
+private network you control (localhost, a LAN address, a tailnet name, or an `https://` name
+published behind a TLS-terminating reverse proxy that only resolves inside it) — never at anything
+reachable from the open internet, and add your own authenticating proxy in front of it if you need
+one. Notesmith summary delivery is different: `munshi summary-delivery configure` can be given a
+credential *source* — an environment variable or an OS keychain entry — and Munshi reads the token
+from it at delivery time and sends `Authorization: Bearer …`, never storing the secret itself
+(the credential is optional, for an unauthenticated local daemon). None of this is a judgement
+about what you should run; anyone is welcome to take this suite and adapt it, and these are the
+assumptions you would be adapting.
+
 ## Quick taste
 
 ```bash
@@ -131,4 +147,8 @@ spoken natively (issue #35,
 [ADR 0013](docs/adr/0013-speak-tls-to-published-endpoints-through-rustls-and-the-system-trust-store.md)),
 an idle machine drains its backlog through `munshi tick` on a platform timer (issue #55), and a
 backlog dashboard addon visualizes the operational contracts (issue #56; see
-[docs/dashboard.md](docs/dashboard.md)). License: MIT OR Apache-2.0.
+[docs/dashboard.md](docs/dashboard.md)).
+
+## License
+
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.

@@ -186,7 +186,8 @@ Hook events already run recovery sweeps and retries on a busy machine, but on an
 parked retries, pending uploads, and failed deliveries only drain when something fires them. That
 something is `munshi tick` (issue #55): one idempotent maintenance sweep that prints nothing when
 there is nothing to do, made to be run forever by a platform timer. On macOS, install the bundled
-15-minute launchd agent (edit the absolute paths in it first — launchd expands no `~`):
+15-minute launchd agent (edit the absolute paths in it first — launchd expands no `~`, so
+replace every `YOUR_USERNAME` placeholder in the plist with your own account name):
 
 ```bash
 cp contrib/launchd/com.munshi.tick.plist ~/Library/LaunchAgents/

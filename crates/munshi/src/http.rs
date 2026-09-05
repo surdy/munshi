@@ -3,8 +3,8 @@
 //!
 //! The client deliberately stays a blocking, one-fresh-connection-per-request `std::net`
 //! design with no async dependency (ADR 0006). `https://` endpoints wrap that same stream in
-//! rustls, verifying against the system trust store with no TLS policy knobs (ADR 0013) — the
-//! Caddy-published `*.clusterfault.com` names are the intended peers, and plain `http://`
+//! rustls, verifying against the system trust store with no TLS policy knobs (ADR 0013) — a
+//! TLS-terminating reverse proxy on a private network is the intended peer, and plain `http://`
 //! remains fully supported for localhost tunnels and trusted-LAN addresses. It supports
 //! arbitrary request headers and raw binary request bodies with content-length framing, which
 //! the resumable chunk uploads (`application/octet-stream` with custom `x-patwari-chunk-*`
@@ -367,10 +367,10 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_http_endpoint("https://patwari.clusterfault.com").unwrap(),
+            parse_http_endpoint("https://patwari.example.net").unwrap(),
             HttpEndpoint {
                 tls: true,
-                host: "patwari.clusterfault.com".to_owned(),
+                host: "patwari.example.net".to_owned(),
                 port: 443
             }
         );
@@ -384,7 +384,7 @@ mod tests {
         );
         assert!(parse_http_endpoint("ftp://host").is_err());
         assert!(parse_http_endpoint("https://").is_err());
-        assert!(parse_http_endpoint("patwari.clusterfault.com").is_err());
+        assert!(parse_http_endpoint("patwari.example.net").is_err());
     }
 
     #[test]
@@ -403,7 +403,7 @@ mod tests {
     fn tls_server_names_accept_both_dns_names_and_ip_literals() {
         use rustls::pki_types::ServerName;
         assert!(matches!(
-            ServerName::try_from("patwari.clusterfault.com".to_owned()).unwrap(),
+            ServerName::try_from("patwari.example.net".to_owned()).unwrap(),
             ServerName::DnsName(_)
         ));
         assert!(matches!(
