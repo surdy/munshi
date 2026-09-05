@@ -1211,6 +1211,16 @@ impl UploadOutcome {
             Self::Failed { .. } => "failed",
         }
     }
+
+    /// The per-session line's outcome text. Issue #86: the kind alone collapses every skip to a
+    /// bare `skipped`, sending the reader to `--json` for a reason the human printer already
+    /// holds. The token is the same one the machine contract serializes.
+    fn as_human(&self) -> String {
+        match self {
+            Self::Skipped { reason } => format!("skipped: {reason}"),
+            other => other.as_kind().to_owned(),
+        }
+    }
 }
 
 /// Ensures the persistent client UUID exists in durable configuration, generating and storing one
@@ -2809,7 +2819,7 @@ impl ArchiveUploadRunReport {
             println!("note: {note}");
         }
         for item in &self.items {
-            println!("{} -> {}", item.session_id, item.outcome.as_kind());
+            println!("{} -> {}", item.session_id, item.outcome.as_human());
         }
     }
 
@@ -3155,6 +3165,50 @@ fn locked_upload_one(
 mod tests {
     use super::*;
     use crate::source::PreviousSource;
+
+    /// Issue #86: the human per-session line carries the skip reason the machine contract already
+    /// serialized; every other outcome keeps its bare kind token.
+    #[test]
+    fn human_outcome_text_carries_the_skip_reason() {
+        assert_eq!(
+            UploadOutcome::Skipped {
+                reason: "missing-transcript.jsonl".to_owned(),
+            }
+            .as_human(),
+            "skipped: missing-transcript.jsonl"
+        );
+        assert_eq!(
+            UploadOutcome::Skipped {
+                reason: "worker-busy".to_owned(),
+            }
+            .as_human(),
+            "skipped: worker-busy"
+        );
+        assert_eq!(
+            UploadOutcome::Uploaded {
+                snapshot_id: "snap".to_owned(),
+                revision: 1,
+            }
+            .as_human(),
+            "uploaded"
+        );
+        assert_eq!(
+            UploadOutcome::AlreadyUploaded {
+                snapshot_id: None,
+                revision: 1,
+            }
+            .as_human(),
+            "already-uploaded"
+        );
+        assert_eq!(
+            UploadOutcome::Failed {
+                category: "network".to_owned(),
+                dead_letter: false,
+            }
+            .as_human(),
+            "failed"
+        );
+    }
 
     #[test]
     fn prepare_artifact_records_both_representations() {
