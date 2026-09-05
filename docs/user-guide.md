@@ -525,10 +525,22 @@ count). Uploads whose backoff has elapsed are
 also retried automatically by the recovery sweep (`munshi hook recover` — a
 recovery command, run by the hooks and by `munshi tick`, and available to you for explicit
 repair), so a transient outage
-recovers without a new revision. `backfill` uploads archived sessions the configured server holds
-no self-contained snapshot for — sessions archived while upload was disabled or unconfigured, and
-sessions whose recorded snapshot is not known to carry both `summary.md` and `transcript.jsonl` —
-running each through the normal upload path (`--limit` bounds one run, default 200). `reconcile`
+recovers without a new revision. `backfill` consults this machine's **local** upload ledger, not the server: it uploads archived
+sessions whose local rows say the configured endpoint holds no self-contained snapshot — sessions
+archived while upload was disabled or unconfigured, sessions whose recorded snapshot is not known
+to carry both `summary.md` and `transcript.jsonl`, and sessions whose recorded Markdown hash has
+drifted — running each through the normal upload path (`--limit` bounds one run, default 200). It
+never asks the server what it holds, so a row that says `uploaded` is not reconsidered even if the
+snapshot is gone from the archive; `backfill` leaves `pending` and `failed` rows to `retry`, and
+ends with a `note:` naming how many it left and what drains them (issue #87). Two recovery paths
+follow from that (issue #89). If the archive lost some snapshots, `reconcile --repair-missing`
+lists the server's snapshots and resets the rows whose snapshot no longer exists, after which
+`backfill` re-uploads them. If the archive was **emptied** — a wiped Patwari data directory, a
+replacement server — the blunt path is
+`munshi hook recover --state-dir <state> --rebuild-state`, which rebuilds operational state from
+your Munshi-owned Markdown and resets the upload rows with it, followed by
+`munshi archive-upload backfill` and then `munshi tick` (or
+`munshi archive-upload retry --all`) for anything left `pending`. `reconcile`
 (issue #76) is a one-time metadata backfill, not an upload: it lists the server's snapshots once and
 fills the `patwari_session_id` onto uploaded rows recorded before that id was stored, matching by
 snapshot id. It is idempotent (a row that already carries the id is left untouched), endpoint-scoped,
