@@ -127,6 +127,18 @@ pub enum RegistrationError {
     UnsafePath(PathBuf),
     #[error("the existing Munshi-owned file is malformed or was not created by this version")]
     MalformedOwnedFile,
+    /// A `config.json` that parses and validates cleanly but records a *different* state
+    /// directory than the one it was loaded from — a configuration copied or moved somewhere it
+    /// does not describe. Distinct from [`Self::MalformedOwnedFile`] because nothing is wrong
+    /// with the file: naming both paths is what lets an operator see that instantly (issue #88).
+    #[error(
+        "the state directory {configured} does not match the one recorded in its configuration \
+         ({recorded})"
+    )]
+    StateDirectoryMismatch {
+        recorded: PathBuf,
+        configured: PathBuf,
+    },
     #[error("the harness settings file at {0} is not a JSON settings object Munshi can merge into")]
     ForeignSettingsUnrecognized(PathBuf),
     #[error("another Munshi registration operation is active")]
@@ -1000,11 +1012,22 @@ pub(crate) fn load_stored_config(
         || (config.summary_delivery.enabled && !config.summary_delivery.is_addressable())
         || (config.archive_upload.enabled && !config.archive_upload.is_addressable())
         || (config.memory_sync.enabled && !config.memory_sync.is_addressable())
-        || Path::new(&config.state_directory) != state_directory
+        || !Path::new(&config.state_directory).is_absolute()
         || !config.harnesses.paths_are_absolute()
         || !config.summarizer_exhaust.path_is_absolute()
     {
         return Err(RegistrationError::MalformedOwnedFile);
+    }
+    // Path identity, not path spelling: `MUNSHI_HOME` reached through a symlink names the very
+    // directory this `config.json` was read out of, so it is the same registration (issue #88).
+    // A genuine mismatch — a configuration copied somewhere it does not describe — gets its own
+    // error naming both paths rather than borrowing the malformed-file message.
+    let recorded = Path::new(&config.state_directory);
+    if !same_directory(recorded, state_directory) {
+        return Err(RegistrationError::StateDirectoryMismatch {
+            recorded: recorded.to_path_buf(),
+            configured: state_directory.to_path_buf(),
+        });
     }
     if stored_config_version(&bytes) == Some(1) {
         // The file still holds the superseded v1 shape: persist the validated migration so the
@@ -1488,6 +1511,28 @@ fn validate_regular_file(path: &Path) -> Result<(), RegistrationError> {
         }
         Ok(_) => Err(RegistrationError::UnsafePath(path.to_path_buf())),
         Err(error) => Err(RegistrationError::Io(error)),
+    }
+}
+
+/// Whether two paths name the same directory on disk, rather than the same string. A state
+/// directory is routinely reached by more than one spelling — an operator's convenience symlink,
+/// `/tmp` in front of `/private/tmp` on macOS, a home directory behind an automounter — and every
+/// one of them is the same registration. Resolved symlinks decide it first; the device+inode pair
+/// is the fallback for the mounts `canonicalize` normalizes differently on either side. Both are
+/// consulted only when the literal paths already disagree, so the common case costs no syscall,
+/// and a path that cannot be resolved at all is simply not the same directory.
+pub fn same_directory(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    if let (Ok(left), Ok(right)) = (fs::canonicalize(left), fs::canonicalize(right)) {
+        if left == right {
+            return true;
+        }
+    }
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
     }
 }
 

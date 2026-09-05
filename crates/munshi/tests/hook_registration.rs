@@ -100,6 +100,147 @@ fn reregistration_preserves_archive_upload_and_summary_delivery_configuration() 
     assert!(after.get("delivery").is_none());
 }
 
+/// Issue #88: a state directory reached through a symlink is the same registration, so every
+/// command that loads `config.json` must behave exactly as it does through the real path. The two
+/// that did not — `archive-upload status` and `summary-delivery status` — failed with the
+/// malformed-file message because the recorded state directory was compared to the configured one
+/// as a *string*. The reported shape — an unchanged state path underneath a symlinked ancestor —
+/// is covered through both `--state-dir` and `MUNSHI_HOME`. A configuration that really does
+/// describe another directory still fails, but now with its own error naming both paths. A state
+/// directory that *is itself* a symlink stays refused: that is the deliberate `ensure_directory`
+/// hardening, it applies uniformly to every command, and its message is already accurate.
+#[test]
+fn status_subcommands_accept_a_symlinked_state_directory() {
+    let directory = test_directory();
+    let paths = Paths::new(&directory);
+    assert_success(&register_command(&paths, fake("success.sh"), 2_000, true));
+
+    let configure = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&paths.state)
+            .output()
+            .unwrap();
+        assert_success(&output);
+    };
+    // Neither endpoint is contacted: configuring only writes the sections whose absence would
+    // otherwise let status degrade to an unregistered report and hide the bug.
+    configure(&[
+        "archive-upload",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:9",
+    ]);
+    configure(&[
+        "summary-delivery",
+        "configure",
+        "--endpoint",
+        "http://127.0.0.1:10",
+        "--vault",
+        "Vault",
+    ]);
+
+    // The same directory, reached under a symlinked ancestor: `<root-link>/munshi-home`.
+    let ancestor = directory.path().join("root-link");
+    symlink(directory.path(), &ancestor).unwrap();
+    let via_symlink = ancestor.join("munshi-home");
+
+    let status_output = |state_dir: &Path, subcommand: &str, by_env: bool| -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_munshi"));
+        if !subcommand.is_empty() {
+            command.arg(subcommand);
+        }
+        command.arg("status").arg("--json");
+        if by_env {
+            command.env("MUNSHI_HOME", state_dir);
+        } else {
+            command.arg("--state-dir").arg(state_dir);
+        }
+        command.output().unwrap()
+    };
+    let status_json = |state_dir: &Path, subcommand: &str, by_env: bool| -> Value {
+        let output = status_output(state_dir, subcommand, by_env);
+        assert_success(&output);
+        serde_json::from_slice(&output.stdout).expect("valid JSON output")
+    };
+
+    // The two reports the issue names carry no paths, so they must match the real path's output
+    // exactly — the failure was total, not cosmetic.
+    for subcommand in ["archive-upload", "summary-delivery"] {
+        let expected = status_json(&paths.state, subcommand, false);
+        for by_env in [false, true] {
+            assert_eq!(
+                status_json(&via_symlink, subcommand, by_env),
+                expected,
+                "`{subcommand} status` through a symlinked state directory (env: {by_env}) \
+                 must match the real path"
+            );
+        }
+    }
+
+    // Plain `status` exited zero through a symlink but quietly flunked its own
+    // `state-directory-match` check on the same string comparison, dragging the whole
+    // configuration verdict to `error`. Its report echoes the path the operator asked for, so
+    // only the verdict is compared, not the whole document.
+    for by_env in [false, true] {
+        let report = status_json(&via_symlink, "", by_env);
+        assert_eq!(report["configuration"]["status"], "ok", "env: {by_env}");
+        assert_eq!(
+            report["configuration"]["runtime_compatible"], true,
+            "env: {by_env}"
+        );
+        let check = report["configuration"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["code"] == "state-directory-match")
+            .expect("the state-directory-match check is reported")
+            .clone();
+        assert_eq!(check["status"], "ok", "env: {by_env}");
+    }
+
+    // A state directory that is itself a symlink is a different question, and every command
+    // refuses it the same way: unchanged, accurate, and not what issue #88 was about.
+    let direct = directory.path().join("state-link");
+    symlink(&paths.state, &direct).unwrap();
+    for subcommand in ["", "archive-upload", "summary-delivery"] {
+        let output = status_output(&direct, subcommand, false);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("refusing an unsafe symlink"),
+            "`{subcommand} status` must keep refusing a symlinked state directory outright"
+        );
+    }
+
+    // A configuration that genuinely describes a different directory is still refused — with its
+    // own error naming both paths, not the message that blames the file.
+    let elsewhere = directory.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::copy(
+        paths.state.join("config.json"),
+        elsewhere.join("config.json"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_munshi"))
+        .args(["archive-upload", "status"])
+        .arg("--state-dir")
+        .arg(&elsewhere)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "a real mismatch must still fail");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !stderr.contains("malformed"),
+        "a path mismatch must not blame the file: {stderr}"
+    );
+    assert!(
+        stderr.contains(&elsewhere.display().to_string())
+            && stderr.contains(&paths.state.display().to_string()),
+        "the mismatch error must name both paths: {stderr}"
+    );
+}
+
 /// Issue #36: a version-1 configuration (top-level `remote_delivery` bool + `delivery` section)
 /// loads losslessly, is persisted as the unified version-2 `summary_delivery` shape on first load,
 /// and round-trips bit-for-bit thereafter.
