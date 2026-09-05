@@ -28,7 +28,7 @@ use munshi::{
     run_archive_worker_for_source, run_recovery, set_archive_upload_enabled, set_delivery_enabled,
     set_memory_sync_enabled, set_project_enabled, summarizer_exhaust_bytes, tick_recovery_sweep,
     unregister, verify_archive_parse, wait_for_hook_result_for_source,
-    session_id_matches_transcript_path,
+    same_directory, session_id_matches_transcript_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -3808,10 +3808,13 @@ fn inspect_configuration(state_directory: &Path) -> ConfigurationAssessment {
                         ),
                     }
 
+                    // Path identity, not path spelling: a state directory reached through a
+                    // symlink is the very directory this configuration was read out of, so it
+                    // matches the command's scope (issue #88).
                     let state_dir_matches = config
                         .state_directory
                         .as_deref()
-                        .is_some_and(|value| Path::new(value) == state_directory);
+                        .is_some_and(|value| same_directory(Path::new(value), state_directory));
                     if state_dir_matches {
                         push_check(
                             &mut checks,

@@ -313,6 +313,23 @@ For routine maintenance — as opposed to a rebuild — `munshi tick` is the sch
 point: it runs the same recovery sweep plus the park lifts, upload/delivery retries, and
 exhaust-retention pruning, and is what a launchd/cron timer should invoke.
 
+## Symlinked state directories
+
+`$MUNSHI_HOME` (or `--state-dir`) may point *through* symlinks: `/tmp/e2e/munshi/state` and
+`/tmp/link/munshi/state`, where `link` is a symlink to `e2e`, are the same registration, and every
+command reports identically through either spelling. Munshi compares path *identity* (resolved
+symlinks, then device+inode), not path spelling.
+
+The state directory may not itself *be* a symlink. `~/.munshi -> /volumes/big/munshi` is refused
+by every command with `refusing an unsafe symlink, file type, or ownership at …`: Munshi writes
+`config.json`, `munshi.db`, and its lock files there and will not follow a link it does not own
+to do it. Point `$MUNSHI_HOME` at the real directory instead.
+
+A configuration that genuinely records a different state directory — a `config.json` copied
+somewhere it does not describe — fails with `the state directory <path> does not match the one
+recorded in its configuration (<path>)`, naming both. Re-run `munshi register` against the
+directory you actually want.
+
 ## "My session archived but never uploaded to Patwari"
 
 Archive upload is opt-in and separate from local archival: a session is archived once its Markdown

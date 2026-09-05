@@ -70,7 +70,7 @@ pub use registration::{
     DEFAULT_SUMMARIZER_EXHAUST_RETENTION_DAYS, DisclosureDecision, ProjectStatus, RegisterConfig,
     RegistrationError, accept_disclosure, accept_disclosure_from_terminal,
     configured_chunk_threshold_bytes, configured_max_event_text_bytes, project_status, register,
-    set_project_enabled, unregister,
+    same_directory, set_project_enabled, unregister,
 };
 pub use render::{
     ArchiveMetadata, ArchiveVersion, ArchivedCursor, ArchivedMarkdown, atomic_replace,
